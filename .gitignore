@@ -101,6 +101,10 @@ target/
 monitoring/secrets/*
 !monitoring/secrets/.gitkeep
 
+# Local podman secrets (file-backed Compose secrets; podman's Docker-API
+# compat layer doesn't materialize `secrets.<name>.environment` sources)
+podman-secrets/
+
 # Docker local overrides
 docker-compose.override.yml
 docker-compose.override.pam.yml

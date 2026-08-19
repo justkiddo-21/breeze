@@ -1,0 +1,43 @@
+# Podman compatibility override — rootless podman's Docker-API emulation does
+# not materialize Compose's `secrets.<name>.environment` source (the redis
+# password never lands at /run/secrets/redis_password, so redis exits 1 with
+# "REDIS_PASSWORD is empty"). `file:`/`environment:` are mutually exclusive on
+# the same named secret, so instead of redefining the top-level secret, bind
+# the local file-backed copy (see podman-secrets/, gitignored) straight at the
+# same in-container path the base compose file already expects. `:z` relabels
+# the file to container_file_t so SELinux (enforcing) permits the read —
+# shared label since both redis and api mount the same host file.
+services:
+  redis:
+    volumes:
+      - ./podman-secrets/redis_password:/run/secrets/redis_password:ro,z
+  api:
+    volumes:
+      - ./podman-secrets/redis_password:/run/secrets/redis_password:ro,z
+
+  # Rootless podman's pasta network backend runs confined under the pasta_t
+  # SELinux domain, which has no cap_net_bind_service allow rule — setcap on
+  # the pasta binary is a no-op here (unlike the classic rootlessport helper,
+  # this isn't a plain Linux-capabilities check). Publish on a high port
+  # instead of lowering the host's unprivileged-port sysctl.
+  #
+  # This deployment sits behind a Cloudflare Tunnel (cloudflared, run as its
+  # own systemd service outside this compose stack) whose origin service is
+  # http://localhost:8080 — Cloudflare terminates public TLS at its edge, so
+  # Caddy must NOT also do its own ACME/auto-HTTPS (CADDY_SITE_ADDRESS must
+  # stay :80, matching Caddyfile.prod's documented Cloudflare Tunnel chain:
+  # Internet -> cloudflared -> Caddy -> API). Only port 80/8080 is needed;
+  # Caddy never opens 443 internally when its site address is :80.
+  caddy:
+    ports: !override
+      - '8080:80'
+    environment:
+      CADDY_SITE_ADDRESS: ':80'
+    # Same SELinux relabeling need as the redis_password bind above — the
+    # base file's Caddyfile.prod bind mount has no :z, so caddy_t can't read
+    # it (permission denied, retries forever). !override replaces the whole
+    # list since Compose otherwise appends duplicates for list-type keys.
+    volumes: !override
+      - ./docker/Caddyfile.prod:/etc/caddy/Caddyfile:ro,z
+      - caddy_data:/data
+      - caddy_config:/config
