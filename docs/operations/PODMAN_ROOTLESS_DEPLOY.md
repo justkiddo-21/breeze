@@ -25,9 +25,20 @@ SELinux, skip the `:z` mount fixes — they're no-ops there but harmless to leav
 
 ## Deploy commands
 
+`scripts/deploy-podman-rootless.sh` automates every step below (secret sanity checks,
+image-existence verification, the redis secret file, the `$`-escaping check, bringing the
+stack up, health-polling, and a smoke test) — it's the encoded version of this whole doc.
+Run it instead of the raw commands by hand:
+
 ```bash
 podman login ghcr.io -u x-access-token --password-stdin   # paste token via stdin, never as a CLI arg
 
+scripts/deploy-podman-rootless.sh --behind-cloudflare-tunnel-http-origin   # omit the flag if not applicable — see §8
+```
+
+Manual equivalent, if you need to run compose directly (e.g. to bring up a single service):
+
+```bash
 podman compose \
   -f docker-compose.yml \
   -f docker-compose.override.yml.ghcr \
@@ -265,6 +276,32 @@ add `header_up X-Forwarded-Proto https` to the API `reverse_proxy` blocks in
 `docker/Caddyfile.prod`, gated so it doesn't regress the strict-production path where Caddy
 really does terminate TLS itself. That's a shared-file change and wasn't made here — treat
 it as a follow-up, not something to copy-paste into a hotfix.
+
+### 9. A literal `$` in a `.env` value silently truncates itself via Compose interpolation
+
+Not podman-specific — this would break under real Docker Compose too — but it surfaced
+during this deploy and is worth catching for the next one. `BREEZE_BOOTSTRAP_ADMIN_PASSWORD`
+was `$$$Fk21102003$$$` in `.env`, an attempt to escape a password containing literal `$`
+characters that got the escaping wrong. Compose interpolates `.env` VALUES themselves (not
+just the YAML) wherever they're substituted into a `${VAR}` placeholder in the compose file
+(here, `docker-compose.yml`'s `BREEZE_BOOTSTRAP_ADMIN_PASSWORD: ${BREEZE_BOOTSTRAP_ADMIN_PASSWORD:-}`),
+and `$$` is the only way to get a literal `$` through that — a bare `$Word` is read as a
+variable reference. `$Fk21102003` doesn't match any real variable, so Compose silently
+substitutes an empty string and prints `The "Fk21102003" variable is not set. Defaulting to
+a blank string.` — a warning easy to miss since it prints *before* the container-status
+lines, and gets scrolled past by any `| tail -N`. The container then failed with a
+downstream, seemingly-unrelated error: `BREEZE_BOOTSTRAP_ADMIN_PASSWORD must be at least 16
+characters in production` — the mangled runtime value was shorter than what's actually
+written in the file, so reading `.env` by eye looked fine.
+
+This value only matters for the very first boot (seeding the initial admin when the users
+table is empty) — by the time this bug was found, that boot had already happened
+successfully, so the fix was simply regenerating a fresh value with no `$` in it at all
+(`openssl rand -base64 24`), since the old one no longer serves any purpose.
+`scripts/deploy-podman-rootless.sh` now runs `podman compose ... config` before `up -d` and
+fails fast on any `variable is not set` warning, naming the exact dangling reference instead
+of letting it surface as a mystifying container-exited-1 later. If you must put a literal
+`$` in any `.env` value, double it (`$$`).
 
 ## Final `docker-compose.override.yml.podman`
 
