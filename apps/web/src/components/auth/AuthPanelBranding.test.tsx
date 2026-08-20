@@ -25,8 +25,8 @@ describe('AuthPanelBranding', () => {
 
     render(<AuthPanelBranding tagline="The modern RMM platform." />);
 
-    // Stock wordmark + marketing copy present.
-    expect(screen.getByText('Breeze')).toBeInTheDocument();
+    // Stock marketing copy present (the stock panel carries no wordmark).
+    expect(screen.queryByText('Breeze')).not.toBeInTheDocument();
     expect(screen.getByText(/Effortless endpoint/i)).toBeInTheDocument();
     expect(screen.getByText('10,000+ endpoints')).toBeInTheDocument();
 
