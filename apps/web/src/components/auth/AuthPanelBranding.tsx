@@ -49,7 +49,7 @@ export default function AuthPanelBranding({ tagline }: { tagline: string }) {
             />
           ) : (
             <>
-              <img src="/branding.png" alt="" className="h-10 w-10 object-contain" />
+              <img src="/branding.png" alt="" className="h-[60px] w-[60px] object-contain" />
               <span className="text-xl font-bold tracking-tight">Breeze</span>
             </>
           )}
