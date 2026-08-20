@@ -99,6 +99,16 @@
       "@grpc/grpc-js@<1.14.4": ">=1.14.4",
       "js-yaml@>=4.0.0 <4.3.1": ">=4.3.1 <5.0.0",
       "nanoid@<3.3.18": ">=3.3.18 <4.0.0"
-    }
+    },
+    "onlyBuiltDependencies": [
+      "@firebase/util",
+      "@sentry/cli",
+      "argon2",
+      "core-js",
+      "cpu-features",
+      "esbuild",
+      "msgpackr-extract",
+      "ssh2"
+    ]
   }
 }
