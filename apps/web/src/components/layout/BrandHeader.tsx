@@ -19,7 +19,7 @@ export default function BrandHeader({ logoUrl, name, showLabel }: BrandHeaderPro
 
   return (
     <div className="flex items-center gap-2">
-      <div className="flex h-7 w-7 shrink-0 items-center justify-center overflow-hidden rounded-[6px] bg-primary/15">
+      <div className="flex h-[42px] w-[42px] shrink-0 items-center justify-center overflow-hidden rounded-[6px] bg-primary/15">
         {safeLogoUrl ? (
           <img src={safeLogoUrl} alt={t('layout.logoAlt', { brand: label })} className="h-full w-full object-contain" />
         ) : (
