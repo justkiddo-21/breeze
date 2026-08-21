@@ -1,0 +1,88 @@
+# Builds + self-signs the Windows agent binary outside release.yml's signing
+# gate (Azure Trusted Signing there needs LanternOps' own verified-business
+# credentials, which this fork doesn't have). Signed with a self-issued
+# "KResLab" code-signing cert instead — this does NOT earn SmartScreen
+# reputation (that requires a CA-chained cert), but a machine that has the
+# public KResLab cert installed in its Trusted Root/Trusted Publishers store
+# (see the exported artifact below) will trust binaries signed with it with
+# no SmartScreen prompt at all. Manual dispatch only — this isn't part of the
+# normal release flow.
+name: Edge Agent (Windows, self-signed)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-sign:
+    name: Build + sign breeze-agent-windows-amd64.exe
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent/go.mod
+
+      - name: Install go-winres
+        run: go install github.com/tc-hib/go-winres@v0.3.3
+
+      - name: Embed version info + admin manifest (mirrors `make build-winres`, agent binary only)
+        working-directory: agent/resources
+        run: |
+          go-winres simply --arch amd64 --no-suffix `
+            --icon icon.ico --admin `
+            --file-version 0.0.0 --product-version 0.0.0 `
+            --product-name "Breeze" `
+            --file-description "Breeze" `
+            --copyright "Copyright (c) Breeze RMM" `
+            --original-filename "breeze-agent.exe" `
+            --out ../cmd/breeze-agent/rsrc_windows_amd64.syso
+
+      - name: Build breeze-agent-windows-amd64.exe
+        working-directory: agent
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go build -o bin/breeze-agent-windows-amd64.exe ./cmd/breeze-agent
+
+      - name: Import KResLab code-signing cert
+        env:
+          PFX_BASE64: ${{ secrets.KRESLAB_CODESIGN_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.KRESLAB_CODESIGN_PFX_PASSWORD }}
+        run: |
+          $bytes = [Convert]::FromBase64String($env:PFX_BASE64)
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\kreslab-codesign.pfx", $bytes)
+          $securePw = ConvertTo-SecureString -String $env:PFX_PASSWORD -Force -AsPlainText
+          Import-PfxCertificate -FilePath "$env:RUNNER_TEMP\kreslab-codesign.pfx" `
+            -CertStoreLocation Cert:\CurrentUser\My -Password $securePw | Out-Null
+
+      - name: Sign the exe
+        run: |
+          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq "CN=KResLab" } | Select-Object -First 1
+          if (-not $cert) { throw "KResLab signing cert not found in CurrentUser\My store" }
+          Set-AuthenticodeSignature -FilePath agent\bin\breeze-agent-windows-amd64.exe `
+            -Certificate $cert -HashAlgorithm SHA256 -TimestampServer "http://timestamp.digicert.com" | Out-Null
+          $sig = Get-AuthenticodeSignature agent\bin\breeze-agent-windows-amd64.exe
+          Write-Host "Signature status: $($sig.Status) — signer: $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'UnknownError' -and $sig.Status -ne 'Valid' -and $sig.Status -ne 'NotTrusted') {
+            throw "Unexpected signature status: $($sig.Status)"
+          }
+
+      - name: Export public KResLab cert (for installing trust on branch PCs)
+        run: |
+          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq "CN=KResLab" } | Select-Object -First 1
+          Export-Certificate -Cert $cert -FilePath kreslab-codesign-public.cer | Out-Null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: breeze-agent-windows-amd64-signed
+          path: |
+            agent/bin/breeze-agent-windows-amd64.exe
+            kreslab-codesign-public.cer
+          retention-days: 30
