@@ -92,8 +92,8 @@ build-winres:
 	cd resources && go-winres simply --arch amd64 --no-suffix \
 		--icon icon.ico --admin \
 		--file-version $(VERSION) --product-version $(VERSION) \
-		--product-name "Breeze RMM Agent" \
-		--file-description "Breeze RMM Agent" \
+		--product-name "Breeze" \
+		--file-description "Breeze" \
 		--copyright "Copyright (c) Breeze RMM" \
 		--original-filename "breeze-agent.exe" \
 		--out ../cmd/breeze-agent/rsrc_windows_amd64.syso
