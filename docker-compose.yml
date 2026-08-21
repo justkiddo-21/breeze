@@ -611,7 +611,13 @@ services:
       - --fingerprint
       - --use-auth-secret
       - --relay-threads=4
-      - --user-quota=4
+      # 4 was too tight for real-world use: a client stuck reconnecting (e.g.
+      # a screen-capture failure on the agent side causing repeated ICE
+      # restarts) burns one allocation per attempt, each held for the full
+      # credential TTL — 4 retries in a few minutes was enough to exhaust the
+      # per-user quota and get every subsequent attempt rejected with 486
+      # Allocation Quota Reached, on top of whatever caused the reconnects.
+      - --user-quota=20
       - --total-quota=1000
       - --max-bps=${TURN_MAX_BPS:-5000000}
       - --no-multicast-peers
