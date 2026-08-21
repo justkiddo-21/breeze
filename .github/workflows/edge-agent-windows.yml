@@ -49,6 +49,15 @@ jobs:
         env:
           GOOS: windows
           GOARCH: amd64
+          # windows-latest auto-detects a C compiler and defaults CGO_ENABLED=1,
+          # which pulls in internal/remote/desktop's cgo-tagged DXGI capture
+          # path instead of the windows-&& !cgo one — that path isn't complete
+          # in this checkout (undefined dxgiCapturer/comVtblFn/etc). Every
+          # other build of this agent (release.yml's ubuntu-latest cross-
+          # compile, the Makefile's local cross-compile) gets CGO_ENABLED=0
+          # implicitly since there's no Windows C cross-compiler on those
+          # hosts; force the same value here for a native windows-latest build.
+          CGO_ENABLED: 0
         run: go build -o bin/breeze-agent-windows-amd64.exe ./cmd/breeze-agent
 
       - name: Import KResLab code-signing cert
