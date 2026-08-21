@@ -15,6 +15,20 @@ services:
     volumes:
       - ./podman-secrets/redis_password:/run/secrets/redis_password:ro,z
 
+  # docker-compose.override.yml.ghcr stubs coturn out to a no-op (`image:
+  # alpine:3.19`, `entrypoint: ["true"]`) on the assumption TURN runs on a
+  # separate DO droplet, which isn't every self-hoster's setup. This override
+  # (loaded after .ghcr) restores the real service for anyone running TURN on
+  # this same host — plus the same podman secrets-materialization fix as
+  # redis_password above, since turn_secret is environment-sourced too.
+  coturn:
+    image: ${COTURN_IMAGE_REF:?Set COTURN_IMAGE_REF to a digest-pinned coturn image ref}
+    entrypoint: !override ['/bin/sh', '-ec']
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./podman-secrets/turn_secret:/run/secrets/turn_secret:ro,z
+
   # Rootless podman's pasta network backend runs confined under the pasta_t
   # SELinux domain, which has no cap_net_bind_service allow rule — setcap on
   # the pasta binary is a no-op here (unlike the classic rootlessport helper,

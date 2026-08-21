@@ -632,11 +632,18 @@ services:
       - --denied-peer-ip=ff00::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
       - --log-file=stdout
       - --verbose
-      - --min-port=49152
-      - --max-port=65535
+      - --min-port=${TURN_MIN_PORT:-49152}
+      - --max-port=${TURN_MAX_PORT:-65535}
       - --no-cli
       - --realm=${TURN_REALM:-breeze.local}
-      - --external-ip=${TURN_HOST:-}
+      # TURN_EXTERNAL_IP lets the server advertise a literal IP that differs
+      # from TURN_HOST (the client-facing hostname/IP used to build ICE server
+      # URLs, see apps/api/src/routes/remote/helpers.ts) — needed when TURN_HOST
+      # is a DDNS hostname that clients resolve fresh each connection, since
+      # coturn's own --external-ip needs the current literal IP at process
+      # start rather than a re-resolved hostname. Falls back to TURN_HOST for
+      # the plain "TURN_HOST is already a static IP" case.
+      - --external-ip=${TURN_EXTERNAL_IP:-${TURN_HOST:-}}
 
 networks:
   # Fixed subnet so Caddy gets a stable, known peer address (see caddy service
