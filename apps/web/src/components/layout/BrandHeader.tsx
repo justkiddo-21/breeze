@@ -23,7 +23,7 @@ export default function BrandHeader({ logoUrl, name, showLabel }: BrandHeaderPro
     <div className="flex items-center gap-2">
       {/* Capped at 48px: the sidebar header is h-16 and the collapsed rail is
           w-16, so a larger mark overflows both. */}
-      <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-[6px] bg-primary/15">
+      <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden">
         {safeLogoUrl ? (
           <img src={safeLogoUrl} alt={t('layout.logoAlt', { brand: altBrand })} className="h-full w-full object-contain" />
         ) : (
