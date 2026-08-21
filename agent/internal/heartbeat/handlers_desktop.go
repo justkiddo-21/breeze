@@ -151,7 +151,7 @@ func handleStartDesktop(h *Heartbeat, cmd Command) tools.CommandResult {
 	}
 
 	// Parse optional display index (multi-monitor selection)
-	displayIndex := 0
+	displayIndex := desktop.PrimaryMonitorIndex()
 	if di, ok := cmd.Payload["displayIndex"].(float64); ok {
 		if di < 0 || di > maxDesktopDisplayIndex || math.Trunc(di) != di {
 			return tools.CommandResult{
@@ -419,7 +419,7 @@ func handleDesktopStreamStart(h *Heartbeat, cmd Command) tools.CommandResult {
 	if f, ok := cmd.Payload["maxFps"].(float64); ok && f >= 1 && f <= 30 {
 		config.MaxFPS = int(f)
 	}
-	displayIndex := 0
+	displayIndex := desktop.PrimaryMonitorIndex()
 	if di, ok := cmd.Payload["displayIndex"].(float64); ok {
 		if di < 0 || di > maxDesktopDisplayIndex || math.Trunc(di) != di {
 			return tools.CommandResult{

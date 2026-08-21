@@ -11,6 +11,24 @@ type MonitorInfo struct {
 	IsPrimary bool   `json:"isPrimary"`
 }
 
+// PrimaryMonitorIndex returns the index of the OS-designated primary
+// monitor, or 0 (list order, not necessarily primary) if enumeration fails
+// or no monitor is flagged primary. Callers use this as the default when a
+// remote session request doesn't specify a displayIndex — monitor
+// enumeration order is not guaranteed to put the primary display first.
+func PrimaryMonitorIndex() int {
+	monitors, err := ListMonitors()
+	if err != nil {
+		return 0
+	}
+	for _, m := range monitors {
+		if m.IsPrimary {
+			return m.Index
+		}
+	}
+	return 0
+}
+
 // GetScreenResolution returns the width and height for the given monitor index.
 // Returns (0, 0) if the monitor can't be enumerated.
 func GetScreenResolution(displayIndex int) (int, int) {

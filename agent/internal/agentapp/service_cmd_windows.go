@@ -43,7 +43,7 @@ var serviceInstallCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("failed to determine executable path: %w", err)
 		}
-		serviceExePath, copied, err := serviceinstall.InstallProtectedBinary(exePath, "breeze-agent.exe")
+		serviceExePath, copied, err := serviceinstall.InstallProtectedBinary(exePath, "breeze.exe")
 		if err != nil {
 			return fmt.Errorf("failed to install service binary in protected Program Files location: %w", err)
 		}
