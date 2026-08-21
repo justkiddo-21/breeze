@@ -7,6 +7,13 @@ export interface InstallCommandOptions {
   token: string;
   /** Optional org enrollment secret */
   enrollmentSecret?: string;
+  /**
+   * Optional URL to a code-signing certificate (.cer) to install into the
+   * Windows machine's Trusted Root store before running the agent — for a
+   * self-signed build (no CA-chained reputation) that would otherwise trip
+   * SmartScreen on a fresh machine. No-op on macOS/Linux.
+   */
+  trustCertUrl?: string;
 }
 
 export interface InstallCommands {
@@ -30,7 +37,7 @@ export interface InstallCommands {
 export function buildInstallCommands(opts: InstallCommandOptions): InstallCommands {
   const apiUrl = opts.apiUrl.replace(/\/+$/, '');
   const ghBase = opts.ghBase.replace(/\/+$/, '');
-  const { token, enrollmentSecret } = opts;
+  const { token, enrollmentSecret, trustCertUrl } = opts;
 
   // The connectivity message is scoped to the fetch + shebang check only —
   // once install.sh runs it reports its own failures precisely, and appending
@@ -54,10 +61,18 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
     `$b=[IO.File]::ReadAllBytes("$pwd\\breeze-agent.exe"); ` +
     `if($b.Length -lt 2 -or $b[0] -ne 0x4D -or $b[1] -ne 0x5A)` +
     `{throw "Breeze: downloaded file is not a Windows executable - a captive portal or web filter may be intercepting this network"}`;
+  // certutil -addstore requires Administrator, same as `service install`
+  // below — no separate elevation prompt beyond what the script already needs.
+  const winTrustCert = trustCertUrl
+    ? `Invoke-WebRequest -Uri "${trustCertUrl}" -OutFile breeze-trust.cer; ` +
+      `certutil -addstore Root breeze-trust.cer; ` +
+      `if($LASTEXITCODE){throw "Breeze: installing the trust certificate failed (exit code $LASTEXITCODE)"}; `
+    : '';
   const windows =
     `$ErrorActionPreference='Stop'; ` +
     `Invoke-WebRequest -Uri "${ghBase}/breeze-agent-windows-amd64.exe" -OutFile breeze-agent.exe; ` +
     `${winMzCheck}; ` +
+    `${winTrustCert}` +
     `.\\breeze-agent.exe service install; ${winThrow('service install')}; ` +
     `.\\breeze-agent.exe enroll "${token}" --server "${apiUrl}"${winSecretFlag}; ${winThrow('enrollment')}; ` +
     `.\\breeze-agent.exe service start; ${winThrow('service start')}`;

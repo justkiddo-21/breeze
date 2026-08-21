@@ -39,10 +39,20 @@ ARG PUBLIC_API_URL=
 ARG PUBLIC_APP_VERSION=0.1.0
 # Build-time UI feature flags (empty → off; see apps/web/src/lib/featureFlags.ts)
 ARG PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST=
+# Base URL the Add Device modal's Windows/Linux/macOS install one-liners
+# download the agent binary from (see apps/web/src/lib/installCommands.ts).
+# Empty -> falls back to the official lanternops/breeze GitHub release.
+ARG PUBLIC_AGENT_DOWNLOAD_URL=
+# Optional trust-cert URL for a self-signed agent build (see
+# InstallCommandOptions.trustCertUrl in installCommands.ts). Empty -> the
+# generated install command skips the certutil step entirely.
+ARG PUBLIC_AGENT_TRUST_CERT_URL=
 ENV NODE_ENV=${NODE_ENV}
 ENV PUBLIC_API_URL=${PUBLIC_API_URL}
 ENV PUBLIC_APP_VERSION=${PUBLIC_APP_VERSION}
 ENV PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST=${PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST}
+ENV PUBLIC_AGENT_DOWNLOAD_URL=${PUBLIC_AGENT_DOWNLOAD_URL}
+ENV PUBLIC_AGENT_TRUST_CERT_URL=${PUBLIC_AGENT_TRUST_CERT_URL}
 
 # Copy dependencies from deps stage
 COPY --from=deps /app/node_modules ./node_modules

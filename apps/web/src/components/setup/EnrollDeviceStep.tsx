@@ -480,6 +480,7 @@ export default function EnrollDeviceStep({ orgId, siteId, onBack, onFinish: _onF
                 'https://github.com/lanternops/breeze/releases/latest/download',
               token: onboardingToken || '<TOKEN>',
               enrollmentSecret: enrollmentSecret || undefined,
+              trustCertUrl: import.meta.env.PUBLIC_AGENT_TRUST_CERT_URL || undefined,
             });
 
             return (

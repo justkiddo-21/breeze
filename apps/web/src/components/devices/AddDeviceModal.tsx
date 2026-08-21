@@ -1178,6 +1178,7 @@ export default function AddDeviceModal({
                   "https://github.com/lanternops/breeze/releases/latest/download",
                 token: onboardingToken || "<TOKEN>",
                 enrollmentSecret: enrollmentSecret || undefined,
+                trustCertUrl: import.meta.env.PUBLIC_AGENT_TRUST_CERT_URL || undefined,
               });
               const commandPlatform =
                 selectedOS === "windows" ? "windows" : "linux";
