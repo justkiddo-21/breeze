@@ -44,7 +44,25 @@ jobs:
             --original-filename "breeze-agent.exe" `
             --out ../cmd/breeze-agent/rsrc_windows_amd64.syso
 
-      - name: Build breeze-agent-windows-amd64.exe
+      # NOT admin (asInvoker) on purpose — this runs with the interactively
+      # logged-in user's own token via CreateProcessAsUser, and an admin
+      # manifest there fails with ELEVATION_REQUIRED (see service_cmd_windows.go
+      # comments). Without this binary present, sessionbroker falls back to
+      # spawning the (admin-manifested) main exe as the per-user helper, which
+      # hits exactly that failure and leaves desktop capture broken.
+      - name: Embed version info for breeze-user-helper.exe (asInvoker, not admin)
+        working-directory: agent/resources
+        run: |
+          go-winres simply --arch amd64 --no-suffix `
+            --icon icon.ico `
+            --file-version 0.0.0 --product-version 0.0.0 `
+            --product-name "Breeze RMM User Helper" `
+            --file-description "Breeze RMM User Helper" `
+            --copyright "Copyright (c) Breeze RMM" `
+            --original-filename "breeze-user-helper.exe" `
+            --out ../cmd/breeze-user-helper/rsrc_windows_amd64.syso
+
+      - name: Build breeze-agent-windows-amd64.exe and breeze-user-helper-windows-amd64.exe
         working-directory: agent
         env:
           GOOS: windows
@@ -58,7 +76,9 @@ jobs:
           # implicitly since there's no Windows C cross-compiler on those
           # hosts; force the same value here for a native windows-latest build.
           CGO_ENABLED: 0
-        run: go build -o bin/breeze-agent-windows-amd64.exe ./cmd/breeze-agent
+        run: |
+          go build -o bin/breeze-agent-windows-amd64.exe ./cmd/breeze-agent
+          go build -ldflags "-H windowsgui" -o bin/breeze-user-helper-windows-amd64.exe ./cmd/breeze-user-helper
 
       - name: Import KResLab code-signing cert
         env:
@@ -71,16 +91,18 @@ jobs:
           Import-PfxCertificate -FilePath "$env:RUNNER_TEMP\kreslab-codesign.pfx" `
             -CertStoreLocation Cert:\CurrentUser\My -Password $securePw | Out-Null
 
-      - name: Sign the exe
+      - name: Sign both exes
         run: |
           $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq "CN=KResLab" } | Select-Object -First 1
           if (-not $cert) { throw "KResLab signing cert not found in CurrentUser\My store" }
-          Set-AuthenticodeSignature -FilePath agent\bin\breeze-agent-windows-amd64.exe `
-            -Certificate $cert -HashAlgorithm SHA256 -TimestampServer "http://timestamp.digicert.com" | Out-Null
-          $sig = Get-AuthenticodeSignature agent\bin\breeze-agent-windows-amd64.exe
-          Write-Host "Signature status: $($sig.Status) — signer: $($sig.SignerCertificate.Subject)"
-          if ($sig.Status -ne 'UnknownError' -and $sig.Status -ne 'Valid' -and $sig.Status -ne 'NotTrusted') {
-            throw "Unexpected signature status: $($sig.Status)"
+          foreach ($f in @("agent\bin\breeze-agent-windows-amd64.exe", "agent\bin\breeze-user-helper-windows-amd64.exe")) {
+            Set-AuthenticodeSignature -FilePath $f `
+              -Certificate $cert -HashAlgorithm SHA256 -TimestampServer "http://timestamp.digicert.com" | Out-Null
+            $sig = Get-AuthenticodeSignature $f
+            Write-Host "$f signature status: $($sig.Status) — signer: $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'UnknownError' -and $sig.Status -ne 'Valid' -and $sig.Status -ne 'NotTrusted') {
+              throw "Unexpected signature status for $f`: $($sig.Status)"
+            }
           }
 
       - name: Export public KResLab cert (for installing trust on branch PCs)
@@ -93,5 +115,6 @@ jobs:
           name: breeze-agent-windows-amd64-signed
           path: |
             agent/bin/breeze-agent-windows-amd64.exe
+            agent/bin/breeze-user-helper-windows-amd64.exe
             kreslab-codesign-public.cer
           retention-days: 30
