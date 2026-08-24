@@ -56,5 +56,6 @@ jobs:
             PUBLIC_APP_VERSION=${{ github.ref_name }}
             PUBLIC_AGENT_DOWNLOAD_URL=https://github.com/justkiddo-21/breeze/releases/download/kreslab-agent-signed-v1
             PUBLIC_AGENT_TRUST_CERT_URL=https://github.com/justkiddo-21/breeze/releases/download/kreslab-agent-signed-v1/kreslab-codesign-public.cer
+            PUBLIC_AGENT_USER_HELPER_URL=https://github.com/justkiddo-21/breeze/releases/download/kreslab-agent-signed-v1/breeze-user-helper-windows-amd64.exe
           cache-from: type=gha,scope=edge-web
           cache-to: type=gha,scope=edge-web,mode=max

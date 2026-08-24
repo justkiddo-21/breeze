@@ -104,6 +104,21 @@ describe('buildInstallCommands', () => {
       // macOS/Linux path is untouched by this Windows-only option.
       expect(withCert.macos).toBe(buildInstallCommands(base).macos);
     });
+
+    it('installs the user helper only when userHelperUrl is provided, after service install', () => {
+      const withHelper = buildInstallCommands({
+        ...base,
+        userHelperUrl: 'https://gh.example.com/dl/breeze-user-helper-windows-amd64.exe',
+      });
+      expect(withHelper.windows).toContain('https://gh.example.com/dl/breeze-user-helper-windows-amd64.exe');
+      expect(withHelper.windows).toContain('$env:ProgramFiles\\Breeze\\breeze-user-helper.exe');
+      expect(withHelper.windows.indexOf('service install')).toBeLessThan(
+        withHelper.windows.indexOf('breeze-user-helper.exe')
+      );
+      expect(buildInstallCommands(base).windows).not.toContain('breeze-user-helper.exe');
+      // macOS/Linux path is untouched by this Windows-only option.
+      expect(withHelper.macos).toBe(buildInstallCommands(base).macos);
+    });
   });
 
   it('strips trailing slashes from apiUrl and ghBase', () => {

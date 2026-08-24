@@ -47,12 +47,18 @@ ARG PUBLIC_AGENT_DOWNLOAD_URL=
 # InstallCommandOptions.trustCertUrl in installCommands.ts). Empty -> the
 # generated install command skips the certutil step entirely.
 ARG PUBLIC_AGENT_TRUST_CERT_URL=
+# Optional standalone breeze-user-helper.exe URL (see
+# InstallCommandOptions.userHelperUrl in installCommands.ts). Empty -> the
+# generated install command skips this step and relies on the agent's normal
+# server-side reconciliation to fetch it after first boot.
+ARG PUBLIC_AGENT_USER_HELPER_URL=
 ENV NODE_ENV=${NODE_ENV}
 ENV PUBLIC_API_URL=${PUBLIC_API_URL}
 ENV PUBLIC_APP_VERSION=${PUBLIC_APP_VERSION}
 ENV PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST=${PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST}
 ENV PUBLIC_AGENT_DOWNLOAD_URL=${PUBLIC_AGENT_DOWNLOAD_URL}
 ENV PUBLIC_AGENT_TRUST_CERT_URL=${PUBLIC_AGENT_TRUST_CERT_URL}
+ENV PUBLIC_AGENT_USER_HELPER_URL=${PUBLIC_AGENT_USER_HELPER_URL}
 
 # Copy dependencies from deps stage
 COPY --from=deps /app/node_modules ./node_modules

@@ -14,6 +14,17 @@ export interface InstallCommandOptions {
    * SmartScreen on a fresh machine. No-op on macOS/Linux.
    */
   trustCertUrl?: string;
+  /**
+   * Optional URL for a standalone breeze-user-helper.exe to place directly at
+   * C:\Program Files\Breeze\breeze-user-helper.exe after service install. A
+   * normal release-versioned agent self-heals a missing companion helper via
+   * server-side reconciliation, but that 404s for a build version that was
+   * never registered in the API's binary catalog (e.g. a custom/self-signed
+   * build) — sessionbroker then falls back to spawning the (admin-manifested)
+   * main exe as the per-user helper, which fails with ELEVATION_REQUIRED and
+   * leaves desktop capture broken. No-op on macOS/Linux.
+   */
+  userHelperUrl?: string;
 }
 
 export interface InstallCommands {
@@ -37,7 +48,7 @@ export interface InstallCommands {
 export function buildInstallCommands(opts: InstallCommandOptions): InstallCommands {
   const apiUrl = opts.apiUrl.replace(/\/+$/, '');
   const ghBase = opts.ghBase.replace(/\/+$/, '');
-  const { token, enrollmentSecret, trustCertUrl } = opts;
+  const { token, enrollmentSecret, trustCertUrl, userHelperUrl } = opts;
 
   // The connectivity message is scoped to the fetch + shebang check only —
   // once install.sh runs it reports its own failures precisely, and appending
@@ -68,12 +79,19 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
       `certutil -addstore Root breeze-trust.cer; ` +
       `if($LASTEXITCODE){throw "Breeze: installing the trust certificate failed (exit code $LASTEXITCODE)"}; `
     : '';
+  // Placed after `service install` succeeds, since that's what creates
+  // C:\Program Files\Breeze\ in the first place.
+  const winUserHelper = userHelperUrl
+    ? `Invoke-WebRequest -Uri "${userHelperUrl}" -OutFile "$env:ProgramFiles\\Breeze\\breeze-user-helper.exe"; ` +
+      `if($LASTEXITCODE){throw "Breeze: installing the user helper failed (exit code $LASTEXITCODE)"}; `
+    : '';
   const windows =
     `$ErrorActionPreference='Stop'; ` +
     `Invoke-WebRequest -Uri "${ghBase}/breeze-agent-windows-amd64.exe" -OutFile breeze-agent.exe; ` +
     `${winMzCheck}; ` +
     `${winTrustCert}` +
     `.\\breeze-agent.exe service install; ${winThrow('service install')}; ` +
+    `${winUserHelper}` +
     `.\\breeze-agent.exe enroll "${token}" --server "${apiUrl}"${winSecretFlag}; ${winThrow('enrollment')}; ` +
     `.\\breeze-agent.exe service start; ${winThrow('service start')}`;
 

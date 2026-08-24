@@ -1179,6 +1179,7 @@ export default function AddDeviceModal({
                 token: onboardingToken || "<TOKEN>",
                 enrollmentSecret: enrollmentSecret || undefined,
                 trustCertUrl: import.meta.env.PUBLIC_AGENT_TRUST_CERT_URL || undefined,
+                userHelperUrl: import.meta.env.PUBLIC_AGENT_USER_HELPER_URL || undefined,
               });
               const commandPlatform =
                 selectedOS === "windows" ? "windows" : "linux";
