@@ -25,6 +25,16 @@ export interface InstallCommandOptions {
    * leaves desktop capture broken. No-op on macOS/Linux.
    */
   userHelperUrl?: string;
+  /**
+   * Optional URL for a standalone breeze-watchdog.exe, downloaded as a SIBLING
+   * next to breeze-agent.exe before `service install`. The agent prefers a
+   * sibling watchdog over its GitHub-download fallback (locateSiblingWatchdog
+   * in watchdog_bootstrap.go), so providing this keeps a self-signed/custom
+   * build from pulling the stock watchdog from LanternOps' release (pinned to
+   * the build's hardcoded version, e.g. v0.5.0) — self-hosted + consistent
+   * branding. No-op on macOS/Linux.
+   */
+  watchdogUrl?: string;
 }
 
 export interface InstallCommands {
@@ -48,7 +58,7 @@ export interface InstallCommands {
 export function buildInstallCommands(opts: InstallCommandOptions): InstallCommands {
   const apiUrl = opts.apiUrl.replace(/\/+$/, '');
   const ghBase = opts.ghBase.replace(/\/+$/, '');
-  const { token, enrollmentSecret, trustCertUrl, userHelperUrl } = opts;
+  const { token, enrollmentSecret, trustCertUrl, userHelperUrl, watchdogUrl } = opts;
 
   // The connectivity message is scoped to the fetch + shebang check only —
   // once install.sh runs it reports its own failures precisely, and appending
@@ -79,6 +89,13 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
       `certutil -addstore Root breeze-trust.cer; ` +
       `if($LASTEXITCODE){throw "Breeze: installing the trust certificate failed (exit code $LASTEXITCODE)"}; `
     : '';
+  // Downloaded as a sibling next to breeze-agent.exe BEFORE `service install`,
+  // so the agent's locateSiblingWatchdog finds it and skips its LanternOps
+  // GitHub-download fallback entirely.
+  const winWatchdog = watchdogUrl
+    ? `Invoke-WebRequest -Uri "${watchdogUrl}" -OutFile breeze-watchdog.exe; ` +
+      `if($LASTEXITCODE){throw "Breeze: downloading the watchdog failed (exit code $LASTEXITCODE)"}; `
+    : '';
   // Placed after `service install` succeeds, since that's what creates
   // C:\Program Files\Breeze\ in the first place.
   const winUserHelper = userHelperUrl
@@ -90,6 +107,7 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
     `Invoke-WebRequest -Uri "${ghBase}/breeze-agent-windows-amd64.exe" -OutFile breeze-agent.exe; ` +
     `${winMzCheck}; ` +
     `${winTrustCert}` +
+    `${winWatchdog}` +
     `.\\breeze-agent.exe service install; ${winThrow('service install')}; ` +
     `${winUserHelper}` +
     `.\\breeze-agent.exe enroll "${token}" --server "${apiUrl}"${winSecretFlag}; ${winThrow('enrollment')}; ` +

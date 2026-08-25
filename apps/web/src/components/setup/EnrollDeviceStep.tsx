@@ -482,6 +482,7 @@ export default function EnrollDeviceStep({ orgId, siteId, onBack, onFinish: _onF
               enrollmentSecret: enrollmentSecret || undefined,
               trustCertUrl: import.meta.env.PUBLIC_AGENT_TRUST_CERT_URL || undefined,
               userHelperUrl: import.meta.env.PUBLIC_AGENT_USER_HELPER_URL || undefined,
+              watchdogUrl: import.meta.env.PUBLIC_AGENT_WATCHDOG_URL || undefined,
             });
 
             return (

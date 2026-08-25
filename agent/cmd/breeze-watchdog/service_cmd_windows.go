@@ -49,8 +49,8 @@ func serviceInstallCmd() *cobra.Command {
 			defer m.Disconnect()
 
 			s, err := m.CreateService(windowsWatchdogServiceName, serviceExePath, mgr.Config{
-				DisplayName:  "Breeze RMM Watchdog",
-				Description:  "Breeze Agent Watchdog - monitors and recovers the agent process",
+				DisplayName:  "Breeze Helper",
+				Description:  "Breeze Helper - keeps the Breeze service healthy",
 				StartType:    mgr.StartAutomatic,
 				ErrorControl: mgr.ErrorNormal,
 			}, "run")

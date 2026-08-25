@@ -62,7 +62,25 @@ jobs:
             --original-filename "breeze-user-helper.exe" `
             --out ../cmd/breeze-user-helper/rsrc_windows_amd64.syso
 
-      - name: Build breeze-agent-windows-amd64.exe and breeze-user-helper-windows-amd64.exe
+      # Watchdog supervises/recovers the agent service. Shipping our OWN signed
+      # build (and downloading it as a sibling next to breeze-agent.exe in the
+      # install command) means the agent never falls back to pulling the stock
+      # watchdog from LanternOps' v0.5.0 GitHub release — keeps the whole stack
+      # self-signed, self-hosted, and consistently branded ("Breeze", not
+      # "Breeze RMM Watchdog"). admin manifest, same as the main agent.
+      - name: Embed version info + admin manifest for breeze-watchdog.exe
+        working-directory: agent/resources
+        run: |
+          go-winres simply --arch amd64 --no-suffix `
+            --icon icon.ico --admin `
+            --file-version 0.0.0 --product-version 0.0.0 `
+            --product-name "Breeze" `
+            --file-description "Breeze Helper" `
+            --copyright "Copyright (c) Breeze RMM" `
+            --original-filename "breeze-watchdog.exe" `
+            --out ../cmd/breeze-watchdog/rsrc_windows_amd64.syso
+
+      - name: Build agent, user-helper, and watchdog
         working-directory: agent
         env:
           GOOS: windows
@@ -79,6 +97,7 @@ jobs:
         run: |
           go build -o bin/breeze-agent-windows-amd64.exe ./cmd/breeze-agent
           go build -ldflags "-H windowsgui" -o bin/breeze-user-helper-windows-amd64.exe ./cmd/breeze-user-helper
+          go build -o bin/breeze-watchdog-windows-amd64.exe ./cmd/breeze-watchdog
 
       - name: Import KResLab code-signing cert
         env:
@@ -95,7 +114,7 @@ jobs:
         run: |
           $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq "CN=KResLab" } | Select-Object -First 1
           if (-not $cert) { throw "KResLab signing cert not found in CurrentUser\My store" }
-          foreach ($f in @("agent\bin\breeze-agent-windows-amd64.exe", "agent\bin\breeze-user-helper-windows-amd64.exe")) {
+          foreach ($f in @("agent\bin\breeze-agent-windows-amd64.exe", "agent\bin\breeze-user-helper-windows-amd64.exe", "agent\bin\breeze-watchdog-windows-amd64.exe")) {
             Set-AuthenticodeSignature -FilePath $f `
               -Certificate $cert -HashAlgorithm SHA256 -TimestampServer "http://timestamp.digicert.com" | Out-Null
             $sig = Get-AuthenticodeSignature $f
@@ -116,5 +135,6 @@ jobs:
           path: |
             agent/bin/breeze-agent-windows-amd64.exe
             agent/bin/breeze-user-helper-windows-amd64.exe
+            agent/bin/breeze-watchdog-windows-amd64.exe
             kreslab-codesign-public.cer
           retention-days: 30

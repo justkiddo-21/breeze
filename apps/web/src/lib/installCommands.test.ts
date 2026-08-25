@@ -119,6 +119,23 @@ describe('buildInstallCommands', () => {
       // macOS/Linux path is untouched by this Windows-only option.
       expect(withHelper.macos).toBe(buildInstallCommands(base).macos);
     });
+
+    it('downloads the watchdog as a sibling only when watchdogUrl is provided, before service install', () => {
+      const withWatchdog = buildInstallCommands({
+        ...base,
+        watchdogUrl: 'https://gh.example.com/dl/breeze-watchdog-windows-amd64.exe',
+      });
+      expect(withWatchdog.windows).toContain('https://gh.example.com/dl/breeze-watchdog-windows-amd64.exe');
+      expect(withWatchdog.windows).toContain('-OutFile breeze-watchdog.exe');
+      // Must land next to breeze-agent.exe BEFORE service install so the agent's
+      // sibling-watchdog lookup finds it and skips the LanternOps download.
+      expect(withWatchdog.windows.indexOf('breeze-watchdog.exe')).toBeLessThan(
+        withWatchdog.windows.indexOf('service install')
+      );
+      expect(buildInstallCommands(base).windows).not.toContain('breeze-watchdog.exe');
+      // macOS/Linux path is untouched by this Windows-only option.
+      expect(withWatchdog.macos).toBe(buildInstallCommands(base).macos);
+    });
   });
 
   it('strips trailing slashes from apiUrl and ghBase', () => {
