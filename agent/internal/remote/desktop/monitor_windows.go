@@ -33,8 +33,88 @@ const (
 	dxgiOutputGetDesc = 7 // IDXGIOutput::GetDesc (IUnknown=3, IDXGIObject=4 more, GetDesc=next)
 )
 
-// ListMonitors enumerates connected displays via DXGI.
+// ListMonitors returns every logical display on the desktop.
+//
+// It starts from the DXGI enumeration (listMonitorsDXGI) and SUPPLEMENTS it with
+// any logical display that DXGI missed, discovered via EnumDisplayMonitors (GDI,
+// which reports the OS's logical displays regardless of GPU adapter or DXGI
+// availability). This ordering is deliberate: the DXGI entries keep their raw
+// EnumOutputs index, which the capture path's EnumOutputs(DisplayIndex) relies
+// on — reordering them would make monitor switching capture the wrong output on
+// machines where DXGI already works. Supplemented monitors get fresh indices
+// after the DXGI ones; the capture path can't reach them through DXGI (that's
+// why they were missing) and falls back to a GDI region capture keyed by the
+// monitor's device name (see gdiCapturer.ensureHandles).
+//
+// The real-world case this fixes: a single-GPU box with two extended displays
+// where one output (e.g. a TV) returns DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
+// (0x887A0022) and breaks the DXGI EnumOutputs loop early, so only the first
+// monitor is listed even though the second is a live, extended desktop.
 func ListMonitors() ([]MonitorInfo, error) {
+	dxgi, dxgiErr := listMonitorsDXGI()
+
+	monitors := append([]MonitorInfo(nil), dxgi...)
+	// Dedup by geometry, not device name: DXGI's OUTPUT_DESC.DeviceName and GDI's
+	// MONITORINFOEX.szDevice are both the `\\.\DISPLAYn` GDI name and normally
+	// match, but keying on bounds is robust even if a driver reports them
+	// differently — two entries covering the same rectangle are the same display,
+	// so 404-style machines (DXGI already sees every monitor) never get phantom
+	// duplicates appended.
+	boundsKey := func(x, y, w, h int) string {
+		return fmt.Sprintf("%d,%d,%d,%d", x, y, w, h)
+	}
+	seen := make(map[string]bool, len(monitors))
+	maxIndex := -1
+	for _, m := range monitors {
+		seen[boundsKey(m.X, m.Y, m.Width, m.Height)] = true
+		if m.Index > maxIndex {
+			maxIndex = m.Index
+		}
+	}
+
+	gdi, gdiErr := enumerateMonitors()
+	if gdiErr != nil {
+		slog.Warn("EnumDisplayMonitors failed", "error", gdiErr.Error())
+	}
+	for _, g := range gdi {
+		gx, gy := int(g.Left), int(g.Top)
+		gw, gh := int(g.Right-g.Left), int(g.Bottom-g.Top)
+		if gw <= 0 || gh <= 0 {
+			continue
+		}
+		key := boundsKey(gx, gy, gw, gh)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		maxIndex++
+		monitors = append(monitors, MonitorInfo{
+			Index:     maxIndex,
+			Name:      g.Device,
+			Width:     gw,
+			Height:    gh,
+			X:         gx,
+			Y:         gy,
+			IsPrimary: g.Primary,
+		})
+		slog.Info("ListMonitors: supplemented a display DXGI could not enumerate",
+			"index", maxIndex, "device", g.Device,
+			"bounds", fmt.Sprintf("%dx%d+%d+%d", gw, gh, gx, gy))
+	}
+
+	if len(monitors) == 0 {
+		if dxgiErr != nil {
+			return nil, dxgiErr
+		}
+		return nil, fmt.Errorf("no monitors found")
+	}
+	return monitors, nil
+}
+
+// listMonitorsDXGI enumerates connected displays via DXGI (one adapter's
+// outputs). It is the base of ListMonitors; see that function for why its
+// result is supplemented rather than trusted as complete.
+func listMonitorsDXGI() ([]MonitorInfo, error) {
 	// Create a temporary D3D11 device to enumerate outputs.
 	var device, context uintptr
 	featureLevel := uint32(d3dFeatureLevel11_0)

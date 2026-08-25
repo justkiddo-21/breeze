@@ -93,12 +93,39 @@ func init() {
 	}
 }
 
-// ensureHandles creates or recreates GDI handles if needed.
-func (c *gdiCapturer) ensureHandles() error {
+// resolveTargetDisplay returns the GDI device name to pass to CreateDC and the
+// pixel dimensions for the monitor this capturer targets (config.DisplayIndex).
+//
+// It matches config.DisplayIndex against ListMonitors so the index space is the
+// SAME one the viewer selects from — crucially including monitors that DXGI
+// cannot enumerate but GDI can (ListMonitors supplements those). Without this,
+// GDI capture always grabbed the primary via the generic "DISPLAY" device, so a
+// viewer that picked the second (extended) monitor of a machine whose DXGI can't
+// serve that output would silently see the primary's content instead.
+//
+// Returns (nil, primaryW, primaryH) — capture the primary via a NULL device — on
+// any lookup failure.
+func (c *gdiCapturer) resolveTargetDisplay() (*uint16, int, int) {
+	if mons, err := ListMonitors(); err == nil {
+		for _, m := range mons {
+			if m.Index == c.config.DisplayIndex && m.Name != "" && m.Width > 0 && m.Height > 0 {
+				if p, perr := syscall.UTF16PtrFromString(m.Name); perr == nil {
+					return p, m.Width, m.Height
+				}
+			}
+		}
+	}
 	w, _, _ := procGetSystemMetrics.Call(smCxScreen)
 	h, _, _ := procGetSystemMetrics.Call(smCyScreen)
+	return nil, int(w), int(h)
+}
+
+// ensureHandles creates or recreates GDI handles if needed.
+func (c *gdiCapturer) ensureHandles() error {
+	deviceName, dw, dh := c.resolveTargetDisplay()
+	w, h := uintptr(dw), uintptr(dh)
 	if w == 0 || h == 0 {
-		return fmt.Errorf("GetSystemMetrics returned zero dimensions")
+		return fmt.Errorf("could not determine capture dimensions for display %d", c.config.DisplayIndex)
 	}
 	// Round to even dimensions so the bitmap, BitBlt, and pixBuf all agree
 	// with the downstream H264 encoder's required even alignment. On displays
@@ -116,14 +143,27 @@ func (c *gdiCapturer) ensureHandles() error {
 	// Release old handles if resolution changed
 	c.releaseHandles()
 
-	// Use CreateDC("DISPLAY") instead of GetDC(0). GetDC(0) returns a DC
-	// for the desktop window which fails on the Winlogon (secure) desktop.
-	// CreateDC("DISPLAY") creates a DC for the physical display directly,
-	// bypassing the window/desktop association, and works on all desktops.
-	hdc, _, _ := procCreateDCW.Call(
-		uintptr(unsafe.Pointer(displayDeviceName)),
-		0, 0, 0,
-	)
+	// Use CreateDC("DISPLAY", <device>) instead of GetDC(0). GetDC(0) returns a
+	// DC for the desktop window which fails on the Winlogon (secure) desktop.
+	// CreateDC creates a DC for the physical display directly, bypassing the
+	// window/desktop association, and works on all desktops. Passing the
+	// resolved device name (e.g. `\\.\DISPLAY2`) as the lpszDevice argument
+	// targets that specific monitor; a nil device selects the primary. The
+	// unsafe.Pointer→uintptr conversions stay inside the .Call argument list so
+	// the GC can't move the strings mid-call.
+	var hdc uintptr
+	if deviceName != nil {
+		hdc, _, _ = procCreateDCW.Call(
+			uintptr(unsafe.Pointer(displayDeviceName)),
+			uintptr(unsafe.Pointer(deviceName)),
+			0, 0,
+		)
+	} else {
+		hdc, _, _ = procCreateDCW.Call(
+			uintptr(unsafe.Pointer(displayDeviceName)),
+			0, 0, 0,
+		)
+	}
 	if hdc == 0 {
 		// Fall back to GetDC(0) if CreateDC fails
 		hdc, _, _ = procGetDC.Call(0)
@@ -332,8 +372,13 @@ func (c *gdiCapturer) CaptureRegion(x, y, width, height int) (*image.RGBA, error
 	return cropped, nil
 }
 
-// GetScreenBounds returns the primary screen dimensions.
+// GetScreenBounds returns the dimensions of the monitor this capturer targets
+// (config.DisplayIndex), so the encoder is sized to the selected display rather
+// than always the primary. Falls back to the primary metrics on lookup failure.
 func (c *gdiCapturer) GetScreenBounds() (width, height int, err error) {
+	if _, dw, dh := c.resolveTargetDisplay(); dw > 0 && dh > 0 {
+		return dw, dh, nil
+	}
 	w, _, _ := procGetSystemMetrics.Call(smCxScreen)
 	h, _, _ := procGetSystemMetrics.Call(smCyScreen)
 	if w == 0 || h == 0 {
