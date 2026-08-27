@@ -161,6 +161,12 @@ describe('buildInstallCommands', () => {
       expect(cmds.linux).toContain('"$(id -u)" = 0');
       // ELF-magic guard against intercepted downloads.
       expect(cmds.linux).toContain('7f454c46');
+      // Sets XDG_RUNTIME_DIR so `systemctl --user` works from a su/SSH shell
+      // that isn't a full login session (else "cannot connect to user bus").
+      expect(cmds.linux).toContain('export XDG_RUNTIME_DIR=');
+      expect(cmds.linux.indexOf('XDG_RUNTIME_DIR')).toBeLessThan(
+        cmds.linux.indexOf('systemctl --user daemon-reload')
+      );
       expect(cmds.linux).toContain('enroll "enroll_abc123" --server "https://rmm.example.com"');
       // Windows and macOS are unaffected.
       expect(cmds.macos).toBe(buildInstallCommands(base).macos);

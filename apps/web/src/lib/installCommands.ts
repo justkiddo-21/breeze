@@ -98,6 +98,13 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
     `chmod 0755 "$BIN"`,
     `"$BIN" --config "$HOME/.config/breeze/agent.yaml" enroll "${token}" --server "${apiUrl}"${unixSecretFlag}`,
     `printf '[Unit]\\nDescription=Breeze RMM Agent (user)\\nAfter=graphical-session.target\\n\\n[Service]\\nType=simple\\nExecStart=%s --config %%h/.config/breeze/agent.yaml run\\nRestart=always\\nRestartSec=10\\n\\n[Install]\\nWantedBy=default.target\\n' "$BIN" > "$HOME/.config/systemd/user/breeze-agent.service"`,
+    // `systemctl --user` needs XDG_RUNTIME_DIR (and a D-Bus address derived from
+    // it) to reach the user manager. A plain `su -`/SSH shell that isn't a full
+    // login session leaves them unset — "Failed to connect to user scope bus".
+    // Default them to the logged-in user's runtime dir (present because the
+    // desktop user has an active graphical session).
+    `export XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"`,
+    `export DBUS_SESSION_BUS_ADDRESS="\${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"`,
     `systemctl --user daemon-reload`,
     `systemctl --user enable --now breeze-agent`,
     `sudo loginctl enable-linger "$(id -un)" 2>/dev/null || true`,
