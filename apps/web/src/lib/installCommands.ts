@@ -91,20 +91,29 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
   const linuxUserCmd = [
     `set -e`,
     `[ "$(id -u)" = 0 ] && { echo "[ERROR] Run this as the desktop user (e.g. icool), NOT with sudo/root — the agent installs as a per-user service." >&2; exit 1; }`,
-    `BIN="$HOME/.local/bin/breeze-agent"`,
-    `mkdir -p "$HOME/.local/bin" "$HOME/.config/breeze" "$HOME/.config/systemd/user"`,
-    `curl -fsSL --connect-timeout 10 -o "$BIN" "${linuxBinaryUrl}" || { echo "[ERROR] Could not fetch the Breeze agent from ${linuxBinaryUrl} — check this machine's network access." >&2; exit 1; }`,
-    `magic=$(od -An -tx1 -N4 "$BIN" | tr -d ' \\n'); [ "$magic" = "7f454c46" ] || { echo "[ERROR] Downloaded file is not a Linux binary — a captive portal or web filter may be intercepting this network." >&2; exit 1; }`,
-    `chmod 0755 "$BIN"`,
-    `"$BIN" --config "$HOME/.config/breeze/agent.yaml" enroll "${token}" --server "${apiUrl}"${unixSecretFlag}`,
-    `printf '[Unit]\\nDescription=Breeze RMM Agent (user)\\nAfter=graphical-session.target\\n\\n[Service]\\nType=simple\\nExecStart=%s --config %%h/.config/breeze/agent.yaml run\\nRestart=always\\nRestartSec=10\\n\\n[Install]\\nWantedBy=default.target\\n' "$BIN" > "$HOME/.config/systemd/user/breeze-agent.service"`,
     // `systemctl --user` needs XDG_RUNTIME_DIR (and a D-Bus address derived from
     // it) to reach the user manager. A plain `su -`/SSH shell that isn't a full
     // login session leaves them unset — "Failed to connect to user scope bus".
     // Default them to the logged-in user's runtime dir (present because the
-    // desktop user has an active graphical session).
+    // desktop user has an active graphical session). Set early so the stop below
+    // can reach the running service.
     `export XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"`,
     `export DBUS_SESSION_BUS_ADDRESS="\${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"`,
+    `BIN="$HOME/.local/bin/breeze-agent"`,
+    `mkdir -p "$HOME/.local/bin" "$HOME/.config/breeze" "$HOME/.config/systemd/user"`,
+    // Stop a running instance first so the binary isn't busy — overwriting a
+    // running executable in place fails with ETXTBSY (curl "error on write").
+    // Best-effort: the unit may not exist yet on a first install.
+    `systemctl --user stop breeze-agent 2>/dev/null || true`,
+    // Download to a temp path and mv into place: an atomic rename swaps the
+    // inode, so even a still-running old binary (holding the old inode) never
+    // blocks the replace.
+    `curl -fsSL --connect-timeout 10 -o "$BIN.new" "${linuxBinaryUrl}" || { echo "[ERROR] Could not fetch the Breeze agent from ${linuxBinaryUrl} — check this machine's network access." >&2; exit 1; }`,
+    `magic=$(od -An -tx1 -N4 "$BIN.new" | tr -d ' \\n'); [ "$magic" = "7f454c46" ] || { echo "[ERROR] Downloaded file is not a Linux binary — a captive portal or web filter may be intercepting this network." >&2; rm -f "$BIN.new"; exit 1; }`,
+    `chmod 0755 "$BIN.new"`,
+    `mv -f "$BIN.new" "$BIN"`,
+    `"$BIN" --config "$HOME/.config/breeze/agent.yaml" enroll "${token}" --server "${apiUrl}"${unixSecretFlag}`,
+    `printf '[Unit]\\nDescription=Breeze RMM Agent (user)\\nAfter=graphical-session.target\\n\\n[Service]\\nType=simple\\nExecStart=%s --config %%h/.config/breeze/agent.yaml run\\nRestart=always\\nRestartSec=10\\n\\n[Install]\\nWantedBy=default.target\\n' "$BIN" > "$HOME/.config/systemd/user/breeze-agent.service"`,
     `systemctl --user daemon-reload`,
     `systemctl --user enable --now breeze-agent`,
     `sudo loginctl enable-linger "$(id -un)" 2>/dev/null || true`,
