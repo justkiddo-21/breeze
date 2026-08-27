@@ -35,6 +35,17 @@ export interface InstallCommandOptions {
    * branding. No-op on macOS/Linux.
    */
   watchdogUrl?: string;
+  /**
+   * Optional URL to a prebuilt Linux agent binary (breeze-agent-linux-amd64).
+   * When set, the Linux install command downloads THIS binary directly and
+   * installs it as a per-user systemd service (systemd --user) under whoever
+   * runs the command — instead of routing through the server-generated
+   * install.sh (which pre-flights an agent-versions catalog this self-hosted
+   * fork leaves empty, and which installs a root system service using the
+   * upstream binary). No-op on Windows/macOS. When unset, Linux falls back to
+   * the install.sh flow.
+   */
+  linuxBinaryUrl?: string;
 }
 
 export interface InstallCommands {
@@ -58,7 +69,7 @@ export interface InstallCommands {
 export function buildInstallCommands(opts: InstallCommandOptions): InstallCommands {
   const apiUrl = opts.apiUrl.replace(/\/+$/, '');
   const ghBase = opts.ghBase.replace(/\/+$/, '');
-  const { token, enrollmentSecret, trustCertUrl, userHelperUrl, watchdogUrl } = opts;
+  const { token, enrollmentSecret, trustCertUrl, userHelperUrl, watchdogUrl, linuxBinaryUrl } = opts;
 
   // The connectivity message is scoped to the fetch + shebang check only —
   // once install.sh runs it reports its own failures precisely, and appending
@@ -69,6 +80,29 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
     `{ curl -fsSL --connect-timeout 10 -o "$f" "${apiUrl}/api/v1/agents/install.sh" && head -n1 "$f" | grep -q '^#!' || ` +
     `{ echo "[ERROR] Could not fetch the Breeze installer from ${apiUrl} — verify this machine has network access to your Breeze server." >&2; false; }; } && ` +
     `sudo bash "$f" --server "${apiUrl}" --token "${token}"${unixSecretFlag}`;
+
+  // Direct-download, per-user Linux install (used when linuxBinaryUrl is set).
+  // Runs entirely as the invoking desktop user — no username is baked in, so
+  // the same command installs under whoever pastes it (e.g. the kiosk user).
+  // The only privileged step is `loginctl enable-linger`, which lets the user
+  // service survive logout/reboot; it is best-effort (|| true). The ELF-magic
+  // check is the Linux analog of the Windows MZ check — a captive portal's HTML
+  // saved as the binary is blamed on the network, not run.
+  const linuxUserCmd = [
+    `set -e`,
+    `[ "$(id -u)" = 0 ] && { echo "[ERROR] Run this as the desktop user (e.g. icool), NOT with sudo/root — the agent installs as a per-user service." >&2; exit 1; }`,
+    `BIN="$HOME/.local/bin/breeze-agent"`,
+    `mkdir -p "$HOME/.local/bin" "$HOME/.config/breeze" "$HOME/.config/systemd/user"`,
+    `curl -fsSL --connect-timeout 10 -o "$BIN" "${linuxBinaryUrl}" || { echo "[ERROR] Could not fetch the Breeze agent from ${linuxBinaryUrl} — check this machine's network access." >&2; exit 1; }`,
+    `magic=$(od -An -tx1 -N4 "$BIN" | tr -d ' \\n'); [ "$magic" = "7f454c46" ] || { echo "[ERROR] Downloaded file is not a Linux binary — a captive portal or web filter may be intercepting this network." >&2; exit 1; }`,
+    `chmod 0755 "$BIN"`,
+    `"$BIN" --config "$HOME/.config/breeze/agent.yaml" enroll "${token}" --server "${apiUrl}"${unixSecretFlag}`,
+    `printf '[Unit]\\nDescription=Breeze RMM Agent (user)\\nAfter=graphical-session.target\\n\\n[Service]\\nType=simple\\nExecStart=%s --config %%h/.config/breeze/agent.yaml run\\nRestart=always\\nRestartSec=10\\n\\n[Install]\\nWantedBy=default.target\\n' "$BIN" > "$HOME/.config/systemd/user/breeze-agent.service"`,
+    `systemctl --user daemon-reload`,
+    `systemctl --user enable --now breeze-agent`,
+    `sudo loginctl enable-linger "$(id -un)" 2>/dev/null || true`,
+    `echo "Breeze agent installed under $(id -un). Status: systemctl --user status breeze-agent"`,
+  ].join('\n');
 
   // The MZ-magic check is the Windows analog of the unix shebang check: a
   // captive portal's 200 HTML saved as breeze-agent.exe would otherwise stop
@@ -113,5 +147,5 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
     `.\\breeze-agent.exe enroll "${token}" --server "${apiUrl}"${winSecretFlag}; ${winThrow('enrollment')}; ` +
     `.\\breeze-agent.exe service start; ${winThrow('service start')}`;
 
-  return { windows, macos: unixCmd, linux: unixCmd };
+  return { windows, macos: unixCmd, linux: linuxBinaryUrl ? linuxUserCmd : unixCmd };
 }

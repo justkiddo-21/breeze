@@ -57,6 +57,10 @@ ARG PUBLIC_AGENT_USER_HELPER_URL=
 # generated install command omits it and the agent falls back to downloading
 # the watchdog from its upstream (LanternOps) GitHub release.
 ARG PUBLIC_AGENT_WATCHDOG_URL=
+# Optional Linux agent binary URL (see InstallCommandOptions.linuxBinaryUrl in
+# installCommands.ts). When set, the Linux install command downloads it directly
+# and installs a per-user systemd service; empty -> Linux uses install.sh.
+ARG PUBLIC_AGENT_LINUX_URL=
 ENV NODE_ENV=${NODE_ENV}
 ENV PUBLIC_API_URL=${PUBLIC_API_URL}
 ENV PUBLIC_APP_VERSION=${PUBLIC_APP_VERSION}
@@ -65,6 +69,7 @@ ENV PUBLIC_AGENT_DOWNLOAD_URL=${PUBLIC_AGENT_DOWNLOAD_URL}
 ENV PUBLIC_AGENT_TRUST_CERT_URL=${PUBLIC_AGENT_TRUST_CERT_URL}
 ENV PUBLIC_AGENT_USER_HELPER_URL=${PUBLIC_AGENT_USER_HELPER_URL}
 ENV PUBLIC_AGENT_WATCHDOG_URL=${PUBLIC_AGENT_WATCHDOG_URL}
+ENV PUBLIC_AGENT_LINUX_URL=${PUBLIC_AGENT_LINUX_URL}
 
 # Copy dependencies from deps stage
 COPY --from=deps /app/node_modules ./node_modules

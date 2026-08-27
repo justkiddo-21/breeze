@@ -138,6 +138,50 @@ describe('buildInstallCommands', () => {
     });
   });
 
+  describe('Linux per-user install (linuxBinaryUrl)', () => {
+    it('keeps the install.sh flow when linuxBinaryUrl is not provided', () => {
+      const { linux, macos } = buildInstallCommands(base);
+      expect(linux).toBe(macos);
+      expect(linux).toContain('/api/v1/agents/install.sh');
+      expect(linux).not.toContain('systemctl --user');
+    });
+
+    it('switches Linux to a direct-download per-user systemd service when linuxBinaryUrl is set', () => {
+      const cmds = buildInstallCommands({
+        ...base,
+        linuxBinaryUrl: 'https://gh.example.com/dl/breeze-agent-linux-amd64',
+      });
+      // Downloads the provided binary directly, not install.sh.
+      expect(cmds.linux).toContain('https://gh.example.com/dl/breeze-agent-linux-amd64');
+      expect(cmds.linux).not.toContain('/api/v1/agents/install.sh');
+      // Per-user systemd, not a root system service.
+      expect(cmds.linux).toContain('systemctl --user enable --now breeze-agent');
+      expect(cmds.linux).toContain('.config/systemd/user/breeze-agent.service');
+      // Refuses to run as root (would target root's user manager).
+      expect(cmds.linux).toContain('"$(id -u)" = 0');
+      // ELF-magic guard against intercepted downloads.
+      expect(cmds.linux).toContain('7f454c46');
+      expect(cmds.linux).toContain('enroll "enroll_abc123" --server "https://rmm.example.com"');
+      // Windows and macOS are unaffected.
+      expect(cmds.macos).toBe(buildInstallCommands(base).macos);
+      expect(cmds.windows).toBe(buildInstallCommands(base).windows);
+    });
+
+    it('appends --enrollment-secret to the Linux per-user enroll only when provided', () => {
+      const withSecret = buildInstallCommands({
+        ...base,
+        linuxBinaryUrl: 'https://gh.example.com/dl/breeze-agent-linux-amd64',
+        enrollmentSecret: 's3cret',
+      });
+      expect(withSecret.linux).toContain('--enrollment-secret "s3cret"');
+      const noSecret = buildInstallCommands({
+        ...base,
+        linuxBinaryUrl: 'https://gh.example.com/dl/breeze-agent-linux-amd64',
+      });
+      expect(noSecret.linux).not.toContain('--enrollment-secret');
+    });
+  });
+
   it('strips trailing slashes from apiUrl and ghBase', () => {
     const cmds = buildInstallCommands({
       ...base,
