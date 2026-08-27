@@ -31,9 +31,21 @@ func ResolveDisplayTargets() ([]DisplayTarget, error) {
 			}
 			display := ":" + num
 			t := DisplayTarget{Display: display, SessionType: "x11"}
-			if pid, argv, uid, ok := findXServerProc(num); ok {
-				t.OwnerUID = uid
-				t.XauthPath = resolveXauthPath(parseAuthArg(argv), uid, pid)
+			// The X socket's owning uid is the most reliable owner signal.
+			// Modern display managers launch Xorg with -displayfd (no ":N" on
+			// argv, so findXServerProc can't match by display number) and
+			// loginctl's Display property is frequently empty — but the socket
+			// under /tmp/.X11-unix is always owned by the session user.
+			if fi, err := os.Stat(filepath.Join("/tmp/.X11-unix", name)); err == nil {
+				if suid := statUID(fi); suid > 0 {
+					t.OwnerUID = suid
+				}
+			}
+			if pid, argv, uid, ok := findXServerProc(num, t.OwnerUID); ok {
+				if t.OwnerUID == 0 {
+					t.OwnerUID = uid
+				}
+				t.XauthPath = resolveXauthPath(parseAuthArg(argv), t.OwnerUID, pid)
 			}
 			if s, ok := sessions[display]; ok {
 				t.OwnerName = s.user
@@ -119,14 +131,22 @@ func rank(t DisplayTarget) int {
 	}
 }
 
-// findXServerProc scans /proc for the Xorg/X/Xwayland process owning display :N,
-// returning its pid, argv, and uid.
-func findXServerProc(displayNum string) (pid int, argv []string, uid int, ok bool) {
+// findXServerProc scans /proc for the Xorg/X/Xwayland process backing display
+// :N, returning its pid, argv, and uid.
+//
+// Primary match is ":N" on the server's argv. Modern launches use -displayfd
+// instead and carry no ":N", so as a fallback we match an X server process
+// OWNED BY ownerUID (the display socket's owner). That lets us still recover the
+// server's -auth argument (the Xauthority path) on -displayfd systems.
+func findXServerProc(displayNum string, ownerUID int) (pid int, argv []string, uid int, ok bool) {
 	procs, err := os.ReadDir("/proc")
 	if err != nil {
 		return 0, nil, 0, false
 	}
 	want := ":" + displayNum
+	var fbPid, fbUID int
+	var fbArgv []string
+	haveFallback := false
 	for _, p := range procs {
 		pidN, err := strconv.Atoi(p.Name())
 		if err != nil {
@@ -144,21 +164,21 @@ func findXServerProc(displayNum string) (pid int, argv []string, uid int, ok boo
 		if base != "Xorg" && base != "X" && base != "Xwayland" {
 			continue
 		}
-		hasDisplay := false
+		procUID := 0
+		if fi, err := os.Stat(filepath.Join("/proc", p.Name())); err == nil {
+			procUID = statUID(fi)
+		}
 		for _, a := range args {
 			if a == want {
-				hasDisplay = true
-				break
+				return pidN, args, procUID, true
 			}
 		}
-		if !hasDisplay {
-			continue
+		if !haveFallback && ownerUID > 0 && procUID == ownerUID {
+			fbPid, fbArgv, fbUID, haveFallback = pidN, args, procUID, true
 		}
-		var st struct{ uid int }
-		if fi, err := os.Stat(filepath.Join("/proc", p.Name())); err == nil {
-			st.uid = statUID(fi)
-		}
-		return pidN, args, st.uid, true
+	}
+	if haveFallback {
+		return fbPid, fbArgv, fbUID, true
 	}
 	return 0, nil, 0, false
 }

@@ -1,0 +1,43 @@
+# Builds the Linux agent binary outside release.yml's signing gate. Linux needs
+# no code signing, so this is a plain cross-arch-free build on ubuntu-latest —
+# unlike the Windows edge workflow there is no cert/manifest step. Used to ship
+# our fork's agent fixes (e.g. the X11 -displayfd display-resolution fix) to
+# self-hosted Linux machines, which otherwise fall back to downloading upstream's
+# unfixed binary via /api/v1/agents/download/linux/amd64.
+name: Edge Agent (Linux)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build breeze-agent-linux-amd64
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent/go.mod
+
+      - name: Build breeze-agent-linux-amd64
+        working-directory: agent
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          # Matches every other build of this agent: the pure-Go X11 capture path
+          # (internal/remote/desktop/x11) needs no cgo.
+          CGO_ENABLED: 0
+        run: go build -o bin/breeze-agent-linux-amd64 ./cmd/breeze-agent
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: breeze-agent-linux-amd64
+          path: agent/bin/breeze-agent-linux-amd64
+          retention-days: 30
