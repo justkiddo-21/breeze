@@ -1182,6 +1182,7 @@ export default function AddDeviceModal({
                 userHelperUrl: import.meta.env.PUBLIC_AGENT_USER_HELPER_URL || undefined,
                 watchdogUrl: import.meta.env.PUBLIC_AGENT_WATCHDOG_URL || undefined,
                 linuxBinaryUrl: import.meta.env.PUBLIC_AGENT_LINUX_URL || undefined,
+                openh264Url: import.meta.env.PUBLIC_AGENT_OPENH264_URL || undefined,
               });
               const commandPlatform =
                 selectedOS === "windows" ? "windows" : "linux";

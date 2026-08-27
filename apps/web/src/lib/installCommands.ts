@@ -46,6 +46,15 @@ export interface InstallCommandOptions {
    * the install.sh flow.
    */
   linuxBinaryUrl?: string;
+  /**
+   * Optional URL to the OpenH264 shared library the Linux agent needs for H264
+   * encoding (libopenh264-2.4.1-linux64.7.so). The agent auto-downloads it from
+   * Cisco/GitHub on first capture, but air-gapped kiosk machines can't reach
+   * those, so remote desktop falls back to a do-nothing placeholder encoder and
+   * sends zero frames. When set, the Linux install places it next to the binary
+   * (the agent's first search location). Only used alongside linuxBinaryUrl.
+   */
+  openh264Url?: string;
 }
 
 export interface InstallCommands {
@@ -69,7 +78,7 @@ export interface InstallCommands {
 export function buildInstallCommands(opts: InstallCommandOptions): InstallCommands {
   const apiUrl = opts.apiUrl.replace(/\/+$/, '');
   const ghBase = opts.ghBase.replace(/\/+$/, '');
-  const { token, enrollmentSecret, trustCertUrl, userHelperUrl, watchdogUrl, linuxBinaryUrl } = opts;
+  const { token, enrollmentSecret, trustCertUrl, userHelperUrl, watchdogUrl, linuxBinaryUrl, openh264Url } = opts;
 
   // The connectivity message is scoped to the fetch + shebang check only —
   // once install.sh runs it reports its own failures precisely, and appending
@@ -112,13 +121,19 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
     `magic=$(od -An -tx1 -N4 "$BIN.new" | tr -d ' \\n'); [ "$magic" = "7f454c46" ] || { echo "[ERROR] Downloaded file is not a Linux binary — a captive portal or web filter may be intercepting this network." >&2; rm -f "$BIN.new"; exit 1; }`,
     `chmod 0755 "$BIN.new"`,
     `mv -f "$BIN.new" "$BIN"`,
+    // OpenH264 encoder lib, placed next to the binary (the agent's first search
+    // path). Best-effort: on an air-gapped box that can't fetch it, the agent
+    // installs fine but remote desktop stays black until the lib is present.
+    openh264Url
+      ? `curl -fsSL --connect-timeout 10 -o "$HOME/.local/bin/libopenh264-2.4.1-linux64.7.so" "${openh264Url}" || echo "[WARN] Could not fetch OpenH264 from ${openh264Url}. Remote desktop needs libopenh264-2.4.1-linux64.7.so in ~/.local/bin — place it there manually if this machine has no internet." >&2`
+      : '',
     `"$BIN" --config "$HOME/.config/breeze/agent.yaml" enroll "${token}" --server "${apiUrl}"${unixSecretFlag}`,
     `printf '[Unit]\\nDescription=Breeze RMM Agent (user)\\nAfter=graphical-session.target\\n\\n[Service]\\nType=simple\\nExecStart=%s --config %%h/.config/breeze/agent.yaml run\\nRestart=always\\nRestartSec=10\\n\\n[Install]\\nWantedBy=default.target\\n' "$BIN" > "$HOME/.config/systemd/user/breeze-agent.service"`,
     `systemctl --user daemon-reload`,
     `systemctl --user enable --now breeze-agent`,
     `sudo loginctl enable-linger "$(id -un)" 2>/dev/null || true`,
     `echo "Breeze agent installed under $(id -un). Status: systemctl --user status breeze-agent"`,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 
   // The MZ-magic check is the Windows analog of the unix shebang check: a
   // captive portal's 200 HTML saved as breeze-agent.exe would otherwise stop

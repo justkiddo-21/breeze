@@ -173,6 +173,24 @@ describe('buildInstallCommands', () => {
       expect(cmds.windows).toBe(buildInstallCommands(base).windows);
     });
 
+    it('fetches the OpenH264 lib next to the binary only when openh264Url is set', () => {
+      const withLib = buildInstallCommands({
+        ...base,
+        linuxBinaryUrl: 'https://gh.example.com/dl/breeze-agent-linux-amd64',
+        openh264Url: 'https://gh.example.com/dl/libopenh264-2.4.1-linux64.7.so',
+      });
+      expect(withLib.linux).toContain('https://gh.example.com/dl/libopenh264-2.4.1-linux64.7.so');
+      expect(withLib.linux).toContain('.local/bin/libopenh264-2.4.1-linux64.7.so');
+      // Must be placed before enroll/service start so the encoder is ready.
+      expect(withLib.linux.indexOf('libopenh264')).toBeLessThan(withLib.linux.indexOf('enroll'));
+      // Not present when the URL is omitted.
+      const noLib = buildInstallCommands({
+        ...base,
+        linuxBinaryUrl: 'https://gh.example.com/dl/breeze-agent-linux-amd64',
+      });
+      expect(noLib.linux).not.toContain('libopenh264');
+    });
+
     it('appends --enrollment-secret to the Linux per-user enroll only when provided', () => {
       const withSecret = buildInstallCommands({
         ...base,

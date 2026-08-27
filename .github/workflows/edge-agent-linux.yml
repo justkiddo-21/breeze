@@ -36,8 +36,23 @@ jobs:
           CGO_ENABLED: 0
         run: go build -o bin/breeze-agent-linux-amd64 ./cmd/breeze-agent
 
+      # Bundle the OpenH264 encoder lib the agent needs for H264. It normally
+      # auto-downloads this on first capture, but air-gapped kiosk machines can't
+      # reach Cisco/GitHub — shipping it in our release (and placing it next to
+      # the binary via the install command) means remote desktop works offline.
+      # The exact filename is what encoder_openh264_dl_other.go searches for.
+      - name: Fetch OpenH264 library
+        working-directory: agent/bin
+        run: |
+          curl -fL --retry 3 -o libopenh264-2.4.1-linux64.7.so.bz2 \
+            "http://ciscobinary.openh264.org/libopenh264-2.4.1-linux64.7.so.bz2"
+          bunzip2 -f libopenh264-2.4.1-linux64.7.so.bz2
+          file libopenh264-2.4.1-linux64.7.so
+
       - uses: actions/upload-artifact@v4
         with:
           name: breeze-agent-linux-amd64
-          path: agent/bin/breeze-agent-linux-amd64
+          path: |
+            agent/bin/breeze-agent-linux-amd64
+            agent/bin/libopenh264-2.4.1-linux64.7.so
           retention-days: 30

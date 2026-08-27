@@ -61,6 +61,10 @@ ARG PUBLIC_AGENT_WATCHDOG_URL=
 # installCommands.ts). When set, the Linux install command downloads it directly
 # and installs a per-user systemd service; empty -> Linux uses install.sh.
 ARG PUBLIC_AGENT_LINUX_URL=
+# Optional OpenH264 library URL for the Linux agent (see
+# InstallCommandOptions.openh264Url). Placed next to the binary so air-gapped
+# machines that can't reach Cisco/GitHub still get an H264 encoder.
+ARG PUBLIC_AGENT_OPENH264_URL=
 ENV NODE_ENV=${NODE_ENV}
 ENV PUBLIC_API_URL=${PUBLIC_API_URL}
 ENV PUBLIC_APP_VERSION=${PUBLIC_APP_VERSION}
@@ -70,6 +74,7 @@ ENV PUBLIC_AGENT_TRUST_CERT_URL=${PUBLIC_AGENT_TRUST_CERT_URL}
 ENV PUBLIC_AGENT_USER_HELPER_URL=${PUBLIC_AGENT_USER_HELPER_URL}
 ENV PUBLIC_AGENT_WATCHDOG_URL=${PUBLIC_AGENT_WATCHDOG_URL}
 ENV PUBLIC_AGENT_LINUX_URL=${PUBLIC_AGENT_LINUX_URL}
+ENV PUBLIC_AGENT_OPENH264_URL=${PUBLIC_AGENT_OPENH264_URL}
 
 # Copy dependencies from deps stage
 COPY --from=deps /app/node_modules ./node_modules
