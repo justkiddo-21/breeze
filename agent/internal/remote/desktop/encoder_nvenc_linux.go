@@ -122,6 +122,7 @@ type nvencEncoderLinux struct {
 
 	funcs   nvencFuncList
 	encoder uintptr // NVENC session handle
+	config  nvencConfig
 
 	cuCtx        uintptr // CUDA context
 	cuInputDPtr  uint64  // CUDA device buffer holding NV12
@@ -315,15 +316,39 @@ func (e *nvencEncoderLinux) initialize() error {
 		return fmt.Errorf("cuCtxSetCurrent (post-session) failed: CUDA error %d", r)
 	}
 
-	// Step 3+4: initialize with encodeConfig=NULL so NVENC applies the preset
-	// (P4) + tuning (ultra-low-latency) defaults itself. We skip the preset-
-	// config query entirely: NvEncGetEncodePresetConfigEx needs a 7th (stack)
-	// arg that purego mis-passes (INVALID_PTR), and the non-Ex form rejected the
-	// P-preset with INVALID_DEVICE. This path uses only ≤2-arg NVENC calls.
+	// Step 3: build NV_ENC_CONFIG by hand. We can't query preset defaults
+	// (GetEncodePresetConfigEx mis-passes a stack arg → INVALID_PTR; the non-Ex
+	// form rejects the P-preset → INVALID_DEVICE) and encodeConfig=NULL segfaults
+	// inside the driver at InitializeEncoder. So zero a config and set its
+	// version plus the fields we need: CBR bitrate, GOP, H264 IDR + repeat
+	// SPS/PPS. Remaining fields stay zero (valid NVENC defaults).
 	fps := e.cfg.FPS
 	if fps <= 0 {
 		fps = 30
 	}
+	bitrate := e.cfg.Bitrate
+	if bitrate <= 0 {
+		bitrate = 2_500_000
+	}
+	idrPeriod := uint32(fps * 10)
+	if idrPeriod < 30 {
+		idrPeriod = 30
+	}
+	e.config = nvencConfig{}
+	ncfgPutU32(&e.config, ncfgVersion, nvencStructVerExt(9)) // NV_ENC_CONFIG_VER
+	ncfgPutGUID(&e.config, ncfgProfileGUID, nvencProfileAutoGUID)
+	ncfgPutU32(&e.config, ncfgGOPLength, idrPeriod)
+	ncfgPutU32(&e.config, ncfgFrameIntervalP, 1) // IP only, no B-frames
+	ncfgPutU32(&e.config, ncfgRCVersion, nvencStructVer(1))
+	ncfgPutU32(&e.config, ncfgRCMode, nvencRCCBR)
+	ncfgPutU32(&e.config, ncfgRCAvgBR, uint32(bitrate))
+	ncfgPutU32(&e.config, ncfgRCMaxBR, uint32(bitrate))
+	ncfgPutU32(&e.config, ncfgRCVBVBuf, uint32(bitrate/fps))
+	ncfgPutU32(&e.config, ncfgRCVBVInit, uint32(bitrate/fps))
+	ncfgPutU32(&e.config, ncfgH264IDRPeriod, idrPeriod)
+	ncfgPutU32(&e.config, ncfgH264Bitfields, ncfgH264RepeatSPSPPS)
+
+	// Step 4: initialize the encoder with the hand-built config.
 	var initParams nvencInitParams
 	initParams.Version = nvencStructVerExt(7)
 	initParams.EncodeGUID = nvencCodecH264GUID
@@ -335,9 +360,10 @@ func (e *nvencEncoderLinux) initialize() error {
 	initParams.FrameRateNum = uint32(fps)
 	initParams.FrameRateDen = 1
 	initParams.EnablePTD = 1
-	initParams.EncodeConfig = 0 // NULL → NVENC applies preset + tuning defaults
+	initParams.EncodeConfig = uintptr(unsafe.Pointer(&e.config))
 	initParams.TuningInfo = nvencTuningUltraLowLat
 	r, _, _ := purego.SyscallN(e.funcs.InitializeEncoder, e.encoder, uintptr(unsafe.Pointer(&initParams)))
+	runtime.KeepAlive(e.config)
 	runtime.KeepAlive(initParams)
 	if r != nvencSuccess {
 		enc := e.encoder
@@ -380,8 +406,8 @@ func (e *nvencEncoderLinux) initialize() error {
 	e.inited = true
 	e.frameIdx = 0
 	slog.Info("NVENC (Linux) encoder initialized",
-		"width", e.width, "height", e.height, "fps", fps,
-		"preset", "P4", "tuning", "ultra-low-latency", "config", "preset-default")
+		"width", e.width, "height", e.height, "fps", fps, "bitrate", bitrate,
+		"preset", "P4", "tuning", "ultra-low-latency", "config", "hand-built")
 	return nil
 }
 
