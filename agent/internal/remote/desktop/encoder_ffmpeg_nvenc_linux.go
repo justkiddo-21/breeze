@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // =============================================================================
@@ -155,14 +156,20 @@ func (e *ffmpegNVENCEncoder) Encode(frame []byte) ([]byte, error) {
 		return nil, fmt.Errorf("ffmpeg-nvenc: write stdin: %w", err)
 	}
 
-	// Grab the encoded AU. A pipeline delay of up to a frame is normal at
-	// startup, so wait briefly; if nothing is ready, report a skipped frame
-	// (nil, nil) rather than stalling the capture loop.
-	au, ok := <-e.aus
-	if !ok {
-		return nil, fmt.Errorf("ffmpeg-nvenc: output closed: %v", e.readErr)
+	// The AU splitter can only close an access unit once the NEXT frame's AUD
+	// arrives, so output runs one frame behind the input — blocking on this
+	// frame's AU would deadlock (its AU needs the next frame written first).
+	// Return whatever complete AU is ready (the prior frame's); if none yet
+	// (startup priming), report a skipped frame instead of stalling.
+	select {
+	case au, ok := <-e.aus:
+		if !ok {
+			return nil, fmt.Errorf("ffmpeg-nvenc: output closed: %v", e.readErr)
+		}
+		return au, nil
+	case <-time.After(250 * time.Millisecond):
+		return nil, nil
 	}
-	return au, nil
 }
 
 // =============================================================================
@@ -237,7 +244,7 @@ func (e *ffmpegNVENCEncoder) start() error {
 	e.inited = true
 	slog.Info("ffmpeg-nvenc encoder started",
 		"width", e.width, "height", e.height, "fps", fps, "bitrate", bitrate,
-		"codec", "h264_nvenc", "preset", "p4", "tune", "ull")
+		"codec", "h264_nvenc", "preset", "p4", "tune", "ull", "build", "ffnv2")
 	return nil
 }
 
