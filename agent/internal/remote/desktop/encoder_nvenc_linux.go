@@ -3,6 +3,7 @@
 package desktop
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"runtime"
@@ -11,6 +12,26 @@ import (
 
 	"github.com/ebitengine/purego"
 )
+
+// NV_ENC_PRESET_LOW_LATENCY_HQ_GUID — a legacy preset the non-Ex
+// NvEncGetEncodePresetConfig understands (the P1–P7 presets are Ex-only, which
+// is why the non-Ex query rejected P4 with INVALID_DEVICE).
+var nvencPresetLowLatencyHQGUID = nvencGUID{
+	Data1: 0x21c6e6b4, Data2: 0x297a, Data3: 0x4cba,
+	Data4: [8]byte{0x99, 0x8f, 0xb6, 0xcb, 0xde, 0x72, 0xad, 0xe3},
+}
+
+// guidWords returns a 16-byte NVENC GUID as the two 64-bit eightbytes the
+// System V AMD64 ABI passes a by-value struct in (NVENC GUIDs are by value; on
+// Linux that means two integer registers, not a pointer).
+func guidWords(g nvencGUID) (uint64, uint64) {
+	var b [16]byte
+	binary.LittleEndian.PutUint32(b[0:], g.Data1)
+	binary.LittleEndian.PutUint16(b[4:], g.Data2)
+	binary.LittleEndian.PutUint16(b[6:], g.Data3)
+	copy(b[8:], g.Data4[:])
+	return binary.LittleEndian.Uint64(b[0:8]), binary.LittleEndian.Uint64(b[8:16])
+}
 
 // =============================================================================
 // NVENC Encoder (Linux) — NVIDIA hardware H264 via NVENC + the CUDA driver API,
@@ -316,12 +337,6 @@ func (e *nvencEncoderLinux) initialize() error {
 		return fmt.Errorf("cuCtxSetCurrent (post-session) failed: CUDA error %d", r)
 	}
 
-	// Step 3: build NV_ENC_CONFIG by hand. We can't query preset defaults
-	// (GetEncodePresetConfigEx mis-passes a stack arg → INVALID_PTR; the non-Ex
-	// form rejects the P-preset → INVALID_DEVICE) and encodeConfig=NULL segfaults
-	// inside the driver at InitializeEncoder. So zero a config and set its
-	// version plus the fields we need: CBR bitrate, GOP, H264 IDR + repeat
-	// SPS/PPS. Remaining fields stay zero (valid NVENC defaults).
 	fps := e.cfg.FPS
 	if fps <= 0 {
 		fps = 30
@@ -334,8 +349,36 @@ func (e *nvencEncoderLinux) initialize() error {
 	if idrPeriod < 30 {
 		idrPeriod = 30
 	}
+
+	// Step 3: get a valid base NV_ENC_CONFIG from the legacy LOW_LATENCY_HQ
+	// preset via the non-Ex query (6 integer args — purego-safe, no stack spill).
+	// A NULL config segfaults the driver and a mostly-zero hand-built config is
+	// rejected with INVALID_PARAM, so we need real preset defaults to build on.
+	// Fall back to a zeroed+versioned config if the query somehow fails.
 	e.config = nvencConfig{}
-	ncfgPutU32(&e.config, ncfgVersion, nvencStructVerExt(9)) // NV_ENC_CONFIG_VER
+	var presetCfg nvencPresetConfig
+	*(*uint32)(unsafe.Pointer(&presetCfg[0])) = nvencStructVerExt(5)
+	*(*uint32)(unsafe.Pointer(&presetCfg[8])) = nvencStructVerExt(9)
+	*(*uint32)(unsafe.Pointer(&presetCfg[8+ncfgRCVersion])) = nvencStructVer(1)
+	codecLo, codecHi := guidWords(nvencCodecH264GUID)
+	presetLo, presetHi := guidWords(nvencPresetLowLatencyHQGUID)
+	rp, _, _ := purego.SyscallN(e.funcs.GetEncodePresetConfig,
+		e.encoder,
+		uintptr(codecLo), uintptr(codecHi),
+		uintptr(presetLo), uintptr(presetHi),
+		uintptr(unsafe.Pointer(&presetCfg)),
+	)
+	runtime.KeepAlive(presetCfg)
+	gotPreset := rp == nvencSuccess
+	if gotPreset {
+		copy(e.config[:], presetCfg[8:8+3584])
+	} else {
+		slog.Warn("nvenc-linux: preset query failed, using hand-built config",
+			"status", nvencStatusStr(rp), "code", rp)
+		ncfgPutU32(&e.config, ncfgVersion, nvencStructVerExt(9)) // NV_ENC_CONFIG_VER
+	}
+
+	// Customize the base config (applies to preset-derived or hand-built).
 	ncfgPutGUID(&e.config, ncfgProfileGUID, nvencProfileAutoGUID)
 	ncfgPutU32(&e.config, ncfgGOPLength, idrPeriod)
 	ncfgPutU32(&e.config, ncfgFrameIntervalP, 1) // IP only, no B-frames
@@ -346,13 +389,16 @@ func (e *nvencEncoderLinux) initialize() error {
 	ncfgPutU32(&e.config, ncfgRCVBVBuf, uint32(bitrate/fps))
 	ncfgPutU32(&e.config, ncfgRCVBVInit, uint32(bitrate/fps))
 	ncfgPutU32(&e.config, ncfgH264IDRPeriod, idrPeriod)
-	ncfgPutU32(&e.config, ncfgH264Bitfields, ncfgH264RepeatSPSPPS)
+	bits := ncfgGetU32(&e.config, ncfgH264Bitfields)
+	bits |= ncfgH264RepeatSPSPPS
+	ncfgPutU32(&e.config, ncfgH264Bitfields, bits)
 
-	// Step 4: initialize the encoder with the hand-built config.
+	// Step 4: initialize with the legacy preset GUID + undefined tuning to match
+	// the config source (P4 + a tuning expects an Ex-derived config).
 	var initParams nvencInitParams
 	initParams.Version = nvencStructVerExt(7)
 	initParams.EncodeGUID = nvencCodecH264GUID
-	initParams.PresetGUID = nvencPresetP4GUID
+	initParams.PresetGUID = nvencPresetLowLatencyHQGUID
 	initParams.EncodeWidth = uint32(e.width)
 	initParams.EncodeHeight = uint32(e.height)
 	initParams.DarWidth = uint32(e.width)
@@ -361,14 +407,14 @@ func (e *nvencEncoderLinux) initialize() error {
 	initParams.FrameRateDen = 1
 	initParams.EnablePTD = 1
 	initParams.EncodeConfig = uintptr(unsafe.Pointer(&e.config))
-	initParams.TuningInfo = nvencTuningUltraLowLat
-	r, _, _ := purego.SyscallN(e.funcs.InitializeEncoder, e.encoder, uintptr(unsafe.Pointer(&initParams)))
+	initParams.TuningInfo = nvencTuningUndef
+	rp, _, _ = purego.SyscallN(e.funcs.InitializeEncoder, e.encoder, uintptr(unsafe.Pointer(&initParams)))
 	runtime.KeepAlive(e.config)
 	runtime.KeepAlive(initParams)
-	if r != nvencSuccess {
+	if rp != nvencSuccess {
 		enc := e.encoder
 		e.shutdownSession()
-		return fmt.Errorf("NvEncInitializeEncoder failed: %s (0x%X) [encoder=0x%X]", nvencStatusStr(r), r, enc)
+		return fmt.Errorf("NvEncInitializeEncoder failed: %s (0x%X) [encoder=0x%X gotPreset=%v]", nvencStatusStr(rp), rp, enc, gotPreset)
 	}
 
 	// Step 6: output bitstream buffer.
@@ -405,9 +451,13 @@ func (e *nvencEncoderLinux) initialize() error {
 
 	e.inited = true
 	e.frameIdx = 0
+	cfgSrc := "hand-built"
+	if gotPreset {
+		cfgSrc = "legacy-preset"
+	}
 	slog.Info("NVENC (Linux) encoder initialized",
 		"width", e.width, "height", e.height, "fps", fps, "bitrate", bitrate,
-		"preset", "P4", "tuning", "ultra-low-latency", "config", "hand-built")
+		"preset", "LOW_LATENCY_HQ", "config", cfgSrc)
 	return nil
 }
 
