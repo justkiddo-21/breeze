@@ -480,7 +480,12 @@ func (e *nvencEncoderLinux) encodeFrame() ([]byte, error) {
 	var out []byte
 	if lockBS.BitstreamSize > 0 && lockBS.DataPtr != 0 {
 		out = make([]byte, lockBS.BitstreamSize)
-		copy(out, unsafe.Slice((*byte)(unsafe.Pointer(lockBS.DataPtr)), lockBS.BitstreamSize))
+		// DataPtr is a C pointer NVENC stored in a uintptr field. Read it back as
+		// an unsafe.Pointer by reinterpreting the field's bits, rather than
+		// unsafe.Pointer(uintptr) directly, which `go vet` flags as a possible
+		// misuse (the value isn't a Go-managed address the GC must track).
+		dataPtr := *(*unsafe.Pointer)(unsafe.Pointer(&lockBS.DataPtr))
+		copy(out, unsafe.Slice((*byte)(dataPtr), lockBS.BitstreamSize))
 	}
 	purego.SyscallN(e.funcs.UnlockBitstream, e.encoder, e.bitstreamBuf)
 
