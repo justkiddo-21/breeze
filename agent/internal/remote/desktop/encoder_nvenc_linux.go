@@ -3,6 +3,7 @@
 package desktop
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"runtime"
@@ -11,6 +12,19 @@ import (
 
 	"github.com/ebitengine/purego"
 )
+
+// guidWords returns a 16-byte NVENC GUID as the two 64-bit eightbytes the
+// System V AMD64 ABI passes a by-value struct in. NVENC's *Ex entry points take
+// GUIDs by value; on Linux that means two integer registers (not a pointer as
+// on the Windows x64 ABI, where >8-byte structs pass by hidden pointer).
+func guidWords(g nvencGUID) (uint64, uint64) {
+	var b [16]byte
+	binary.LittleEndian.PutUint32(b[0:], g.Data1)
+	binary.LittleEndian.PutUint16(b[4:], g.Data2)
+	binary.LittleEndian.PutUint16(b[6:], g.Data3)
+	copy(b[8:], g.Data4[:])
+	return binary.LittleEndian.Uint64(b[0:8]), binary.LittleEndian.Uint64(b[8:16])
+}
 
 // =============================================================================
 // NVENC Encoder (Linux) — NVIDIA hardware H264 via NVENC + the CUDA driver API,
@@ -311,10 +325,16 @@ func (e *nvencEncoderLinux) initialize() error {
 	*(*uint32)(unsafe.Pointer(&presetCfg[0])) = nvencStructVerExt(5)
 	*(*uint32)(unsafe.Pointer(&presetCfg[8])) = nvencStructVerExt(9)
 	*(*uint32)(unsafe.Pointer(&presetCfg[8+ncfgRCVersion])) = nvencStructVer(1)
+	// GUIDs are passed BY VALUE (two eightbytes each on System V), not by
+	// pointer — see guidWords. tuningInfo (enum) is one word; presetCfg is a
+	// pointer. Total 7 args: encoder, codec.lo, codec.hi, preset.lo, preset.hi,
+	// tuning, &presetCfg.
+	codecLo, codecHi := guidWords(nvencCodecH264GUID)
+	presetLo, presetHi := guidWords(nvencPresetP4GUID)
 	r, _, _ := purego.SyscallN(e.funcs.GetPresetConfigEx,
 		e.encoder,
-		uintptr(unsafe.Pointer(&nvencCodecH264GUID)),
-		uintptr(unsafe.Pointer(&nvencPresetP4GUID)),
+		uintptr(codecLo), uintptr(codecHi),
+		uintptr(presetLo), uintptr(presetHi),
 		uintptr(nvencTuningUltraLowLat),
 		uintptr(unsafe.Pointer(&presetCfg)),
 	)
