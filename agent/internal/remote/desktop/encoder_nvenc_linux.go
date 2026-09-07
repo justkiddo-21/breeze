@@ -319,29 +319,29 @@ func (e *nvencEncoderLinux) initialize() error {
 		e.destroyCUDA()
 		return fmt.Errorf("NvEncOpenEncodeSessionEx failed: %s (0x%X)", nvencStatusStr(r), r)
 	}
+	slog.Info("nvenc-linux: encode session opened", "encoder", fmt.Sprintf("0x%X", e.encoder))
 
-	// Step 3: preset config (P4, ultra-low-latency) — mirrors the Windows path.
+	// Step 3: preset config. Use the NON-Ex NvEncGetEncodePresetConfig: it drops
+	// the tuningInfo param, so with the by-value GUIDs (two eightbytes each) the
+	// call is exactly 6 integer args (encoder, codec.lo, codec.hi, preset.lo,
+	// preset.hi, &presetCfg) — all in registers, no System V stack spill. The
+	// *Ex form needs a 7th (stack) arg, which returned INVALID_PTR here.
 	var presetCfg nvencPresetConfig
 	*(*uint32)(unsafe.Pointer(&presetCfg[0])) = nvencStructVerExt(5)
 	*(*uint32)(unsafe.Pointer(&presetCfg[8])) = nvencStructVerExt(9)
 	*(*uint32)(unsafe.Pointer(&presetCfg[8+ncfgRCVersion])) = nvencStructVer(1)
-	// GUIDs are passed BY VALUE (two eightbytes each on System V), not by
-	// pointer — see guidWords. tuningInfo (enum) is one word; presetCfg is a
-	// pointer. Total 7 args: encoder, codec.lo, codec.hi, preset.lo, preset.hi,
-	// tuning, &presetCfg.
 	codecLo, codecHi := guidWords(nvencCodecH264GUID)
 	presetLo, presetHi := guidWords(nvencPresetP4GUID)
-	r, _, _ := purego.SyscallN(e.funcs.GetPresetConfigEx,
+	r, _, _ := purego.SyscallN(e.funcs.GetEncodePresetConfig,
 		e.encoder,
 		uintptr(codecLo), uintptr(codecHi),
 		uintptr(presetLo), uintptr(presetHi),
-		uintptr(nvencTuningUltraLowLat),
 		uintptr(unsafe.Pointer(&presetCfg)),
 	)
 	runtime.KeepAlive(presetCfg)
 	if r != nvencSuccess {
 		e.shutdownSession()
-		return fmt.Errorf("NvEncGetEncodePresetConfigEx failed: %s (0x%X)", nvencStatusStr(r), r)
+		return fmt.Errorf("NvEncGetEncodePresetConfig failed: %s (0x%X) [encoder=0x%X]", nvencStatusStr(r), r, e.encoder)
 	}
 
 	// Step 4: customize config (copy embedded NV_ENC_CONFIG out of the preset).
