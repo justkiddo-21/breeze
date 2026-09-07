@@ -321,6 +321,15 @@ func (e *nvencEncoderLinux) initialize() error {
 	}
 	slog.Info("nvenc-linux: encode session opened", "encoder", fmt.Sprintf("0x%X", e.encoder))
 
+	// NVENC requires our CUDA context to be CURRENT on the calling thread for
+	// device-touching API calls. OpenEncodeSessionEx can leave a different (or
+	// no) context current, which makes the very next call return INVALID_DEVICE.
+	// Re-assert it before the preset query and the rest of init.
+	if r, _, _ := purego.SyscallN(cuCtxSetCurrentPtr, e.cuCtx); r != cudaSuccess {
+		e.shutdownSession()
+		return fmt.Errorf("cuCtxSetCurrent (post-session) failed: CUDA error %d", r)
+	}
+
 	// Step 3: preset config. Use the NON-Ex NvEncGetEncodePresetConfig: it drops
 	// the tuningInfo param, so with the by-value GUIDs (two eightbytes each) the
 	// call is exactly 6 integer args (encoder, codec.lo, codec.hi, preset.lo,
@@ -340,8 +349,9 @@ func (e *nvencEncoderLinux) initialize() error {
 	)
 	runtime.KeepAlive(presetCfg)
 	if r != nvencSuccess {
+		enc := e.encoder // capture before shutdownSession zeroes it
 		e.shutdownSession()
-		return fmt.Errorf("NvEncGetEncodePresetConfig failed: %s (0x%X) [encoder=0x%X]", nvencStatusStr(r), r, e.encoder)
+		return fmt.Errorf("NvEncGetEncodePresetConfig failed: %s (0x%X) [encoder=0x%X]", nvencStatusStr(r), r, enc)
 	}
 
 	// Step 4: customize config (copy embedded NV_ENC_CONFIG out of the preset).
