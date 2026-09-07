@@ -3,7 +3,6 @@
 package desktop
 
 import (
-	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"runtime"
@@ -12,19 +11,6 @@ import (
 
 	"github.com/ebitengine/purego"
 )
-
-// guidWords returns a 16-byte NVENC GUID as the two 64-bit eightbytes the
-// System V AMD64 ABI passes a by-value struct in. NVENC's *Ex entry points take
-// GUIDs by value; on Linux that means two integer registers (not a pointer as
-// on the Windows x64 ABI, where >8-byte structs pass by hidden pointer).
-func guidWords(g nvencGUID) (uint64, uint64) {
-	var b [16]byte
-	binary.LittleEndian.PutUint32(b[0:], g.Data1)
-	binary.LittleEndian.PutUint16(b[4:], g.Data2)
-	binary.LittleEndian.PutUint16(b[6:], g.Data3)
-	copy(b[8:], g.Data4[:])
-	return binary.LittleEndian.Uint64(b[0:8]), binary.LittleEndian.Uint64(b[8:16])
-}
 
 // =============================================================================
 // NVENC Encoder (Linux) — NVIDIA hardware H264 via NVENC + the CUDA driver API,
@@ -136,7 +122,6 @@ type nvencEncoderLinux struct {
 
 	funcs   nvencFuncList
 	encoder uintptr // NVENC session handle
-	config  nvencConfig
 
 	cuCtx        uintptr // CUDA context
 	cuInputDPtr  uint64  // CUDA device buffer holding NV12
@@ -330,59 +315,15 @@ func (e *nvencEncoderLinux) initialize() error {
 		return fmt.Errorf("cuCtxSetCurrent (post-session) failed: CUDA error %d", r)
 	}
 
-	// Step 3: preset config. Use the NON-Ex NvEncGetEncodePresetConfig: it drops
-	// the tuningInfo param, so with the by-value GUIDs (two eightbytes each) the
-	// call is exactly 6 integer args (encoder, codec.lo, codec.hi, preset.lo,
-	// preset.hi, &presetCfg) — all in registers, no System V stack spill. The
-	// *Ex form needs a 7th (stack) arg, which returned INVALID_PTR here.
-	var presetCfg nvencPresetConfig
-	*(*uint32)(unsafe.Pointer(&presetCfg[0])) = nvencStructVerExt(5)
-	*(*uint32)(unsafe.Pointer(&presetCfg[8])) = nvencStructVerExt(9)
-	*(*uint32)(unsafe.Pointer(&presetCfg[8+ncfgRCVersion])) = nvencStructVer(1)
-	codecLo, codecHi := guidWords(nvencCodecH264GUID)
-	presetLo, presetHi := guidWords(nvencPresetP4GUID)
-	r, _, _ := purego.SyscallN(e.funcs.GetEncodePresetConfig,
-		e.encoder,
-		uintptr(codecLo), uintptr(codecHi),
-		uintptr(presetLo), uintptr(presetHi),
-		uintptr(unsafe.Pointer(&presetCfg)),
-	)
-	runtime.KeepAlive(presetCfg)
-	if r != nvencSuccess {
-		enc := e.encoder // capture before shutdownSession zeroes it
-		e.shutdownSession()
-		return fmt.Errorf("NvEncGetEncodePresetConfig failed: %s (0x%X) [encoder=0x%X]", nvencStatusStr(r), r, enc)
-	}
-
-	// Step 4: customize config (copy embedded NV_ENC_CONFIG out of the preset).
-	copy(e.config[:], presetCfg[8:8+3584])
-
+	// Step 3+4: initialize with encodeConfig=NULL so NVENC applies the preset
+	// (P4) + tuning (ultra-low-latency) defaults itself. We skip the preset-
+	// config query entirely: NvEncGetEncodePresetConfigEx needs a 7th (stack)
+	// arg that purego mis-passes (INVALID_PTR), and the non-Ex form rejected the
+	// P-preset with INVALID_DEVICE. This path uses only ≤2-arg NVENC calls.
 	fps := e.cfg.FPS
 	if fps <= 0 {
 		fps = 30
 	}
-	bitrate := e.cfg.Bitrate
-	if bitrate <= 0 {
-		bitrate = 2_500_000
-	}
-	ncfgPutGUID(&e.config, ncfgProfileGUID, nvencProfileAutoGUID)
-	idrPeriod := uint32(fps * 10)
-	if idrPeriod < 30 {
-		idrPeriod = 30
-	}
-	ncfgPutU32(&e.config, ncfgGOPLength, idrPeriod)
-	ncfgPutU32(&e.config, ncfgFrameIntervalP, 1) // IP only, no B-frames
-	ncfgPutU32(&e.config, ncfgRCMode, nvencRCCBR)
-	ncfgPutU32(&e.config, ncfgRCAvgBR, uint32(bitrate))
-	ncfgPutU32(&e.config, ncfgRCMaxBR, uint32(bitrate))
-	ncfgPutU32(&e.config, ncfgRCVBVBuf, uint32(bitrate/fps))
-	ncfgPutU32(&e.config, ncfgRCVBVInit, uint32(bitrate/fps))
-	ncfgPutU32(&e.config, ncfgH264IDRPeriod, idrPeriod)
-	bits := ncfgGetU32(&e.config, ncfgH264Bitfields)
-	bits |= ncfgH264RepeatSPSPPS
-	ncfgPutU32(&e.config, ncfgH264Bitfields, bits)
-
-	// Step 5: initialize the encoder.
 	var initParams nvencInitParams
 	initParams.Version = nvencStructVerExt(7)
 	initParams.EncodeGUID = nvencCodecH264GUID
@@ -394,14 +335,14 @@ func (e *nvencEncoderLinux) initialize() error {
 	initParams.FrameRateNum = uint32(fps)
 	initParams.FrameRateDen = 1
 	initParams.EnablePTD = 1
-	initParams.EncodeConfig = uintptr(unsafe.Pointer(&e.config))
+	initParams.EncodeConfig = 0 // NULL → NVENC applies preset + tuning defaults
 	initParams.TuningInfo = nvencTuningUltraLowLat
-	r, _, _ = purego.SyscallN(e.funcs.InitializeEncoder, e.encoder, uintptr(unsafe.Pointer(&initParams)))
-	runtime.KeepAlive(e.config)
+	r, _, _ := purego.SyscallN(e.funcs.InitializeEncoder, e.encoder, uintptr(unsafe.Pointer(&initParams)))
 	runtime.KeepAlive(initParams)
 	if r != nvencSuccess {
+		enc := e.encoder
 		e.shutdownSession()
-		return fmt.Errorf("NvEncInitializeEncoder failed: %s (0x%X)", nvencStatusStr(r), r)
+		return fmt.Errorf("NvEncInitializeEncoder failed: %s (0x%X) [encoder=0x%X]", nvencStatusStr(r), r, enc)
 	}
 
 	// Step 6: output bitstream buffer.
@@ -439,8 +380,8 @@ func (e *nvencEncoderLinux) initialize() error {
 	e.inited = true
 	e.frameIdx = 0
 	slog.Info("NVENC (Linux) encoder initialized",
-		"width", e.width, "height", e.height, "bitrate", bitrate, "fps", fps,
-		"preset", "P4", "tuning", "ultra-low-latency")
+		"width", e.width, "height", e.height, "fps", fps,
+		"preset", "P4", "tuning", "ultra-low-latency", "config", "preset-default")
 	return nil
 }
 
