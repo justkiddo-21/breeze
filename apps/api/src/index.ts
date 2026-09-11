@@ -161,6 +161,7 @@ import { unifiRoutes } from './routes/unifi';
 import { accountingRoutes } from './routes/accounting';
 import { sensitiveDataRoutes } from './routes/sensitiveData';
 import { peripheralControlRoutes } from './routes/peripheralControl';
+import { fileEgressControlRoutes } from './routes/fileEgress';
 import { browserSecurityRoutes } from './routes/browserSecurity';
 import { c2cRoutes, m365CallbackRoute } from './routes/c2c';
 import { googleRoutes } from './routes/google';
@@ -1001,6 +1002,7 @@ api.route('/accounting', accountingRoutes);
 api.route('/software-inventory', softwareInventoryRoutes);
 api.route('/sensitive-data', sensitiveDataRoutes);
 api.route('/peripherals', peripheralControlRoutes);
+api.route('/file-egress', fileEgressControlRoutes);
 api.route('/browser-security', browserSecurityRoutes);
 api.route('/', m365CallbackRoute); // Public callback (no auth) — must precede c2c group
 api.route('/c2c', c2cRoutes);
