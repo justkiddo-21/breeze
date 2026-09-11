@@ -14,6 +14,63 @@ import type { AiTool } from './aiTools';
 import { createDrExecutionAndEnqueue } from './drExecutionService';
 import { resolveSiteDevicePartition } from './aiToolsSiteScope';
 
+/**
+ * Deny a group mutation whose STORED membership reaches outside the caller's
+ * sites.
+ *
+ * `manage_dr_plan` declares `deviceArgs: ['devices']`, so the central gate in
+ * aiTools.ts org+site checks every device id the caller SUBMITS. It cannot see
+ * what the group already holds, which leaves the same bypass the HTTP routes
+ * had (#3653): an update_group carrying devices:[theirOwnDevice] over a stored
+ * [theirOwnDevice, otherSiteDevice] silently drops the out-of-site device from
+ * the recovery plan without ever naming it. delete_group removes it outright.
+ *
+ * No-op for unrestricted callers — resolveSiteDevicePartition returns null.
+ */
+async function forbiddenDeviceIds(
+  auth: AuthContext,
+  orgId: string,
+): Promise<Set<string> | null> {
+  const partition = await resolveSiteDevicePartition(orgId, auth);
+  return partition ? new Set(partition.forbidden) : null;
+}
+
+function holdsForbiddenDevice(forbidden: Set<string>, storedDevices: unknown): boolean {
+  return (Array.isArray(storedDevices) ? storedDevices : [])
+    .some((id) => typeof id === 'string' && forbidden.has(id));
+}
+
+async function storedGroupDevicesDenied(
+  auth: AuthContext,
+  orgId: string,
+  storedDevices: unknown,
+): Promise<boolean> {
+  const forbidden = await forbiddenDeviceIds(auth, orgId);
+  return forbidden ? holdsForbiddenDevice(forbidden, storedDevices) : false;
+}
+
+/**
+ * Deny a plan-level mutation when ANY of the plan's groups reaches outside the
+ * caller's sites. Plan status gates execution and archival disables recovery
+ * outright, so this is a control-plane action over every site the plan touches
+ * — the AI-tool counterpart of authorizePlanStoredDevices in routes/dr.ts.
+ */
+async function planStoredDevicesDenied(
+  auth: AuthContext,
+  orgId: string,
+  planId: string,
+): Promise<boolean> {
+  const forbidden = await forbiddenDeviceIds(auth, orgId);
+  if (!forbidden) return false;
+
+  const groups = await db
+    .select({ devices: drPlanGroups.devices })
+    .from(drPlanGroups)
+    .where(and(eq(drPlanGroups.planId, planId), eq(drPlanGroups.orgId, orgId)));
+
+  return groups.some((group) => holdsForbiddenDevice(forbidden, group.devices));
+}
+
 type DRHandler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
 
 // ============================================
@@ -57,19 +114,6 @@ async function loadPlanWithAccess(planId: string, auth: AuthContext) {
     .limit(1);
 
   return plan ?? null;
-}
-
-/** Collect the distinct in-plan device IDs across a set of DR plan groups. */
-function collectGroupDeviceIds(groups: Array<{ devices: unknown }>): string[] {
-  const ids = new Set<string>();
-  for (const group of groups) {
-    if (Array.isArray(group.devices)) {
-      for (const deviceId of group.devices) {
-        if (typeof deviceId === 'string') ids.add(deviceId);
-      }
-    }
-  }
-  return [...ids];
 }
 
 // ============================================
@@ -343,31 +387,12 @@ export function registerDRTools(aiTools: Map<string, AiTool>): void {
         .where(and(...groupConditions))
         .orderBy(asc(drPlanGroups.sequence));
 
-      // Site axis (app-layer only; RLS enforces org, NOT site). This Tier-3 tool
-      // has no deviceArgs — the devices live in the group JSON arrays, so the
-      // central per-device site gate never sees them. A site-restricted caller
-      // may execute a plan only if EVERY device across all its groups is within
-      // their site scope; deny otherwise. The authorized set is then pinned onto
-      // the execution so the (system-context) worker refuses to dispatch to any
-      // out-of-scope device even if the plan's groups are later edited.
-      const planDeviceIds = collectGroupDeviceIds(groups);
-      let authorizedDeviceIds: string[] | null = null;
-      const partition = await resolveSiteDevicePartition(plan.orgId, auth);
-      if (partition) {
-        const allowed = new Set(partition.allowed);
-        const outOfScope = planDeviceIds.filter((id) => !allowed.has(id));
-        if (outOfScope.length > 0) {
-          return JSON.stringify({ error: 'DR plan includes devices outside your site access' });
-        }
-        authorizedDeviceIds = planDeviceIds;
-      }
-
       const execution = await createDrExecutionAndEnqueue({
         planId: plan.id,
         orgId: plan.orgId,
         executionType: executionType as 'rehearsal' | 'failover' | 'failback',
         initiatedBy: auth.user?.id ?? null,
-        authorizedDeviceIds,
+        auth,
       });
       if (!execution) return JSON.stringify({ error: 'Failed to create DR execution record' });
 
@@ -466,6 +491,9 @@ export function registerDRTools(aiTools: Map<string, AiTool>): void {
 
         const plan = await loadPlanWithAccess(planId, auth);
         if (!plan) return JSON.stringify({ error: 'Plan not found or access denied' });
+        if (await planStoredDevicesDenied(auth, plan.orgId, plan.id)) {
+          return JSON.stringify({ error: 'Plan not found or access denied' });
+        }
 
         const updateData: Record<string, unknown> = { updatedAt: new Date() };
         if (typeof input.name === 'string') updateData.name = input.name.trim();
@@ -527,12 +555,15 @@ export function registerDRTools(aiTools: Map<string, AiTool>): void {
         const gc = orgWhere(auth, drPlanGroups.orgId);
         if (gc) groupConditions.push(gc);
         const [existing] = await db
-          .select({ id: drPlanGroups.id })
+          .select({ id: drPlanGroups.id, orgId: drPlanGroups.orgId, devices: drPlanGroups.devices })
           .from(drPlanGroups)
           .where(and(...groupConditions))
           .limit(1);
 
         if (!existing) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (await storedGroupDevicesDenied(auth, existing.orgId, existing.devices)) {
+          return JSON.stringify({ error: 'Group not found or access denied' });
+        }
 
         const updateData: Record<string, unknown> = {};
         if (typeof input.name === 'string') updateData.name = input.name.trim();
@@ -569,12 +600,15 @@ export function registerDRTools(aiTools: Map<string, AiTool>): void {
         const gc = orgWhere(auth, drPlanGroups.orgId);
         if (gc) groupConditions.push(gc);
         const [existing] = await db
-          .select({ id: drPlanGroups.id })
+          .select({ id: drPlanGroups.id, orgId: drPlanGroups.orgId, devices: drPlanGroups.devices })
           .from(drPlanGroups)
           .where(and(...groupConditions))
           .limit(1);
 
         if (!existing) return JSON.stringify({ error: 'Group not found or access denied' });
+        if (await storedGroupDevicesDenied(auth, existing.orgId, existing.devices)) {
+          return JSON.stringify({ error: 'Group not found or access denied' });
+        }
 
         await db.delete(drPlanGroups).where(eq(drPlanGroups.id, groupId));
         return JSON.stringify({ success: true, deleted: true, groupId });

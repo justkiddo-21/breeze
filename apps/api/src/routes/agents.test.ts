@@ -150,6 +150,10 @@ vi.mock('../db/schema', () => ({
     'workstation', 'server', 'printer', 'router', 'switch', 'firewall',
     'access_point', 'phone', 'iot', 'camera', 'nas', 'unknown',
   ] },
+  // unifiTelemetryService.ts builds a canonical-MAC sql fragment from
+  // discoveredAssets.macAddress at module load (#5087), and this suite reaches
+  // it transitively, so the partial mock must expose the column too.
+  discoveredAssets: { id: 'id', macAddress: 'mac_address' },
 }));
 
 vi.mock('../services/enrollmentKeySecurity', async () => {
@@ -193,6 +197,10 @@ vi.mock('../services/vaultSyncPersistence', () => ({
 
 vi.mock('../services/restoreResultPersistence', () => ({
   updateRestoreJobByCommandId: vi.fn(),
+}));
+
+vi.mock('../services/automationTerminalEvidence', () => ({
+  applyCommandAutomationTerminal: vi.fn(),
 }));
 
 vi.mock('../services/commandQueue', () => ({
@@ -1064,6 +1072,64 @@ describe('agent routes', () => {
     });
   });
 
+  describe('POST /agents/:id/commands/:commandId/pam-observations', () => {
+    const receivedBody = {
+      protocolVersion: 1,
+      observation: {
+        protocolVersion: 2,
+        observationId: '10000000-0000-4000-8000-000000000001',
+        actuationId: '20000000-0000-4000-8000-000000000001',
+        generation: 1,
+        state: 'received',
+        observedAt: '2026-08-27T12:00:00.000Z',
+        evidence: { bootId: 'boot-1' },
+      },
+    };
+
+    it('requires a valid agent credential through the real agent router', async () => {
+      vi.mocked(agentAuthMiddleware).mockImplementationOnce((c: any) =>
+        c.json({ error: 'Invalid agent token' }, 401));
+
+      const res = await app.request(
+        '/agents/agent-123/commands/60000000-0000-4000-8000-000000000001/pam-observations',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(receivedBody),
+        },
+      );
+
+      expect(res.status).toBe(401);
+      expect(agentAuthMiddleware).toHaveBeenCalledTimes(1);
+      expect(db.select).not.toHaveBeenCalled();
+    });
+
+    it('rejects a watchdog credential through the primary-agent role gate', async () => {
+      vi.mocked(agentAuthMiddleware).mockImplementationOnce((c: any, next: any) => {
+        c.set('agent', {
+          deviceId: 'device-123',
+          agentId: 'agent-123',
+          orgId: 'org-123',
+          siteId: 'site-123',
+          role: 'watchdog',
+        });
+        return next();
+      });
+
+      const res = await app.request(
+        '/agents/agent-123/commands/60000000-0000-4000-8000-000000000001/pam-observations',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(receivedBody),
+        },
+      );
+
+      expect(res.status).toBe(403);
+      expect(db.select).not.toHaveBeenCalled();
+    });
+  });
+
   describe('POST /agents/:id/commands/:commandId/result', () => {
     it('accepts non-UUID command IDs without querying device_commands', async () => {
       const res = await app.request('/agents/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/commands/mon-test-123/result', {
@@ -1383,6 +1449,17 @@ describe('agent routes', () => {
         update: vi.fn().mockReturnValue({
           set: vi.fn().mockReturnValue({
             where: vi.fn().mockResolvedValue(undefined)
+          })
+        }),
+        // No existing device_patches row for this device+patch — the
+        // installed-path version-aware flip (#2736) falls back to the global
+        // patches.version, which this fixture (installedAt-null handling) does
+        // not otherwise exercise.
+        select: vi.fn().mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([])
+            })
           })
         }),
         insert: vi.fn()

@@ -1,62 +1,29 @@
-/**
- * Detect a Postgres unique-violation (SQLSTATE 23505) from a thrown error.
- *
- * postgres.js raises a `PostgresError` with `.code === '23505'` (and a
- * `.constraint`), but Drizzle wraps it in a `DrizzleQueryError` whose own
- * `.code`/`.constraint` are undefined — the real fields live on `.cause`.
- * Checks that only read the top-level `err.code` therefore miss every
- * Drizzle-issued insert/update and leak a raw 500 instead of mapping the
- * conflict to a friendly error. This walks the `.cause` chain so both shapes
- * are handled.
- *
- * @param constraint  When given, only matches that specific unique index.
- *   If the driver surfaced a constraint name we compare it exactly; if it
- *   didn't (some wrappers drop it), we fall back to scanning the error message
- *   for the constraint name.
- */
-export function isPgUniqueViolation(err: unknown, constraint?: string): boolean {
-  let cur: unknown = err;
-  for (let depth = 0; cur && typeof cur === 'object' && depth < 5; depth++) {
-    const e = cur as { code?: unknown; constraint?: unknown; constraint_name?: unknown; message?: unknown };
-    if (e.code === '23505') {
-      if (!constraint) return true;
-      // postgres.js surfaces the index as `constraint_name`; node-postgres uses
-      // `constraint`. Fall back to a message scan only if neither is present.
-      const name = typeof e.constraint_name === 'string' ? e.constraint_name
-        : typeof e.constraint === 'string' ? e.constraint : undefined;
-      if (name !== undefined) return name === constraint;
-      return typeof e.message === 'string' && e.message.includes(constraint);
-    }
-    cur = (cur as { cause?: unknown }).cause;
-  }
-  return false;
-}
+// Shared with extensions so every Drizzle caller unwraps the same error shapes.
+import { pgErrorCode } from '@breeze/shared/pgErrors';
+export { isPgUniqueViolation, pgErrorCode, pgErrorNode, pgErrorConstraint } from '@breeze/shared/pgErrors';
 
 /**
- * Returns the Postgres SQLSTATE (e.g. '23505', '23503', '22P02') from a thrown
- * error, unwrapping the DrizzleQueryError `.cause` chain. Use for error mappers
- * that branch on several codes; for a simple unique check prefer
- * {@link isPgUniqueViolation}. Returns undefined if no SQLSTATE is found.
- */
-export function pgErrorCode(err: unknown): string | undefined {
-  let cur: unknown = err;
-  for (let depth = 0; cur && typeof cur === 'object' && depth < 5; depth++) {
-    const code = (cur as { code?: unknown }).code;
-    if (typeof code === 'string') return code;
-    cur = (cur as { cause?: unknown }).cause;
-  }
-  return undefined;
-}
-
-/**
- * 40P01 = deadlock_detected, 40001 = serialization_failure. Both mean "you lost
- * a lock race, the work was not applied, try again" — never "the request was
- * invalid". Postgres picks a victim and the winner finishes immediately after,
- * so the retry almost always succeeds.
+ * 40P01 = deadlock_detected, 40001 = serialization_failure, 55P03 =
+ * lock_not_available. All three mean "you lost a lock race, the work was not
+ * applied, try again" — never "the request was invalid". Postgres picks a
+ * victim (40P01/40001) or gives up at a `lock_timeout` bound (55P03) and the
+ * winner finishes immediately after, so the retry almost always succeeds.
+ *
+ * 55P03 is a no-op for every EXISTING caller of `retryOnTransientLockError`
+ * below (see its call sites): Postgres can only raise it where a
+ * `lock_timeout` is actually set, and until #3925 none of THOSE callers' own
+ * transactions set one, so none of them could have observed it before. (Other
+ * transactions in this codebase already set `lock_timeout` via
+ * `tightenLockTimeout` — e.g. deviceDeletion.ts, catalogService.ts — but
+ * those don't route through `retryOnTransientLockError`, so this change is
+ * still a no-op for them.) Adding 55P03 here starts mattering only once a
+ * `retryOnTransientLockError` caller bounds its own lock waits, which #3925
+ * is the first to do (see `tightenLockTimeout` in `../db/lockTimeout`,
+ * used by `ingestSoftwareInventoryReport` in `../services/softwareInventoryObservations`).
  */
 export function isTransientLockError(err: unknown): boolean {
   const code = pgErrorCode(err);
-  return code === '40P01' || code === '40001';
+  return code === '40P01' || code === '40001' || code === '55P03';
 }
 
 /**
@@ -71,12 +38,23 @@ export function isTransientLockError(err: unknown): boolean {
  * writers of the same rows, because losing a lock race should cost a retry,
  * not an entire inventory report.
  *
- * IMPORTANT — only wrap a NESTED drizzle transaction (one running inside a
- * request-long `withDbAccessContext`, which drizzle emits as a SAVEPOINT).
- * Retrying a statement that aborted the OUTER transaction cannot work: every
- * follow-up fails with 25P02 until the outer transaction ends. A nested
- * transaction rolls back to its savepoint and leaves the outer usable — see
- * dbSavepointErrorIsolation.integration.test.ts for the isolation proof.
+ * IMPORTANT — `fn` must own a transaction boundary that the victim's rollback
+ * actually reaches. Exactly two shapes qualify:
+ *
+ *  1. A NESTED drizzle transaction (one running inside a request-long
+ *     `withDbAccessContext`, which drizzle emits as a SAVEPOINT) — it rolls
+ *     back to its savepoint and leaves the outer transaction usable. See
+ *     dbSavepointErrorIsolation.integration.test.ts for the isolation proof.
+ *     Example: the software-inventory ingest in routes/agents/inventory.ts.
+ *  2. A TOP-LEVEL transaction opened by `fn` itself from OUTSIDE any held
+ *     context (e.g. `retryOnTransientLockError(..., () => correlateOrg(orgId))`
+ *     in jobs/vulnerabilityJobs.ts, where each call opens its own
+ *     withSystemDbAccessContext) — the victim has fully rolled back, so the
+ *     retry starts clean.
+ *
+ * What must NEVER be wrapped is a bare statement whose failure aborted an
+ * enclosing transaction the retry cannot escape: every follow-up then fails
+ * with 25P02 until that transaction ends, and the retries are pure noise.
  */
 export async function retryOnTransientLockError<T>(
   label: string,

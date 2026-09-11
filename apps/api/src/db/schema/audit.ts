@@ -1,8 +1,16 @@
 import { pgTable, uuid, varchar, text, timestamp, jsonb, pgEnum, integer, boolean, bigserial, bigint } from 'drizzle-orm/pg-core';
+import { ACTOR_TYPES, AUDIT_RESULTS } from '@breeze/shared';
 import { organizations } from './orgs';
 
-export const actorTypeEnum = pgEnum('actor_type', ['user', 'api_key', 'agent', 'system']);
-export const auditResultEnum = pgEnum('audit_result', ['success', 'failure', 'denied']);
+// 'agent' is the Go device agent; 'ai_agent' is the autonomous AI agent
+// principal (wave 3). They are different actors and must stay distinguishable
+// in the audit trail. Values come from @breeze/shared so the DB enum, the
+// shared union, the validators, the AI tool schemas and the OpenAPI spec all
+// widen together. NOTE: this does not author the Postgres type — that is
+// hand-written SQL in migrations/, so a new value still needs an
+// `ALTER TYPE ... ADD VALUE` migration alongside the constant (#3908).
+export const actorTypeEnum = pgEnum('actor_type', ACTOR_TYPES);
+export const auditResultEnum = pgEnum('audit_result', AUDIT_RESULTS);
 export const initiatedByEnum = pgEnum('initiated_by_type', ['manual', 'ai', 'automation', 'policy', 'schedule', 'agent', 'integration']);
 
 export const auditLogs = pgTable('audit_logs', {
@@ -62,7 +70,10 @@ export const auditChainAnchors = pgTable('audit_chain_anchors', {
 
 export const auditRetentionPolicies = pgTable('audit_retention_policies', {
   id: uuid('id').primaryKey().defaultRandom(),
-  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  // Unique per org (migration 2026-10-08-100700) so upsertOrgAuditRetentionPolicy
+  // can use a real ON CONFLICT — see that service for why the earlier
+  // SELECT...FOR UPDATE approach was not actually race-safe.
+  orgId: uuid('org_id').notNull().unique().references(() => organizations.id, { onDelete: 'cascade' }),
   retentionDays: integer('retention_days').notNull().default(365),
   archiveToS3: boolean('archive_to_s3').notNull().default(false),
   lastCleanupAt: timestamp('last_cleanup_at'),

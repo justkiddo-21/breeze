@@ -50,9 +50,11 @@ function stubState(orgs: OrgRow[], links: LinkRow[], extraSelects: unknown[][] =
     ...o,
   }));
   const queue: unknown[][] = [orgRows, links, ...extraSelects];
-  selectMock.mockImplementation(() => ({
+  selectMock.mockImplementation((selection?: Record<string, unknown>) => ({
     from: () => {
-      const rows = queue.shift() ?? [];
+      const rows = selection && 'currencyCode' in selection
+        ? [{ currencyCode: 'CAD' }]
+        : queue.shift() ?? [];
       return {
         where: () => {
           const p = Promise.resolve(rows) as Promise<unknown[]> & { limit: () => Promise<unknown[]> };
@@ -114,6 +116,16 @@ describe('normalizeOrgName', () => {
 });
 
 describe('previewOrgImport', () => {
+  // #3967 — the reserved-slug set is compared against a lowercase candidate,
+  // so an existing mixed-case slug must still count as taken; otherwise the
+  // generated slug collides with organizations_partner_slug_uniq at insert.
+  it('treats an existing mixed-case slug as taken when resolving a new one', async () => {
+    // Name deliberately unrelated so this is a plain `create`, not a name-match.
+    stubState([{ id: 'org-1', name: 'Zeta Holdings', slug: 'Acme-Co' }], []);
+    const rows = await previewOrgImport([{ organization: 'Acme Co', site: 'HQ' }], 'p1');
+    expect(rows[0]).toMatchObject({ annotation: 'create', slug: 'acme-co-2' });
+  });
+
   it('annotates a fresh row as create with a resolved slug', async () => {
     stubState([], []);
     const rows = await previewOrgImport([{ organization: 'Acme Co', site: 'HQ' }], 'p1');
@@ -369,7 +381,7 @@ describe('commitOrgImport — create', () => {
     expect(summary.imported[1]).toMatchObject({ createdOrganization: false });
 
     // Insert order: org, link, site, site.
-    expect(insertedValues[0]!.values).toMatchObject({ partnerId: 'p1', name: 'Acme', slug: 'acme', type: 'customer' });
+    expect(insertedValues[0]!.values).toMatchObject({ partnerId: 'p1', currencyCode: 'CAD', name: 'Acme', slug: 'acme', type: 'customer' });
     expect(insertedValues[1]!.values).toMatchObject({
       orgId: 'row-1', partnerId: 'p1', system: 'datto_rmm', externalId: '1', createdBy: 'u1',
     });

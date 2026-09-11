@@ -81,4 +81,44 @@ describe('mfaStepUpSchema operation field', () => {
       mfaStepUpSchema.parse({ method: 'totp', code: '123456', operation: 'admin_takeover' })
     ).toThrow();
   });
+
+  // #4018: enroll_first_factor is a REAL StepUpOperation, so the `satisfies`
+  // constraint on STEP_UP_OPERATIONS would happily accept it being added to
+  // the client-requestable list — nothing in the type system stops that. But
+  // it is minted ONLY by the SSO re-auth callback, after a forced IdP
+  // round-trip proves identity for a passwordless account. If a client could
+  // request it here, anyone who can already satisfy step-up could mint one
+  // without ever re-authenticating. This test is the guard the type system
+  // does not provide.
+  it('rejects enroll_first_factor — SSO-reauth-mint only, never client-requestable', () => {
+    expect(() =>
+      mfaStepUpSchema.parse({ method: 'totp', code: '123456', operation: 'enroll_first_factor' })
+    ).toThrow();
+  });
+
+  // RMM-QA-176 D11 (T12): entering/extending device maintenance mode is a
+  // client-requestable step-up operation, and its resource binding must be
+  // accepted by this schema. The duration cap is imported from the grant
+  // service, so a value the device route would refuse can never mint a grant.
+  it('accepts device_maintenance with a maintenance resource binding', () => {
+    const parsed = mfaStepUpSchema.parse({
+      method: 'totp',
+      code: '123456',
+      operation: 'device_maintenance',
+      resource: { deviceIds: ['00000000-0000-4000-8000-000000000010'], reason: 'scheduled patching', durationHours: 4 },
+    });
+    expect(parsed.operation).toBe('device_maintenance');
+    expect(parsed.resource).toMatchObject({ durationHours: 4, reason: 'scheduled patching' });
+  });
+
+  it('rejects a maintenance resource with a duration above the shared cap', () => {
+    expect(() =>
+      mfaStepUpSchema.parse({
+        method: 'totp',
+        code: '123456',
+        operation: 'device_maintenance',
+        resource: { deviceIds: ['00000000-0000-4000-8000-000000000010'], reason: 'scheduled patching', durationHours: 169 },
+      })
+    ).toThrow();
+  });
 });

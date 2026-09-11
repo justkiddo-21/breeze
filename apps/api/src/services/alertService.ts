@@ -27,6 +27,7 @@ import { resolveAlertRulesForDevice, resolveMaintenanceConfigForDevice, isInMain
 import { publishEvent } from './eventBus';
 import { resolveDeviceSiteId } from './deviceSiteResolver';
 import { enqueueAlertCorrelation } from '../jobs/alertCorrelation';
+import { captureException } from './sentry';
 
 // Types for alert creation
 export interface CreateAlertParams {
@@ -48,6 +49,71 @@ export interface RuleWithTemplate {
   effectiveCooldownMinutes: number;
   notificationChannelIds: string[];
   escalationPolicyId?: string;
+}
+
+/**
+ * Publish `alert.triggered` for an already-inserted alert row, rolling the row
+ * back if the publish fails.
+ *
+ * A committed `active` alert that was never published is worse than no alert at
+ * all: every creator dedupes on open alerts, so the unpublished row makes them
+ * skip re-creating it forever — the silent, inbox-only alert #5241 exists to
+ * eliminate. Deleting it lets the next evaluation retry the whole
+ * create + publish.
+ *
+ * @returns true when the event was published; false when the row was rolled
+ *          back (the caller must not burn a cooldown or enqueue follow-up work).
+ */
+async function publishAlertTriggeredOrRollback(opts: {
+  alertId: string;
+  orgId: string;
+  deviceId: string;
+  /** Producing subsystem, used for the Sentry tag and log lines. */
+  source: string;
+  payload: Record<string, unknown>;
+  publisher: string;
+  siteId: string | null | undefined;
+}): Promise<boolean> {
+  const { alertId, orgId, deviceId, source, payload, publisher, siteId } = opts;
+
+  try {
+    await publishEvent('alert.triggered', orgId, payload, publisher, { siteId });
+    return true;
+  } catch (error) {
+    captureException(error, undefined, {
+      errorId: 'alert-triggered-publish-failed',
+      alertId,
+      alertSource: source,
+      orgId,
+      deviceId
+    });
+    console.error(
+      `[AlertService] Failed to publish alert.triggered for ${source} alert ${alertId}; rolling the alert row back:`,
+      error
+    );
+    try {
+      await db.delete(alerts).where(eq(alerts.id, alertId));
+    } catch (deleteError) {
+      // Now the row IS stranded — unpublished and undeletable. Nothing else
+      // will notice it, so report it under its own errorId. Note that
+      // `captureException` is a no-op when Sentry is not initialised (the
+      // common self-hosted shape), so on those deployments the console.error
+      // below is the only durable trace — operators who want to be paged on
+      // this need a log-based alert on it.
+      captureException(deleteError, undefined, {
+        errorId: 'alert-triggered-orphan-rollback-failed',
+        alertId,
+        alertSource: source,
+        orgId,
+        deviceId
+      });
+      console.error(
+        `[AlertService] Could not roll back unpublished alert ${alertId}; it is stranded active with no notification:`,
+        deleteError
+      );
+    }
+    return false;
+  }
 }
 
 /**
@@ -145,17 +211,17 @@ export async function createAlert(params: CreateAlertParams): Promise<string | n
     return null;
   }
 
-  // Set cooldown
-  await setCooldown(ruleId, deviceId, cooldownMinutes);
-
-  enqueueAlertCorrelationForDevice(orgId, deviceId);
-
-  // Publish event — attach the device's site so site-restricted users see it
+  // Publish event — attach the device's site so site-restricted users see it.
+  // The cooldown and the correlation job are deliberately set only AFTER a
+  // successful publish: on a rollback the next evaluation must be free to retry
+  // the whole create + publish, and nothing may point at the deleted row.
   const siteId = await resolveDeviceSiteId(deviceId);
-  await publishEvent(
-    'alert.triggered',
+  const published = await publishAlertTriggeredOrRollback({
+    alertId: newAlert.id,
     orgId,
-    {
+    deviceId,
+    source: 'alert_rule',
+    payload: {
       alertId: newAlert.id,
       ruleId,
       deviceId,
@@ -163,13 +229,136 @@ export async function createAlert(params: CreateAlertParams): Promise<string | n
       title,
       message
     },
-    'alert-service',
-    { siteId }
-  );
+    publisher: 'alert-service',
+    siteId
+  });
+
+  if (!published) {
+    return null;
+  }
+
+  // Set cooldown
+  await setCooldown(ruleId, deviceId, cooldownMinutes);
+
+  enqueueAlertCorrelationForDevice(orgId, deviceId);
 
   console.log(`[AlertService] Created alert ${newAlert.id} for rule=${ruleId} device=${deviceId}`);
 
   return newAlert.id;
+}
+
+/**
+ * Parameters for {@link createSourcedAlert}.
+ */
+export interface CreateSourcedAlertParams {
+  deviceId: string;
+  orgId: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
+  title: string;
+  message: string;
+  /**
+   * Persisted to `alerts.context`. `source` names the producing subsystem and
+   * is also what the caller's own dedupe query keys on.
+   */
+  context: Record<string, unknown> & { source: string };
+  /** Event-bus publisher label, e.g. `'monitor-worker'`. */
+  publisher: string;
+  /** Extra fields merged into the `alert.triggered` payload. */
+  eventPayload?: Record<string, unknown>;
+  triggeredAt?: Date;
+  /** Config-policy alert rule behind this alert, when there is one. */
+  configPolicyId?: string | null;
+  /** Human label for the producing config item, e.g. `'warranty_expiry'`. */
+  configItemName?: string | null;
+  /**
+   * Site to scope the published event to. Omit to resolve it from the device;
+   * pass it explicitly (including `null`) when the caller already knows it.
+   */
+  siteId?: string | null;
+}
+
+/**
+ * Create an alert that has no `alert_rules` row behind it and publish
+ * `alert.triggered` for it.
+ *
+ * Rule-less producers (network monitors, warranty, network baseline, …) cannot
+ * use {@link createAlert}: that path looks up `alertRules`/`alertTemplates` by
+ * `ruleId` for its cooldown + dedupe settings and bails when the rule does not
+ * exist. Inserting into `alerts` directly instead — which is what
+ * `monitorWorker` did before #5241 — makes the alert visible in the inbox but
+ * invisible to every `alert.triggered` consumer: no notifications, no
+ * escalation, no automations, no AI verdict.
+ *
+ * This helper is the shared insert + publish tail. Cooldown, dedupe and
+ * flap-suppression stay with the caller, whose keys are source-specific
+ * (a monitor rule id, a warranty end date, …) rather than an `alertRules` id.
+ *
+ * @returns the new alert id, or null if the insert produced no row or the
+ *          publish failed and the row was rolled back — in either case nothing
+ *          was published and the caller should not burn its cooldown.
+ */
+export async function createSourcedAlert(params: CreateSourcedAlertParams): Promise<string | null> {
+  const { deviceId, orgId, severity, title, message, context, publisher, eventPayload, triggeredAt } = params;
+
+  const [newAlert] = await db
+    .insert(alerts)
+    .values({
+      ruleId: null,
+      deviceId,
+      orgId,
+      configPolicyId: params.configPolicyId ?? null,
+      configItemName: params.configItemName ?? null,
+      severity,
+      title,
+      message,
+      context,
+      status: 'active',
+      triggeredAt: triggeredAt ?? new Date()
+    })
+    .returning({ id: alerts.id });
+
+  const alertId = newAlert?.id;
+  if (!alertId) {
+    const err = new Error(
+      `[AlertService] Insert returned no row for ${context.source} alert (org=${orgId} device=${deviceId}); nothing published`
+    );
+    console.error(err.message);
+    captureException(err, undefined, { alertSource: context.source, orgId, deviceId });
+    return null;
+  }
+
+  // Attach the device's site so site-restricted users see it, same as createAlert.
+  const siteId = params.siteId !== undefined ? params.siteId : await resolveDeviceSiteId(deviceId);
+  const published = await publishAlertTriggeredOrRollback({
+    alertId,
+    orgId,
+    deviceId,
+    source: context.source,
+    payload: {
+      alertId,
+      ruleId: null,
+      deviceId,
+      severity,
+      title,
+      message,
+      // `source` last so it is always the one persisted in context — a caller
+      // cannot accidentally publish a source that disagrees with the row.
+      ...eventPayload,
+      source: context.source
+    },
+    publisher,
+    siteId
+  });
+
+  if (!published) {
+    return null;
+  }
+
+  // Only correlate an alert that actually published — a rolled-back row must
+  // not leave a correlation job pointing at a deleted alert.
+  enqueueAlertCorrelationForDevice(orgId, deviceId);
+
+  return alertId;
 }
 
 /**
@@ -233,18 +422,19 @@ export async function checkAutoResolve(alertId: string): Promise<boolean> {
     const triggerConditions = (overrides?.conditions as unknown) ?? template.conditions;
     const result = await evaluateConditions(triggerConditions, alert.deviceId);
 
-    // Auto-resolve if trigger conditions are NO LONGER met
+    // Auto-resolve if trigger conditions are NO LONGER met.
+    // Report what resolveAlert's compare-and-swap actually did: returning a bare
+    // `true` here made every caller that LOST the race look like a resolver, which
+    // is what inflates `checkAllAutoResolve`'s count (#4094).
     if (!result.triggered) {
-      await resolveAlert(alertId, 'Auto-resolved: conditions cleared');
-      return true;
+      return await resolveAlert(alertId, 'Auto-resolved: conditions cleared');
     }
   } else {
     // Evaluate specific auto-resolve conditions
     const result = await evaluateAutoResolveConditions(autoResolveConditions, alert.deviceId);
 
     if (result.shouldResolve) {
-      await resolveAlert(alertId, `Auto-resolved: ${result.reason}`);
-      return true;
+      return await resolveAlert(alertId, `Auto-resolved: ${result.reason}`);
     }
   }
 
@@ -254,20 +444,220 @@ export async function checkAutoResolve(alertId: string): Promise<boolean> {
 /**
  * Resolve an alert
  */
+/**
+ * The two terminal statuses are `resolved` and `dismissed`; everything else is
+ * still resolvable. Exported with the predicate builder below so tests can
+ * assert the COMPILED SQL — a mocked-drizzle assertion that only checks column
+ * names appear cannot tell `and` from `or`, nor catch this list gaining a
+ * terminal status, and both mutations turn the CAS into a no-op or a
+ * fleet-wide overwrite.
+ */
+export const RESOLVABLE_ALERT_STATUSES = ['active', 'acknowledged', 'suppressed'] as const;
+
+/** The `alert_status` enum, as the column itself types it. */
+type AlertStatus = (typeof alerts.$inferSelect)['status'];
+
+/**
+ * What a resolve path reports when it LOSES the compare-and-swap.
+ *
+ * Deliberately states only what the code can verify — that the row is no longer in
+ * a resolvable status. It does NOT claim "another request resolved it": an empty
+ * `RETURNING` is also what an RLS-invisible write produces, and naming the benign
+ * cause in user-visible text forecloses the one hypothesis worth chasing when the
+ * cause is not benign.
+ */
+export const ALERT_CAS_LOST_MESSAGE =
+  'Alert is no longer resolvable — it already reached a terminal status (resolved or dismissed).';
+
+/**
+ * The compare-and-swap predicate for resolving ONE alert by id. See the note above.
+ *
+ * This is the single definition of "this alert is still resolvable" for every
+ * single-alert resolve path (#4094): `resolveAlert`, both HTTP resolve routes, the
+ * `manage_alerts` AI tool, and the warranty auto-resolve sweep. Building a second
+ * copy inline is how the predicate and its compiled-SQL test drifted apart once
+ * already.
+ *
+ * Two paths deliberately do NOT use this builder because they write many rows at
+ * once and need `inArray(alerts.id, ...)` rather than an id equality — they compose
+ * `RESOLVABLE_ALERT_STATUSES` directly instead:
+ *   - the correlation-group resolve (`routes/alerts/correlations.ts`);
+ *   - the bulk alert action (`routes/alerts/alerts.ts`), which is stricter still —
+ *     it pins each row to the exact status its snapshot saw.
+ */
+export function buildResolveAlertCas(alertId: string) {
+  return buildAlertStatusCas(alertId, RESOLVABLE_ALERT_STATUSES);
+}
+
+/**
+ * The one status an alert can be acknowledged FROM.
+ *
+ * Deliberately narrower than the resolvable set and not derivable from it: every
+ * acknowledge call site already refuses a non-active alert at its pre-read, and
+ * re-acknowledging an acknowledged alert is not a workflow anybody asked for. What
+ * the pre-read could never do is stop the write, which is the #4101 bug — see
+ * `buildAcknowledgeAlertCas`.
+ */
+export const ACKNOWLEDGEABLE_ALERT_STATUSES = ['active'] as const;
+
+/**
+ * The statuses an alert can be suppressed FROM: everything except the two terminal
+ * ones. `suppressed` is in the set on purpose — re-timing an existing mute
+ * (extending or shortening it) is a legitimate operation, unlike re-acknowledging.
+ *
+ * Textually identical to `RESOLVABLE_ALERT_STATUSES` today, and kept a separate
+ * constant anyway: the two express different invariants ("still silenceable" vs
+ * "still resolvable") and must be free to diverge when a status is added. Aliasing
+ * them would make a future non-terminal status silently inherit both answers.
+ * `alertService.ackCasSql.test.ts` derives both from the `alert_status` enum so a
+ * new value forces the classification instead of defaulting to one.
+ */
+export const SUPPRESSIBLE_ALERT_STATUSES = ['active', 'acknowledged', 'suppressed'] as const;
+
+/**
+ * What an acknowledge path reports when it LOSES the compare-and-swap.
+ *
+ * Same discipline as `ALERT_CAS_LOST_MESSAGE`: state only what the code can verify
+ * (the row is no longer active), never "another request acknowledged it" — an empty
+ * `RETURNING` is also what an RLS-invisible write produces, and naming the benign
+ * cause in user-visible text forecloses the hypothesis worth chasing when the cause
+ * is not benign.
+ */
+export const ALERT_ACKNOWLEDGE_CAS_LOST_MESSAGE =
+  'Alert is no longer acknowledgeable — its status is no longer active.';
+
+/** What a suppress path reports when it LOSES the compare-and-swap. */
+export const ALERT_SUPPRESS_CAS_LOST_MESSAGE =
+  'Alert is no longer suppressible — it already reached a terminal status (resolved or dismissed).';
+
+/**
+ * The statuses an alert can be dismissed FROM: every one except `dismissed` itself.
+ *
+ * The widest of the four sets, and deliberately the only one containing a TERMINAL
+ * status. Dismiss is the "make this go away for good" action and is documented as
+ * legal from any other status — clearing an already-`resolved` alert off the list is
+ * the workflow it exists for, so excluding `resolved` here would break a supported
+ * operation rather than close a race.
+ *
+ * `dismissed` is excluded for the opposite reason, and that exclusion is the entire
+ * guard: with it in the set the predicate would match an already-dismissed row, the
+ * losing caller's UPDATE would succeed, and `dismissedAt`/`dismissedBy` would be
+ * re-stamped over the winner's — a CAS present in the code and absent in effect.
+ */
+export const DISMISSIBLE_ALERT_STATUSES = [
+  'active',
+  'acknowledged',
+  'suppressed',
+  'resolved',
+] as const;
+
+/**
+ * What a dismiss path reports when it LOSES the compare-and-swap.
+ *
+ * Same discipline as the three above: state only what the code can verify. An empty
+ * `RETURNING` here means the row is no longer dismissible, which is also what an
+ * RLS-invisible or deleted row produces — so this does not claim "another request
+ * dismissed it", however likely that is.
+ *
+ * Phrased "already reached the dismissed status" rather than "has already been
+ * dismissed" for exactly that reason: the first states the eligibility fact the CAS
+ * establishes, in the same shape `ALERT_CAS_LOST_MESSAGE` uses, while the second
+ * reads as a claim about an actor and would quietly foreclose the RLS/deleted-row
+ * hypothesis — the one worth chasing when the cause is not benign.
+ */
+export const ALERT_DISMISS_CAS_LOST_MESSAGE =
+  'Alert is no longer dismissible — it already reached the dismissed status.';
+
+/**
+ * The compare-and-swap predicate for acknowledging ONE alert by id (#4101).
+ *
+ * The acknowledge handlers had the identical check-then-act shape the resolve paths
+ * carried before #4094/#4099: read the status, then UPDATE by id unconditionally.
+ * The damage is worse than a double-acknowledge. Tech A resolves — the resolve CAS
+ * wins, `alert.resolved` publishes, the escalation is cancelled. Tech B's stale list
+ * still shows the alert active and B clicks Acknowledge; B's id-only UPDATE stamps
+ * `status='acknowledged'` over the resolution, leaving a reopened alert that still
+ * carries `resolvedAt`/`resolvedBy` and whose escalation is already gone.
+ *
+ * Single definition for every single-alert acknowledge path: both HTTP routes
+ * (`routes/alerts/alerts.ts`, `routes/mobile.ts`) and the `manage_alerts` AI tool.
+ * The two multi-row acknowledge paths compose the status predicate directly because
+ * they need `inArray(alerts.id, ...)` rather than an id equality:
+ *   - the correlation-group acknowledge (`routes/alerts/correlations.ts`);
+ *   - the bulk alert action (`routes/alerts/alerts.ts`), stricter still — it pins
+ *     each row to the exact status its snapshot saw.
+ */
+export function buildAcknowledgeAlertCas(alertId: string) {
+  return buildAlertStatusCas(alertId, ACKNOWLEDGEABLE_ALERT_STATUSES);
+}
+
+/**
+ * The compare-and-swap predicate for suppressing ONE alert by id (#4101). Same
+ * check-then-act defect and the same fix shape as `buildAcknowledgeAlertCas`; a
+ * stale suppress landing on a just-resolved alert un-resolves it.
+ */
+export function buildSuppressAlertCas(alertId: string) {
+  return buildAlertStatusCas(alertId, SUPPRESSIBLE_ALERT_STATUSES);
+}
+
+/**
+ * The compare-and-swap predicate for dismissing ONE alert by id (#4293) — the last
+ * single-alert transition to get one.
+ *
+ * What a lost race costs here is narrower than #4101 and is NOT a reopened alert:
+ * because dismiss is legal from every other status, a dismiss landing on a
+ * just-resolved alert is the intended outcome. The casualty is PROVENANCE. Two techs
+ * dismiss the same alert; both id-only UPDATEs matched, so `dismissedAt`/`dismissedBy`
+ * described whichever write landed second while BOTH callers got a 200, an ML feedback
+ * emit and an audit row claiming the transition. For the terminal action, "who
+ * dismissed this and when" is the field most likely to be asked about later.
+ *
+ * Unlike the other three transitions, dismiss has exactly ONE other write path, not
+ * two: the bulk alert action. There is no correlation-group dismiss — `mutateAlerts`
+ * in `routes/alerts/correlations.ts` takes only `'acknowledge' | 'resolve'`. Bulk
+ * composes its predicate directly because it needs `inArray(alerts.id, ...)`, and it
+ * pins each row to the exact status its snapshot saw, which is stricter than this set
+ * but correct there — bulk reports a `skipped` count rather than an error, so a
+ * concurrent change costs the caller a retry hint, not a refused operation.
+ */
+export function buildDismissAlertCas(alertId: string) {
+  return buildAlertStatusCas(alertId, DISMISSIBLE_ALERT_STATUSES);
+}
+
+/**
+ * The one place the CAS SHAPE lives. The four builders above differ only in which
+ * statuses they admit; funnelling them through here means a change to the shape
+ * (`and` → `or`, dropping the id equality) cannot land on one transition and miss
+ * the other three — which is exactly how a predicate and its compiled-SQL test have
+ * drifted apart in this file before.
+ */
+function buildAlertStatusCas(alertId: string, statuses: readonly AlertStatus[]) {
+  return and(
+    eq(alerts.id, alertId),
+    inArray(alerts.status, [...statuses]),
+  );
+}
+
 export async function resolveAlert(
   alertId: string,
   resolutionNote?: string,
   resolvedBy?: string
-): Promise<void> {
+): Promise<boolean> {
+  // Winner-takes-all. The status predicate IS the concurrency control: reading
+  // the row first and then updating by id unconditionally lets two callers
+  // both "resolve" the same alert and both run the fan-out below — the state
+  // transition, the cooldown write, and an `alert.resolved` publish that
+  // cancels escalations and feeds the AI triage loop guard.
+  //
+  // Two callers is not hypothetical: policy.compliant redelivery, the
+  // auto-resolve sweep and monitorWorker can all reach the same alert, and
+  // wave 3.5c makes event delivery at-least-once.
+  //
+  // RETURNING replaces the previous SELECT. Note it returns the POST-update
+  // row: safe only because nothing below reads a column this SET writes
+  // (status / resolvedAt / resolvedBy / resolutionNote). Adding such a read
+  // later would silently observe the new value.
   const [alert] = await db
-    .select()
-    .from(alerts)
-    .where(eq(alerts.id, alertId))
-    .limit(1);
-
-  if (!alert) return;
-
-  await db
     .update(alerts)
     .set({
       status: 'resolved',
@@ -275,7 +665,11 @@ export async function resolveAlert(
       resolvedBy: resolvedBy ?? null,
       resolutionNote: resolutionNote ?? null
     })
-    .where(eq(alerts.id, alertId));
+    .where(buildResolveAlertCas(alertId))
+    .returning();
+
+  // Already resolved by someone else (or gone). Not an error — just not ours.
+  if (!alert) return false;
 
   // Phase 6a: Record resolution state transition for flapping detection
   try {
@@ -324,7 +718,16 @@ export async function resolveAlert(
     }
   }
 
-  // Publish event — attach the device's site so site-restricted users see it
+  // Publish event — attach the device's site so site-restricted users see it.
+  //
+  // C2 fix: resolvedAt/resolvedBy/triggeredAt ride on the payload so a
+  // subscriber never has to re-read this row to learn the resolve state —
+  // a re-read on a fresh connection can observe this transaction's write
+  // before it commits (the auto-resolve sweep and monitorWorker both call
+  // this function from inside one `withSystemDbAccessContext` transaction
+  // spanning the whole sweep). See `alertVerdictSubscriber.ts`'s contract
+  // comment. Values come from `alert`, the RETURNING row this same UPDATE
+  // just produced — never a second read.
   const siteId = await resolveDeviceSiteId(alert.deviceId);
   await publishEvent(
     'alert.resolved',
@@ -333,13 +736,17 @@ export async function resolveAlert(
       alertId,
       ruleId: alert.ruleId,
       deviceId: alert.deviceId,
-      resolutionNote
+      resolutionNote,
+      resolvedAt: alert.resolvedAt!.toISOString(),
+      resolvedBy: alert.resolvedBy,
+      triggeredAt: alert.triggeredAt.toISOString(),
     },
     'alert-service',
     { siteId }
   );
 
   console.log(`[AlertService] Resolved alert ${alertId}`);
+  return true;
 }
 
 /**
@@ -672,56 +1079,40 @@ export async function evaluateDeviceAlertsFromPolicy(deviceId: string): Promise<
         const title = interpolateTemplate(rule.titleTemplate, templateContext);
         const message = interpolateTemplate(rule.messageTemplate, templateContext);
 
-        // 9. Create alert with config policy references (ruleId left null)
-        const [newAlert] = await db
-          .insert(alerts)
-          .values({
-            ruleId: null,
-            deviceId,
-            orgId: device.orgId,
-            configPolicyId: rule.id,
+        // 9. Create alert with config policy references (ruleId left null).
+        // Routed through createSourcedAlert so a failed publish rolls the row
+        // back instead of leaving a silent, dedupe-blocking alert (#5325).
+        const newAlertId = await createSourcedAlert({
+          deviceId,
+          orgId: device.orgId,
+          severity: rule.severity,
+          title,
+          message,
+          context: {
+            ...result.context,
+            conditionsMet: result.conditionsMet,
+            conditionsNotMet: result.conditionsNotMet,
+            cooldownMinutes: rule.cooldownMinutes,
+            source: 'config_policy',
+          },
+          configPolicyId: rule.id,
+          configItemName: rule.name,
+          publisher: 'alert-service',
+          eventPayload: {
+            configPolicyAlertRuleId: rule.id,
             configItemName: rule.name,
-            severity: rule.severity,
-            title,
-            message,
-            context: {
-              ...result.context,
-              conditionsMet: result.conditionsMet,
-              conditionsNotMet: result.conditionsNotMet,
-              cooldownMinutes: rule.cooldownMinutes,
-              source: 'config_policy',
-            },
-            status: 'active',
-            triggeredAt: new Date(),
-          })
-          .returning();
+          },
+          // The device row already carries its site — no need to re-resolve it.
+          siteId: device.siteId,
+        });
 
-        if (newAlert) {
-          // 10. Set cooldown
+        if (newAlertId) {
+          // 10. Set cooldown — only once the alert actually published, so a
+          // rolled-back create is retried on the next evaluation.
           await markConfigPolicyRuleCooldown(rule.id, deviceId, rule.cooldownMinutes);
 
-          enqueueAlertCorrelationForDevice(device.orgId, deviceId);
-
-          // 11. Publish event — carry siteId so site-restricted users get it
-          await publishEvent(
-            'alert.triggered',
-            device.orgId,
-            {
-              alertId: newAlert.id,
-              configPolicyAlertRuleId: rule.id,
-              configItemName: rule.name,
-              deviceId,
-              severity: rule.severity,
-              title,
-              message,
-              source: 'config_policy',
-            },
-            'alert-service',
-            { siteId: device.siteId }
-          );
-
-          console.log(`[AlertService] Created config policy alert ${newAlert.id} for cpar=${rule.id} device=${deviceId}`);
-          createdAlerts.push(newAlert.id);
+          console.log(`[AlertService] Created config policy alert ${newAlertId} for cpar=${rule.id} device=${deviceId}`);
+          createdAlerts.push(newAlertId);
         }
       }
     } catch (error) {
@@ -776,6 +1167,15 @@ export async function checkAutoResolveFromConfigPolicy(deviceId: string): Promis
 
   let resolvedCount = 0;
 
+  // Both branches below count — and previously also wrote the config-policy
+  // cooldown — only on `resolveAlert`'s compare-and-swap WINNER (#4094). Doing it
+  // unconditionally meant a caller that lost the race to the monitor worker or a
+  // policy.compliant redelivery still reported a resolution it did not perform and
+  // still stamped a cooldown, suppressing the next legitimate alert for that rule.
+  // The explicit cooldown write is gone rather than merely gated: on the winning
+  // path `resolveAlert` already calls `markConfigPolicyRuleCooldown` with the same
+  // rule id, device and `cooldownMinutes` (see its config-policy branch), so it was
+  // a duplicate of a write the winner performs anyway.
   for (const alert of activeAlerts) {
     try {
       const rule = ruleMap.get(alert.configPolicyId!);
@@ -795,18 +1195,14 @@ export async function checkAutoResolveFromConfigPolicy(deviceId: string): Promis
           alert.deviceId
         );
 
-        if (result.shouldResolve) {
-          await resolveAlert(alert.id, `Auto-resolved: ${result.reason}`);
-          await markConfigPolicyRuleCooldown(rule.id, alert.deviceId, rule.cooldownMinutes);
+        if (result.shouldResolve && await resolveAlert(alert.id, `Auto-resolved: ${result.reason}`)) {
           resolvedCount++;
         }
       } else {
         // No specific auto-resolve conditions; use inverse of trigger conditions
         const result = await evaluateConditions(rule.conditions, alert.deviceId);
 
-        if (!result.triggered) {
-          await resolveAlert(alert.id, 'Auto-resolved: conditions cleared');
-          await markConfigPolicyRuleCooldown(rule.id, alert.deviceId, rule.cooldownMinutes);
+        if (!result.triggered && await resolveAlert(alert.id, 'Auto-resolved: conditions cleared')) {
           resolvedCount++;
         }
       }

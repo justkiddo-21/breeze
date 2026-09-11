@@ -20,6 +20,10 @@ import { users } from './users';
 import { configPolicyFeatureLinks, backupModeEnum } from './configurationPolicies';
 import { storageEncryptionKeys } from './storageEncryption';
 import { BACKUP_SNAPSHOT_ID_MAX_LENGTH } from './backupConstants';
+import {
+  recoveryAuthorizationSubjectChecks,
+  recoveryAuthorizationSubjectColumns,
+} from './recoveryAuthorizationSubject';
 
 export const backupProviderEnum = pgEnum('backup_provider', [
   'local',
@@ -294,8 +298,13 @@ export const backupSnapshots = pgTable(
     size: bigint('size', { mode: 'number' }),
     fileCount: integer('file_count'),
     isIncremental: boolean('is_incremental').notNull().default(false),
+    // ON DELETE SET NULL (2026-10-15-140004): an incremental snapshot's
+    // parent pointer must not block the parent's own retention deletion —
+    // see the migration and deleteSnapshotRow's comment above for the D17
+    // history/lineage rationale.
     parentSnapshotId: uuid('parent_snapshot_id').references(
-      (): AnyPgColumn => backupSnapshots.id
+      (): AnyPgColumn => backupSnapshots.id,
+      { onDelete: 'set null' }
     ),
     expiresAt: timestamp('expires_at'),
     metadata: jsonb('metadata'),
@@ -353,9 +362,12 @@ export const restoreJobs = pgTable(
     orgId: uuid('org_id')
       .notNull()
       .references(() => organizations.id),
-    snapshotId: uuid('snapshot_id')
-      .notNull()
-      .references(() => backupSnapshots.id),
+    // Nullable + ON DELETE SET NULL (2026-10-15-140004): a restore job is
+    // history and must survive its snapshot's retention deletion — see D17 /
+    // deleteSnapshotRow's comment on backup_snapshots above.
+    snapshotId: uuid('snapshot_id').references(() => backupSnapshots.id, {
+      onDelete: 'set null',
+    }),
     deviceId: uuid('device_id')
       .notNull()
       .references(() => devices.id),
@@ -370,16 +382,21 @@ export const restoreJobs = pgTable(
     initiatedBy: uuid('initiated_by').references(() => users.id),
     targetConfig: jsonb('target_config'),
     recoveryTokenId: uuid('recovery_token_id'),
-    commandId: uuid('command_id').references(() => deviceCommands.id),
+    commandId: uuid('command_id').references(() => deviceCommands.id, { onDelete: 'set null' }),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
+    ...recoveryAuthorizationSubjectColumns(),
   },
   (table) => ({
     orgIdIdx: index('restore_jobs_org_id_idx').on(table.orgId),
     snapshotIdIdx: index('restore_jobs_snapshot_id_idx').on(table.snapshotId),
     deviceIdIdx: index('restore_jobs_device_id_idx').on(table.deviceId),
     statusIdx: index('restore_jobs_status_idx').on(table.status),
+    authorizationClaimIdx: index('restore_jobs_authorization_claim_idx')
+      .on(table.status, table.authorizationState)
+      .where(sql`${table.status} IN ('pending', 'running')`),
     commandIdIdx: index('restore_jobs_command_id_idx').on(table.commandId),
     recoveryTokenUniqueIdx: uniqueIndex('restore_jobs_recovery_token_id_uniq').on(table.recoveryTokenId),
+    ...recoveryAuthorizationSubjectChecks('restore_jobs', table),
   })
 );

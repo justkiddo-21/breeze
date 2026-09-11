@@ -6,6 +6,8 @@ import { getBullMQConnection } from '../services/redis';
 import { isReusableState } from '../services/bullmqUtils';
 import { captureException } from '../services/sentry';
 import { syncSftpPriceFile } from '../services/tdSynnexSftpSync';
+import { jobSchedule } from './scheduleRegistry';
+import { attachWorkerObservability } from './workerObservability';
 
 const TDS_SFTP_QUEUE = 'td-synnex-sftp-sync';
 /**
@@ -13,7 +15,7 @@ const TDS_SFTP_QUEUE = 'td-synnex-sftp-sync';
  * generation window and offset from the Pax8 sweep (04:15) so the two nightly
  * distributor syncs don't contend for the same pooled DB connections.
  */
-const TDS_SFTP_SYNC_CRON = '40 5 * * *';
+const TDS_SFTP_SYNC_CRON = jobSchedule('tdsynnex-sftp-sync');
 
 type TdSynnexSftpJobData =
   | { type: 'sync-integration'; integrationId: string }
@@ -139,6 +141,7 @@ export async function scheduleTdSynnexSftpJobs(): Promise<void> {
 export async function initializeTdSynnexSftpWorkers(): Promise<void> {
   try {
     sftpWorker = createTdSynnexSftpWorker();
+  attachWorkerObservability(sftpWorker, 'tdSynnexSftpSyncWorker');
     sftpWorker.on('error', (error) => {
       console.error('[TdSynnexSftpWorker] Worker error:', error);
       captureException(error);

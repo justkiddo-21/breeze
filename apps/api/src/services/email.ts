@@ -1,5 +1,6 @@
 import nodemailer, { type Transporter } from 'nodemailer';
 import { Resend } from 'resend';
+import { captureException } from './sentry';
 import {
   escapeHtml,
   getSupportEmail,
@@ -40,6 +41,17 @@ export interface InvoiceEmailParams {
   // intentionally the same for ALL invoices; there's no behavioral copy fork.
   amountDueNow?: string;
   amountPaid?: string;
+  /** Optional free-text note from the sender, shown above the "View invoice" CTA. */
+  message?: string;
+  /** Sender-chosen subject line; falls back to the standard one. */
+  subject?: string;
+  /** Whether the caller is attaching the PDF — drives the "A PDF copy is attached" copy. */
+  pdfAttached?: boolean;
+  /** Partner's configured plain-text signature, rendered muted under the CTA. */
+  signature?: string;
+  /** True when the linked page can take payment (payable status + partner has
+   *  Stripe connected) — flips the CTA to "View & pay invoice". */
+  payEnabled?: boolean;
 }
 
 export interface PasswordResetEmailParams {
@@ -143,6 +155,8 @@ type SmtpProviderConfig = {
   from: string;
   user?: string;
   pass?: string;
+  /** #3905 — connection/greeting/socket deadline, ms. Never undefined. */
+  timeoutMs: number;
 };
 
 type MailgunProviderConfig = {
@@ -151,6 +165,8 @@ type MailgunProviderConfig = {
   domain: string;
   baseUrl: string;
   from: string;
+  /** #3905 — whole-request deadline for the Mailgun API call, ms. */
+  timeoutMs: number;
 };
 
 type ResolvedProviderConfig = ResendProviderConfig | SmtpProviderConfig | MailgunProviderConfig;
@@ -177,10 +193,26 @@ export class EmailService {
       return;
     }
 
+    // #3905 — explicit deadlines. Without these nodemailer inherits its own
+    // defaults (2min connect, 30s greeting, 10min socket), so a mail server
+    // that accepts the TCP connection and then goes silent holds the send for
+    // ten minutes. Quote/invoice sends are best-effort and swallow failures,
+    // so an unbounded hang is strictly worse than a bounded failure: the
+    // caller can record `send_email_reason` and show the "no email was
+    // delivered" banner instead of leaking a worker (and, before the
+    // deferred-send fix, a pooled Postgres connection and a row lock).
+    //
+    // All three take the same value on purpose. `socketTimeout` is an
+    // INACTIVITY timeout, not a total-transfer budget, so it does not cap how
+    // long a large PDF attachment may take to upload — only how long the
+    // socket may stall mid-transfer.
     this.smtpTransport = nodemailer.createTransport({
       host: config.host,
       port: config.port,
       secure: config.secure,
+      connectionTimeout: config.timeoutMs,
+      greetingTimeout: config.timeoutMs,
+      socketTimeout: config.timeoutMs,
       auth: config.user && config.pass
         ? {
           user: config.user,
@@ -388,11 +420,37 @@ export function getEmailService(): EmailService | null {
       emailServiceAvailable = false;
       const reason = err instanceof Error ? err.message : 'unknown error';
       console.warn(`Email service not configured: ${reason}`);
+      // A malformed VALUE is an incident: the verdict is cached for the life of
+      // the process, so every outbound email in the product stops until someone
+      // restarts with a corrected env. An UNSET var is the supported
+      // self-hosted-without-email state and stays log-only. See
+      // EmailConfigValueError.
+      if (err instanceof EmailConfigValueError) captureException(err);
       return null;
     }
   }
 
   return cachedService;
+}
+
+/**
+ * An email env var whose VALUE is malformed — as opposed to email simply not
+ * being configured, which is a supported self-hosted state.
+ *
+ * The distinction matters because `getEmailService` collapses every config
+ * failure into "email is not configured" + a `console.warn`, then caches that
+ * verdict for the life of the process. For an operator who never set email up
+ * that is correct and silent by design. For an operator who typed
+ * `SMTP_TIMEOUT_MS=30s` it means ALL outbound mail — password resets,
+ * verification, invites, quotes, invoices, alerts — stops until someone
+ * notices, with nothing but a log line to notice. Only this class is reported
+ * to Sentry (#3905 review): a typo is an incident, an unset var is not.
+ */
+class EmailConfigValueError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EmailConfigValueError';
+  }
 }
 
 function getEnvString(name: string): string | undefined {
@@ -412,7 +470,7 @@ function parseEmailProviderSelection(): EmailProviderSelection {
     return raw;
   }
 
-  throw new Error(`EMAIL_PROVIDER must be one of: auto, resend, smtp, mailgun (received "${raw}")`);
+  throw new EmailConfigValueError(`EMAIL_PROVIDER must be one of: auto, resend, smtp, mailgun (received "${raw}")`);
 }
 
 function parseSmtpPort(): number {
@@ -423,11 +481,49 @@ function parseSmtpPort(): number {
 
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
-    throw new Error(`SMTP_PORT must be an integer between 1 and 65535 (received "${raw}")`);
+    throw new EmailConfigValueError(`SMTP_PORT must be an integer between 1 and 65535 (received "${raw}")`);
   }
 
   return parsed;
 }
+
+/**
+ * #3905 — parse a transport deadline in milliseconds.
+ *
+ * Deliberately THROWS on a malformed value rather than falling back to the
+ * default. `resolveEmailProviderConfig` is called from `getEmailService`,
+ * which turns a config error into a null service + a startup warning — so a
+ * typo surfaces as "email is not configured", not as a transport that is
+ * silently unbounded again. Silently defaulting is how an operator who typed
+ * `SMTP_TIMEOUT_MS=30s` ends up back at the ten-minute nodemailer default with
+ * no signal that their setting was ignored.
+ *
+ * Range: 1s-10min. Below a second no real mail server completes a handshake;
+ * above ten minutes the bound stops being one.
+ */
+function parseTransportTimeoutMs(name: string, defaultMs: number): number {
+  const raw = getEnvString(name);
+  if (!raw) {
+    return defaultMs;
+  }
+
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isInteger(parsed) || String(parsed) !== raw || parsed < 1000 || parsed > 600_000) {
+    throw new EmailConfigValueError(`${name} must be an integer between 1000 and 600000 milliseconds (received "${raw}")`);
+  }
+
+  return parsed;
+}
+
+/** SMTP connection/greeting/socket deadline. 30s is generous for a handshake
+ *  and, being an inactivity timeout, does not cap a slow attachment upload. */
+const DEFAULT_SMTP_TIMEOUT_MS = 30_000;
+
+/** Mailgun whole-request deadline. Larger than the SMTP one because
+ *  `AbortSignal.timeout` bounds the ENTIRE request including the multipart
+ *  attachment upload, not just an idle socket — a multi-MB proposal PDF on a
+ *  slow uplink must still be able to finish. */
+const DEFAULT_MAILGUN_TIMEOUT_MS = 120_000;
 
 function parseSmtpSecure(): boolean {
   const raw = getEnvString('SMTP_SECURE');
@@ -443,7 +539,7 @@ function parseSmtpSecure(): boolean {
     return false;
   }
 
-  throw new Error(`SMTP_SECURE must be a boolean value (received "${raw}")`);
+  throw new EmailConfigValueError(`SMTP_SECURE must be a boolean value (received "${raw}")`);
 }
 
 function resolveResendConfig(resendApiKey: string | undefined, emailFrom: string | undefined): ResendProviderConfig {
@@ -484,7 +580,8 @@ function resolveSmtpConfig(
     secure: parseSmtpSecure(),
     from: smtpFrom,
     user: smtpUser,
-    pass: smtpPass
+    pass: smtpPass,
+    timeoutMs: parseTransportTimeoutMs('SMTP_TIMEOUT_MS', DEFAULT_SMTP_TIMEOUT_MS)
   };
 }
 
@@ -509,7 +606,8 @@ function resolveMailgunConfig(
     apiKey: mailgunApiKey,
     domain: mailgunDomain,
     baseUrl: normalizeBaseUrl(mailgunBaseUrl ?? 'https://api.mailgun.net'),
-    from: mailgunFrom
+    from: mailgunFrom,
+    timeoutMs: parseTransportTimeoutMs('MAILGUN_TIMEOUT_MS', DEFAULT_MAILGUN_TIMEOUT_MS)
   };
 }
 
@@ -607,6 +705,28 @@ function buildMailgunEndpoint(config: MailgunProviderConfig): string {
   return `${config.baseUrl}/v3/${encodeURIComponent(config.domain)}/messages`;
 }
 
+/**
+ * #3905 — the Mailgun POST with its deadline translated.
+ *
+ * An aborted `fetch` rejects with a bare `TimeoutError: The operation was
+ * aborted due to timeout`, which names neither the transport nor the budget
+ * that expired. Callers persist the failure as an opaque `send_failed` reason
+ * and an operator then has to guess whether Mailgun was down, slow, or simply
+ * bounded too tightly — so re-throw with both facts attached, preserving the
+ * original as `cause`. Non-timeout failures (DNS, TLS, connection refused)
+ * pass through untouched: they already carry a usable message.
+ */
+async function mailgunFetch(config: MailgunProviderConfig, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(buildMailgunEndpoint(config), init);
+  } catch (err) {
+    if (err instanceof Error && err.name === 'TimeoutError') {
+      throw new Error(`Mailgun request timed out after ${config.timeoutMs}ms`, { cause: err });
+    }
+    throw err;
+  }
+}
+
 async function sendViaMailgun(
   config: MailgunProviderConfig,
   params: SendEmailParams & { from: string }
@@ -617,6 +737,12 @@ async function sendViaMailgun(
   const replyTos = params.replyTo
     ? (Array.isArray(params.replyTo) ? params.replyTo : [params.replyTo])
     : [];
+
+  // #3905 — a whole-request deadline. Both fetches previously passed no
+  // AbortSignal, so a Mailgun endpoint that accepted the connection and then
+  // stalled had NO client-side bound at all. `AbortSignal.timeout` is created
+  // per send (not shared) because its clock starts at construction.
+  const signal = AbortSignal.timeout(config.timeoutMs);
 
   // Attachments require multipart/form-data; otherwise keep the simpler
   // urlencoded body (matches the long-standing contract + the email.test.ts
@@ -643,10 +769,11 @@ async function sendViaMailgun(
       });
       body.append('attachment', blob, attachment.filename);
     }
-    response = await fetch(buildMailgunEndpoint(config), {
+    response = await mailgunFetch(config, {
       method: 'POST',
       headers: { Authorization: `Basic ${authToken}` },
-      body
+      body,
+      signal
     });
   } else {
     const body = new URLSearchParams();
@@ -663,13 +790,14 @@ async function sendViaMailgun(
         body.set(`h:${name}`, value);
       }
     }
-    response = await fetch(buildMailgunEndpoint(config), {
+    response = await mailgunFetch(config, {
       method: 'POST',
       headers: {
         Authorization: `Basic ${authToken}`,
         'Content-Type': 'application/x-www-form-urlencoded'
       },
-      body: body.toString()
+      body: body.toString(),
+      signal
     });
   }
 
@@ -858,22 +986,39 @@ function buildInviteTemplate(params: InviteEmailParams): EmailTemplate {
 
 export function buildInvoiceTemplate(params: InvoiceEmailParams): EmailTemplate {
   const number = params.invoiceNumber.trim();
-  const subject = `Invoice ${number} from ${params.partnerName}`;
+  const subject = params.subject?.trim() || `Invoice ${number} from ${params.partnerName}`;
   const preheader = `Invoice ${number} — ${params.total}${params.dueDate ? `, due ${params.dueDate}` : ''}.`;
   const dueNow = params.amountDueNow ?? params.total;
+  // The composer can drop the attachment; the intro must not then promise one.
+  const pdfAttached = params.pdfAttached ?? true;
+  const introSuffix = pdfAttached ? ' A PDF copy is attached to this email.' : '';
   const dueLine = params.dueDate
     ? `<p style="${BODY_PARA}">Amount due now: <strong>${escapeHtml(dueNow)}</strong> by <strong>${escapeHtml(params.dueDate)}</strong>.</p>`
     : `<p style="${BODY_PARA}">Amount due now: <strong>${escapeHtml(dueNow)}</strong>.</p>`;
   const paidLine = params.amountPaid
     ? `<p style="${MUTED_PARA}">Paid to date: ${escapeHtml(params.amountPaid)} of ${escapeHtml(params.total)}.</p>`
     : '';
+  // Sender's personal note, if any. Escaped, with newlines preserved as <br> so a
+  // multi-line note keeps its shape. Rendered between the intro and the amounts
+  // (mirrors buildQuoteTemplate).
+  const note = params.message?.trim();
+  const messageBlock = note
+    ? `<p style="${BODY_PARA}">${escapeHtml(note).replace(/\r?\n/g, '<br>')}</p>`
+    : '';
+  // Partner signature: muted, under the CTA — reads as a sign-off, not content.
+  const signature = params.signature?.trim();
+  const signatureBlock = signature
+    ? `<p style="${MUTED_PARA}">${escapeHtml(signature).replace(/\r?\n/g, '<br>')}</p>`
+    : '';
   const body = `
       <p style="${BODY_PARA}">Hi there,</p>
-      <p style="${BODY_PARA}">${escapeHtml(params.partnerName)} has sent you invoice <strong>${escapeHtml(number)}</strong>. A PDF copy is attached to this email.</p>
+      <p style="${BODY_PARA}">${escapeHtml(params.partnerName)} has sent you invoice <strong>${escapeHtml(number)}</strong>.${introSuffix}</p>
+      ${messageBlock}
       ${dueLine}
       ${paidLine}
-      ${renderButton('View invoice', params.portalUrl)}
-      <p style="${MUTED_PARA}">You can view this invoice and download a copy any time from your customer portal.</p>
+      ${renderButton(params.payEnabled ? 'View & pay invoice' : 'View invoice', params.portalUrl)}
+      <p style="${MUTED_PARA}">You can view this invoice and download a copy any time using this link — no sign-in needed.</p>
+      ${signatureBlock}
   `;
   const html = renderLayout({
     title: subject,
@@ -888,15 +1033,76 @@ export function buildInvoiceTemplate(params: InvoiceEmailParams): EmailTemplate 
   const support = getSupportEmail(params.supportEmail);
   const text = [
     'Hi there,',
-    `${params.partnerName} has sent you invoice ${number}. A PDF copy is attached.`,
+    `${params.partnerName} has sent you invoice ${number}.${pdfAttached ? ' A PDF copy is attached.' : ''}`,
+    note || null,
     params.dueDate ? `Amount due now: ${dueNow} by ${params.dueDate}.` : `Amount due now: ${dueNow}.`,
     params.amountPaid ? `Paid to date: ${params.amountPaid} of ${params.total}.` : null,
-    `View invoice: ${params.portalUrl}`,
+    `${params.payEnabled ? 'View & pay invoice' : 'View invoice'}: ${params.portalUrl}`,
+    signature || null,
     support ? `Questions about this invoice? Contact ${support}.` : null,
   ]
     .filter(Boolean)
     .join('\n');
 
+  return { subject, html, text };
+}
+
+export interface QuoteOutcomeEmailParams {
+  outcome: 'accepted' | 'declined';
+  quoteNumber: string;
+  /** Customer organization name — the subject's "who". */
+  orgName: string;
+  /** Signer name when the customer path recorded one. */
+  signerName?: string | null;
+  /** Verbatim customer note from a decline. Escaped; newlines preserved. */
+  declineReason?: string | null;
+  /** Invoice auto-issued by the accept, when one was. */
+  invoiceNumber?: string | null;
+  /** Deep link to the quote in the web app; omitted when no app base is configured. */
+  quoteUrl?: string | null;
+}
+
+/**
+ * INTERNAL notification to the MSP tech who sent a quote — the customer
+ * responded (2026-08-21 decline-completion spec §A). Breeze-branded (default
+ * brand: this goes TO the MSP, unlike the customer-facing templates above).
+ * Before this, both outcomes were silent: a decline wrote the row and returned,
+ * and the reason the customer typed was never shown to anyone.
+ */
+export function buildQuoteOutcomeTemplate(params: QuoteOutcomeEmailParams): EmailTemplate {
+  const verb = params.outcome === 'accepted' ? 'accepted' : 'declined';
+  const subject = `Quote ${params.quoteNumber} ${verb} — ${params.orgName}`;
+  const who = params.signerName?.trim()
+    ? `${params.signerName.trim()} at ${params.orgName}`
+    : params.orgName;
+  const reason = params.declineReason?.trim();
+  const reasonBlock = reason
+    ? `<p style="${BODY_PARA}">Their note:</p>
+       <blockquote style="margin: 0 0 12px; padding: 10px 14px; border-left: 3px solid #d1d5db; font-size: 14px; line-height: 1.55; color: #374151;">${escapeHtml(reason).replace(/\r?\n/g, '<br>')}</blockquote>`
+    : '';
+  const invoiceLine = params.outcome === 'accepted' && params.invoiceNumber
+    ? `<p style="${BODY_PARA}">Invoice <strong>${escapeHtml(params.invoiceNumber)}</strong> has been issued and emailed to the customer.</p>`
+    : '';
+  const body = `
+      <p style="${BODY_PARA}">${escapeHtml(who)} has <strong>${verb}</strong> quote <strong>${escapeHtml(params.quoteNumber)}</strong>.</p>
+      ${reasonBlock}
+      ${invoiceLine}
+      ${params.quoteUrl ? renderButton('View quote', params.quoteUrl) : ''}
+  `;
+  const html = renderLayout({
+    title: subject,
+    preheader: `${params.orgName} ${verb} ${params.quoteNumber}.`,
+    heading: `Quote ${verb}`,
+    body,
+  });
+  const text = [
+    `${who} has ${verb} quote ${params.quoteNumber}.`,
+    reason ? `Their note: ${reason}` : null,
+    params.outcome === 'accepted' && params.invoiceNumber ? `Invoice ${params.invoiceNumber} has been issued and emailed to the customer.` : null,
+    params.quoteUrl ? `View quote: ${params.quoteUrl}` : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
   return { subject, html, text };
 }
 

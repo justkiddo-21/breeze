@@ -587,6 +587,7 @@
     "startScan": "Start scan",
     "startScansWatchProgressAndReviewScan": "Start scans, watch progress, and review scan history across devices.",
     "started": "Started {{time}}",
+    "startedColumn": "Started",
     "status": "Status: {{status}}",
     "status2": "Status",
     "type": "Type"
@@ -1069,6 +1070,11 @@
       "title": "Delete PAM rule",
       "message": "Delete rule \"{{name}}\"? Elevation requests will no longer match it.",
       "confirm": "Delete rule"
+    },
+    "staleTierBadge": {
+      "label": "Stale",
+      "tooltip": "Risk tier {{tier}} no longer matches anything this rule can select, so it can never match.",
+      "tooltipWithTiers": "Risk tier {{tier}} no longer matches anything this rule can select, so it can never match. Tiers currently in use: {{tiers}}."
     }
   },
   "pamPamSignerGroupsTab": {
@@ -1139,7 +1145,7 @@
       "noPolicy": "No policy (manual config)",
       "deviceIds": "Device IDs",
       "deviceIdsHelp": "One UUID per line, or comma-separated.",
-      "deviceIdsPlaceholder": "device-uuid-1&#10;device-uuid-2",
+      "deviceIdsPlaceholder": "device-uuid-1\ndevice-uuid-2",
       "detectionClasses": "Detection Classes"
     },
     "actions": {
@@ -1343,7 +1349,7 @@
     "providers": {
       "umbrella": {
         "label": "Cisco Umbrella",
-        "helpText": "API key + secret from the Umbrella Reporting API; organizationId from your Umbrella dashboard URL.",
+        "helpText": "API key + secret from an Umbrella API Keys credential. Organization ID is optional — the token itself scopes the org.",
         "apiKeyPlaceholder": "reporting-api-key",
         "apiSecretPlaceholder": "reporting-api-secret",
         "organizationIdPlaceholder": "1234567"

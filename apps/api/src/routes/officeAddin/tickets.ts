@@ -4,15 +4,20 @@ import { db } from '../../db';
 import { partners, tickets } from '../../db/schema';
 import { zValidator } from '../../lib/validation';
 import { officeAddinTechAuthMiddleware, requireAddinCapability } from '../../middleware/officeAddinTechAuth';
-import { resolveDefaultModel } from '../../services/aiAgent';
 import { recordUsage } from '../../services/aiCostTracker';
 import { writeAuditEvent } from '../../services/auditEvents';
 import { applyDlp } from '../../services/clientAiDlp';
 import { getOrgPolicy } from '../../services/clientAiPolicy';
+import { captureException } from '../../services/sentry';
 import { ticketThreadAnchor } from '../../services/inboundEmail/outboundThreading';
 import { insertEmailAuthoredComment } from '../../services/inboundEmail/emailComments';
-import { createConfirmedContact, findPortalUserByEmail } from '../../services/officeAddin/addinContacts';
+import { resolveConfirmedContact, findPortalUserByEmail } from '../../services/officeAddin/addinContacts';
 import { draftTicketFromEmail, EmailDraftFailedError } from '../../services/officeAddin/aiEmailDraft';
+import {
+  getAnthropicClientForPartner,
+  LlmUnavailableError,
+  resolveWireModel,
+} from '../../services/llm/llmConfigResolver';
 import { claimMessageLink, findLinkByMessageId, normalizeMessageId } from '../../services/ticketEmailLinks';
 import {
   addTicketComment,
@@ -83,11 +88,11 @@ import { draftSchema, fromEmailSchema, linkEmailSchema } from './schemas';
  *       ticketService.ts), so the job retries and expires instead of
  *       corrupting anything.
  *     - `createAuditLogAsync` leaves an orphan `ticket.create` audit row.
- *     - `createConfirmedContact` (the `create_contact` requester branch) runs
- *       before the nested transaction opens, so the requester's portal-user
+ *     - `resolveConfirmedContact` (the `create_contact` requester branch) runs
+ *       before the nested transaction opens, so the requester's `contacts`
  *       row survives a claim-race loser. Intentional: the technician
- *       explicitly confirmed that contact, and it stays valid for the winning
- *       ticket / future ones.
+ *       explicitly confirmed that person, and they stay valid for the winning
+ *       ticket / future ones. (#3258 — this used to be a `portal_users` row.)
  *   The first three are pre-existing consequences of the shapes those helpers
  *   chose; the route adds no new escape. The route's OWN audit event
  *   (`office_addin.ticket.created_from_email`) is written only after the nested
@@ -280,7 +285,7 @@ async function partnerAiEnabled(partnerId: string): Promise<boolean> {
  * timeout / model error, and the DLP block's 422 is one of them too), and ANY
  * non-200 makes the pane fall back to a deterministic (non-AI) prefill.
  *
- * Check order is entitlement -> API key -> DLP -> model: the cheapest and most
+ * Check order is entitlement -> LLM config -> DLP -> model: the cheapest and most
  * authoritative "you may not do this at all" answer first, so an unentitled
  * partner never reaches DLP evaluation or the model.
  */
@@ -303,9 +308,19 @@ officeAddinTicketRoutes.post(
       return c.json({ error: 'ai_not_enabled' }, 403);
     }
 
-    if (!process.env.ANTHROPIC_API_KEY) {
-      return c.json({ error: 'ai_unavailable' }, 503);
+    let llm: Awaited<ReturnType<typeof getAnthropicClientForPartner>>;
+    try {
+      llm = await getAnthropicClientForPartner(auth.partnerId, {
+        surface: 'one_shot_email_draft',
+        orgId: input.orgId,
+      });
+    } catch (err) {
+      if (err instanceof LlmUnavailableError) {
+        return c.json({ error: 'ai_unavailable' }, 503);
+      }
+      throw err;
     }
+    const { client, resolved: llmConfig } = llm;
 
     const policy = await getOrgPolicy(input.orgId);
     const dlpResult = await applyDlp({ text: input.bodyText, dlpConfig: policy?.dlpConfig, orgId: input.orgId });
@@ -313,13 +328,28 @@ officeAddinTicketRoutes.post(
       return c.json({ error: 'dlp_blocked' }, 422);
     }
 
-    const model = resolveDefaultModel();
+    // `model` stays the platform-logical id for metering/budgets; `wire.model`
+    // is what the resolved endpoint speaks (a catalog endpoint 404s on the
+    // platform id), and `wire.catalogPricing` is what meters catalog traffic.
+    const model = llmConfig.model;
+    let wire;
+    try {
+      wire = resolveWireModel(llmConfig, model);
+    } catch (err) {
+      if (err instanceof LlmUnavailableError) {
+        return c.json({ error: 'ai_unavailable' }, 503);
+      }
+      throw err;
+    }
     try {
       const draft = await withTimeout(
         draftTicketFromEmail({
           subject: input.subject,
           bodyText: dlpResult.text ?? input.bodyText,
-          model,
+          model: wire.model,
+          partnerId: auth.partnerId,
+          orgId: input.orgId,
+          client,
         }),
         DRAFT_TIMEOUT_MS
       );
@@ -331,7 +361,16 @@ officeAddinTicketRoutes.post(
       // failed-then-recovered attempt 1 is metered too. Best-effort: a
       // metering failure must never turn a good draft into a 503 for the pane.
       try {
-        await recordUsage(null, input.orgId, model, draft.inputTokens, draft.outputTokens, false);
+        await recordUsage(
+          null,
+          input.orgId,
+          model,
+          draft.inputTokens,
+          draft.outputTokens,
+          false,
+          llmConfig.source === 'partner' ? 'partner_key' : 'platform',
+          wire.catalogPricing,
+        );
       } catch (err) {
         console.error('[office-addin] draft usage accounting failed', err);
       }
@@ -345,7 +384,16 @@ officeAddinTicketRoutes.post(
       // rejects with a plain Error before token counts exist.
       if (err instanceof EmailDraftFailedError && (err.inputTokens > 0 || err.outputTokens > 0)) {
         try {
-          await recordUsage(null, input.orgId, model, err.inputTokens, err.outputTokens, false);
+          await recordUsage(
+            null,
+            input.orgId,
+            model,
+            err.inputTokens,
+            err.outputTokens,
+            false,
+            llmConfig.source === 'partner' ? 'partner_key' : 'platform',
+            wire.catalogPricing,
+          );
         } catch (meterErr) {
           console.error('[office-addin] draft usage accounting failed', meterErr);
         }
@@ -382,7 +430,19 @@ officeAddinTicketRoutes.post(
 
     // 3. Requester. `create_contact` is a technician-confirmed action, never an
     //    inferred one — the pane only sends it after an explicit choice.
+    //
+    //    The two branches produce DIFFERENT columns, and deliberately so
+    //    (#3258): naming an existing LOGIN sets `submitted_by` (from which
+    //    `createTicket` derives that login's own contact), while confirming a
+    //    sender resolves the PERSON and sets `requester_contact_id`. The add-in
+    //    grants nobody portal access, so it mints no login — see
+    //    `services/officeAddin/addinContacts.ts` for what that used to cost.
     let submittedBy: string | undefined;
+    let requesterContactId: string | undefined;
+    // Recorded in the audit event: without it the log says only which KIND of
+    // requester was sent, so "did this ticket get a person, and if not why"
+    // cannot be answered afterwards.
+    let contactLink: string | null = null;
     if (input.requester.kind === 'portal_user') {
       const portalUser = await getPortalUserForValidation(input.requester.id);
       if (!portalUser || portalUser.orgId !== input.orgId) {
@@ -390,11 +450,30 @@ officeAddinTicketRoutes.post(
       }
       submittedBy = portalUser.id;
     } else if (input.requester.kind === 'create_contact') {
-      const contact = await createConfirmedContact(input.orgId, {
-        email: input.requester.email,
-        name: input.requester.name ?? null,
-      });
-      submittedBy = contact.portalUserId;
+      try {
+        const contact = await resolveConfirmedContact(
+          input.orgId,
+          { email: input.requester.email, name: input.requester.name ?? null },
+          { userId: auth.userId }
+        );
+        // A shared mailbox resolves to no single person. The ticket still gets
+        // made — it keeps the submitter name/email snapshot below — it is simply
+        // not attributed to a contact, which is the same refusal inbound email
+        // makes rather than guessing whose history to hand over.
+        requesterContactId = contact.contactId ?? undefined;
+        contactLink = contact.outcome;
+      } catch (err) {
+        // A contacts failure is OURS, not the technician's. Dropping the email
+        // they are filing would be a far worse outcome than an unattributed
+        // ticket, and the submitter snapshot below still records who it came
+        // from — so the ticket proceeds and the failure is reported.
+        console.error('[office-addin] confirmed-contact resolution failed:', {
+          orgId: input.orgId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        captureException(err, { eventCode: 'office_addin_contact_link_failed' } as never);
+        contactLink = 'link-failed';
+      }
     }
 
     // 4. Closed-ticket continuation: carry the original thread key so replies to
@@ -441,6 +520,7 @@ officeAddinTicketRoutes.post(
             submitterEmail: input.from.email,
             submitterName: input.from.name ?? undefined,
             submittedBy,
+            requesterContactId,
           },
           actor
         );
@@ -500,6 +580,8 @@ officeAddinTicketRoutes.post(
         bindingId: auth.bindingId,
         hasMessageId: Boolean(messageId),
         requesterKind: input.requester.kind,
+        contactLink,
+        requesterContactId: requesterContactId ?? null,
         followUpOf: input.followUpOf?.ticketId ?? null,
       },
     });

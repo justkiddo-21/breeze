@@ -12,6 +12,7 @@ import { getMailboxToken } from '../services/ticketMailbox/mailboxToken';
 import { listInboxDelta, markRead } from '../services/ticketMailbox/graphMailClient';
 import { normalizeGraphMessage } from '../services/ticketMailbox/normalizeGraphMessage';
 import { enqueueInboundEmail } from '../services/inboundEmailQueue';
+import { attachWorkerObservability } from './workerObservability';
 
 const QUEUE_NAME = 'ticket-mailbox-poll';
 const SWEEP_INTERVAL_MS = 90 * 1000;
@@ -120,9 +121,21 @@ export async function initializeTicketMailboxPollWorker(): Promise<void> {
     },
     { connection: getBullMQConnection(), concurrency: 1 },
   );
+  attachWorkerObservability(worker, 'ticketMailboxPollWorker');
 
   worker.on('failed', (job, err) => {
     console.error('[mailboxPoll] sweep job failed', { id: job?.id, err: err?.message });
   });
   console.log('[mailboxPoll] worker initialized');
+}
+
+export async function shutdownTicketMailboxPollWorker(): Promise<void> {
+  if (worker) {
+    await worker.close();
+    worker = null;
+  }
+  if (queue) {
+    await queue.close();
+    queue = null;
+  }
 }

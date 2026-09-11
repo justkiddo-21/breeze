@@ -5,6 +5,10 @@ import { runAbuseSweep, runAbuseDigest } from '../services/abuseSignals';
 import { recordAbuseSweepRun } from '../services/abuseMetrics';
 import { abuseSignalsEnabled, abuseSignalsExplicitlyDisabled } from '../config/env';
 import { captureException } from '../services/sentry';
+import { jobSchedule } from './scheduleRegistry';
+import { processPartnerTrustJob, schedulePartnerTrustJobs } from './partnerTrustJobs';
+import { partnerTrustMode } from '../config/partnerTrustMode';
+import { shutdownIpClassifyQueue } from '../services/ipClassify';
 
 const ABUSE_QUEUE = 'abuse-signals';
 const SWEEP_JOB = 'abuse-sweep';
@@ -12,8 +16,10 @@ const DIGEST_JOB = 'abuse-digest';
 // jobIds use hyphens, never colons (BullMQ jobId rule).
 const SWEEP_REPEAT_ID = 'abuse-sweep-repeat';
 const DIGEST_REPEAT_ID = 'abuse-digest-repeat';
-const SWEEP_INTERVAL_MS = 60 * 60 * 1000; // hourly
-const DIGEST_CRON = '0 9 * * 1'; // Monday 09:00
+// Hourly/weekly cron slots, not intervals: `every` is epoch-anchored
+// (see jobs/scheduleRegistry.ts).
+const SWEEP_CRON = jobSchedule('abuse-signals-sweep');
+const DIGEST_CRON = jobSchedule('abuse-signals-digest'); // Monday morning
 
 type AbuseJobData = Record<string, never>;
 
@@ -43,7 +49,7 @@ export async function scheduleAbuseSignalsJobs(): Promise<void> {
   await removeAbuseRepeatables(queue);
   await queue.add(SWEEP_JOB, {}, {
     jobId: SWEEP_REPEAT_ID,
-    repeat: { every: SWEEP_INTERVAL_MS },
+    repeat: { pattern: SWEEP_CRON },
     removeOnComplete: { count: 10 },
     removeOnFail: { count: 25 },
   });
@@ -69,6 +75,8 @@ export function createAbuseSignalsWorker(): Worker<AbuseJobData> {
           await runAbuseDigest();
           return {};
         }
+        const partnerTrustResult = await processPartnerTrustJob(job);
+        if (partnerTrustResult !== undefined) return partnerTrustResult;
         console.warn(`[AbuseSignals] Unknown job name: ${job.name}`);
         return {};
       } catch (error) {
@@ -139,8 +147,10 @@ async function teardownAbuseRepeatables(): Promise<void> {
 }
 
 export async function initializeAbuseSignalsWorker(): Promise<void> {
+  const abuseEnabled = abuseSignalsEnabled();
+  const trustEnabled = partnerTrustMode() !== 'off';
   // Signup-abuse detection is hosted-only by default — see abuseSignalsEnabled().
-  if (!abuseSignalsEnabled()) {
+  if (!abuseEnabled && !trustEnabled) {
     // Repeat keys are SHARED Redis state, so removing them on the merely-
     // default-off path is a multi-replica hazard: one replica booting with an
     // unmapped IS_HOSTED (a real, documented failure — issue #570) would delete
@@ -166,8 +176,15 @@ export async function initializeAbuseSignalsWorker(): Promise<void> {
   }
   abuseWorker = createAbuseSignalsWorker();
   attachWorkerObservability(abuseWorker, 'abuseSignalsWorker');
-  await scheduleAbuseSignalsJobs();
-  console.log('[AbuseSignals] Sweep worker initialized');
+  if (abuseEnabled) {
+    await scheduleAbuseSignalsJobs();
+  } else if (abuseSignalsExplicitlyDisabled()) {
+    // Keep the shared queue open for partner-trust jobs, but ensure an
+    // explicit abuse-signals opt-out cannot leave its repeat jobs live.
+    await removeAbuseRepeatables(getAbuseSignalsQueue());
+  }
+  await schedulePartnerTrustJobs(getAbuseSignalsQueue());
+  console.log('[AbuseSignals] Abuse/partner-trust worker initialized');
 }
 
 export async function shutdownAbuseSignalsWorker(): Promise<void> {
@@ -179,4 +196,5 @@ export async function shutdownAbuseSignalsWorker(): Promise<void> {
     await abuseQueue.close();
     abuseQueue = null;
   }
+  await shutdownIpClassifyQueue();
 }

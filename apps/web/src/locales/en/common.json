@@ -1,9 +1,16 @@
 {
+  "lists": {
+    "separator": ", "
+  },
   "nav": {
     "fleetPosture": "Fleet Posture",
     "dashboard": "Dashboard",
     "devices": "Devices",
     "alerts": "Alerts",
+    "approvals": "Approvals",
+    "pendingApprovals": "{{count}} pending approvals",
+    "pendingApprovals_one": "{{count}} pending approval",
+    "pendingApprovals_other": "{{count}} pending approvals",
     "tickets": "Tickets",
     "incidents": "Incidents",
     "remoteAccess": "Remote Access",
@@ -11,19 +18,15 @@
     "patches": "Patches",
     "vulnerabilities": "Vulnerabilities",
     "oneDrive": "OneDrive",
-    "fleet": "Fleet",
-    "aiWorkspace": "AI Workspace",
     "aiForOffice": "AI for Office",
     "networkMonitor": "Network Monitor",
     "networkDiscovery": "Network Discovery",
-    "security": "Security",
     "edr": "EDR",
     "dnsSecurity": "DNS Security",
     "pam": "PAM",
     "userRisk": "User Risk",
     "sensitiveData": "Sensitive Data",
     "peripherals": "Peripherals",
-    "aiRiskEngine": "AI Risk Engine",
     "cisBenchmarks": "CIS Benchmarks",
     "complianceBaselines": "Compliance Baselines",
     "quotes": "Quotes",
@@ -31,12 +34,9 @@
     "contracts": "Contracts",
     "timesheets": "Timesheets",
     "productCatalog": "Product Catalog",
-    "softwareLibrary": "Software Library",
-    "softwarePolicies": "Software Policies",
     "deviceGroups": "Device Groups",
     "configPolicies": "Config Policies",
     "integrations": "Integrations",
-    "backup": "Backup",
     "cloudBackup": "Cloud Backup",
     "disasterRecovery": "Disaster Recovery",
     "reports": "Reports",
@@ -44,8 +44,12 @@
     "auditTrail": "Audit Trail",
     "eventLogs": "Event Logs",
     "partner": "Partner",
+    "billing": "Billing",
     "organizations": "Organizations",
     "aiUsageBudget": "AI Usage & Budget",
+    "aiAgents": "AI Agents",
+    "aiAgentRuns": "AI Agent Runs",
+    "aiImpact": "AI Impact",
     "customFields": "Custom Fields",
     "variables": "Variables",
     "savedFilters": "Saved Filters",
@@ -54,18 +58,29 @@
     "sso": "SSO",
     "accessReviews": "Access Reviews",
     "enrollmentKeys": "Enrollment Keys",
-    "deletionRequests": "Deletion requests",
+    "deletionRequests": "Deletion Requests",
     "quarantinedDevices": "Quarantined Devices",
     "thirdPartyCatalog": "Third-Party Catalog",
-    "connectedAppsAdmin": "Connected Apps (admin)",
-    "sectionAiFleet": "AI & Fleet",
-    "sectionMonitoring": "Monitoring",
+    "connectedAppsAdmin": "Connected Apps",
     "sectionSecurity": "Security",
-    "sectionOperations": "Operations",
     "sectionBackup": "Backup",
     "sectionReporting": "Reporting",
     "sectionSettings": "Settings",
-    "sectionExtensions": "Extensions"
+    "sectionExtensions": "Extensions",
+    "llmProviderCatalog": "LLM Provider Catalog",
+    "aiKillSwitch": "AI Kill Switch",
+    "sectionAi": "AI",
+    "sectionFleetManagement": "Fleet Management",
+    "sectionBilling": "Billing",
+    "sectionAdministration": "Administration",
+    "fleetOrchestration": "Fleet Orchestration",
+    "aiAssistant": "AI Assistant",
+    "software": "Software",
+    "securityOverview": "Overview",
+    "aiRisk": "AI Risk",
+    "deviceBackup": "Device Backup",
+    "sectionServiceDesk": "Service Desk",
+    "serviceManagement": "Service Management"
   },
   "documentTitles": {
     "dashboard": "Dashboard",
@@ -156,6 +171,19 @@
     "none": "None",
     "optional": "Optional",
     "required": "Required"
+  },
+  "runContext": {
+    "label": "Run as",
+    "scriptDefault": "Script default",
+    "scriptDefaultNamed": "Script default ({{context}})",
+    "system": "System",
+    "user": "Logged-in user",
+    "elevated": "Elevated",
+    "unknown": "Not recorded",
+    "userInSession": "Logged-in user (session {{session}})",
+    "sessionLabel": "Target session",
+    "sessionAny": "Any active session",
+    "effectiveLabel": "Run context"
   },
   "shared": {
     "accessDenied": {
@@ -347,6 +375,9 @@
       "criticalPending": "{{count}} critical patches pending",
       "criticalPending_one": "{{count}} critical patch pending",
       "criticalPending_other": "{{count}} critical patches pending",
+      "unratedPending": "{{count}} unrated patches pending (won't auto-approve)",
+      "unratedPending_one": "{{count}} unrated patch pending (won't auto-approve)",
+      "unratedPending_other": "{{count}} unrated patches pending (won't auto-approve)",
       "empty": "No patch data yet"
     },
     "vuln": {
@@ -487,6 +518,9 @@
         "days": "days",
         "weeks": "weeks",
         "months": "months"
+      },
+      "enumOverrides": {
+        "decommissioned": "Removed"
       }
     }
   },
@@ -699,7 +733,20 @@
       "recently": "Recently",
       "markUnread": "Mark unread",
       "markRead": "Mark read",
-      "preferences": "Notification preferences"
+      "preferences": "Notification preferences",
+      "types": {
+        "alert": "Alert",
+        "device": "Device",
+        "script": "Script",
+        "automation": "Automation",
+        "system": "System",
+        "user": "User",
+        "security": "Security",
+        "ticket": "Ticket",
+        "approval": "Approval",
+        "ai": "AI",
+        "unknown": "Notification"
+      }
     },
     "sidebar": {
       "autoHide": "Auto-hide sidebar",
@@ -745,7 +792,8 @@
           "service": "Service"
         },
         "noResults": "No matching catalog items.",
-        "placeholder": "Search catalog by name or SKU"
+        "placeholder": "Search catalog by name or SKU",
+        "noPriceInCurrency": "No {{currency}} price"
       },
       "PolishButton": {
         "actions": {
@@ -1604,6 +1652,12 @@
         "editEntry": "Edit entry {{id}}",
         "total": "Total: {{duration}}",
         "billableTotal": "Billable: {{duration}}"
+      },
+      "sourceBadge": {
+        "timer": "Timer",
+        "location": "From location",
+        "remote_session": "From remote session",
+        "support_session": "From Quick Support"
       }
     },
     "snmp": {
@@ -1990,9 +2044,10 @@
         "skipReasons": {
           "siteDenied": "Site not accessible to you",
           "notMember": "No longer affected by this finding",
-          "decommissioned": "Device is decommissioned",
+          "decommissioned": "Device is removed",
           "timeout": "Timed out after 30 minutes",
-          "dispatchEnqueueFailed": "Never dispatched — queueing failed"
+          "dispatchEnqueueFailed": "Never dispatched — queueing failed",
+          "maintenanceWindow": "Device is in a maintenance window"
         },
         "viewProgress": "View progress",
         "errors": {
@@ -2380,5 +2435,13 @@
     "later": "Show me later",
     "learnMore": "Learn more",
     "link": "What's new"
+  },
+  "money": {
+    "approximateTotal": "≈ {{amount}} approximate · rates as of {{rateDate}}",
+    "approximateFailed": "≈ total unavailable — could not load exchange rates",
+    "approximateUnavailableMissing": "≈ total unavailable — no {{target}} exchange rate for {{codes}}",
+    "approximateUnavailableStale": "≈ total unavailable — {{target}} exchange rate too old for {{codes}}",
+    "approximateUnavailableMixed": "≈ total unavailable — {{codes}} could not be converted to {{target}}",
+    "approximateUnavailableCodesOverflow": "{{codes}} and {{more}} more"
   }
 }

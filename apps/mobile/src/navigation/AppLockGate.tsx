@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AppState, type AppStateStatus, Pressable, Text, View } from 'react-native';
+import { AppState, Pressable, Text, View } from 'react-native';
 import * as LocalAuthentication from 'expo-local-authentication';
 
 import { useAppDispatch, useAppSelector } from '../store';
@@ -9,6 +9,15 @@ import {
   getBiometricTypeName,
   getSecurityLevel,
 } from '../services/biometrics';
+import { LOCK_GRACE_MS } from '../services/appLockState';
+import { readAppLockState, writeAppLockState } from '../services/appLockStore';
+import {
+  initialLockState,
+  reduceLock,
+  type AppLifecycle,
+  type LockEvent,
+} from '../services/appLockMachine';
+import { reportInternalError } from '../lib/errorReporting';
 import { palette, radii, spacing, type } from '../theme';
 
 /**
@@ -19,31 +28,30 @@ import { palette, radii, spacing, type } from '../theme';
  * real exposure. Two distinct protections live here, and they are NOT the same
  * mechanism:
  *
- *  1. **Privacy cover** — rendered whenever the app is not `active`. iOS
- *     snapshots the UI on the way out to `inactive` to build the app-switcher
- *     card, and writes that snapshot to disk. Covering on `inactive` (not just
- *     `background`) is what keeps fleet data and pending approvals out of both
- *     the switcher and that on-disk image.
+ *  1. **Privacy cover** — rendered whenever the app is not `active`, and while
+ *     the cold-launch check is still running. iOS snapshots the UI on the way
+ *     out to `inactive` to build the app-switcher card, and writes that
+ *     snapshot to disk. Covering on `inactive` (not just `background`) is what
+ *     keeps fleet data and pending approvals out of both the switcher and that
+ *     on-disk image.
  *
- *  2. **Lock** — requires device authentication to get back in, but only after
- *     the app has actually been in the `background` for {@link LOCK_GRACE_MS}.
- *     Locking on bare `inactive` would be unusable: the Face ID sheet, Control
- *     Centre, and incoming-call banners all flip the app to `inactive`, and the
- *     biometric prompt doing so would make the unlock itself re-trigger a lock.
+ *  2. **Lock** — requires device authentication to get back in. Within one
+ *     process that means after {@link LOCK_GRACE_MS} in the `background`;
+ *     locking on bare `inactive` would be unusable, since the Face ID sheet,
+ *     Control Centre and incoming-call banners all flip the app to `inactive`
+ *     and the biometric prompt doing so would make the unlock re-trigger a
+ *     lock. Across a cold launch the same grace window applies, plus
+ *     fail-secure defaults a resume does not need — most importantly, no
+ *     persisted record at all locks.
  *
- * Scope boundary: this covers background → foreground within one process
- * lifetime. A cold launch is deliberately NOT gated on biometrics — that is a
- * separate product decision, and the session restore already re-validates
- * against the server.
+ * **This component holds no decisions.** Every rule lives in the pure
+ * `services/appLockMachine.ts`, because `vitest.config.ts` includes only `.ts`
+ * and so nothing in a `.tsx` file can be reached by a test. What remains here
+ * is wiring: subscribe to `AppState`, run the biometric prompt, perform the
+ * writes the machine asks for, render. Put logic back in this file and it
+ * becomes untestable again — which is how the background-launch bypass that
+ * `bootResolved` now closes went unnoticed in the first place.
  */
-
-/**
- * How long the app may sit in the background before it locks. Short enough that
- * a phone left on a desk locks, long enough that hopping to the authenticator
- * app or a password manager and straight back does not demand Face ID.
- */
-export const LOCK_GRACE_MS = 60_000;
-
 interface Props {
   children: React.ReactNode;
 }
@@ -52,110 +60,167 @@ export function AppLockGate({ children }: Props) {
   const dispatch = useAppDispatch();
   const token = useAppSelector((s) => s.auth.token);
 
-  const [obscured, setObscured] = useState(false);
-  const [locked, setLocked] = useState(false);
+  const [lock, setLock] = useState(initialLockState);
   const [unlocking, setUnlocking] = useState(false);
-  const [unlockFailed, setUnlockFailed] = useState(false);
   const [biometricName, setBiometricName] = useState('Face ID');
 
-  const backgroundedAt = useRef<number | null>(null);
-  const appState = useRef<AppStateStatus>((AppState.currentState ?? 'unknown') as AppStateStatus);
+  // The machine's state is mirrored in a ref so `send` can stay referentially
+  // stable: the AppState listener is registered once and would otherwise close
+  // over a stale snapshot. Written only from event handlers, never during
+  // render, so a discarded concurrent render cannot leave it lying.
+  const machine = useRef(initialLockState);
+  const lifecycle = useRef<AppLifecycle>((AppState.currentState ?? 'unknown') as AppLifecycle);
+  const bootStarted = useRef(false);
+  // Mirrored so the always-on AppState listener below can consult the live
+  // session without re-subscribing (and missing transitions) on every change.
+  const tokenRef = useRef(token);
+  useEffect(() => {
+    tokenRef.current = token;
+  }, [token]);
+
+  const send = useCallback((event: LockEvent) => {
+    const { state, persist } = reduceLock(machine.current, event, LOCK_GRACE_MS);
+    machine.current = state;
+    setLock(state);
+    if (persist) void writeAppLockState(persist);
+  }, []);
 
   useEffect(() => {
     getBiometricTypeName().then(setBiometricName).catch(() => {});
   }, []);
 
+  // No session, nothing to protect — and covering the login screen would just
+  // make sign-in flicker. This also releases the lock the sign-out path holds
+  // until the session is actually gone; both logoutAsync outcomes clear the
+  // token, so it always arrives.
   useEffect(() => {
-    // No session, nothing to protect — and covering the login screen would just
-    // make sign-in flicker. Reset so a later sign-in starts from a clean slate.
-    if (!token) {
-      setObscured(false);
-      setLocked(false);
-      backgroundedAt.current = null;
-      return;
-    }
+    if (token) return;
+    send({ type: 'signedOut' });
+  }, [token, send]);
 
+  // Cold-launch check, at most once per process. Runs the first time this
+  // process sees a session, which is either a restore from the keychain (lock
+  // per the persisted record) or an interactive sign-in, where
+  // `markAppLockUnlocked` has just stamped a fresh unlocked record.
+  useEffect(() => {
+    if (!token || bootStarted.current) return;
+    bootStarted.current = true;
+
+    let cancelled = false;
+    void (async () => {
+      const record = await readAppLockState();
+      // Dropping the result when the session vanished mid-read is what keeps a
+      // late verdict from locking the login screen; the `signedOut` effect above
+      // has already cleared the cover by then.
+      if (cancelled) return;
+      // Ask React Native for the lifecycle NOW rather than trusting the value
+      // captured at mount. On iOS the JS bundle evaluates while the process is
+      // still `inactive` (before `applicationDidBecomeActive`), and any
+      // transition that fires before our own listener attaches — or during an
+      // interactive sign-in, when the login screen's autofill / Face ID sheet
+      // bounces the app through `inactive` — is missed by the ref. A stale
+      // non-`active` value here raised the privacy cover with no later event to
+      // lower it, which is the "stuck on the Breeze wordmark after login" bug.
+      // `AppState.currentState` is maintained by RN from the same event stream
+      // and is never stale in that way.
+      const current = (AppState.currentState ?? lifecycle.current) as AppLifecycle;
+      lifecycle.current = current;
+      send({
+        type: 'bootResolved',
+        record,
+        lifecycle: current,
+        now: Date.now(),
+      });
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [token, send]);
+
+  // Subscribed for the life of the component, NOT only while signed in: the
+  // `lifecycle` ref must track every transition, including the ones that happen
+  // on the login screen, or the cold-launch check reads a stale value (see the
+  // boot effect above). Only the *machine* is gated on the session — a
+  // signed-out app must never stamp the record, since an unlocked stamp written
+  // after sign-out would outlive the session it describes.
+  useEffect(() => {
     const sub = AppState.addEventListener('change', (next) => {
-      const prev = appState.current;
-      appState.current = next;
-
-      if (next === 'active') {
-        setObscured(false);
-        const since = backgroundedAt.current;
-        backgroundedAt.current = null;
-        if (since !== null && Date.now() - since >= LOCK_GRACE_MS) {
-          setUnlockFailed(false);
-          setLocked(true);
-        }
-        return;
-      }
-
-      setObscured(true);
-      // Only a real background starts the lock clock. `inactive` is transient
-      // (Face ID sheet, Control Centre, call banner) and must not — in
-      // particular the unlock prompt itself flips us to `inactive`, so treating
-      // that as a lock trigger would make unlocking re-arm the lock.
-      if (next === 'background' && prev !== 'background') {
-        backgroundedAt.current = Date.now();
-      }
+      const prev = lifecycle.current;
+      lifecycle.current = next as AppLifecycle;
+      if (!tokenRef.current) return;
+      send({ type: 'lifecycle', prev, next: next as AppLifecycle, now: Date.now() });
     });
-
     return () => sub.remove();
-  }, [token]);
+  }, [send]);
 
   const attemptUnlock = useCallback(async () => {
     setUnlocking(true);
     try {
       const ok = await authenticateWithBiometrics('Unlock Breeze');
-      if (ok) {
-        setLocked(false);
-        setUnlockFailed(false);
-      } else {
-        setUnlockFailed(true);
-      }
+      send(ok ? { type: 'unlockSucceeded', now: Date.now() } : { type: 'unlockRejected' });
+    } catch (error) {
+      // `authenticateWithBiometrics` swallows internally today, so this is
+      // defensive — but without it a throw would leave the button dead: no
+      // failure copy, no telemetry, and an unhandled rejection.
+      reportInternalError(error, 'app-lock-unlock');
+      send({ type: 'unlockRejected' });
     } finally {
       setUnlocking(false);
     }
-  }, []);
+  }, [send]);
 
   // Prompt as soon as the lock screen appears, so the common case is a single
-  // glance rather than "tap Unlock, then look".
+  // glance rather than "tap Unlock, then look". Neither a rejected unlock nor an
+  // unavailable authenticator changes `phase`, so this cannot re-fire into a
+  // prompt loop — the user drives retries from the button.
   useEffect(() => {
-    if (!locked) return;
+    if (lock.phase !== 'locked' || lock.signingOut || lock.authUnavailable) return;
     let cancelled = false;
-    (async () => {
-      // A device with neither biometrics nor a passcode cannot satisfy the
-      // prompt, and locking against an authenticator that does not exist would
-      // strand the user with no way back in. The device itself is unprotected
-      // in that case, so an app lock adds nothing anyway.
-      const level = await getSecurityLevel().catch(() => LocalAuthentication.SecurityLevel.NONE);
+
+    void (async () => {
+      let level: LocalAuthentication.SecurityLevel;
+      try {
+        level = await getSecurityLevel();
+      } catch (error) {
+        // "I could not find out" is not "there is no authenticator". Fail
+        // closed; the Sign out button remains the way forward.
+        if (cancelled) return;
+        reportInternalError(error, 'app-lock-security-level');
+        send({ type: 'authenticatorUnavailable' });
+        return;
+      }
       if (cancelled) return;
+
       if (level === LocalAuthentication.SecurityLevel.NONE) {
-        setLocked(false);
+        send({ type: 'noAuthenticator' });
         return;
       }
       await attemptUnlock();
     })();
+
     return () => {
       cancelled = true;
     };
-  }, [locked, attemptUnlock]);
+  }, [lock.phase, lock.signingOut, lock.authUnavailable, attemptUnlock, send]);
 
   return (
     <View style={{ flex: 1 }}>
       {children}
-      {locked ? (
+      {lock.phase === 'locked' ? (
         <LockScreen
           biometricName={biometricName}
-          busy={unlocking}
-          failed={unlockFailed}
+          busy={unlocking || lock.signingOut}
+          failed={lock.unlockFailed}
+          authUnavailable={lock.authUnavailable}
+          signingOut={lock.signingOut}
           onUnlock={attemptUnlock}
           onSignOut={() => {
-            setLocked(false);
-            void dispatch(logoutAsync());
+            send({ type: 'signOutRequested', now: Date.now() });
+            void dispatch(logoutAsync({ deliberate: true }));
           }}
         />
-      ) : obscured ? (
+      ) : lock.obscured || (lock.phase === 'booting' && Boolean(token)) ? (
         <PrivacyCover />
       ) : null}
     </View>
@@ -187,16 +252,39 @@ function PrivacyCover() {
   );
 }
 
+function lockScreenCopy({
+  biometricName,
+  authUnavailable,
+  signingOut,
+  failed,
+}: {
+  biometricName: string;
+  authUnavailable: boolean;
+  signingOut: boolean;
+  failed: boolean;
+}): string {
+  if (signingOut) return 'Signing out…';
+  if (authUnavailable) {
+    return "Couldn't check this device's security settings. Try again, or sign out.";
+  }
+  if (failed) return `${biometricName} didn't verify. Try again, or sign out.`;
+  return `Locked. Unlock with ${biometricName} to continue.`;
+}
+
 function LockScreen({
   biometricName,
   busy,
   failed,
+  authUnavailable,
+  signingOut,
   onUnlock,
   onSignOut,
 }: {
   biometricName: string;
   busy: boolean;
   failed: boolean;
+  authUnavailable: boolean;
+  signingOut: boolean;
   onUnlock: () => void;
   onSignOut: () => void;
 }) {
@@ -217,9 +305,7 @@ function LockScreen({
           { color: palette.dark.textMd, marginTop: spacing[3], textAlign: 'center' },
         ]}
       >
-        {failed
-          ? `${biometricName} didn't verify. Try again, or sign out.`
-          : `Locked. Unlock with ${biometricName} to continue.`}
+        {lockScreenCopy({ biometricName, authUnavailable, signingOut, failed })}
       </Text>
 
       <Pressable
@@ -242,9 +328,13 @@ function LockScreen({
 
       <Pressable
         onPress={onSignOut}
+        disabled={signingOut}
         accessibilityRole="button"
         hitSlop={8}
-        style={({ pressed }) => ({ marginTop: spacing[5], opacity: pressed ? 0.7 : 1 })}
+        style={({ pressed }) => ({
+          marginTop: spacing[5],
+          opacity: signingOut ? 0.5 : pressed ? 0.7 : 1,
+        })}
       >
         <Text style={[type.meta, { color: palette.dark.textLo }]}>Sign out</Text>
       </Pressable>

@@ -1,4 +1,5 @@
 import type { Context } from 'hono';
+import type { AuditResult } from '@breeze/shared';
 import { and, eq, isNull, sql } from 'drizzle-orm';
 import * as dbModule from '../../db';
 import { users, partnerUsers, organizationUsers, organizations, userPasskeys } from '../../db/schema';
@@ -14,7 +15,7 @@ import {
 } from '../../services';
 import { envStr } from '../../utils/envStr';
 import { getImmediatePeerIpOrUndefined, rateLimitIpKey, trustsForwardedHeadersFrom } from '../../services/clientIp';
-import { effectiveRequestScheme } from '../../services/requestTransport';
+import { effectiveRequestScheme, isSameOriginRequest } from '../../services/requestTransport';
 import { createAuditLogAsync } from '../../services/auditService';
 import { recordFailedLogin } from '../../services/anomalyMetrics';
 import { consumeMFAToken } from '../../services/mfa';
@@ -22,6 +23,10 @@ import { mintStepUpGrant, validateStepUpGrant, consumeStepUpGrant } from '../../
 import { readMobileDeviceId } from '../../services/mobileDeviceBinding';
 import type { AuthContext } from '../../middleware/auth';
 import type { RequestLike } from '../../services/auditEvents';
+import type {
+  AuthorizedUserSession,
+  LegacyUserSessionDuringTransition,
+} from '../../services/userSession';
 import { createHash, randomBytes, timingSafeEqual } from 'crypto';
 import {
   decryptMfaTotpSecret,
@@ -30,6 +35,11 @@ import {
   type MfaSecretDecryptionResult
 } from '../../services/mfaSecretCrypto';
 import { DEFAULT_ALLOWED_ORIGINS, shouldIncludeDefaultOrigins } from '../../services/corsOrigins';
+import {
+  getRecoveryCodePepper as getRecoveryCodePepperFromService,
+  hashRecoveryCode as hashRecoveryCodeWithKdf,
+  hashRecoveryCodes as hashRecoveryCodesWithKdf,
+} from '../../services/recoveryCodeAuth';
 import { assertActiveTenantContext } from '../../services/tenantStatus';
 import type { PublicTokenPayload, UserTokenContext } from './schemas';
 import {
@@ -45,9 +55,46 @@ import {
 
 const { db } = dbModule;
 
+export const AUTH_BINDING_COOKIE_NAME = 'breeze_auth_binding';
+export const AUTH_TRANSITION_CAPABILITY_HEADER = 'x-breeze-auth-transition';
+
+export function isAuthTransitionV1Request(c: Context): boolean {
+  return c.req.header(AUTH_TRANSITION_CAPABILITY_HEADER)?.trim().toLowerCase() === 'v1';
+}
+
+export function authClientUpgradeRequiredResponse(c: Context): Response {
+  return c.json({
+    error: 'Authentication client upgrade required',
+    reason: 'auth_client_upgrade_required',
+  }, 426);
+}
+
+/**
+ * Run `fn` inside the SYSTEM DB access context.
+ *
+ * FAILS CLOSED when the wrapper is unavailable. This used to degrade silently
+ * to a bare `fn()`, which is not a graceful fallback — it is a CONTEXTLESS
+ * query, the exact bug class the callers below exist to avoid. Under forced
+ * RLS as `breeze_app` a contextless read matches ZERO rows rather than
+ * erroring, so the caller sees "no such user / no factors" and hands back the
+ * PERMISSIVE answer. {@link userIsMfaProtected} answering `false` that way
+ * would open the first-factor-enrollment gate for an account that actually
+ * holds factors.
+ *
+ * The `typeof` check only ever fired under a test mock of `../../db` that
+ * omitted the wrapper; production always exports it. Nested inside an existing
+ * request context the real `withSystemDbAccessContext` short-circuits on its
+ * own — that legitimate case is unchanged, it never reached this branch.
+ */
 export const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
   const withSystem = dbModule.withSystemDbAccessContext;
-  return typeof withSystem === 'function' ? withSystem(fn) : fn();
+  if (typeof withSystem !== 'function') {
+    const message =
+      '[auth] runWithSystemDbAccess: withSystemDbAccessContext is unavailable; refusing to run a security probe with no DB access context';
+    console.error(message);
+    throw new Error(message);
+  }
+  return withSystem(fn);
 };
 
 // Shared floor-the-clock timing equalizer for pre-auth endpoints whose latency
@@ -145,21 +192,125 @@ export function getClientRateLimitKey(c: RequestLike): string {
   return `fp:${digest}`;
 }
 
+// ============================================
+// #4470: rejected-proof responses
+// ============================================
+
+/**
+ * #4470: a rejected FACTOR PROOF — the TOTP/SMS/recovery code, or the
+ * current-password / enrollment grant the user supplied IN THE REQUEST BODY —
+ * is a request-validation failure, NOT an authentication failure. It must
+ * never share a status with the bearer guard.
+ *
+ * Why this matters more than HTTP pedantry: every browser client funnels a 401
+ * into refresh-and-replay and then `handleSessionExpired` (see
+ * `apps/web/src/stores/auth.ts` `fetchWithAuth`). When a mistyped 6-digit code
+ * answered 401, that logged the user out mid-enrollment (#4413/#4414). PR
+ * #4439 patched it client-side with an opt-in `skipUnauthorizedRetry` flag,
+ * which every future caller has to remember; this is the server-side fix that
+ * makes the flag unnecessary.
+ *
+ * The invariant: **401 means "the credential that authenticates THIS request
+ * is missing, expired, or invalid"** — the bearer token, or the login
+ * challenge's `tempToken`. Everything else the user typed is body data, and a
+ * rejection of it is a 400 carrying a stable machine-readable `code`.
+ *
+ * Clients must branch on `code`, never on the human `error`/`message` text.
+ */
+export const MFA_CODE_INVALID = 'mfa_code_invalid';
+/** A step-up factor proof (TOTP/SMS/passkey) was rejected, or no usable factor exists. */
+export const MFA_PROOF_INVALID = 'mfa_proof_invalid';
+/** A step-up / enrollment credential (password, SSO re-auth grant) was rejected. */
+export const INVALID_CREDENTIALS_CODE = 'invalid_credentials';
+
+/** The status a rejected body-supplied proof answers with. */
+export type ProofRejectionStatus = 400 | 401;
+
+/**
+ * Build the uniform rejected-proof body: `{ error, message, code }`.
+ *
+ * `error` and `message` are BOTH populated because the existing clients read
+ * `data.error ?? data.message`; `code` is the stable contract.
+ *
+ * `status` is a parameter rather than a constant because the shared step-up
+ * helpers below are also used by routes whose clients still key on 401 (mobile
+ * `approvals.ts` maps a 401 decision to `STEP_UP_FAILED`). Those keep 401 by
+ * default; the MFA factor-management routes opt in to 400.
+ */
+export function rejectProof(
+  c: Context,
+  message: string,
+  code: string,
+  status: ProofRejectionStatus,
+  extra?: Record<string, unknown>,
+): Response {
+  return c.json({ error: message, message, code, ...extra }, status);
+}
+
+/**
+ * #4746: both non-rejection failure bodies of the step-up helpers populate
+ * `error` AND `message`, exactly as {@link rejectProof} does, because clients
+ * are split on which key they read. The web profile form renders
+ * `data.message` and — unlike its siblings in the same file — does NOT fall
+ * back to `data.error`, so it shows a generic "Failed to change password" when
+ * `message` is absent (`apps/web/src/components/settings/ProfilePage.tsx`).
+ *
+ * That makes both of these indistinguishable from a mistyped password unless
+ * `message` is set: a throttle the user cannot see is a throttle they will keep
+ * hammering, and a Redis outage the user cannot see is one they will retry as
+ * though they got their own password wrong. `/auth/change-password` acquired
+ * both branches when it moved onto this helper, so both are fixed together.
+ */
+const STEP_UP_THROTTLED_MESSAGE = 'Too many attempts. Please try again later.';
+const STEP_UP_UNAVAILABLE_MESSAGE = 'Service temporarily unavailable';
+
 export async function requireCurrentPasswordStepUp(
   c: Context,
   userId: string,
   currentPassword: string,
-  keyPrefix = 'auth:pwd-stepup'
+  keyPrefix = 'auth:pwd-stepup',
+  /**
+   * #4470: MFA factor-management routes pass 400 so a mistyped password is not
+   * mistaken for bearer expiry by the web client's generic 401 handler.
+   * Defaults to 401 for every pre-existing caller whose client contract keys
+   * on it (approvals/PAM step-up, users email-change, authenticator).
+   */
+  opts: {
+    rejectionStatus?: ProofRejectionStatus;
+    /**
+     * #4746: user-facing text for a rejected password. Defaults to the opaque
+     * 'Invalid credentials' every step-up caller has always sent, because on a
+     * step-up the specific reason is not the caller's to disclose.
+     *
+     * `/auth/change-password` overrides it: the request is already
+     * authenticated AS the account being changed, so opacity buys nothing
+     * there, and the web client renders `message` verbatim on the profile form
+     * (`apps/web/src/components/settings/ProfilePage.tsx`). Answering
+     * "Invalid credentials" to a mistyped current password would read as a
+     * dead session — the exact confusion #4660/#4739 just removed.
+     */
+    invalidMessage?: string;
+    /**
+     * Text for an account that has no password hash at all. Defaults to
+     * `invalidMessage`, keeping the two cases indistinguishable for callers
+     * that do not opt in.
+     */
+    noPasswordMessage?: string;
+  } = {},
 ): Promise<Response | null> {
+  const rejectionStatus = opts.rejectionStatus ?? 401;
+  const invalidMessage = opts.invalidMessage ?? 'Invalid credentials';
+  const noPasswordMessage = opts.noPasswordMessage ?? invalidMessage;
   const redis = getRedis();
   if (!redis) {
-    return c.json({ error: 'Service temporarily unavailable' }, 503);
+    return c.json({ error: STEP_UP_UNAVAILABLE_MESSAGE, message: STEP_UP_UNAVAILABLE_MESSAGE }, 503);
   }
 
   const rateCheck = await rateLimiter(redis, `${keyPrefix}:${userId}`, 5, 5 * 60);
   if (!rateCheck.allowed) {
     return c.json({
-      error: 'Too many attempts. Please try again later.',
+      error: STEP_UP_THROTTLED_MESSAGE,
+      message: STEP_UP_THROTTLED_MESSAGE,
       retryAfter: Math.ceil((rateCheck.resetAt.getTime() - Date.now()) / 1000)
     }, 429);
   }
@@ -171,12 +322,12 @@ export async function requireCurrentPasswordStepUp(
     .limit(1);
 
   if (!user?.passwordHash) {
-    return c.json({ error: 'Invalid credentials' }, 401);
+    return rejectProof(c, noPasswordMessage, INVALID_CREDENTIALS_CODE, rejectionStatus);
   }
 
   const valid = await verifyPassword(user.passwordHash, currentPassword);
   if (!valid) {
-    return c.json({ error: 'Invalid credentials' }, 401);
+    return rejectProof(c, invalidMessage, INVALID_CREDENTIALS_CODE, rejectionStatus);
   }
 
   return null;
@@ -187,7 +338,7 @@ export async function requireCurrentPasswordStepUp(
  * no password to satisfy {@link requireCurrentPasswordStepUp}. Verifies a fresh
  * TOTP code against the user's enrolled MFA secret. Mirrors the password
  * step-up's shape (rate limit → lookup → verify) and returns the same opaque
- * 401/429/503 responses so callers can `if (err) return err` uniformly. Only
+ * rejection/429/503 responses so callers can `if (err) return err` uniformly. Only
  * TOTP step-up is supported here; SMS/passkey L4 re-auth is out of scope.
  */
 export async function requireFreshMfaStepUp(
@@ -196,15 +347,21 @@ export async function requireFreshMfaStepUp(
   code: string,
   keyPrefix = 'auth:mfa-stepup',
 ): Promise<Response | null> {
+  // #4470: no `rejectionStatus` opt-in here — unlike its siblings this helper
+  // has no factor-management caller (only approvals/PAM L4 re-auth), so an
+  // unused knob would just be untested dead code. Add it when a caller needs
+  // it. The BODY is uniform with the siblings so a client sees one shape.
+  const rejectionStatus: ProofRejectionStatus = 401;
   const redis = getRedis();
   if (!redis) {
-    return c.json({ error: 'Service temporarily unavailable' }, 503);
+    return c.json({ error: STEP_UP_UNAVAILABLE_MESSAGE, message: STEP_UP_UNAVAILABLE_MESSAGE }, 503);
   }
 
   const rateCheck = await rateLimiter(redis, `${keyPrefix}:${userId}`, 5, 5 * 60);
   if (!rateCheck.allowed) {
     return c.json({
-      error: 'Too many attempts. Please try again later.',
+      error: STEP_UP_THROTTLED_MESSAGE,
+      message: STEP_UP_THROTTLED_MESSAGE,
       retryAfter: Math.ceil((rateCheck.resetAt.getTime() - Date.now()) / 1000)
     }, 429);
   }
@@ -219,12 +376,12 @@ export async function requireFreshMfaStepUp(
   // Allowlist on the method (not a denylist) so any non-TOTP/unset method is
   // rejected even if a stale secret lingers — defense-in-depth for the auth path.
   if (!user?.mfaEnabled || user.mfaMethod !== 'totp' || !user.mfaSecret) {
-    return c.json({ error: 'Invalid credentials' }, 401);
+    return rejectProof(c, 'Invalid credentials', INVALID_CREDENTIALS_CODE, rejectionStatus);
   }
 
   const secret = decryptMfaTotpSecret(user.mfaSecret);
   if (!secret) {
-    return c.json({ error: 'Invalid credentials' }, 401);
+    return rejectProof(c, 'Invalid credentials', INVALID_CREDENTIALS_CODE, rejectionStatus);
   }
 
   // consumeMFAToken (not verifyMFAToken): enforce single-use of the TOTP step
@@ -232,7 +389,7 @@ export async function requireFreshMfaStepUp(
   // its validity window. This L4 path had no other single-use binding. (sec review #2)
   const valid = await consumeMFAToken(secret, code, userId);
   if (!valid) {
-    return c.json({ error: 'Invalid credentials' }, 401);
+    return rejectProof(c, 'Invalid credentials', INVALID_CREDENTIALS_CODE, rejectionStatus);
   }
 
   return null;
@@ -252,6 +409,16 @@ export async function requireFreshMfaStepUp(
  * `/passkeys/register/*`) call this from within their own request-scoped
  * (user-id-scoped) RLS context, where it would still resolve correctly, but
  * system context keeps this probe uniform regardless of caller context.
+ *
+ * THROWS when the row is missing rather than reporting `false`. Every caller
+ * is authenticated, so the row must exist; a zero-row read means the probe did
+ * not run as intended (lost DB access context, a row vanishing mid-request),
+ * and `false` is the PERMISSIVE answer on every gate that consumes this — it
+ * says "no factor yet, initial enrollment, password-only is enough" for an
+ * account that may hold factors. Failing loud pushes those gates onto their
+ * error path (a 500) instead of silently waving the caller through. Today the
+ * `!user -> 401` probe in {@link resolveEnrollmentStepUp} happens to fire
+ * first, but that is call ordering, not a designed control.
  */
 export async function userIsMfaProtected(userId: string): Promise<boolean> {
   const [row] = await runWithSystemDbAccess(() =>
@@ -264,7 +431,12 @@ export async function userIsMfaProtected(userId: string): Promise<boolean> {
       .where(eq(users.id, userId))
       .limit(1)
   );
-  return row?.mfaEnabled === true || Number(row?.passkeyCount ?? 0) > 0;
+  if (!row) {
+    const message = `[auth] userIsMfaProtected: no users row for ${userId}; refusing to report the account unprotected`;
+    console.error(message);
+    throw new Error(message);
+  }
+  return row.mfaEnabled === true || Number(row.passkeyCount ?? 0) > 0;
 }
 
 /**
@@ -298,7 +470,7 @@ export async function enforceExistingFactorStepUp(
   if (!(await userIsMfaProtected(auth.user.id))) return null;
 
   const epochs = await getUserEpochs(auth.user.id);
-  if (!epochs || !auth.token.sid) {
+  if (!epochs || !auth.token?.sid) {
     return c.json({ error: 'Service temporarily unavailable' }, 503);
   }
 
@@ -317,6 +489,163 @@ export async function enforceExistingFactorStepUp(
   if (!ok) {
     return c.json({ error: 'existing_factor_step_up_required', stepUpUrl: '/auth/mfa/step-up' }, 403);
   }
+  return null;
+}
+
+// ============================================
+// First-factor enrollment step-up (#4018)
+// ============================================
+
+/**
+ * The single decision point for "may this caller install a FIRST MFA factor?".
+ *
+ * Two roads, never both:
+ *   - password — the historical path, unchanged, and evaluated FIRST.
+ *   - SSO re-auth grant — for accounts with `password_hash IS NULL`, which have
+ *     no password to prove and previously could not enroll at all (#4018). The
+ *     grant is minted only by the SSO re-auth callback (`GET /sso/callback`,
+ *     reauth mode) after a forced, fresh IdP authentication.
+ *
+ * The SSO road is refused outright for an account that HAS a password: two
+ * roads of differing strength to the same door is how a step-up gets bypassed.
+ *
+ * It is ALSO refused for a passwordless account that already holds any factor.
+ * The grant's operation is `enroll_first_factor` and that is all it may ever
+ * do: without this check a passwordless account with a TOTP secret or a
+ * registered passkey could re-auth at its IdP and use the resulting grant to
+ * install a SECOND factor, side-stepping {@link enforceExistingFactorStepUp}
+ * (SR2-20), which exists precisely to require proving an EXISTING factor
+ * before adding a new one. The predicate is {@link userIsMfaProtected} — the
+ * same one SR2-20 uses — so the two gates can never drift apart. A protected
+ * passwordless account is REFUSED this road outright; it does not fall
+ * through to any other step-up here. Its route back in is the SR2-20 path,
+ * proving the factor it already holds.
+ *
+ * Every rejection is the same opaque `Invalid credentials` response the
+ * password path already returns — SAME status, same body, whichever road was
+ * refused (#4470 moved that status behind `opts.rejectionStatus`, so it is
+ * uniform per call site rather than globally). The response never reveals
+ * whether the account has
+ * a password, has a factor, or exists at all — with ONE deliberate exception:
+ * a passwordless account that offered NO proof at all gets
+ * `enrollment_proof_required`. That case is not a failed authentication
+ * attempt, it is a client that has lost its single-use grant (a reload while
+ * the QR was on screen, a restored session, a second tab), and a generic
+ * `Invalid credentials` renders on a screen with no password field and no way
+ * to retry. It discloses nothing: the caller is already authenticated AS this
+ * account and `/users/me` already tells them `hasPassword`.
+ *
+ * `opts.consume` mirrors the {@link validateStepUpGrant}/{@link consumeStepUpGrant}
+ * split the SR2-20 grant already uses: `false` at the gate of a two-step flow
+ * (`/mfa/setup`, `/passkeys/register/options`), `true` at the terminal factor
+ * write (`/mfa/enable`, `/passkeys/register/verify`), so one SSO round-trip
+ * yields exactly one enrollment and a fat-fingered TOTP code does not burn the
+ * grant.
+ *
+ * `opts.passwordAlreadyProven` is for the TERMINAL call of such a two-step
+ * flow, whose GATE already ran this function and satisfied the password road
+ * (re-verifying there would double-charge the per-user step-up rate limit, and
+ * `/passkeys/register/verify` carries no password field at all). It ONLY
+ * short-circuits the password road; the SSO road still consumes the grant.
+ * Never set it on an endpoint that is not downstream of such a gate.
+ */
+export async function resolveEnrollmentStepUp(
+  c: Context,
+  auth: AuthContext,
+  input: { currentPassword?: string; ssoReauthGrantId?: string },
+  opts: {
+    keyPrefix: string;
+    consume: boolean;
+    passwordAlreadyProven?: boolean;
+    /**
+     * #4470: the status EVERY rejection below answers with. It must stay
+     * uniform within a call site or the status itself becomes the oracle the
+     * opacity rule above exists to close. MFA factor-management routes pass
+     * 400; callers that have not migrated their clients keep the 401 default.
+     */
+    rejectionStatus?: ProofRejectionStatus;
+  },
+): Promise<Response | null> {
+  const rejectionStatus = opts.rejectionStatus ?? 401;
+  // Road 1, FIRST and byte-for-byte the historical path: a password was
+  // offered, so a password is what must check out. requireCurrentPasswordStepUp
+  // already returns the same opaque 401 when the account has no hash at all, so
+  // a passwordless account that offers a password is rejected here rather than
+  // sliding onto the SSO road — one request, one road, chosen by what it sent.
+  if (input.currentPassword) {
+    return requireCurrentPasswordStepUp(c, auth.user.id, input.currentPassword, opts.keyPrefix, { rejectionStatus });
+  }
+
+  // No password offered. Decide whether this account is even eligible for the
+  // SSO road before looking at the grant.
+  //
+  // System DB access, same idiom and same reason as {@link userIsMfaProtected}:
+  // the `/mfa/verify` Case-2 caller runs with NO ambient access context (its
+  // `await authMiddleware(c, async () => {})` tears the context down when that
+  // empty `next` returns — see the I3 note there). A contextless read under
+  // forced RLS as `breeze_app` matches ZERO rows rather than erroring, so an
+  // unwrapped probe would land on `!user` and 401 EVERY caller of that path,
+  // password accounts included. Nested inside a request context this is a
+  // no-op, so the other callers are unaffected.
+  const [user] = await runWithSystemDbAccess(() =>
+    db
+      .select({ passwordHash: users.passwordHash })
+      .from(users)
+      .where(eq(users.id, auth.user.id))
+      .limit(1)
+  );
+  if (!user) return rejectProof(c, 'Invalid credentials', INVALID_CREDENTIALS_CODE, rejectionStatus);
+
+  if (user.passwordHash != null) {
+    // The gate of this flow already verified the password; nothing is left for
+    // the terminal call to do. Deliberately still a live DB read rather than an
+    // assumption that the gate ran — this must fail CLOSED for a passwordless
+    // account that reaches a terminal write with no grant.
+    if (opts.passwordAlreadyProven) return null;
+    return rejectProof(c, 'Invalid credentials', INVALID_CREDENTIALS_CODE, rejectionStatus);
+  }
+
+  if (!input.ssoReauthGrantId) {
+    // Distinguishable ON PURPOSE — see the doc comment. `reauthUrl` mirrors the
+    // `stepUpUrl` affordance enforceExistingFactorStepUp already returns, so a
+    // client can offer the one action that resolves this.
+    // #4470: shares `rejectionStatus` with every sibling rejection above. A
+    // status that differed here would re-open the password/passwordless oracle
+    // through the status line even though the BODY is distinguishable on
+    // purpose.
+    return c.json({ error: 'enrollment_proof_required', reauthUrl: '/sso/reauth/start' }, rejectionStatus);
+  }
+
+  // FIRST factor only — see the doc comment above. Checked BEFORE the grant is
+  // consumed so a refused enrollment never burns the caller's grant.
+  if (await userIsMfaProtected(auth.user.id)) {
+    return rejectProof(c, 'Invalid credentials', INVALID_CREDENTIALS_CODE, rejectionStatus);
+  }
+
+  const epochs = await getUserEpochs(auth.user.id);
+  const sid = auth.token?.sid;
+  if (!epochs || !sid) {
+    return c.json({ error: 'Service temporarily unavailable' }, 503);
+  }
+
+  // Must reconstruct the mint-site tuple in `routes/sso.ts` (reauth branch)
+  // MEMBER FOR MEMBER: bindsMatch fails closed on any difference, so a
+  // divergence here would silently reject every legitimate grant.
+  const bind = {
+    userId: auth.user.id,
+    operation: 'enroll_first_factor' as const,
+    authEpoch: epochs.authEpoch,
+    mfaEpoch: epochs.mfaEpoch,
+    sid,
+  };
+
+  const ok = opts.consume
+    ? await consumeStepUpGrant(input.ssoReauthGrantId, bind)
+    : await validateStepUpGrant(input.ssoReauthGrantId, bind);
+  if (!ok) {
+    return rejectProof(c, 'Invalid credentials', INVALID_CREDENTIALS_CODE, rejectionStatus);
+  }
+
   return null;
 }
 
@@ -370,7 +699,7 @@ export async function enforceApproverRegisterStepUp(
   opts: { consume: boolean },
 ): Promise<Response | null> {
   const epochs = await getUserEpochs(auth.user.id);
-  if (!epochs || !auth.token.sid) {
+  if (!epochs || !auth.token?.sid) {
     return c.json({ error: 'Service temporarily unavailable' }, 503);
   }
 
@@ -586,6 +915,11 @@ export function buildRefreshTokenCookie(refreshToken: string, connectionSecure: 
   return `${REFRESH_COOKIE_NAME}=${encodeURIComponent(refreshToken)}; Path=${REFRESH_COOKIE_PATH}; HttpOnly${buildCookieSecuritySuffix(sameSite, connectionSecure)}; Max-Age=${REFRESH_COOKIE_MAX_AGE_SECONDS}`;
 }
 
+export function buildAuthBindingCookie(value: string, connectionSecure: boolean): string {
+  const sameSite = resolveAuthCookieSameSite();
+  return `${AUTH_BINDING_COOKIE_NAME}=${encodeURIComponent(value)}; Path=/; HttpOnly${buildCookieSecuritySuffix(sameSite, connectionSecure)}; Max-Age=${REFRESH_COOKIE_MAX_AGE_SECONDS}`;
+}
+
 export function buildCsrfTokenCookie(csrfToken: string, connectionSecure: boolean): string {
   const sameSite = resolveAuthCookieSameSite();
   return `${CSRF_COOKIE_NAME}=${encodeURIComponent(csrfToken)}; Path=${CSRF_COOKIE_PATH}${buildCookieSecuritySuffix(sameSite, connectionSecure)}; Max-Age=${REFRESH_COOKIE_MAX_AGE_SECONDS}`;
@@ -594,6 +928,11 @@ export function buildCsrfTokenCookie(csrfToken: string, connectionSecure: boolea
 export function buildClearRefreshTokenCookie(connectionSecure: boolean): string {
   const sameSite = resolveAuthCookieSameSite();
   return `${REFRESH_COOKIE_NAME}=; Path=${REFRESH_COOKIE_PATH}; HttpOnly${buildCookieSecuritySuffix(sameSite, connectionSecure)}; Max-Age=0`;
+}
+
+export function buildClearAuthBindingCookie(connectionSecure: boolean): string {
+  const sameSite = resolveAuthCookieSameSite();
+  return `${AUTH_BINDING_COOKIE_NAME}=; Path=/; HttpOnly${buildCookieSecuritySuffix(sameSite, connectionSecure)}; Max-Age=0`;
 }
 
 export function buildClearCsrfTokenCookie(connectionSecure: boolean): string {
@@ -695,6 +1034,18 @@ export function setRefreshTokenCookie(c: Context, refreshToken: string): void {
   c.header('Set-Cookie', buildCsrfTokenCookie(csrfToken, connectionSecure), { append: true });
 }
 
+export function installAuthorizedUserSessionCookies(c: Context, issued: AuthorizedUserSession): void {
+  setRefreshTokenCookie(c, issued.refreshToken);
+}
+
+/** Temporary companion boundary for the source-frozen enforcement-false seam. */
+export function installLegacyUserSessionCookiesDuringTransition(
+  c: Context,
+  issued: LegacyUserSessionDuringTransition,
+): void {
+  setRefreshTokenCookie(c, issued.refreshToken);
+}
+
 export function clearRefreshTokenCookie(c: Context): void {
   // Derive from the same request so the clearing cookie's attributes match the
   // set cookie's within this transport (a `Secure` clear sent over HTTP would
@@ -789,8 +1140,11 @@ export function validateCookieCsrfRequest(c: Context): string | null {
     return 'Invalid CSRF token';
   }
 
+  // A same-origin request (SSH tunnel / LAN name that is not the configured
+  // public URL) is not CSRF even when its Origin is outside the allowlist —
+  // see isSameOriginRequest.
   const origin = c.req.header('origin');
-  if (origin && !isAllowedOrigin(origin)) {
+  if (origin && !isAllowedOrigin(origin) && !isSameOriginRequest(c, origin)) {
     return 'Invalid request origin';
   }
 
@@ -803,6 +1157,31 @@ export function validateCookieCsrfRequest(c: Context): string | null {
     }
   }
 
+  return null;
+}
+
+/** Terminal browser mutations never accept the legacy non-browser sentinel. */
+export function validateStrictCookieCsrfRequest(c: Context): string | null {
+  const csrfHeader = c.req.header(CSRF_HEADER_NAME)?.trim();
+  if (!csrfHeader) return 'Missing CSRF header';
+
+  const csrfCookie = getCookieValue(c.req.header('cookie'), CSRF_COOKIE_NAME);
+  if (!csrfCookie) return 'Missing CSRF cookie';
+  if (csrfHeader === '1' || csrfCookie === '1' || !safeCompareTokens(csrfHeader, csrfCookie)) {
+    return 'Invalid CSRF token';
+  }
+
+  const origin = c.req.header('origin');
+  if (!origin) return 'Missing request origin';
+  if (!isAllowedOrigin(origin) && !isSameOriginRequest(c, origin)) return 'Invalid request origin';
+
+  const fetchSite = c.req.header('sec-fetch-site');
+  if (fetchSite) {
+    const normalized = fetchSite.toLowerCase();
+    if (normalized !== 'same-origin' && normalized !== 'same-site') {
+      return 'Cross-site request blocked';
+    }
+  }
   return null;
 }
 
@@ -855,25 +1234,15 @@ export function decryptMfaSecretForMigration(secret: string | null | undefined):
 }
 
 export function getRecoveryCodePepper(): string {
-  const pepper = process.env.MFA_RECOVERY_CODE_PEPPER?.trim();
-  if (pepper) return pepper;
-
-  if (process.env.NODE_ENV === 'test') {
-    return 'test-mfa-recovery-code-pepper';
-  }
-
-  throw new Error('No MFA recovery code pepper configured. Set MFA_RECOVERY_CODE_PEPPER.');
+  return getRecoveryCodePepperFromService();
 }
 
 export function hashRecoveryCode(code: string): string {
-  const normalizedCode = code.trim().toUpperCase();
-  return createHash('sha256')
-    .update(`${getRecoveryCodePepper()}:${normalizedCode}`)
-    .digest('hex');
+  return hashRecoveryCodeWithKdf(code);
 }
 
 export function hashRecoveryCodes(codes: string[]): string[] {
-  return codes.map(hashRecoveryCode);
+  return hashRecoveryCodesWithKdf(codes);
 }
 
 // ============================================
@@ -884,11 +1253,21 @@ export interface PendingMfaRecord {
   userId: string;
   mfaMethod: 'totp' | 'sms' | 'passkey';
   passkeyAvailable: boolean;
+  recoveryAvailable: boolean;
   authEpoch: number;
   mfaEpoch: number;
+  transitionId: string;
+  browserGeneration: number;
   statusExpectation: string;
   allowedMethods: { totp: boolean; sms: boolean; passkey: boolean };
   expiresAt: number;
+  /**
+   * #4067: set when this MFA step is the continuation of a link-on-first-SSO-
+   * login ceremony (the sso:pendinglink token hash). On successful factor
+   * verification the completion endpoints finalize the SSO link + SSO-style
+   * mint instead of the password-login mint.
+   */
+  ssoLinkTokenHash?: string;
 }
 
 /**
@@ -906,30 +1285,55 @@ export function parsePendingMfa(raw: string): PendingMfaRecord | null {
   }
   const method = parsed.mfaMethod;
   const am = parsed.allowedMethods as Record<string, unknown> | undefined;
+  const isNonNegativeInteger = (value: unknown): value is number =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 0;
   if (
     typeof parsed.userId !== 'string' ||
     (method !== 'totp' && method !== 'sms' && method !== 'passkey') ||
-    typeof parsed.authEpoch !== 'number' ||
-    typeof parsed.mfaEpoch !== 'number' ||
+    typeof parsed.passkeyAvailable !== 'boolean' ||
+    typeof parsed.recoveryAvailable !== 'boolean' ||
+    !isNonNegativeInteger(parsed.authEpoch) ||
+    !isNonNegativeInteger(parsed.mfaEpoch) ||
+    typeof parsed.transitionId !== 'string' ||
+    !isNonNegativeInteger(parsed.browserGeneration) ||
     typeof parsed.statusExpectation !== 'string' ||
     typeof parsed.expiresAt !== 'number' ||
-    !am || typeof am !== 'object'
+    !Number.isFinite(parsed.expiresAt) ||
+    parsed.expiresAt <= Date.now() ||
+    !am || typeof am !== 'object' ||
+    typeof am.totp !== 'boolean' ||
+    typeof am.sms !== 'boolean' ||
+    typeof am.passkey !== 'boolean'
   ) {
+    return null;
+  }
+  // #4067: a PRESENT-but-malformed link pointer must reject the whole record,
+  // never be silently dropped — dropping it would downgrade an SSO-link
+  // continuation into a plain password-login mint, on the one path whose
+  // password check deliberately bypasses assertPasswordAuthAllowedBySso.
+  if ('ssoLinkTokenHash' in parsed
+      && (typeof parsed.ssoLinkTokenHash !== 'string' || parsed.ssoLinkTokenHash.length === 0)) {
     return null;
   }
   return {
     userId: parsed.userId,
     mfaMethod: method,
-    passkeyAvailable: parsed.passkeyAvailable === true,
+    passkeyAvailable: parsed.passkeyAvailable,
+    recoveryAvailable: parsed.recoveryAvailable,
     authEpoch: parsed.authEpoch,
     mfaEpoch: parsed.mfaEpoch,
+    transitionId: parsed.transitionId,
+    browserGeneration: parsed.browserGeneration,
     statusExpectation: parsed.statusExpectation,
     allowedMethods: {
-      totp: am.totp !== false,
-      sms: am.sms !== false,
-      passkey: am.passkey !== false,
+      totp: am.totp,
+      sms: am.sms,
+      passkey: am.passkey,
     },
     expiresAt: parsed.expiresAt,
+    ...(typeof parsed.ssoLinkTokenHash === 'string' && parsed.ssoLinkTokenHash.length > 0
+      ? { ssoLinkTokenHash: parsed.ssoLinkTokenHash }
+      : {}),
   };
 }
 
@@ -950,6 +1354,56 @@ export function evaluatePendingMfa(
   if (live.status !== 'active' || record.statusExpectation !== live.status) {
     return { ok: false, reason: 'status_changed' };
   }
+  return { ok: true };
+}
+
+export type PendingMfaVerificationMethod = 'totp' | 'sms' | 'recovery';
+
+export type PendingMfaMethodVerdict =
+  | { ok: true }
+  | {
+      ok: false;
+      reason:
+        | 'pending_method_not_allowed'
+        | 'factor_not_enrolled'
+        | 'recovery_not_available'
+        | 'live_policy_disallowed';
+      terminal: boolean;
+    };
+
+/**
+ * Authorize a client-selected MFA continuation against both the immutable
+ * challenge snapshot and live account policy/enrollment. Only live-policy
+ * drift is terminal; an unavailable selection reveals no authority and may
+ * be retried with another method from the same challenge.
+ */
+export function evaluatePendingMfaMethod(
+  pending: PendingMfaRecord,
+  method: PendingMfaVerificationMethod,
+  liveUser: { mfaSecret: string | null; mfaMethod: string | null; phoneNumber: string | null },
+  liveAllowedMethods: PendingMfaRecord['allowedMethods'],
+): PendingMfaMethodVerdict {
+  if (method === 'recovery') {
+    return pending.recoveryAvailable
+      ? { ok: true }
+      : { ok: false, reason: 'recovery_not_available', terminal: false };
+  }
+
+  if (!pending.allowedMethods[method]) {
+    return { ok: false, reason: 'pending_method_not_allowed', terminal: false };
+  }
+
+  const enrolled = method === 'totp'
+    ? Boolean(liveUser.mfaSecret)
+    : liveUser.mfaMethod === 'sms' && Boolean(liveUser.phoneNumber);
+  if (!enrolled) {
+    return { ok: false, reason: 'factor_not_enrolled', terminal: false };
+  }
+
+  if (!liveAllowedMethods[method]) {
+    return { ok: false, reason: 'live_policy_disallowed', terminal: true };
+  }
+
   return { ok: true };
 }
 
@@ -1162,7 +1616,7 @@ export function writeAuthAudit(
   opts: {
     orgId?: string;
     action: string;
-    result: 'success' | 'failure' | 'denied';
+    result: AuditResult;
     reason?: string;
     userId?: string;
     email?: string;

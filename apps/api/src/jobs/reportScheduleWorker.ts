@@ -28,13 +28,22 @@ import {
   isNull,
   ne,
   not,
+  notInArray,
   or,
   sql,
 } from 'drizzle-orm';
 import { Job, Queue, Worker } from 'bullmq';
 
 import * as dbModule from '../db';
-import { reports, reportRuns, organizations, partners } from '../db/schema';
+import { breezeRole } from '../config/env';
+import {
+  contacts,
+  organizations,
+  partners,
+  reportRuns,
+  reportScheduleRecipients,
+  reports,
+} from '../db/schema';
 import {
   assertReportExecutionPreflight,
   generateReport,
@@ -45,8 +54,6 @@ import { getEmailService } from '../services/email';
 import { renderLayout, renderButton, renderParagraph, escapeHtml } from '../services/emailLayout';
 import { getBullMQConnection, isRedisAvailable } from '../services/redis';
 import {
-  resolveEffectiveTimezone,
-  canonicalizeTimezone,
   rowsToCsv,
   lastOccurrenceKey,
   isDue,
@@ -56,6 +63,10 @@ import {
 import { buildReportPdf, type ReportBranding } from '@breeze/shared/reportPdf';
 import type { PostureSummary, ExecutiveSummary } from '@breeze/shared';
 import { loadReportBrandingForOrg } from '../services/reportBranding';
+import {
+  resolveOrgTimezone,
+  resolveTimezoneFromRows,
+} from '../services/portal/timezone';
 import { captureException } from '../services/sentry';
 import { attachWorkerObservability } from './workerObservability';
 import {
@@ -118,36 +129,31 @@ function scheduleConfigOf(config: Record<string, unknown>): ScheduleConfig {
   return raw && typeof raw === 'object' ? (raw as ScheduleConfig) : {};
 }
 
-// Org -> partner -> UTC timezone chain (no site axis for org-level reports),
-// same source-of-truth rules as featureConfigResolver's partnerTimezoneFrom.
-function timezoneFor(
-  orgSettings: unknown,
-  partnerTzColumn: string | null,
-  partnerSettings: unknown,
-): string {
-  const orgTz =
-    orgSettings && typeof orgSettings === 'object'
-      ? (orgSettings as Record<string, unknown>).timezone
-      : null;
-  const partnerColumn = canonicalizeTimezone(partnerTzColumn);
-  const partnerFromSettings =
-    partnerSettings && typeof partnerSettings === 'object'
-      ? (partnerSettings as Record<string, unknown>).timezone
-      : null;
-  const partnerTz =
-    partnerColumn !== null && partnerColumn !== 'UTC'
-      ? partnerColumn
-      : typeof partnerFromSettings === 'string' && partnerFromSettings.length > 0
-        ? partnerFromSettings
-        : partnerColumn;
-  return resolveEffectiveTimezone({
-    siteTz: null,
-    orgTz: typeof orgTz === 'string' ? orgTz : null,
-    partnerTz,
-  });
-}
+/**
+ * P2-3 (#4190) — report types this worker must never poll for or execute.
+ *
+ * A weekly AI narrative definition lives in `reports` with `schedule =
+ * 'weekly'`, so it matches the polling predicate on shape alone; its
+ * occurrences belong to the AGENT scheduler, and its artifact is stored by the
+ * run's own transaction rather than generated.
+ *
+ * Excluding it here does a second job that is easy to miss: it keeps those rows
+ * out of the "requires scope reauthorization" warning count below. A system
+ * definition has `execution_scope_user_id IS NULL` by construction, so it fails
+ * `completeExecutableScope` forever — and without this exclusion the operator
+ * signal would climb by one per org, per narrative schedule, pointing at rows
+ * nobody can or should reauthorize.
+ */
+const WORKER_EXCLUDED_REPORT_TYPES = ['ai_org_narrative'] as const;
 
-export async function findDueReports(now: Date): Promise<Array<{ id: string; occurrenceKey: number }>> {
+export async function findDueReports(
+  now: Date,
+): Promise<Array<{ id: string; occurrenceKey: number; lastGeneratedAt: Date | null }>> {
+  // Applied to BOTH statements below — see WORKER_EXCLUDED_REPORT_TYPES.
+  const pollable = and(
+    ne(reports.schedule, 'one_time'),
+    notInArray(reports.type, [...WORKER_EXCLUDED_REPORT_TYPES]),
+  )!;
   const completeExecutableScope = and(
     eq(reports.executionScopeVersion, 1),
     inArray(reports.executionScopeKind, ['unrestricted', 'restricted']),
@@ -178,12 +184,12 @@ export async function findDueReports(now: Date): Promise<Array<{ id: string; occ
     .from(reports)
     .innerJoin(organizations, eq(reports.orgId, organizations.id))
     .leftJoin(partners, eq(organizations.partnerId, partners.id))
-    .where(and(ne(reports.schedule, 'one_time'), completeExecutableScope));
+    .where(and(pollable, completeExecutableScope));
 
   const [skipped] = await db
     .select({ count: sql<number>`count(*)` })
     .from(reports)
-    .where(and(ne(reports.schedule, 'one_time'), not(completeExecutableScope)));
+    .where(and(pollable, not(completeExecutableScope)));
   const skippedCount = Number(skipped?.count ?? 0);
   if (skippedCount > 0) {
     console.warn(
@@ -192,32 +198,131 @@ export async function findDueReports(now: Date): Promise<Array<{ id: string; occ
     );
   }
 
-  const due: Array<{ id: string; occurrenceKey: number }> = [];
+  const due: Array<{ id: string; occurrenceKey: number; lastGeneratedAt: Date | null }> = [];
   for (const row of rows) {
     const candidate: DueCandidate = {
       id: row.id,
       schedule: row.schedule as ScheduleCadence,
       lastGeneratedAt: row.lastGeneratedAt,
       config: (row.config ?? {}) as Record<string, unknown>,
-      timeZone: timezoneFor(row.orgSettings, row.partnerTimezone, row.partnerSettings),
+      timeZone: resolveTimezoneFromRows(row.orgSettings, row.partnerTimezone, row.partnerSettings),
     };
     const key = lastOccurrenceKey(now, candidate.schedule, scheduleConfigOf(candidate.config), candidate.timeZone);
     if (isDue(candidate.lastGeneratedAt, key, candidate.timeZone)) {
-      due.push({ id: candidate.id, occurrenceKey: key });
+      due.push({ id: candidate.id, occurrenceKey: key, lastGeneratedAt: candidate.lastGeneratedAt });
     }
   }
   return due;
 }
 
+// ─── Occurrence claim (CAS) ──────────────────────────────────────────────────
+
+/**
+ * The inline (Redis-less) path's cross-tick winner predicate, extracted so
+ * its COMPILED SQL can be asserted directly (see `reportScheduleWorker.claimSql.test.ts`
+ * — a mocked-drizzle `.where(...)` assertion can only substring-match column
+ * names, which cannot tell `eq` from `isNull` or notice a dropped id
+ * predicate; either mutation would let two overlapping 5-minute ticks
+ * double-generate the same occurrence). `observedLastGeneratedAt` is the value
+ * `findDueReports` read when it decided the report was due — the CAS only
+ * claims the row if nothing has changed it since.
+ */
+export function buildOccurrenceClaimCas(reportId: string, observedLastGeneratedAt: Date | null) {
+  return and(
+    eq(reports.id, reportId),
+    observedLastGeneratedAt === null
+      ? isNull(reports.lastGeneratedAt)
+      : eq(reports.lastGeneratedAt, observedLastGeneratedAt),
+  );
+}
+
+/**
+ * Atomically claims a due occurrence for inline execution: stamps
+ * `lastGeneratedAt` now, but ONLY if it still matches what was observed when
+ * the occurrence was found due. Returns whether the claim won — a lost race
+ * (another overlapping check already claimed it) returns false and the caller
+ * skips the report rather than generating it twice.
+ */
+async function claimReportOccurrence(reportId: string, observedLastGeneratedAt: Date | null): Promise<boolean> {
+  const now = new Date();
+  const claimed = await db
+    .update(reports)
+    .set({ lastGeneratedAt: now, updatedAt: now })
+    .where(buildOccurrenceClaimCas(reportId, observedLastGeneratedAt))
+    .returning({ id: reports.id });
+  return claimed.length > 0;
+}
+
 // ─── Execution ───────────────────────────────────────────────────────────────
 
-function recipientsOf(config: Record<string, unknown>): string[] {
-  const raw = config.emailRecipients;
-  if (!Array.isArray(raw)) return [];
-  return raw
-    .filter((r): r is string => typeof r === 'string')
-    .map((r) => r.trim())
-    .filter((r) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(r));
+function validEmail(value: unknown): value is string {
+  return typeof value === 'string'
+    && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+}
+
+export async function resolveScheduledReportRecipients(args: {
+  reportId: string;
+  orgId: string;
+  config: Record<string, unknown>;
+}): Promise<string[]> {
+  const contactRows = await db
+    .select({
+      contactId: contacts.id,
+      email: contacts.email,
+    })
+    .from(reportScheduleRecipients)
+    .innerJoin(
+      contacts,
+      and(
+        eq(contacts.id, reportScheduleRecipients.contactId),
+        eq(contacts.orgId, reportScheduleRecipients.orgId),
+      ),
+    )
+    .where(and(
+      eq(reportScheduleRecipients.reportId, args.reportId),
+      eq(reportScheduleRecipients.orgId, args.orgId),
+      eq(contacts.orgId, args.orgId),
+    ));
+
+  const candidates: string[] = [];
+  for (const row of contactRows) {
+    if (!row.email) {
+      console.warn(
+        '[ReportScheduleWorker] Recipient contact has no email; skipping',
+        {
+          reportId: args.reportId,
+          contactId: row.contactId,
+        },
+      );
+      continue;
+    }
+    if (validEmail(row.email)) candidates.push(row.email.trim());
+  }
+
+  const legacy = args.config.emailRecipients;
+  if (Array.isArray(legacy)) {
+    candidates.push(
+      ...legacy.filter(validEmail).map((email) => email.trim()),
+    );
+  }
+
+  const deduped = new Map<string, string>();
+  for (const email of candidates) {
+    const key = email.toLowerCase();
+    if (!deduped.has(key)) deduped.set(key, email);
+  }
+
+  const resolved = [...deduped.values()];
+  if (resolved.length > 50) {
+    console.warn(
+      '[ReportScheduleWorker] Recipient union exceeds 50; truncating',
+      {
+        reportId: args.reportId,
+        requested: resolved.length,
+      },
+    );
+  }
+  return resolved.slice(0, 50);
 }
 
 /** One-line trend summary for the email body — "Posture score 79 — up from
@@ -382,7 +487,7 @@ async function emailReportRun(opts: {
 
 export async function processRunScheduledReport(
   data: RunScheduledReportJobData,
-  opts: { finalAttempt?: boolean } = {},
+  opts: { finalAttempt?: boolean; occurrenceClaimed?: boolean } = {},
 ): Promise<void> {
   const [report] = await db
     .select()
@@ -391,9 +496,34 @@ export async function processRunScheduledReport(
     .limit(1);
   if (!report) return; // deleted or switched to one_time since enqueue
 
+  // P2-3 (#4190) — a job already on the queue when the type exclusion in
+  // `findDueReports` shipped, or one forced in by hand. An EARLY RETURN with no
+  // run row, deliberately unlike the `deny()` paths below: a failed
+  // `report_runs` row would render in the org's report history under the
+  // narrative definition, beside the real weekly artifacts, claiming the weekly
+  // narrative failed. It did not — this worker simply is not its owner.
+  if ((WORKER_EXCLUDED_REPORT_TYPES as readonly string[]).includes(report.type)) {
+    console.warn(
+      '[ReportScheduleWorker] Skipping a report type owned by the agent scheduler',
+      { reportId: report.id, orgId: report.orgId, type: report.type },
+    );
+    return;
+  }
+
   const config = (report.config ?? {}) as Record<string, unknown>;
 
-  const deny = async (reason: string): Promise<void> => {
+  const deny = async (
+    reason: string,
+    requestedByKind:
+      | 'user'
+      | 'system'
+      | 'portal_user'
+      | null = report.executionScopePrincipalKind === 'system'
+        ? 'system'
+        : report.executionScopeUserId
+          ? 'user'
+          : null,
+  ): Promise<void> => {
     await db
       .insert(reportRuns)
       .values({
@@ -401,9 +531,38 @@ export async function processRunScheduledReport(
         status: 'failed',
         completedAt: new Date(),
         errorMessage: reason,
+        requestedByKind,
+        requestedByUserId:
+          requestedByKind === 'user' ? report.executionScopeUserId : null,
+        requestedByPortalUserId: null,
       })
       .returning();
   };
+
+  // P2-3 (#4190) — defence in depth. A system-authored definition (the weekly
+  // AI org narrative) has no acting user, so there is nobody for this worker to
+  // reauthorize against; it is owned by the agent scheduler, not the report
+  // scheduler. findDueReports already skips it (its executable-scope predicate
+  // requires execution_scope_user_id NOT NULL) and A7 adds the type exclusion —
+  // this refuses it even if a caller forces the job in directly, BEFORE any
+  // scope decode or authority resolution can invent a principal.
+  const definitionPrincipalKind = report.executionScopePrincipalKind ?? null;
+  if (definitionPrincipalKind !== null && definitionPrincipalKind !== 'user') {
+    console.warn(
+      '[ReportScheduleWorker] Refusing a non-user-principal report definition',
+      {
+        reportId: report.id,
+        orgId: report.orgId,
+        principalKind: definitionPrincipalKind,
+      },
+    );
+    if (definitionPrincipalKind === 'system') {
+      await deny('system_principal_definition');
+    } else if (definitionPrincipalKind === 'portal_user') {
+      await deny('portal_user_principal_definition', 'portal_user');
+    }
+    return;
+  }
 
   let persistedScope;
   try {
@@ -459,6 +618,7 @@ export async function processRunScheduledReport(
   }
 
   const executionAuthority: ReportExecutionAuthority = {
+    principalKind: 'user',
     scope: effectiveScope,
     principalUserId: liveResult.authority.principalUserId,
     capturedAt: liveResult.authority.capturedAt,
@@ -478,6 +638,9 @@ export async function processRunScheduledReport(
       reportId: report.id,
       status: 'running',
       startedAt: new Date(),
+      requestedByKind: 'user',
+      requestedByUserId: executionAuthority.principalUserId,
+      requestedByPortalUserId: null,
       ...persistedSiteScopeValues(executionAuthority),
     })
     .returning();
@@ -485,10 +648,15 @@ export async function processRunScheduledReport(
 
   // Stamp lastGeneratedAt up front so a crash mid-generation doesn't cause a
   // tight retry loop every check interval; the failed run row records the error.
-  await db
-    .update(reports)
-    .set({ lastGeneratedAt: new Date(), updatedAt: new Date() })
-    .where(eq(reports.id, report.id));
+  // Skipped when the caller already claimed the occurrence atomically (the
+  // inline CAS path in processCheckSchedules) — that claim IS this stamp, and
+  // re-stamping here would just be a redundant (harmless but pointless) write.
+  if (!opts.occurrenceClaimed) {
+    await db
+      .update(reports)
+      .set({ lastGeneratedAt: new Date(), updatedAt: new Date() })
+      .where(eq(reports.id, report.id));
+  }
 
   try {
     const previous = await previousBaselineFor(
@@ -515,7 +683,11 @@ export async function processRunScheduledReport(
       })
       .where(eq(reportRuns.id, run.id));
 
-    const recipients = recipientsOf(config);
+    const recipients = await resolveScheduledReportRecipients({
+      reportId: report.id,
+      orgId: report.orgId,
+      config,
+    });
     if (recipients.length > 0) {
       try {
         // Timezone + branding are only needed to build the email — deferred
@@ -523,13 +695,7 @@ export async function processRunScheduledReport(
         // transient failure in either lookup can't sink a no-recipient run's
         // occurrence-keyed job (a failed job blocks re-enqueue of that
         // occurrence, and by this point the run row is already stored).
-        const [tzRow] = await db
-          .select({ orgSettings: organizations.settings, partnerTimezone: partners.timezone, partnerSettings: partners.settings })
-          .from(organizations)
-          .leftJoin(partners, eq(organizations.partnerId, partners.id))
-          .where(eq(organizations.id, report.orgId))
-          .limit(1);
-        const timeZone = timezoneFor(tzRow?.orgSettings ?? null, tzRow?.partnerTimezone ?? null, tzRow?.partnerSettings ?? null);
+        const timeZone = await resolveOrgTimezone(report.orgId);
         const branding = await loadReportBrandingForOrg(report.orgId).catch((err) => {
           console.error('[ReportScheduleWorker] Branding load failed; sending unbranded:', err);
           return { name: null, logoDataUrl: null, logoAspect: null };
@@ -565,7 +731,11 @@ export async function processRunScheduledReport(
     // Only once the job is out of retries: an earlier attempt may still succeed,
     // and this occurrence will not be re-enqueued after the last one fails.
     if (opts.finalAttempt) {
-      const recipients = recipientsOf(config);
+      const recipients = await resolveScheduledReportRecipients({
+        reportId: report.id,
+        orgId: report.orgId,
+        config,
+      });
       if (recipients.length > 0) {
         try {
           await emailReportFailure({ reportName: report.name, recipients });
@@ -585,13 +755,41 @@ export async function processCheckSchedules(): Promise<void> {
 
   for (const item of due) {
     if (!isRedisAvailable()) {
+      // Inline fallback is 'all'-only: a worker-role process requires Redis to
+      // boot at all (never this limp mode), and unlike 'all' — a single
+      // self-hosted process — a worker-role deploy may run multiple replicas,
+      // where bypassing the BullMQ jobId dedup would double-generate the same
+      // occurrence across containers. Under worker/api roles with Redis down
+      // (a transient blip after boot, since worker.ts's own mandatory check
+      // already passed), skip rather than risk that — the next check interval
+      // retries once Redis is back.
+      if (breezeRole() !== 'all') {
+        console.warn(
+          `[ReportScheduleWorker] Redis unavailable outside 'all' role; skipping inline fallback for report ${item.id}`,
+        );
+        continue;
+      }
       // Inline mode has no queue to absorb a throw, so one failing report would
       // abort the loop and silently starve every remaining org's reports.
       // There is no retry here either, hence finalAttempt.
+      //
+      // The occurrence is claimed via CAS before running: a slow prior tick
+      // still mid-generation when the next 5-minute interval fires would
+      // otherwise find the same report due twice (lastGeneratedAt isn't
+      // stamped until deep inside processRunScheduledReport) and generate it
+      // twice. The claim uses the lastGeneratedAt findDueReports observed, so
+      // only the first tick to reach it wins.
+      const claimed = await claimReportOccurrence(item.id, item.lastGeneratedAt);
+      if (!claimed) {
+        console.warn(
+          `[ReportScheduleWorker] Occurrence for report ${item.id} already claimed by a concurrent check; skipping`,
+        );
+        continue;
+      }
       try {
         await processRunScheduledReport(
           { type: 'run-scheduled-report', reportId: item.id, occurrenceKey: item.occurrenceKey },
-          { finalAttempt: true },
+          { finalAttempt: true, occurrenceClaimed: true },
         );
       } catch (err) {
         console.error(`[ReportScheduleWorker] Inline run failed for report ${item.id}:`, err);

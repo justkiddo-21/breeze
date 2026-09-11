@@ -24,6 +24,8 @@ import {
  *   - `canAccessDeviceSite`           per-file helper convention
  *   - `getDeviceWithOrgAndSiteCheck`  canonical helper (`routes/devices/helpers.ts`)
  *   - `canAccessSite`                 underlying primitive (`services/permissions.ts`)
+ *   - `authorizeRouteResilienceResources` shared recovery lineage gate
+ *   - `resolveRouteAuthorizedDeviceIds` shared recovery list narrowing
  *
  * The allowlist below captures the set of routes that were known to be
  * missing the gate as of the SP2 sweep that added this test (PR #864/#868
@@ -32,6 +34,12 @@ import {
  * explaining why the site-scope check is intentionally absent or being
  * deferred — the default action on a new failure is to fix the handler,
  * not extend the allowlist.
+ *
+ * NOTE: the scanner is `:deviceId`-only — the contact routes
+ * (`routes/orgContacts.ts`, #3258) carry no device in their path and are
+ * covered by their own suites (`orgContacts.test.ts`, `contacts/crud.test.ts`,
+ * `contacts/import.test.ts`, `contactImport.integration.test.ts`); do not
+ * extend the scanner to reach them.
  *
  * NOTE: this test only catches per-device URL patterns. Handlers that take
  * a `deviceId` via query/body filter are still vulnerable to the same
@@ -144,13 +152,15 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
   'routes/agents/bootPerformance.ts:POST /:id/boot-performance',
   'routes/agents/changes.ts:PUT /:id/changes',
   'routes/agents/commands.ts:POST /:id/commands/:commandId/result',
+  // Primary agent-token path: command lookup is pinned to the authenticated
+  // device ID plus exact command ID/type/target role; no user site scope exists.
+  'routes/agents/pamObservations.ts:POST /:id/commands/:commandId/pam-observations',
   'routes/agents/connections.ts:PUT /:id/connections',
   'routes/agents/elevationRequests.ts:POST /:id/elevation-requests',
   'routes/agents/enrollment.ts:POST /enroll',
   'routes/agents/inventory.ts:PUT /:id/disks',
   'routes/agents/inventory.ts:PUT /:id/hardware',
   'routes/agents/inventory.ts:PUT /:id/network',
-  'routes/agents/inventory.ts:PUT /:id/software',
   'routes/agents/inventory.ts:PUT /:id/warranty-info',
   // Agent-token mTLS renewal confirm (Wave 5 Task 4/6). The atomic
   // activate+demote writes device_mtls_certificates and devices.mtls_cert_*
@@ -175,11 +185,16 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
   'routes/tunnels.ts:POST /upgrade-to-webrtc',
   // ---- Not the bug class: platform-admin-only, portal-session auth, or a
   // mobile/OAuth device row (not an RMM device with a site).
-  'routes/admin/abuse.ts:POST /partners/:id/suspend-for-abuse',
-  // Resolves a mobile/OAuth device row (mobile_devices, no site_id/org_id) to
-  // scope authenticator registration — already narrowed by userId, tighter
-  // than site-scope, so a site gate is not meaningful here.
-  'routes/authenticator.ts:POST /devices',
+  // routes/authenticator.ts:POST /devices was exempt here until #1374 W02
+  // extracted its mobile_devices lookup into the shared
+  // resolveOwnedMobileDeviceId() helper (so the new attested
+  // POST /devices/mobile/verify route cannot drift from it) — the file-local
+  // scanner no longer attributes the query to either handler. Same shape as
+  // the routes/mobile.ts:POST /notifications/register removal below. The
+  // exemption REASON is unchanged and still true: it resolves a mobile/OAuth
+  // device row (mobile_devices, no site_id/org_id) already narrowed by userId,
+  // which is tighter than site-scope, so a site gate is not meaningful. Only
+  // the detector's visibility changed, not the query or its predicates.
   'routes/lifecycle.ts:GET /admin/users/:userId/mobile-devices',
   'routes/lifecycle.ts:GET /me/mobile-devices',
   'routes/mobile.ts:POST /devices',
@@ -200,18 +215,10 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
   // site-restricted caller sees no sessions here in the first place.
   'routes/remote/supportSessions.ts:GET /support-sessions',
   'routes/remote/supportSessions.ts:GET /support-sessions/:id',
-  // ---- Org-wide AGGREGATE reads: return only counts/summaries (no
-  // per-device rows), so no cross-site device data is disclosed (returns
-  // re-verified 2026-05-31). NB: totals still span the org incl. other
-  // sites — site-scoping the aggregates themselves is a separate product call.
-  // routes/metrics.ts:GET / and GET /trends were exempted here as org-wide
-  // aggregates with the note that site-scoping them was "a separate product
-  // call". Wave 2 made that call: GET / now applies the allowed-site
-  // predicate to every aggregate and GET /trends denies site-restricted
-  // callers outright, so the ratchet correctly demands these entries go.
+  // ---- Partner/system-only aggregates: organization site-restricted roles
+  // cannot reach these handlers. User-reachable software/SentinelOne summaries
+  // apply site scope directly (RMM-QA-221), as do the earlier metrics fixes.
   'routes/huntress.ts:GET /status',
-  'routes/sentinelOne.ts:GET /status',
-  'routes/softwarePolicies.ts:GET /compliance/overview',
   'routes/updateRings.ts:GET /:id/compliance',
   // Org-scoped compliance list, identical posture to its sibling routes
   // (/firewall, /trends) which resolve rows through the same org-scoped
@@ -220,6 +227,21 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
   // lookup is constrained (inArray) to the device ids listStatusRows already
   // resolved, so it discloses no device beyond the caller's accessible orgs.
   'routes/security/compliance.ts:GET /encryption',
+  // ---- AI agent RUN reads (wave 6.1, #3828/#4157): org-wide reads that take
+  // NO device-selection input. Flagged only because the run row carries an
+  // `aiAgentRuns.deviceId` column, which is display metadata on an ORG-owned
+  // run row — never a caller-supplied device selector.
+  // Fleet runs list: query is cursor/limit/agentId/status/orgId only; rows are
+  // constrained by auth.orgCondition(aiAgentRuns.orgId) (the routes/devices/
+  // core.ts fleet-list pattern) and an optional orgId filter 403s unless
+  // auth.canAccessOrg, with RLS beneath.
+  'routes/aiAgents.ts:GET /runs',
+  // Run detail: path param is a RUN uuid, not a device; the row is org-scoped
+  // by the same orgCondition predicate + RLS, and 404s when out of scope.
+  'routes/aiAgents.ts:GET /runs/:runId',
+  // Agent-scoped runs list: path param is an AGENT uuid resolved through
+  // getAgent(auth, id) (404 unless accessible); query is `limit` only.
+  'routes/aiAgents.ts:GET /:id/runs',
 ]);
 
 // SITE_SCOPE_INPUT_EXEMPT entries that ARE reached via the user `authMiddleware`
@@ -232,9 +254,9 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
 // future regression where a non-user-auth file is migrated to plain user auth.
 const SITE_SCOPE_INPUT_EXEMPT_USER_SESSION_OK: ReadonlySet<string> = new Set<string>([
   // Mobile/OAuth device rows keyed on the user — not RMM devices with a site.
-  // routes/authenticator.ts resolves the row itself — already narrowed by
-  // userId, tighter than site-scope.
-  'routes/authenticator.ts:POST /devices',
+  // routes/authenticator.ts:POST /devices dropped out of this set in #1374 W02
+  // when its lookup moved into resolveOwnedMobileDeviceId(); see the note in
+  // SITE_SCOPE_INPUT_SOURCED_BASELINE above.
   'routes/mobile.ts:POST /devices',
   'routes/lifecycle.ts:GET /admin/users/:userId/mobile-devices',
   'routes/lifecycle.ts:GET /me/mobile-devices',
@@ -249,19 +271,24 @@ const SITE_SCOPE_INPUT_EXEMPT_USER_SESSION_OK: ReadonlySet<string> = new Set<str
   // all, let alone reach a device through them.
   'routes/remote/supportSessions.ts:GET /support-sessions',
   'routes/remote/supportSessions.ts:GET /support-sessions/:id',
-  // Org-wide AGGREGATE reads: return only counts/summaries (no per-device rows),
-  // so no cross-site device data is disclosed. Reached via user auth but exempt
-  // for the aggregate reason rather than non-user auth — recorded here so the
-  // re-verification test (added in #1041) accepts them. (Site-scoping the
-  // aggregate totals themselves is a separate product call.)
+  // Partner/system-only aggregates use user auth but cannot be reached by
+  // organization site-restricted roles; see SITE_SCOPE_INPUT_EXEMPT above.
   'routes/huntress.ts:GET /status',
-  'routes/sentinelOne.ts:GET /status',
-  'routes/softwarePolicies.ts:GET /compliance/overview',
   'routes/updateRings.ts:GET /:id/compliance',
   // Org-scoped compliance list (see note in SITE_SCOPE_INPUT_EXEMPT). Reached
   // via user auth (requireScope) but exempt because the escrow enrichment is
   // constrained to the org-scoped device set listStatusRows already resolved.
   'routes/security/compliance.ts:GET /encryption',
+  // AI agent run reads (wave 6.1, #3828/#4157). Reached via plain user auth
+  // (requireAiRead), so they carry a `permissions` context and must be listed
+  // here — but they are exempt for the no-device-input reason, not the
+  // non-user-auth one: every query is constrained to the caller's accessible
+  // orgs (auth.orgCondition / getAgent / canAccessOrg) with RLS beneath, no
+  // parameter selects a device, and `deviceId` is display metadata on an
+  // org-owned run row. See the matching note in SITE_SCOPE_INPUT_EXEMPT.
+  'routes/aiAgents.ts:GET /runs',
+  'routes/aiAgents.ts:GET /runs/:runId',
+  'routes/aiAgents.ts:GET /:id/runs',
 ]);
 
 // BASELINE RATCHET — pre-existing handlers flagged at the time this detector

@@ -1,6 +1,6 @@
 ---
 title: User Sessions
-description: Track active user sessions, login/logout events, idle time, and activity states across all managed devices.
+description: Track console, RDP, and SSH sessions across managed devices, with login and logout events, idle detection, and real-time event bus publishing.
 ---
 
 import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
@@ -8,6 +8,17 @@ import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 User Sessions gives you real-time visibility into who is logged into every managed device, how they connected, and whether they are actively working or idle. The Breeze agent continuously monitors OS-level session events -- console logins, RDP connections, SSH sessions, lock/unlock transitions -- and reports them to the API every five minutes. Login and logout events are published to the event bus in real time so you can trigger automations, generate alerts, or feed session data into your SIEM.
 
 This feature is designed for security auditing, license compliance, and helpdesk workflows. When a technician needs to know if someone is actively using a workstation before pushing a reboot, they can check the session list. When compliance requires proof that only authorized users accessed a server, the session history provides timestamped evidence with per-session deduplication.
+
+---
+
+## Using the Console
+
+Session data does not have a dedicated console page today; it surfaces in two places on a device's Device Details page:
+
+- **Overview tab** -- the idle-time stat next to the logged-in user reads the device's active sessions and shows the console session's idle time (or the least-idle active session if there is no console login). Hover it to see every active session on the device and when the data was last updated.
+- **Shadow Desktop / Run Script session picker** -- when starting a remote-desktop shadow session or running a script against a specific session, the picker lists the device's live OS sessions (queried directly from the agent, not the stored history) to choose which one to target.
+
+Full session history and the aggregate "experience" metrics (average duration, login performance, idle time across a date range) are available via the API below but are not yet rendered as a console report.
 
 ---
 
@@ -171,6 +182,10 @@ You can use these events to trigger automations -- for example, sending a Slack 
 | Method | Path | Description |
 |---|---|---|
 | `PUT` | `/agents/:id/sessions` | Submit current session state and events for a device (agent auth required) |
+| `GET` | `/devices/:id/sessions/active` | List the device's currently active sessions from the stored inventory |
+| `GET` | `/devices/:id/sessions/live` | Live OS session enumeration fetched from the agent in real time (no DB persistence) |
+| `GET` | `/devices/:id/sessions/history` | Paginated session history for the device (`limit`, `daysBack` query params) |
+| `GET` | `/devices/:id/sessions/experience` | Aggregate login/idle/duration metrics for the device over a date range (`daysBack` query param) |
 
 ### PUT /agents/:id/sessions
 

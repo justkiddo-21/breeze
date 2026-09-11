@@ -53,3 +53,66 @@ describe('createAutomationSchema.actions wiring', () => {
     expect(parsed.success).toBe(false);
   });
 });
+
+describe('automationActionSchema - ai_triage', () => {
+  it('accepts the bare ai_triage action', () => {
+    const parsed = automationActionSchema.safeParse({ type: 'ai_triage' });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('rejects ai_triage with an agentId because the arm is strict', () => {
+    const parsed = automationActionSchema.safeParse({ type: 'ai_triage', agentId: 'x' });
+    expect(parsed.success).toBe(false);
+  });
+
+  it('accepts an ai_triage action through the real create path', () => {
+    const parsed = createAutomationSchema.safeParse({
+      name: 'A',
+      trigger: { type: 'schedule', cron: '0 0 * * *' },
+      actions: [{ type: 'ai_triage' }],
+    });
+    expect(parsed.success).toBe(true);
+  });
+});
+
+// #5128 W4 — offline behaviour on the two device-command action types.
+describe('automationActionSchema - whenOffline', () => {
+  const SCRIPT_ID = '11111111-2222-4333-8444-555555555555';
+
+  it('defaults run_script whenOffline to queue', () => {
+    const parsed = automationActionSchema.safeParse({ type: 'run_script', scriptId: SCRIPT_ID });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.data).toMatchObject({ whenOffline: 'queue' });
+  });
+
+  it('defaults execute_command whenOffline to queue', () => {
+    const parsed = automationActionSchema.safeParse({ type: 'execute_command', command: 'whoami' });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.data).toMatchObject({ whenOffline: 'queue' });
+  });
+
+  it('accepts an explicit skip', () => {
+    const parsed = automationActionSchema.safeParse({
+      type: 'run_script', scriptId: SCRIPT_ID, whenOffline: 'skip',
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.data).toMatchObject({ whenOffline: 'skip' });
+  });
+
+  it('rejects a value outside the enum', () => {
+    const parsed = automationActionSchema.safeParse({
+      type: 'execute_command', command: 'whoami', whenOffline: 'defer',
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it('carries whenOffline through the real create path', () => {
+    const parsed = createAutomationSchema.safeParse({
+      name: 'A',
+      trigger: { type: 'schedule', cron: '0 0 * * *' },
+      actions: [{ type: 'run_script', scriptId: SCRIPT_ID, whenOffline: 'skip' }],
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.data.actions[0]).toMatchObject({ whenOffline: 'skip' });
+  });
+});

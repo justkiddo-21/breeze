@@ -12,7 +12,7 @@ function queueResult(rows: unknown[]) { results.push(rows); }
 vi.mock('../db', () => {
   const makeChain = () => {
     const chain: Record<string, unknown> = {};
-    const methods = ['select', 'from', 'where', 'limit', 'orderBy', 'insert', 'values', 'returning', 'update', 'set', 'delete', 'for', 'innerJoin', 'execute'];
+    const methods = ['select', 'from', 'where', 'limit', 'orderBy', 'groupBy', 'insert', 'values', 'returning', 'update', 'set', 'delete', 'for', 'innerJoin', 'execute'];
     for (const m of methods) chain[m] = vi.fn(() => chain);
     (chain as { then: unknown }).then = (resolve: (v: unknown) => unknown) => {
       const rows = results.shift() ?? [];
@@ -21,14 +21,26 @@ vi.mock('../db', () => {
     return chain;
   };
   const db = makeChain();
+  // Draft writers wrap their invoice-first lock + mutation in db.transaction
+  // (#3774 B10); the callback gets the same chain so queued results behave
+  // identically inside it.
+  (db as { transaction?: unknown }).transaction = vi.fn(
+    async (fn: (tx: unknown) => unknown) => fn(db)
+  );
   return {
     db,
     runOutsideDbContext: (fn: () => unknown) => fn(),
-    withSystemDbAccessContext: (fn: () => unknown) => fn()
+    withSystemDbAccessContext: (fn: () => unknown) => fn(),
+    // Phase D2: the payment outbox reads the ambient scope to decide whether
+    // an org-scoped caller can write the partner-axis mapping row.
+    getCurrentDbAccessContext: () => undefined
   };
 });
 
-vi.mock('./catalogService', () => ({ resolvePrice: vi.fn(), computeBundleEconomics: vi.fn() }));
+vi.mock('./catalogService', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./catalogService')>();
+  return { ...actual, resolvePrice: vi.fn(), computeBundleEconomics: vi.fn() };
+});
 vi.mock('./invoiceEvents', () => ({ emitInvoiceEvent: vi.fn().mockResolvedValue(undefined) }));
 vi.mock('./stripeConnectService', () => ({ getConnection: vi.fn().mockResolvedValue(null) }));
 
@@ -58,6 +70,8 @@ describe('invoiceService site-axis guard', () => {
   it('getInvoice allows a site-restricted actor an in-site invoice', async () => {
     queueResult([{ id: 'i1', status: 'sent', orgId: 'org1', partnerId: 'p1', siteId: 'siteA' }]); // getOwnedInvoiceOr404
     queueResult([]); // lines
+    queueResult([]); // grouped evidence counts
+    queueResult([]); // accounting_entity_mappings (no QuickBooks mapping)
     const result = await svc.getInvoice('i1', restricted);
     expect(result.invoice.id).toBe('i1');
   });
@@ -65,6 +79,8 @@ describe('invoiceService site-axis guard', () => {
   it('getInvoice is unaffected for an unrestricted actor (out-of-site & null-site both visible)', async () => {
     queueResult([{ id: 'i1', status: 'sent', orgId: 'org1', partnerId: 'p1', siteId: 'siteB' }]);
     queueResult([]); // lines
+    queueResult([]); // grouped evidence counts
+    queueResult([]); // accounting_entity_mappings (no QuickBooks mapping)
     const result = await svc.getInvoice('i1', unrestricted);
     expect(result.invoice.id).toBe('i1');
   });

@@ -5,6 +5,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 type InsertCall = { table: unknown; values: Record<string, unknown> };
 let insertCalls: InsertCall[] = [];
 
+const dbTestState = vi.hoisted(() => ({ lastTransaction: null as unknown }));
+
 // Fake schema sentinels — good enough for `is this the right table?` asserts.
 vi.mock('../db/schema', () => ({
   partners: { __t: 'partners', id: 'partners.id', slug: 'partners.slug', name: 'partners.name', mcpOrigin: 'partners.mcpOrigin', createdAt: 'partners.createdAt' },
@@ -38,7 +40,10 @@ vi.mock('../db', () => {
       const chain: any = {};
       chain.values = vi.fn((vals: Record<string, unknown>) => {
         insertCalls.push({ table, values: vals });
-        chain.returning = vi.fn(async (_cols?: unknown) => [{ id: idFor(table) }]);
+        chain.returning = vi.fn(async (_cols?: unknown) => [{
+          id: idFor(table),
+          ...((table as any)?.__t === 'partners' ? { currencyCode: 'CAD' } : {}),
+        }]);
         // Plain awaited insert (no returning) should also resolve.
         chain.then = (resolve: any) => resolve(undefined);
         return chain;
@@ -86,19 +91,96 @@ vi.mock('../db', () => {
 
   return {
     db: {
-      transaction: vi.fn(async (cb: any) => cb(makeTx())),
+      transaction: vi.fn(async (cb: any) => {
+        const tx = makeTx();
+        dbTestState.lastTransaction = tx;
+        return cb(tx);
+      }),
       select: vi.fn(),
     },
   };
 });
 
 import { createPartner } from './partnerCreate';
+import { db } from '../db';
 
 beforeEach(() => {
   insertCalls = [];
 });
 
 describe('createPartner', () => {
+  it('writes probation whenever hosted partner trust evaluation is running (shadow or enforce), omits it when off', async () => {
+    const previousIsHosted = process.env.IS_HOSTED;
+    const previousMode = process.env.PARTNER_TRUST_MODE;
+    try {
+      process.env.IS_HOSTED = 'true';
+      process.env.PARTNER_TRUST_MODE = 'enforce';
+      await createPartner({
+        orgName: 'Enforced',
+        adminEmail: 'enforced@example.com',
+        adminName: 'Enforced',
+        passwordHash: 'hashed',
+        origin: { mcp: false },
+        status: 'active',
+      });
+      const enforcedInsert = insertCalls.find((c) => (c.table as any).__t === 'partners')!;
+      expect(enforcedInsert.values).toHaveProperty('trustState', 'probation');
+
+      insertCalls = [];
+      process.env.PARTNER_TRUST_MODE = 'shadow';
+      await createPartner({
+        orgName: 'Shadow',
+        adminEmail: 'shadow@example.com',
+        adminName: 'Shadow',
+        passwordHash: 'hashed',
+        origin: { mcp: false },
+        status: 'active',
+      });
+      const shadowInsert = insertCalls.find((c) => (c.table as any).__t === 'partners')!;
+      expect(shadowInsert.values).toHaveProperty('trustState', 'probation');
+
+      insertCalls = [];
+      process.env.PARTNER_TRUST_MODE = 'off';
+      await createPartner({
+        orgName: 'Off',
+        adminEmail: 'off@example.com',
+        adminName: 'Off',
+        passwordHash: 'hashed',
+        origin: { mcp: false },
+        status: 'active',
+      });
+      const offInsert = insertCalls.find((c) => (c.table as any).__t === 'partners')!;
+      expect(offInsert.values).not.toHaveProperty('trustState');
+    } finally {
+      if (previousIsHosted === undefined) delete process.env.IS_HOSTED;
+      else process.env.IS_HOSTED = previousIsHosted;
+      if (previousMode === undefined) delete process.env.PARTNER_TRUST_MODE;
+      else process.env.PARTNER_TRUST_MODE = previousMode;
+    }
+  });
+
+  it('uses a caller transaction without opening a nested transaction', async () => {
+    const input = {
+      orgName: 'Outer Transaction',
+      adminEmail: 'outer@example.com',
+      adminName: 'Outer',
+      passwordHash: 'hashed',
+      origin: { mcp: false as const },
+      status: 'active' as const,
+    };
+    await db.transaction(async () => undefined);
+    const tx = dbTestState.lastTransaction;
+    if (!tx) throw new Error('test transaction was not captured');
+    vi.mocked(db.transaction).mockClear();
+    insertCalls = [];
+
+    const result = await Reflect.apply(createPartner, null, [input, { tx }]);
+
+    expect(result.adminUserId).toBe('users-id');
+    expect(db.transaction).not.toHaveBeenCalled();
+    expect(insertCalls.some((call) => (call.table as any).__t === 'users')).toBe(true);
+  });
+
   it('inserts partner, admin user, admin role, partner-user link, default org, and default site in a single transaction', async () => {
     const result = await createPartner({
       orgName: 'Acme',
@@ -136,10 +218,32 @@ describe('createPartner', () => {
     expect(partnerCall.values.mcpOriginIp ?? null).toBeNull();
     expect(partnerCall.values.mcpOriginUserAgent ?? null).toBeNull();
 
+    const orgCall = insertCalls.find((c) => (c.table as any).__t === 'organizations')!;
+    expect(orgCall.values.currencyCode).toBe('CAD');
+
     // User insert: email lowercased.
     const userCall = insertCalls.find((c) => (c.table as any).__t === 'users')!;
     expect(userCall.values.email).toBe('alex@acme.com');
     expect(userCall.values.passwordHash).toBe('hashed');
+  });
+
+  // Issue #3608: new partners must opt IN to inbound email-to-ticket rather
+  // than inheriting the readers' absent-flag-means-true fallback (which
+  // exists solely as the pre-#3606 upgrade path for existing partners).
+  it('writes an explicit settings.ticketing.inbound.enabled=false for new partners', async () => {
+    await createPartner({
+      orgName: 'Acme',
+      adminEmail: 'alex@acme.com',
+      adminName: 'Alex',
+      passwordHash: 'hashed',
+      origin: { mcp: false },
+      status: 'active',
+    });
+
+    const partnerCall = insertCalls.find((c) => (c.table as any).__t === 'partners')!;
+    expect(partnerCall.values.settings).toMatchObject({
+      ticketing: { inbound: { enabled: false } },
+    });
   });
 
   it('inserts six system ticket_statuses rows inside the transaction', async () => {
@@ -216,6 +320,29 @@ describe('createPartner', () => {
       signupIp: '198.51.100.7',
       signupUserAgent: 'ua',
       mcpOriginIp: null,
+    });
+  });
+
+  // RMM-QA-164: the tenant Partner Admin copy must be created with
+  // force_mfa=true. The 2026-05-25-f migration ran before this row existed
+  // and never revisits it, so the literal on the insert is the invariant.
+  it('inserts the tenant Partner Admin role with forceMfa: true', async () => {
+    await createPartner({
+      orgName: 'Forced MFA Co',
+      adminEmail: 'forced@example.com',
+      adminName: 'Forced',
+      passwordHash: 'hashed',
+      origin: { mcp: false },
+      status: 'active',
+    });
+
+    const roleCall = insertCalls.find((c) => (c.table as any).__t === 'roles');
+    expect(roleCall).toBeDefined();
+    expect(roleCall!.values).toMatchObject({
+      scope: 'partner',
+      name: 'Partner Admin',
+      isSystem: true,
+      forceMfa: true,
     });
   });
 });

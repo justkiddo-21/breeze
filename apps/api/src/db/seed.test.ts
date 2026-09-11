@@ -93,9 +93,10 @@ describe('SYSTEM_ROLES ⊆ DEFAULT_PERMISSIONS', () => {
   // permission a system role grants must be seeded. The reverse is NOT asserted:
   // DEFAULT_PERMISSIONS (and the shared PERMISSION_GRANTS registry) may legitimately
   // be a superset, defining permissions no system role grants yet (e.g.
-  // time_entries:*, automations:* live in the registry but aren't seeded because
-  // no system role references them). A registry/seed superset is fine; an
-  // unseeded role grant is the bug.
+  // automations:* lives in the registry but isn't seeded because no system role
+  // references it). A registry/seed superset is fine; an unseeded role grant is
+  // the bug. time_entries:* used to be the example here; #4251 moved it into
+  // DEFAULT_PERMISSIONS when Partner Technician started granting it.
   const seededKeys = new Set(
     DEFAULT_PERMISSIONS.map((p) => `${p.resource}:${p.action}`),
   );
@@ -117,6 +118,19 @@ describe('SYSTEM_ROLES ⊆ DEFAULT_PERMISSIONS', () => {
   it('every DEFAULT_PERMISSIONS entry is a unique resource:action', () => {
     const keys = DEFAULT_PERMISSIONS.map((p) => `${p.resource}:${p.action}`);
     expect(new Set(keys).size).toBe(keys.length);
+  });
+});
+
+describe('agent rollback RBAC', () => {
+  const byName = (name: string) => SYSTEM_ROLES.find((role) => role.name === name);
+
+  it('seeds agent_rollback:create and grants it explicitly only to Org Admin', () => {
+    expect(DEFAULT_PERMISSIONS).toContainEqual(expect.objectContaining({ resource: 'agent_rollback', action: 'create' }));
+    expect(byName('Partner Admin')?.permissions).toContain('*:*');
+    expect(byName('Org Admin')?.permissions).toContain('agent_rollback:create');
+    for (const role of SYSTEM_ROLES.filter((candidate) => !['Partner Admin', 'Org Admin'].includes(candidate.name))) {
+      expect(role.permissions).not.toContain('agent_rollback:create');
+    }
   });
 });
 
@@ -213,6 +227,67 @@ describe('approvals:decide permission (action intents approval layer, §4)', () 
   });
 });
 
+describe('audit:manage permission (audit retention policy settings, #4633)', () => {
+  const byName = (name: string) => SYSTEM_ROLES.find((r) => r.name === name);
+
+  it('defines audit:manage in DEFAULT_PERMISSIONS', () => {
+    expect(
+      DEFAULT_PERMISSIONS.some(
+        (p) => p.resource === 'audit' && p.action === 'manage',
+      ),
+    ).toBe(true);
+  });
+
+  it('registers audit:manage in the shared PERMISSION_GRANTS registry', () => {
+    expect(PERMISSION_GRANTS.AUDIT_MANAGE).toEqual({ resource: 'audit', action: 'manage' });
+  });
+
+  it('grants audit:manage to Org Admin', () => {
+    expect(byName('Org Admin')?.permissions).toContain('audit:manage');
+  });
+
+  it('does NOT grant audit:manage to Org Technician or Org Viewer', () => {
+    expect(byName('Org Technician')?.permissions).not.toContain('audit:manage');
+    expect(byName('Org Viewer')?.permissions).not.toContain('audit:manage');
+  });
+
+  it('Partner Admin covers audit:manage via the wildcard grant (does not need a redundant literal entry)', () => {
+    const role = byName('Partner Admin');
+    expect(role?.permissions).toContain('*:*');
+    expect(role?.permissions).not.toContain('audit:manage');
+  });
+});
+
+describe('backup:cross_site_restore permission', () => {
+  const byName = (name: string) => SYSTEM_ROLES.find((role) => role.name === name);
+
+  it('registers and seeds the distinct cross-site restore capability', () => {
+    expect(PERMISSION_GRANTS.BACKUP_CROSS_SITE_RESTORE).toEqual({
+      resource: 'backup',
+      action: 'cross_site_restore',
+    });
+    expect(DEFAULT_PERMISSIONS).toEqual(expect.arrayContaining([
+      expect.objectContaining({ resource: 'backup', action: 'cross_site_restore' }),
+    ]));
+  });
+
+  it('grants cross-site restore only to recovery administrators by default', () => {
+    expect(byName('Partner Admin')?.permissions).toContain('*:*');
+    expect(byName('Org Admin')?.permissions).toContain('backup:cross_site_restore');
+
+    for (const role of SYSTEM_ROLES) {
+      if (role.name === 'Partner Admin' || role.name === 'Org Admin') continue;
+      expect(role.permissions).not.toContain('backup:cross_site_restore');
+    }
+  });
+
+  it('does not broaden ordinary backup:write into cross-site recovery', () => {
+    const technician = byName('Partner Technician');
+    expect(technician?.permissions).toContain('backup:write');
+    expect(technician?.permissions).not.toContain('backup:cross_site_restore');
+  });
+});
+
 describe('topology:write permission (issue #1728)', () => {
   it('topology:write is a seeded permission', () => {
     const keys = DEFAULT_PERMISSIONS.map((p) => `${p.resource}:${p.action}`);
@@ -253,5 +328,58 @@ describe('topology:write permission (issue #1728)', () => {
   it('Partner Admin covers topology via the wildcard grant', () => {
     const role = SYSTEM_ROLES.find((r) => r.name === 'Partner Admin');
     expect(role?.permissions).toContain('*:*');
+  });
+});
+
+describe('technician ticket + time-entry RBAC (#4251)', () => {
+  // #3206 shipped a mobile start/stop timer whose routes require
+  // time_entries:write. The seeded technician roles held tickets:read only, so
+  // the only grant path (2026-06-12-a-ticketing-time-parts.sql, which
+  // propagates time_entries:* off the matching tickets:* perm) gave them
+  // time_entries:read and nothing else: the timesheet renders, start/stop 403s.
+  // These assertions pin the fix so a later trim of the role can't silently
+  // re-break the timer.
+  const byName = (name: string) => SYSTEM_ROLES.find((r) => r.name === name);
+
+  it('Partner Technician can update a ticket and log time against it', () => {
+    expect(byName('Partner Technician')?.permissions).toEqual(
+      expect.arrayContaining(['tickets:read', 'tickets:write', 'time_entries:read', 'time_entries:write']),
+    );
+  });
+
+  it('Partner Technician does NOT gain tickets:manage', () => {
+    // tickets:manage reassigns ticket organization and edits any author's
+    // comment — an admin action, deliberately still withheld.
+    expect(byName('Partner Technician')?.permissions).not.toContain('tickets:manage');
+  });
+
+  it('Partner Viewer stays read-only on tickets and time entries', () => {
+    const perms = byName('Partner Viewer')?.permissions ?? [];
+    expect(perms).not.toContain('tickets:write');
+    expect(perms).not.toContain('time_entries:write');
+  });
+
+  it('time_entries:read/write are seeded, or seedRoles silently drops the grant', () => {
+    const seeded = new Set(DEFAULT_PERMISSIONS.map((p) => `${p.resource}:${p.action}`));
+    expect(seeded.has('time_entries:read')).toBe(true);
+    expect(seeded.has('time_entries:write')).toBe(true);
+  });
+});
+
+describe('system role MFA posture (RMM-QA-164)', () => {
+  // The stored roles.force_mfa flag is what services/mfaPolicy.ts reads; the
+  // 2026-05-25-f migration only ever flipped rows that existed when it ran,
+  // and on a fresh database autoMigrate applies it BEFORE seed(). The seed
+  // definition is therefore the source of truth for a fresh install, and it
+  // must state the posture of every role explicitly rather than leave the
+  // column to its DEFAULT false.
+  it('every system role declares forceMfa as a boolean', () => {
+    for (const role of SYSTEM_ROLES) {
+      expect(typeof role.forceMfa, `role "${role.name}" must declare forceMfa`).toBe('boolean');
+    }
+  });
+
+  it('forces MFA for Partner Admin and for no other system role (D9: Org Admin stays MSP opt-in)', () => {
+    expect(SYSTEM_ROLES.filter((role) => role.forceMfa).map((role) => role.name)).toEqual(['Partner Admin']);
   });
 });

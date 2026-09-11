@@ -1,6 +1,6 @@
 ---
 title: Environment Variables
-description: Complete reference for all Breeze RMM configuration variables.
+description: "Reference for every Breeze RMM environment variable: database, Redis, auth, email, object storage, TURN, monitoring, Sentry, and feature flags."
 sidebar:
   order: 2
   label: Environment Variables
@@ -27,10 +27,38 @@ All configuration is done through environment variables, defined in your `.env.p
 | `POSTGRES_DB` | `breeze` | | Database name |
 | `POSTGRES_PORT` | `5432` | | PostgreSQL port |
 | `DATABASE_URL` | — | Auto | Full connection string (constructed from above in Docker) |
-| `DATABASE_URL_APP` | — | One of these three (prod) | Explicit connection string for the **unprivileged request role** (`breeze_app`). Preferred, and **required** for multi-host / high-availability `DATABASE_URL` values, which cannot be derived automatically. |
+| `DATABASE_URL_APP` | — | One of these three (prod) | Explicit connection string for the **unprivileged request role** (`breeze_app`). Preferred for direct (non-Compose) deployments and for `deploy/docker-compose.prod.yml` (managed Postgres), and **required** for multi-host / high-availability `DATABASE_URL` values, which cannot be derived automatically. **Leave it empty on the bundled root `docker-compose.yml`** — see the callout below. |
 | `BREEZE_APP_DB_PASSWORD` | — | One of these three (prod) | Password for the `breeze_app` role, used to derive its connection string from `DATABASE_URL`. |
 
 In production, Breeze runs request handlers as an unprivileged, row-level-security-enforced database role (`breeze_app`) rather than as the database owner. **The API refuses to start** unless it can configure that role — set one of `DATABASE_URL_APP`, `BREEZE_APP_DB_PASSWORD`, or `POSTGRES_PASSWORD`. This check runs whenever `NODE_ENV=production`, **including when `AUTO_MIGRATE=false`**. The API also **refuses to start if it detects it is running as a `SUPERUSER` or `BYPASSRLS` role** — if you were previously running as the `postgres` superuser, switch to a `NOSUPERUSER`/`NOBYPASSRLS` role. After doing so you may notice rows that were previously visible to a tenant "disappear"; that is row-level security working correctly, not data loss. See the [request-database-role runbook](https://github.com/LanternOps/breeze/blob/main/docs/runbooks/request-database-role.md).
+
+:::caution[Bundled Docker Compose: leave `DATABASE_URL_APP` empty]
+The bundled root `docker-compose.yml` rebuilds `DATABASE_URL` as
+`...@postgres:5432` *inside* the api container, but passes `DATABASE_URL_APP`
+through verbatim. A `localhost` value — such as the one older `.env.example`
+files shipped — therefore makes the request pool dial the **api container's own
+loopback**.
+
+On a **fresh** install, migrations and role setup still succeed (they use
+`DATABASE_URL`) and startup fails at the initial seed. The last two lines are
+illustrative Node/driver output rather than fixed Breeze strings:
+
+```
+[auto-migrate] No users found, running initial seed...
+[CRITICAL] API startup failed: AggregateError [ECONNREFUSED]
+  connect ECONNREFUSED 127.0.0.1:5432
+```
+
+On an **already-seeded** database the same misconfiguration surfaces later and
+looks completely different — `[database] Could not query the effective request
+database role.` — so an upgrading operator will not find the seed message above.
+
+Set it empty (or leave the line commented) and Breeze derives
+`breeze_app@postgres` from the container's own `DATABASE_URL`, provided
+`POSTGRES_PASSWORD` or `BREEZE_APP_DB_PASSWORD` is set — the bundled compose
+requires `POSTGRES_PASSWORD` anyway. Only set `DATABASE_URL_APP` explicitly when
+pointing at a database the api container can actually reach.
+:::
 
 ## Redis
 
@@ -49,17 +77,26 @@ In production, Breeze runs request handlers as an unprivileged, row-level-securi
 | `PARTNER_API_CURSOR_SIGNING_KEY` | — | Yes (prod) | Dedicated key that signs the pagination cursors returned by the Partner Export API. Must be **canonical (standard) base64** — not base64url or hex — decoding to at least 32 bytes, and must not reuse `JWT_SECRET`. Generate: `openssl rand -base64 32`. **The API refuses to start in production without it.** |
 | `AGENT_ENROLLMENT_SECRET` | — | Yes | Shared secret for agent enrollment. Generate: `openssl rand -hex 32` |
 | `APP_ENCRYPTION_KEY` | — | Yes | AES encryption key for sensitive data at rest |
-| `APP_ENCRYPTION_KEY_ID` | — | | Optional identifier for the active encryption key (letters, digits, `.`/`_`/`-`). Setting it enables versioned, context-bound ciphertext for newly stored secrets and is **required for the Microsoft 365 reset-password one-time credential reveal** — without it the reset still succeeds but the temporary password is deliberately discarded rather than stored. Not present in the stock compose file: add it to `.env` **and** to the `api` service `environment:` block. |
+| `APP_ENCRYPTION_KEY_ID` | — | | Optional identifier for the active encryption key (letters, digits, `.`/`_`/`-`). Setting it enables versioned, context-bound ciphertext for newly stored secrets. **From v0.106.0 it is required whenever `M365_GRAPH_ACTIONS_TOOLS_ENABLED=true`, and the API refuses to start without it** — the write-action reveal path seals its temporary credential with key-bound ciphertext and fails closed, so the credential would be discarded and never revealable. Not present in the stock compose file: add it to `.env` **and** to the `api` service `environment:` block. |
 | `MFA_ENCRYPTION_KEY` | — | Yes | Encryption key for MFA secrets |
 | `ENROLLMENT_KEY_PEPPER` | — | Yes | HMAC pepper for enrollment key hashing |
 | `MFA_RECOVERY_CODE_PEPPER` | — | Yes | HMAC pepper for recovery code hashing |
-| `ENROLLMENT_KEY_DEFAULT_TTL_MINUTES` | `60` | | Default enrollment key expiry |
-| `CHILD_ENROLLMENT_KEY_TTL_MINUTES` | `1440` | | Fresh TTL (minutes) given to a "child" enrollment key minted at installer-download, installer-link, or short-code redemption time, measured from mint time rather than the parent key's remaining lifetime |
+| `ENROLLMENT_KEY_DEFAULT_TTL_MINUTES` | `43200` (30 days) | | Default enrollment key expiry. Every path that mints a key shares this fallback — the Add Device modal, the Partner API, and installer child keys |
+| `CHILD_ENROLLMENT_KEY_TTL_MINUTES` | inherits `ENROLLMENT_KEY_DEFAULT_TTL_MINUTES` | | Fresh TTL (minutes) given to a "child" enrollment key minted at installer-download, installer-link, or short-code redemption time, measured from mint time rather than the parent key's remaining lifetime |
 | `INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES` | `1440` | | Base TTL (minutes) for a freshly-issued installer bootstrap token when no explicit `ttlMinutes` is supplied. The token's own expiry, not the parent enrollment key's, governs how long an installer has to complete enrollment — see [Enrollment Keys](/agents/enrollment-keys/#installer-bootstrap-tokens) |
 | `INSTALLER_PARENT_MIN_REMAINING_SECONDS` | `60` | | Minimum remaining lifetime (seconds) a parent enrollment key must have to be used as an installer source. Guards against building an installer from a parent that expires before the download reaches the target machine |
 | `ENROLLMENT_KEY_CLEANUP_ENABLED` | `true` | | Set to `false` to disable the daily sweep that purges expired enrollment keys |
 | `ENROLLMENT_KEY_PURGE_AFTER_DAYS` | `7` | | Grace period (days past expiry) before an expired enrollment key is purged |
 | `SESSION_SECRET` | — | Yes | Session signing secret |
+| `BREEZE_BOOTSTRAP_ADMIN_EMAIL` | — | Yes (prod, first boot) | Email for the initial admin account, created automatically the first time the API starts against an empty `users` table. **Required in production** — without it, that first-boot auto-seed throws and the API crash-loops. Must not be the dev default (`admin@breeze.local`). |
+| `BREEZE_BOOTSTRAP_ADMIN_PASSWORD` | — | Yes (prod, first boot) | Password for the initial admin account. **Required in production**, must be at least 16 characters, and must not be the dev default or look like a placeholder (`changeme`, `password`, `change-in-production`, etc.) — the API refuses to start otherwise. Generate a one-time secret (`openssl rand -base64 24`) and rotate it after first login. |
+| `BREEZE_BOOTSTRAP_ADMIN_NAME` | `Bootstrap Admin` (prod) / `Breeze Admin` (dev) | | Display name for the initial admin account. |
+| `BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED` | `true` | | Whether an approver device must have **server-verified** platform attestation before it counts as a level-4 authenticator for the most sensitive approvals. **On by default** — leave it alone unless you have a documented reason. Set it to `false` only to accept a device's own unverified claim that it is platform-bound. This is a fail-closed gate: an unrecognized value logs a warning and keeps enforcement on, and the API refuses to boot on a malformed value rather than silently disabling it. |
+| `APPLE_APP_ATTEST_APP_ID` | `D8W6N2JYMA.com.breeze.rmm` | | Apple's `<TeamID>.<bundle id>` App Attest identifier, checked when an iPhone registers as a level-4 approver device. It's hashed into the attestation, so a wrong value rejects every genuine attestation rather than accepting a foreign one. Only override it if you build your own signed iOS app. |
+| `APPLE_APP_ATTEST_ENVIRONMENT` | `production` | | Which App Attest environment's attestations are accepted. Only the exact value `development` opts into accepting development-build attestations; anything else (a typo, a stray space) is treated as `production` and logs a warning — the wrong value can only ever reject a genuine attestation, never admit a forged one. |
+| `PARTNER_API_ENROLLMENT_KEY_MAX_TTL_MINUTES` | `525600` (365 days) | | Ceiling on the lifetime a caller may request when creating an enrollment key through `POST /partner-api/v1/enrollment-keys` |
+| `PARTNER_API_ENROLLMENT_KEY_WRITE_RATE_LIMIT` | `10` | | Enrollment-key creations per hour per service principal on the Partner API |
+| `PARTNER_API_ENROLLMENT_KEY_WRITE_PARTNER_RATE_LIMIT` | `100` | | Enrollment-key creations per hour per partner, across all of that partner's service principals |
 
 Access-token (15m) and refresh-token (7d) lifetimes are fixed in code
 (`apps/api/src/services/jwt.ts`) — short-lived access tokens backed by
@@ -73,16 +110,19 @@ deployment env vars.
 | `NODE_ENV` | `production` | | Environment mode |
 | `API_PORT` | `3001` | | API server port |
 | `WEB_PORT` | `4321` | | Web dashboard port |
+| `BREEZE_API_ROLE` | `all` | | Which work the `api` container takes on. `all` (the default) keeps the single-container behaviour: the API serves requests, holds agent connections, and runs every background job itself. Set it to `api` only when you also run a separate worker container, so the two do not both run the same scheduled jobs. See [Worker Split](/deploy/worker-split/). |
+| `BREEZE_ROLE` | `all` | | The role the process itself runs as. You normally set `BREEZE_API_ROLE` instead and let the compose file map it; the optional worker container fixes this to `worker` for you. |
 | `PUBLIC_API_URL` | `https://${BREEZE_DOMAIN}` (bundled compose only) | | Public API URL used for generated agent installers and shareable links. The bundled `docker-compose.yml` derives this from `BREEZE_DOMAIN`. If you use a custom compose file, you must set `PUBLIC_API_URL` in `.env` **and** map it into the `api` service `environment:` block, or **Generate Link** / **Download Installer** will fail with `Server URL not configured`. |
 | `API_URL` | — | | Legacy fallback for `PUBLIC_API_URL`, honored only by enrollment, installer, and MCP-invite code paths. Auto-update, dev-push, and a few other routes read `PUBLIC_API_URL` only — prefer setting `PUBLIC_API_URL`. |
-| `BREEZE_DOMAIN` | — | Yes (prod) | Domain for Caddy TLS provisioning |
+| `BREEZE_DOMAIN` | — | Yes (prod) | Domain for Caddy TLS provisioning. Also the default source for `PUBLIC_API_URL` and `PUBLIC_PORTAL_URL` in the bundled compose file, so it's required even when you front TLS yourself. |
 | `ACME_EMAIL` | — | Yes (prod) | Email for Let's Encrypt certificate notifications |
-| `CORS_ALLOWED_ORIGINS` | — | | Comma-separated allowed CORS origins |
+| `CADDY_LOCAL_CERTS` | — (empty) | | Set to the literal `local_certs` when `BREEZE_DOMAIN` is a domain Let's Encrypt cannot reach — an internal name that only resolves on a LAN/VPN, or a host whose ports 80/443 are closed to the internet. Caddy then issues from its own internal CA instead of failing the ACME order and aborting the TLS handshake, which browsers report as `ERR_SSL_PROTOCOL_ERROR` with no warning to click through. Browsers warn until the root from `docker compose exec caddy cat /data/caddy/pki/authorities/local/root.crt` is trusted on each client. Leave empty for any internet-reachable deployment; not needed for `localhost` or a bare IP, which Caddy already self-signs. |
+| `CORS_ALLOWED_ORIGINS` | — | | Comma-separated allowed CORS origins. Requests the browser sends from the same origin as the API — including a browser reaching Breeze through an SSH tunnel or on a LAN address — are accepted whether or not that origin is listed, so you only need this for a genuinely cross-origin front end. |
 | `IS_HOSTED` | — | Yes (prod) | `true` for hosted SaaS edition, `false` for self-hosted. Must be set explicitly — the API refuses to boot otherwise. Controls signup gating, billing, email-verification policy, and the default for signup-abuse detection. |
 | `ABUSE_SIGNALS_ENABLED` | value of `IS_HOSTED` | | Signup-abuse detection switch. Defaults to the value of `IS_HOSTED` — **on** for a hosted deployment, **off** for a self-hosted one (its heuristics police untrusted public signups and are noise on a single-team install; when off, the only artifact is one `[AbuseSignals] Disabled` line at boot). Set `true` to opt a genuinely multi-tenant self-hosted service in, or `false` to switch a hosted deployment off. When set, it must be a boolean (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`) — validated at boot. |
 | `TRUST_PROXY_HEADERS` | — | Yes (prod) | `true` when behind a reverse proxy (Caddy, Cloudflare). Must be set explicitly in production. |
 | `TRUSTED_PROXY_CIDRS` | — | When `TRUST_PROXY_HEADERS=true` | Comma-separated CIDRs of trusted reverse proxies (e.g., `10.0.0.0/8,172.16.0.0/12`). Required when proxy headers are trusted. |
-| `TRUST_CF_CONNECTING_IP` | `false` | | Set to `true` **only** when Breeze is fronted by Cloudflare. Cloudflare overwrites the `CF-Connecting-IP` header at its edge, but a non-Cloudflare reverse proxy (including the bundled Caddy) does not strip it — so trusting it without a Cloudflare front would let a client spoof the header to defeat IP allowlists and per-IP rate limits. When off, client IPs are resolved from `X-Forwarded-For` instead. If you are behind Cloudflare and leave this unset, client-IP attribution (rate limits, audit logs, IP allowlists) falls back to `X-Forwarded-For`; the API logs a startup warning in that case. |
+| `TRUST_CF_CONNECTING_IP` | `false` | `true` / `false`, `1` / `0`, `yes` / `no`, `on` / `off` (empty or unset is allowed) | Set to `true` **only** when Breeze is fronted by Cloudflare. Cloudflare overwrites the `CF-Connecting-IP` header at its edge, but a non-Cloudflare reverse proxy (including the bundled Caddy) does not strip it — so trusting it without a Cloudflare front would let a client spoof the header to defeat IP allowlists and per-IP rate limits. When off, client IPs are resolved from `X-Forwarded-For` instead. If you are behind Cloudflare and leave this unset, client-IP attribution (rate limits, audit logs, IP allowlists) falls back to `X-Forwarded-For`; the API logs a startup warning in that case. **From v0.106.0 a value outside the list above stops the API from starting** — previously a typo here was silently read as "off", quietly attributing every client IP to the wrong address. |
 | `IP_ALLOWLIST_ENFORCEMENT_MODE` | `enforce` | | Partner dashboard IP allowlist mode. Use `off` only as a break-glass switch if an allowlist locks everyone out. The allowlist only enforces when a partner has entries configured and proxy trust is working through `TRUST_PROXY_HEADERS` plus `TRUSTED_PROXY_CIDRS`. Only `enforce`, `off` or an empty/whitespace-only value (treated as unset) are accepted — anything else refuses startup rather than silently enforcing while you believe enforcement is off. |
 | `DASHBOARD_URL` | — | | URL for links in emails |
 | `PUBLIC_APP_URL` | — | | Public-facing app URL |
@@ -107,6 +147,8 @@ deployment env vars.
 | `MAILGUN_DOMAIN` | — | Mailgun sending domain |
 | `MAILGUN_BASE_URL` | `https://api.mailgun.net` | Mailgun API base URL |
 | `MAILGUN_FROM` | `noreply@breeze.local` | Mailgun-specific sender address |
+| `SMTP_TIMEOUT_MS` | `30000` | How long an outbound SMTP send may take before it is abandoned. Applies to **all** outbound mail. Without a bound, a wedged mail host can hold a send open for nodemailer's ten-minute default |
+| `MAILGUN_TIMEOUT_MS` | `120000` | The same bound for the Mailgun HTTP transport |
 
 ## SMS (Twilio)
 
@@ -130,6 +172,25 @@ Push notifications to the iOS app go directly through Apple's push service (APNs
 | `APNS_BUNDLE_ID` | — | iOS app bundle identifier |
 | `APNS_ENVIRONMENT` | `production` | `production` or `sandbox`. An empty value is treated as unset. |
 
+## Mobile Push Notifications (Android)
+
+Push notifications to the Android app go through Firebase Cloud Messaging.
+
+| Variable | Default | Description |
+|---|---|---|
+| `FIREBASE_SERVICE_ACCOUNT` | — | Firebase service-account credentials JSON for the project that owns the Android app. Optional — leave it unset and Android devices simply receive no push notifications; nothing else changes and the API still boots. iOS push is unaffected either way. |
+| `PLAY_INTEGRITY_SERVICE_ACCOUNT` | — | Google service-account credentials for decoding **Play Integrity** verdicts when an Android phone registers as an approver device for [high-assurance approvals](/features/approval-security/). Accepts the raw JSON or a base64-encoded copy of it. Optional: leave it unset and Android approver registration is verified by hardware **Key Attestation** alone. |
+
+<Aside type="caution" title="A mangled Play Integrity credential stops the boot">
+  `PLAY_INTEGRITY_SERVICE_ACCOUNT` is validated at startup, and a value that
+  cannot be read as a service account — bad base64, truncated JSON, a missing
+  client email or private key, a private key without its PEM header — **stops the
+  API from starting** and names the problem. That is deliberate: the alternative
+  is an install that reports "Play Integrity not configured" forever while an
+  operator believes it is on. The check is structural only, so a well-formed but
+  wrong key still boots and fails at the first verdict decode instead.
+</Aside>
+
 ## Binary Distribution
 
 | Variable | Default | Required | Description |
@@ -142,9 +203,9 @@ Push notifications to the iOS app go directly through Apple's push service (APNs
 | `HELPER_BINARY_DIR` | `./agent/bin` | | Local directory containing helper binaries. The bundled Docker Compose sets this to `/data/binaries/helper`. |
 | `GITHUB_REPO` | — | | **Deprecated** alias for `BINARY_GITHUB_REPOSITORY`, kept so a deployment that set it before the release-source unification does not silently revert to the official repo on upgrade. It is honoured only when `BINARY_GITHUB_REPOSITORY` is unset, logs a deprecation warning, and counts as an override for the production key requirement below. Migrate to `BINARY_GITHUB_REPOSITORY`. |
 | `BINARY_VERSION_FILE` | — | | Path to `VERSION` file for local mode DB registration (set automatically in Docker Compose) |
-| `BINARY_VERSION` | — | | Release tag for GitHub redirect mode (falls back to `BREEZE_VERSION`, then `latest`) |
+| `BINARY_VERSION` | — | | Release tag used for both the download redirect **and** boot-time GitHub sync (falls back to `BREEZE_VERSION`, then `latest`). Point it at the newest release that is actually **published** on GitHub — a pin to a tag with no published release registers no agent binaries at all, and does not fall back to `latest`. |
 | `RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS` | `yzx8ftmcls6uBetFC5SYnZhBo+cbur3IX50TbBthTso=` (official releases) | Yes (prod) | Comma-separated raw base64 Ed25519 public keys that sign release manifests. Use the published default for official Breeze releases (it is a public key, safe to commit); only change it if you sign your own binaries. When `BINARY_GITHUB_REPOSITORY` points at your own signing repository, this **must** be your own manifest key (the workflow run summary prints it). The API refuses to start in production without it. `BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS` is accepted as an alias. |
-| `AGENT_AUTO_PROMOTE` | `true` | | Controls whether a newly registered/synced agent release immediately becomes the fleet upgrade target. `true` (default): publishing a release promotes it to the fleet at once. `false`: new binaries stay downloadable but the fleet only advances when you explicitly promote a version (platform admin + MFA) — see [Controlled agent fleet rollout](/deploy/upgrades/#controlled-agent-fleet-rollout). |
+| `AGENT_AUTO_PROMOTE` | `true` | | Controls whether a newly registered/synced agent release immediately becomes the fleet upgrade target. `true` (default): syncing a release promotes it to the fleet at once. Boot-time sync is pinned to the release matching your own `BREEZE_VERSION` (or `BINARY_VERSION`), so a newly published GitHub release does not move your fleet until you upgrade your server images. `false`: new binaries stay downloadable but the fleet only advances when you explicitly promote a version (platform admin + MFA) — see [Controlled agent fleet rollout](/deploy/upgrades/#controlled-agent-fleet-rollout). |
 
 See [Binary Distribution](/deploy/binaries/) for details on local vs GitHub mode and S3 offloading.
 
@@ -167,9 +228,9 @@ The Breeze stack includes a [coturn](https://github.com/coturn/coturn) TURN serv
 
 | Variable | Default | Required | Description |
 |---|---|---|---|
-| `TURN_HOST` | — | Yes (prod) | Public IP or hostname of the TURN server. Must be reachable by agents and viewers. |
+| `TURN_HOST` | — | Only with the `turn` profile | Public IP or hostname of the TURN server. Must be reachable by agents and viewers. |
 | `TURN_PORT` | `3478` | | TURN listening port (UDP and TCP) |
-| `TURN_SECRET` | — | Yes (prod) | Shared secret for TURN credential generation. Generate: `openssl rand -hex 32` |
+| `TURN_SECRET` | — | Only with the `turn` profile | Shared secret for TURN credential generation. Generate: `openssl rand -hex 32`. Not needed to bring the stack up: the bundled Compose file only starts coturn under the `turn` profile, and when it is enabled coturn refuses to start on an empty secret rather than running as an open relay. The value is mounted as a file rather than passed on the command line. |
 | `TURN_REALM` | `breeze.local` | | TURN authentication realm |
 
 <Aside type="tip">
@@ -184,7 +245,7 @@ The Breeze stack includes a [coturn](https://github.com/coturn/coturn) TURN serv
 
 | Variable | Default | Description |
 |---|---|---|
-| `METRICS_SCRAPE_TOKEN` | — | Bearer token for `/metrics/scrape` |
+| `METRICS_SCRAPE_TOKEN` | — | Bearer token for `/metrics/scrape`. The same token also guards the optional worker container's own `/metrics` endpoint — a separate scrape target. See [Worker Split](/deploy/worker-split/). |
 | `METRICS_INCLUDE_ORG_ID` | `false` | Include org IDs in Prometheus labels |
 | `METRICS_SCRAPE_IP_ALLOWLIST` | — | Restrict metrics scraping by IP |
 | `LOG_LEVEL` | `info` | Log verbosity: `debug`, `info`, `warn`, `error` |
@@ -197,6 +258,57 @@ The Breeze stack includes a [coturn](https://github.com/coturn/coturn) TURN serv
 | `ALERTMANAGER_PORT` | `9093` | Alertmanager web UI port (monitoring stack) |
 | `LOKI_PORT` | `3100` | Loki log aggregation API port (monitoring stack) |
 | `DEVICE_METRICS_RETENTION_DAYS` | `30` | Retention for the raw `device_metrics` series, clamped to 1–365. History charts are served from `metric_rollups` and are unaffected. **On first run after upgrading, older raw metrics are pruned — set this before starting the new version if you need more than 30 days.** |
+
+### Background retention sweeps
+
+Breeze prunes its own operational tables nightly so a long-running instance does not accumulate delivery queues and diagnostic history forever. Every one of these is optional — the defaults are sensible and nothing needs setting on a normal deployment. Each sweep runs in batches so it never holds a long transaction; raise `*_MAX_BATCHES` only if a sweep repeatedly stops before it has caught up.
+
+| Variable | Default | Description |
+|---|---|---|
+| `TICKET_OUTBOX_RETENTION_DAYS` | `14` | Days to keep delivered or exhausted ticket-email delivery records, clamped to 1–365 |
+| `TICKET_OUTBOX_RETENTION_BATCH_SIZE` | `5000` | Rows deleted per batch |
+| `TICKET_OUTBOX_RETENTION_MAX_BATCHES` | `50` | Maximum batches per nightly run |
+| `INTENT_OUTBOX_RETENTION_DAYS` | `14` | Days to keep delivered approval/action-intent delivery records, clamped to 1–365 |
+| `INTENT_OUTBOX_RETENTION_BATCH_SIZE` | `5000` | Rows deleted per batch |
+| `INTENT_OUTBOX_RETENTION_MAX_BATCHES` | `50` | Maximum batches per nightly run |
+| `METRIC_ANOMALY_INCIDENT_RETENTION_DAYS` | `14` | Days to keep resolved metric-anomaly incidents, clamped to 1–365 |
+| `METRIC_ANOMALY_INCIDENT_RETENTION_BATCH_SIZE` | `5000` | Rows deleted per batch |
+| `METRIC_ANOMALY_INCIDENT_RETENTION_MAX_BATCHES` | `50` | Maximum batches per nightly run |
+| `AGENT_LOG_RETENTION_DAYS` | `7` | Days to keep uploaded agent diagnostic logs, clamped to 1–365 |
+| `AGENT_LOG_RETENTION_BATCH_SIZE` | `10000` | Rows deleted per batch |
+| `AGENT_LOG_RETENTION_MAX_BATCHES` | `200` | Maximum batches per nightly run |
+| `CHANGE_LOG_RETENTION_DAYS` | `90` | Days to keep processed device change-log entries, clamped to 1–365 |
+| `CHANGE_LOG_RETENTION_BATCH_SIZE` | `10000` | Rows deleted per batch |
+| `CHANGE_LOG_RETENTION_MAX_BATCHES` | `200` | Maximum batches per nightly run |
+| `IP_HISTORY_RETENTION_DAYS` | `90` | Days to keep device IP-address history, clamped to 1–365 |
+| `IP_HISTORY_RETENTION_BATCH_SIZE` | `10000` | Rows deleted per batch |
+| `IP_HISTORY_RETENTION_MAX_BATCHES` | `200` | Maximum batches per nightly run |
+| `SNMP_METRICS_RETENTION_DAYS` | `7` | Days to keep raw SNMP-polled metrics, clamped to 1–365 |
+| `SNMP_METRICS_RETENTION_BATCH_SIZE` | `10000` | Rows deleted per batch |
+| `SNMP_METRICS_RETENTION_MAX_BATCHES` | `200` | Maximum batches per nightly run |
+| `PROCESS_SAMPLE_RETENTION_DAYS` | `7` | Days to keep per-process monitoring samples, clamped to 1–14. Not batch/max-batches tunable — this sweep loops in fixed 10,000-row batches until caught up. |
+| `SERVICE_PROCESS_CHECK_RESULTS_RETENTION_DAYS` | `14` | Days to keep service/process watch check results, clamped to 1–365. Not batch/max-batches tunable — same fixed-batch-loop shape as the process-sample sweep above. |
+| `RELIABILITY_HISTORY_RETENTION_DAYS` | `120` | Days to keep device reliability-scoring history, floored at 30 |
+| `RELIABILITY_HISTORY_RETENTION_BATCH_SIZE` | `10000` | Rows deleted per batch |
+| `RELIABILITY_HISTORY_RETENTION_MAX_BATCHES` | `50` | Maximum batches per nightly run |
+| `ML_OUTPUT_RETENTION_DAYS` | `365` | Days to keep stored ML model outputs, floored at 30 |
+| `ML_OUTPUT_RETENTION_BATCH_SIZE` | `5000` | Rows deleted per batch |
+| `ML_OUTPUT_RETENTION_MAX_BATCHES` | `50` | Maximum batches per nightly run |
+| `USER_RISK_RETENTION_DAYS` | `90` | Days to keep resolved user-risk signal history, floored at 30 |
+| `USER_RISK_RETENTION_BATCH_SIZE` | `5000` | Rows deleted per batch |
+| `USER_RISK_RETENTION_MAX_BATCHES` | `50` | Maximum batches per nightly run |
+
+Audit-log retention is **not** set here — it is a per-organization policy an operator saves in the app. See [Audit Logs → Retention](/reference/audit-logs/#retention-policies).
+
+### Audit-chain verification
+
+The nightly job that re-verifies the tamper-evident audit chain is bounded rather than walking the whole table every night.
+
+| Variable | Default | Description |
+|---|---|---|
+| `AUDIT_CHAIN_VERIFY_ENABLED` | `true` | Set to `false` to turn nightly verification off. From v0.110.0 this also stops a sweep that is already running, not just the schedule — previously, restarting the API with the flag off could hand the in-flight sweep to the fresh container and re-run it from the beginning |
+| `AUDIT_CHAIN_VERIFY_MODE` | `incremental` | `incremental` verifies new rows since the last anchor plus one rolling slice of history per night. Set to `full` to restore the old whole-table walk — expect substantially more database I/O |
+| `AUDIT_CHAIN_VERIFY_RESCAN_SLICES` | `30` | How many nightly slices the historical portion of the chain is divided into. At the default, every historical row is re-verified at least once a month |
 
 ### Event-loop lag monitor
 
@@ -286,6 +398,26 @@ Like event-loop lag, these figures are kept off the unauthenticated
 `/health/ready` for the same reason — they describe how close the instance is to
 falling over.
 
+### Readiness probe tuning
+
+`/ready` and `/health/ready` answer a real readiness question — are Postgres,
+Redis and the background consumers this process needs actually up — as distinct
+from `/health`, which is liveness only and answers 200 well before that. Point a
+load balancer or Compose healthcheck that should hold traffic back at `/ready`.
+See [Health Monitoring](/monitoring/health/) for the response shapes and for the
+worker container's own variant of the endpoint.
+
+Neither of these needs setting; the defaults suit every deployment we know of.
+
+| Variable | Default | Description |
+|---|---|---|
+| `READINESS_CACHE_TTL_MS` | `5000` | How long a readiness verdict is reused before the probes run again, so a busy load balancer cannot turn a healthcheck into a database workload. Accepted range is `0`–`10000` minus the probe timeout below. |
+| `READINESS_PROBE_TIMEOUT_MS` | `3000` | Hard bound on each individual Postgres and Redis probe. Clamped to `100`–`5000` — a wedged dependency reports not-ready rather than hanging the healthcheck. |
+
+| Variable | Default | Description |
+|---|---|---|
+| `OFFLINE_DETECTOR_WORKER_CONCURRENCY` | `5` | How many offline-sweep jobs the offline detector processes at once. Clamped to `1`–`20`; anything unparseable falls back to `5`. Raise it only if offline detection visibly lags on a very large fleet. |
+
 ## Sentry
 
 Both API and web Sentry integrations are off by default. Leave the DSN variables blank to disable. See [Error Tracking & Privacy](/security/error-tracking/) for what gets collected and how scrubbing works.
@@ -293,7 +425,7 @@ Both API and web Sentry integrations are off by default. Leave the DSN variables
 | Variable | Default | Description |
 |---|---|---|
 | `SENTRY_DSN` | — | API Sentry DSN. Leave blank to disable server-side error tracking. |
-| `SENTRY_ENVIRONMENT` | `production` | Sentry environment tag |
+| `SENTRY_ENVIRONMENT` | `production` | Sentry environment tag. In a **multi-region** deployment use a region-qualified value (`production-us`, `production-eu`) — a bare `production` on every region makes them indistinguishable in Sentry, and `server_name` is a per-deploy container hash, so nothing else can attribute an error to a region. |
 | `SENTRY_RELEASE` | — | Sentry release tag (e.g. git SHA) |
 | `SENTRY_TRACES_SAMPLE_RATE` | `0.1` | Sentry performance trace sample rate (0.0-1.0) |
 | `SENTRY_PROFILES_SAMPLE_RATE` | — | API performance-profiling sample rate (0.0-1.0). Leave blank to disable profiling. |
@@ -302,13 +434,17 @@ Both API and web Sentry integrations are off by default. Leave the DSN variables
 
 ## Rate Limiting
 
-Per-user and per-endpoint rate limits (login, MFA, dashboard usage) are fixed in code and not configurable via environment variables. The one deployment-tunable limit is the per-org agent cap, which bounds how much traffic a single tenant's fleet can generate, even with thousands of agents.
+Most per-endpoint rate limits (MFA, dashboard usage) are fixed in code and not configurable via environment variables. A few are deployment-tunable: the per-org agent cap, which bounds how much traffic a single tenant's fleet can generate even with thousands of agents, plus the account lockout and refresh-token limits on the login path.
 
 | Variable | Default | Description |
 |---|---|---|
 | `AGENT_ORG_RATE_LIMIT_PER_MIN` | `600` | **Floor** for the per-organization sliding-window rate limit on agent-authenticated endpoints. The effective ceiling scales with the org's enrolled device count (see `AGENT_ORG_RATE_LIMIT_PER_DEVICE`), so this value only applies to small orgs. Returns `429` with a `Retry-After` derived from the window reset. Not mapped in the stock compose file — to change it, add it to the `api` service `environment:` block as well as `.env`. |
 | `AGENT_ORG_RATE_LIMIT_PER_DEVICE` | `12` | Requests per minute allowed per enrolled device when sizing the per-organization ceiling. A steady-state agent uses ~2 req/min, so the default leaves roughly 6x headroom for synchronized bursts, manual scans and command traffic. |
 | `AGENT_ORG_RATE_LIMIT_MAX` | `20000` | Hard platform ceiling for the per-organization limit, regardless of device count. Keeps the per-tenant guardrail meaningful for very large fleets. |
+| `LOGIN_ACCOUNT_LOCKOUT_MAX` | `5` | Consecutive failed password attempts (keyed per account, not per IP) before the account is locked for the window below. Set to `0` to disable lockout entirely. Not mapped in the stock compose file — add it to the `api` service `environment:` block as well as `.env`. |
+| `LOGIN_ACCOUNT_LOCKOUT_WINDOW_SECONDS` | `900` | Lockout duration once `LOGIN_ACCOUNT_LOCKOUT_MAX` is reached. Not mapped in the stock compose file — add it to the `api` service `environment:` block as well as `.env`. |
+| `AUTH_REFRESH_RATE_LIMIT` | `60` | Requests per window allowed on `POST /auth/refresh`, keyed per refresh-token family (roughly one browser session chain). |
+| `AUTH_REFRESH_RATE_WINDOW_SECONDS` | `60` | Window for `AUTH_REFRESH_RATE_LIMIT`. |
 
 <Aside type="note">
   Earlier `.env.example` files carried `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX_REQUESTS`, `SESSION_MAX_AGE`, and `ENABLE_API_DOCS` entries. None of these were ever read by the API — they are gone from `.env.example` as of v0.99.0 and can be safely deleted from your `.env`.
@@ -356,22 +492,56 @@ with its own rollout gate. See [Rollout Modes](/deploy/rollout-modes/).
 | `AGENT_MTLS_BINDING_MODE` | `off` | `audit` counts certificate/device binding mismatches without denying; `enforce` denies them. Requires a validating proxy. Never inferred from `NODE_ENV`/`IS_HOSTED`/`CF_MTLS_*`. |
 | `MANAGED_SOFTWARE_POLICY_MODE` | `compat` | `enforce` requires an upgraded agent for every managed-software command, public destinations included. Check your not-yet-upgraded device count first — they are denied outright. |
 | `AGENT_REQUIRE_MANIFEST_SIGNING_KEY_ID` | `false` | Requires update manifests to carry a signing key ID. Not fleet-wide: older agent builds ignore the pushed value. Only enable once the missing-ID count has been zero for 7 consecutive days. |
+| `AUTH_BROWSER_TRANSITIONS_ENFORCED` | `false` | Phased rollout switch for a browser-session binding hardening mechanism that ties an issued session to a browser-generated binding value, so a stolen refresh token alone is not enough to move a session to a different browser. `true` requires every new session to carry the binding and disables legacy issuance. Validated at boot: must be a boolean (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`) when set. |
+| `AUTH_BROWSER_TERMINAL_PREPARATION_ENABLED` | `false` | Extends the same binding to terminal/native sessions. Requires `AUTH_BROWSER_TRANSITIONS_ENFORCED=true` — the API refuses to boot if this is `true` while that one is not. |
 
 ## Feature Flags
 
 | Variable | Default | Description |
 |---|---|---|
 | `ENABLE_REGISTRATION` | `true` | Allow new user registration |
+| `PENDING_ACCOUNT_MEETING_URL` | — | Optional absolute `http(s)` URL to a scheduling page. When set, a partner whose account is still **pending** sees it as a secondary link beside the billing call-to-action on the account-inactive screen, so a partner who cannot complete payment is not left at a dead end. Values that are not `http`/`https` are ignored. |
+| `PENDING_ACCOUNT_MEETING_LABEL` | `Book a call with us` | Optional link text for the pending-account booking link above. |
 | `ENABLE_2FA` | `true` | Enable two-factor authentication |
 | `ENABLE_API_DOCS_UI` | on outside production, off in production | Serve the interactive Swagger UI and OpenAPI spec at `/api/v1/docs`. The UI loads its scripts and styles from unpkg, which is why it defaults off in production. (The former `ENABLE_API_DOCS` variable was never read and has been removed.) |
 | `USE_AGENT_SDK` | — | Use Claude Agent SDK for AI chat |
 | `PORTAL_STATE_BACKEND` | `memory` | Portal state backend: `memory` or `redis` (auto `redis` in production) |
 | `PUBLIC_ENABLE_EDR_INTEGRATIONS` | `false` | Surface the EDR UI: the `/security/edr` fleet page, the device Security-tab EDR panel, and the Security dashboard summary cards. Set `true` at web image build time to enable. |
-| `PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST` | `false` | Surface network-discovered assets alongside agent endpoints in the Devices list view. Set `true` at web image build time to enable. |
+| `PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST` | `true` | Surface network-discovered assets alongside agent endpoints in the Devices list view (on by default since v0.111). Set `false` at web image build time to return to the agent-only list. |
+| `BREEZE_WORKSPACE_ENABLED` | `false` in the production compose files (`true` in the dev override) | Load the built-in **AI Workspace** extension. Off by default — leave it unset unless you want Workspace. **Requires a PostgreSQL image that provides the `pgvector` extension** (see the aside below). |
+| `BREEZE_AI_AGENTS_ENABLED` | `false` | Surface **AI Agents** (Settings → AI Agents). Off by default — no agent exists, runs, or appears in the UI until this is `true`. Enabling the flag does not by itself let an agent change anything: every agent starts in **Off**, and moving one to **Act** is a separate, MFA-confirmed opt-in per agent. Must also be mapped in the `api` service's `environment:` block, not just set in `.env`. |
+| `BREEZE_AI_AGENTS_POLICY_DECIDE_ENABLED` | `false` | Sub-flag of `BREEZE_AI_AGENTS_ENABLED` for the policy-decide capability, which is **not yet generally available** — leave it off. When enabled it lets an agent authorise a supervised-scope action on its own policy decision instead of sending it to a human approver, and it is what allows an operation to be **promoted** to that status from the Graduation panel. Automatic **demotion** is not gated by this flag and is always on. An operation only ever goes live on the organization's own agent — a partner-wide list is a ceiling, not a grant, so grant each organization explicitly before enabling this. See [AI Agents → Graduation](/features/ai-agents/#graduation-feedback-loop). An unrecognised value stops the API at boot rather than silently reading as off. |
+| `DEVICE_COMMAND_OFFLINE_QUEUE_ENABLED` | `true` | Fire-and-forget device actions (scripts, patch installs, patch scans, software installs, reboots, automations, …) issued against an offline device are queued and delivered on its next successful heartbeat, up to a per-action-type deadline. Most action types — including scripts, patch installs, and patch scans — get **7 days**; a narrower set of self-superseding actions (device inventory/config-sync commands, plus reboot/shutdown/scheduled-restart) get **24 hours** instead, since a week-old copy of one of those would be stale by the time it lands. Set `false` to go back to the pre-#5128 behavior of rejecting the action outright when the device is offline. This escape hatch is temporary and is removed in a later release, so treat `false` as a window to adjust your automations, not a permanent setting. |
+| `DEVICE_COMMAND_QUEUE_TTL_HOURS` | `168` (7 days) | How long a queued **standard** action may wait for its device before it expires undelivered. Covers scripts, patch installs, patch scans, software installs, and automation actions. |
+| `DEVICE_COMMAND_QUEUE_SHORT_TTL_HOURS` | `24` | Deadline for **self-superseding** queued work — inventory refreshes, log-level changes, agent auto-update and rollback, browser-policy application, and the audit, security, reliability, hardware and encryption-key collections. The next run of any of these replaces the last, so a week-old copy would be stale by the time it landed. |
+| `DEVICE_COMMAND_QUEUE_POWER_STATE_TTL_HOURS` | `24` | Deadline for queued **power-state** work: reboot, shutdown, and scheduled restart. |
+
+<Aside type="note" title="Queue deadlines are per action type">
+  All three deadlines are read per queued action when it is created, in hours, and any value that is not a positive number falls back to the default. Lowering one does not shorten rows that are already queued — the deadline is stamped at queue time. A row that reaches its deadline without the device coming back expires **undelivered**, and the action reports as expired rather than sitting pending forever. See [Devices → Queued actions](/features/devices/) for what a technician sees.
+</Aside>
 
 <Aside>
   Variables prefixed with `PUBLIC_` are **web build-time flags** — they are baked into the web bundle when the image is built and cannot be changed at runtime by editing `.env`. To toggle them, set the value in your build environment and rebuild the web image.
 </Aside>
+
+<Aside type="caution" title="Enabling AI Workspace requires pgvector">
+  Workspace's migrations run `CREATE EXTENSION vector` when the API boots. On a stock `postgres:16-alpine` the API **refuses to start** with `extension "vector" is not available`, naming the flag and both remedies.
+
+  Use a Postgres image that ships the extension — the `POSTGRES_IMAGE_REF` default (`pgvector/pgvector:pg16`) already does, and is the same Postgres major version as stock with the extension baked in. On a managed Postgres, confirm your provider offers `pgvector` before turning the flag on.
+
+  If you do not want Workspace, leave `BREEZE_WORKSPACE_ENABLED` unset — no extension is needed and nothing else changes.
+</Aside>
+
+## Durable event dispatch
+
+Event dispatch settings select how a subscriber receives events. They do not enable or disable the feature behind that subscriber. For example, the ticket-helpdesk and anomaly agent lanes still run in-process with the default `off` mode. See [AI Agents](/features/ai-agents/) for lane requirements and durable trigger guidance.
+
+| Variable | Default | Description |
+|---|---|---|
+| `EVENT_DISPATCH_MODE` | `off` | Accepts `off`, `shadow`, or `enforce`. `off` uses in-process delivery only. `shadow` also mirrors routing plans into delivery receipts for observability but executes nothing through the queue. `enforce` sends each named subscriber through the BullMQ queue only, skips its in-process delivery, and leaves unnamed subscribers in-process. |
+| `EVENT_DISPATCH_QUEUE_SUBSCRIBERS` | — | Comma-separated subscriber IDs used only when the mode is `enforce`: `ai-agent-alert-verdict`, `ai-agent-anomaly`, `ai-agent-ticket-helpdesk`, `automation-worker`, `dns-threat-alerts`, `notification-dispatcher`, `policy-alert-bridge`, `webhook-delivery`. An empty list is accepted but leaves everything in-process and produces a boot warning. The variable is ignored in other modes. |
+
+Both variables are validated when the API starts. An invalid mode or an unknown subscriber ID stops the API from starting and identifies the invalid value. As with other API settings, map each variable in the `api` service's `environment:` block of your compose file as well as setting it in `.env`.
 
 ## MCP Server
 
@@ -402,6 +572,12 @@ with its own rollout gate. See [Rollout Modes](/deploy/rollout-modes/).
 | `CF_ACCESS_TEAM_DOMAIN` | — | Required when trust is enabled. Bare hostname of your Cloudflare team domain, e.g. `example.cloudflareaccess.com`. No scheme. |
 | `CF_ACCESS_AUD` | — | Required when trust is enabled. AUD tag for the Cloudflare Access application protecting Breeze. |
 | `CF_ACCESS_TRUSTS_MFA` | `false` | Treat a valid CF Access JWT as MFA-satisfied for the minted Breeze session. Only enable if your CF Access policy actually requires step-up MFA. |
+
+## Backup (Enterprise Agent Backup)
+
+| Variable | Default | Description |
+|---|---|---|
+| `AGENT_BACKUP_SERVER_URL` | — | Instance-level backup control-plane URL, pushed to every agent through its config, enrollment response, and heartbeat reply. Lets you point the [enterprise backup](/deploy/binaries/#backup-binary) subsystem (Hyper-V, MSSQL, system image) at a separate backup control plane instead of the main API. Must be `https://` in production; `http://` is accepted only for `localhost`/`127.0.0.1`. Leave unset to keep backups pointed at the main API. |
 
 ## Cloud-to-Cloud Backup (M365)
 
@@ -497,7 +673,7 @@ It uses the same isolation model as Graph-read: the Entra certificate and Key Va
 
 | Variable | Required when enabled | Format / example | Meaning |
 |---|---|---|---|
-| `M365_GRAPH_ACTIONS_TOOLS_ENABLED` | — (the switch) | `true` / `false` (default `false`) | Master switch for the M365 write-action tools. When `false`, none of the variables below are validated and the write tools are unavailable. |
+| `M365_GRAPH_ACTIONS_TOOLS_ENABLED` | — (the switch) | `true` / `false`, `1` / `0`, `yes` / `no`, `on` / `off` (default `false`) | Master switch for the M365 write-action tools. When `false`, none of the variables below are validated and the write tools are unavailable. **From v0.106.0 a value outside the list above stops the API from starting** (it was previously read as "off", silently leaving the write tools dark), and turning it on additionally requires `APP_ENCRYPTION_KEY_ID`. |
 | `M365_GRAPH_ACTIONS_TOOLS_ORG_IDS` | Yes | Literal `*` or comma-separated canonical org UUIDs | Which Breeze organizations may use M365 write actions. `*` = all organizations; otherwise an allowlist. Leave empty while the feature is off. |
 | `M365_CUSTOMER_GRAPH_ACTIONS_CLIENT_ID` | Yes | Canonical UUID | Entra application (client) ID of the multi-tenant Graph-actions app. |
 | `M365_CUSTOMER_GRAPH_ACTIONS_CREDENTIAL_VERSION` | Yes | Exactly 32 lowercase hex characters | Pins which stored credential version the executor must use. Must equal the version segment of `M365_CUSTOMER_GRAPH_ACTIONS_VAULT_REF`. |
@@ -547,6 +723,24 @@ It uses the same isolation model as Graph-read: the Entra certificate and Key Va
 | `ANTHROPIC_AUTH_TOKEN` | — | Bearer token for the custom backend (use instead of `ANTHROPIC_API_KEY` when `ANTHROPIC_BASE_URL` is set). |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Override the default model id for a raw vLLM backend. Leave unset with a LiteLLM gateway that aliases `claude-sonnet-4-6` → your model. |
 
+### AI Operator (preview, off by default)
+
+[AI Operator](/features/ai-agents/#ai-operator-preview) hands a long-running task
+to an agent that keeps working after the browser is closed. It is gated
+separately from the rest of the AI-agent subsystem, and `BREEZE_AI_AGENTS_ENABLED`
+still has to be on above it.
+
+| Variable | Default | Description |
+|---|---|---|
+| `AI_OPERATOR_TASKS_ENABLED` | `false` | Admit AI Operator tasks and their continuation runs. With this off, the **Delegate to Operator** action does not appear and no task can be created. |
+| `AI_OPERATOR_RECIPE_SERVICE_RECOVERY_ENABLED` | `false` | Allow the one shipped recipe, **service recovery**. Task admission needs this as well as the flag above. |
+
+With both flags off the whole subsystem is inert. Its two background workers —
+the task coordinator (15-second tick) and the task-event publisher (5-second
+tick) — are still registered so that a task already in flight when you turn the
+feature off can finish cleanly, but with no tasks being admitted neither has
+anything to do. No new queue is added.
+
 ### Self-hosted: alternative Anthropic-compatible backends
 
 A self-hosted operator can run the AI Agent against any backend that speaks the
@@ -581,6 +775,12 @@ cheap local model, not `$0`. For accurate accounting, add the served model id to
 `MODEL_PRICING` in `aiCostTracker.ts`, or use the openai-compatible path's
 `MCP_LLM_PRICE_*` overrides.
 
+## Breeze AI for Office (add-ins, optional)
+
+| Variable | Default | Description |
+|---|---|---|
+| `CLIENT_AI_ENTRA_CLIENT_ID` | — | Entra application (client) ID for the multi-tenant **Breeze AI for Office** add-in app registration. The entire `/api/v1/client-ai/admin/*` admin surface (tenant mapping, org policy, usage, templates) answers `404` ("Breeze AI for Office is not enabled") until this is set. Leave unset if you don't use the Office add-ins' AI features. |
+
 ## Accounting (QuickBooks Online)
 
 | Variable | Default | Description |
@@ -589,9 +789,10 @@ cheap local model, not `$0`. For accurate accounting, add the served model id to
 | `QBO_CLIENT_SECRET` | — | Intuit OAuth client secret |
 | `QBO_REDIRECT_URI` | — | OAuth callback URL registered with Intuit (e.g. `https://your-domain/accounting/quickbooks/callback`) |
 | `QBO_ENVIRONMENT` | — | `sandbox` or `production` |
+| `QBO_WEBHOOK_VERIFIER_TOKEN` | — | Intuit app verifier token for `POST /api/v1/webhooks/quickbooks`. Optional. Without it the webhook endpoint answers `503` on every delivery (so Intuit keeps retrying) and payments arrive on the 15-minute reconcile sweep instead — the sweep is the guaranteed path either way, the webhook only makes it faster. Intuit allows one webhook endpoint per app, so a multi-region deployment can only point it at one region. |
 
 <Aside>
-  All four are optional and validated lazily — the API boots fine without them. Until they're set, the in-app QuickBooks connect flow reports that QuickBooks isn't configured on this instance. Set all four to enable [Accounting integration](/features/integrations/#accounting-integrations).
+  The first four are optional and validated lazily — the API boots fine without them. Until they're set, the in-app QuickBooks connect flow reports that QuickBooks isn't configured on this instance. Set all four to enable [Accounting integration](/features/integrations/#accounting-integrations). `QBO_WEBHOOK_VERIFIER_TOKEN` is independent of them and only affects how quickly recorded payments come back.
 </Aside>
 
 ## Vulnerability Management
@@ -599,3 +800,17 @@ cheap local model, not `$0`. For accurate accounting, add the served model id to
 | Variable | Default | Description |
 |---|---|---|
 | `NVD_API_KEY` | — | Optional NIST NVD API key. Raises NVD request rate limits so vulnerability feed syncs run faster. Without it, syncs use the slower public rate; the feature works either way. |
+
+## Partner trust probation (hosted service only)
+
+<Aside type="note" title="Self-hosted installs can skip this section">
+  These variables drive the signup-abuse controls on the hosted Breeze service, where anyone can create a partner account. On a self-hosted install they do nothing: the mode resolves to `off` unless `IS_HOSTED=true`, whatever value you set, and with it off no trust code path touches the database, Redis, or the network. You do not need to set any of them.
+</Aside>
+
+| Variable | Default | Description |
+|---|---|---|
+| `PARTNER_TRUST_MODE` | `off` when `IS_HOSTED` is not `true`; otherwise `shadow` | `off` disables the feature entirely. `shadow` classifies new self-serve partners and records what it *would* have done without denying anything. `enforce` places new partners in probation until a card payment settles and ages, or an admin approves them from the trust queue. |
+| `IP_CLASSIFY_PROVIDER` | — | IP-reputation provider used to classify a signup's origin. Unset means signups classify as `unknown` and promotion out of probation is manual only. |
+| `IP_CLASSIFY_API_KEY` | — | API key for that provider. Setting a provider without a key logs a warning and falls back to the offline classifier. |
+| `TRUST_ACTION_TOKEN_SECRET` | falls back to `JWT_SECRET` | Signs the one-time action links in trust-review emails. |
+| `PARTNER_MEETING_URL` | — | Booking link offered to a partner under review so they can talk to a human. Omitted from the notice when unset. |

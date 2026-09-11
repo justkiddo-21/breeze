@@ -1,15 +1,34 @@
 import '@/lib/i18n';
 import { useTranslation } from 'react-i18next';
 import { useState, useEffect, useCallback } from 'react';
-import { Bot, DollarSign, Flag, MessageSquare, Zap, Save, Loader2, Lock } from 'lucide-react';
+import { Bot, Coins, DollarSign, Flag, MessageSquare, Zap, Save, Loader2, Lock } from 'lucide-react';
 import { fetchWithAuth } from '../../stores/auth';
 import { useOrgStore } from '../../stores/orgStore';
-import { formatDateTime } from '@/lib/dateTimeFormat';
+import { formatDate, formatDateTime } from '@/lib/dateTimeFormat';
 import { formatCurrency, formatNumber } from '@/lib/i18n/format';
+import AiBudgetThresholdsInput, { DEFAULT_THRESHOLDS_PLACEHOLDER } from './AiBudgetThresholdsInput';
+
+/**
+ * Literal keys per alert period, so the i18n key scanner can see them (a
+ * `t(\`...${f.period}\`)` template is a dynamic key it cannot check).
+ */
+const PERIOD_LABEL_KEYS = {
+  daily: 'aiUsagePage.periodLabel.daily',
+  monthly: 'aiUsagePage.periodLabel.monthly',
+} as const;
 
 interface UsageData {
   daily: { inputTokens: number; outputTokens: number; totalCostCents: number; messageCount: number };
   monthly: { inputTokens: number; outputTokens: number; totalCostCents: number; messageCount: number };
+  /** Who pays for LLM calls: the platform key or the partner's own Anthropic key (BYOK). */
+  billedTo?: 'platform' | 'partner_key';
+  /** Name of the catalog endpoint the org's most recent session used, when
+   *  billed to the partner key via a platform-vetted third-party endpoint
+   *  rather than direct Anthropic (#3922 W4). */
+  catalogEndpointName?: string | null;
+  /** #4388 W04: the partner's cached platform-credit balance. `null`/absent
+   *  when BYOK, no partner id, or nothing cached yet. */
+  credits?: { remaining: number; includedBalance: number; purchasedBalance: number; fetchedAt: string } | null;
   budget: {
     enabled: boolean;
     monthlyBudgetCents: number | null;
@@ -17,7 +36,11 @@ interface UsageData {
     monthlyUsedCents: number;
     dailyUsedCents: number;
     approvalMode: string;
+    alertThresholdPercents?: number[];
   } | null;
+  alerts?: {
+    fired: Array<{ period: string; periodKey: string; thresholdPct: number; createdAt: string; deliveredAt: string | null }>;
+  };
 }
 
 interface SessionRow {
@@ -44,6 +67,7 @@ interface BudgetForm {
   messagesPerMinutePerUser: string;
   messagesPerHourPerOrg: string;
   approvalMode: ApprovalMode;
+  alertThresholdPercents: number[] | undefined;
 }
 
 export default function AiUsagePage() {
@@ -56,6 +80,12 @@ export default function AiUsagePage() {
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showFlaggedOnly, setShowFlaggedOnly] = useState(false);
+  // The org row cannot distinguish "inherit" from an explicit ladder, and the
+  // form seeds itself from the EFFECTIVE budget, so sending the field on every
+  // save would pin the inherited default (50/80/95) onto the org. Only a field
+  // the user actually edited in this session is sent (#4388 W03).
+  const [thresholdsDirty, setThresholdsDirty] = useState(false);
+  const [thresholdsValid, setThresholdsValid] = useState(true);
   const { currentOrgId } = useOrgStore();
   const [budget, setBudget] = useState<BudgetForm>({
     enabled: true,
@@ -65,6 +95,7 @@ export default function AiUsagePage() {
     messagesPerMinutePerUser: '20',
     messagesPerHourPerOrg: '200',
     approvalMode: 'per_step',
+    alertThresholdPercents: undefined,
   });
 
   const fetchData = useCallback(async () => {
@@ -73,15 +104,22 @@ export default function AiUsagePage() {
       const sessionsUrl = showFlaggedOnly
         ? '/ai/admin/sessions?limit=50&flagged=true'
         : '/ai/admin/sessions?limit=50';
-      const [usageRes, sessionsRes] = await Promise.all([
+      const [usageRes, sessionsRes, effRes] = await Promise.all([
         fetchWithAuth('/ai/usage'),
-        fetchWithAuth(sessionsUrl)
+        fetchWithAuth(sessionsUrl),
+        currentOrgId
+          ? fetchWithAuth(`/orgs/organizations/${currentOrgId}/effective-settings`).catch((err) => {
+              console.warn('[AiUsagePage] Error fetching effective settings:', err);
+              return null;
+            })
+          : Promise.resolve(null),
       ]);
 
       if (usageRes.ok) {
         const data = await usageRes.json();
         setUsage(data);
         if (data.budget) {
+          setThresholdsDirty(false);
           setBudget({
             enabled: data.budget.enabled,
             monthlyBudgetDollars: data.budget.monthlyBudgetCents ? (data.budget.monthlyBudgetCents / 100).toFixed(2) : '',
@@ -90,6 +128,7 @@ export default function AiUsagePage() {
             messagesPerMinutePerUser: '20',
             messagesPerHourPerOrg: '200',
             approvalMode: data.budget.approvalMode || 'per_step',
+            alertThresholdPercents: data.budget.alertThresholdPercents,
           });
         }
       }
@@ -99,17 +138,10 @@ export default function AiUsagePage() {
         setSessions(data.data || []);
       }
 
-      // Fetch locked fields from partner
-      if (currentOrgId) {
-        try {
-          const effRes = await fetchWithAuth(`/orgs/organizations/${currentOrgId}/effective-settings`);
-          if (effRes.ok) {
-            const effData = await effRes.json();
-            setLocked(effData.locked || []);
-          }
-        } catch (err) {
-          console.warn('[AiUsagePage] Error fetching effective settings:', err);
-        }
+      // Locked fields from partner (effective-settings), fetched in parallel above.
+      if (effRes && effRes.ok) {
+        const effData = await effRes.json();
+        setLocked(effData.locked || []);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : t('aiUsagePage.failedToLoadData'));
@@ -125,7 +157,7 @@ export default function AiUsagePage() {
   const budgetFields = [
     'enabled', 'monthlyBudgetCents', 'dailyBudgetCents',
     'maxTurnsPerSession', 'messagesPerMinutePerUser', 'messagesPerHourPerOrg',
-    'approvalMode',
+    'approvalMode', 'alertThresholdPercents',
   ];
   const allFieldsLocked = budgetFields.every((f) => isLocked(f));
 
@@ -142,6 +174,12 @@ export default function AiUsagePage() {
       if (!isLocked('messagesPerMinutePerUser')) payload.messagesPerMinutePerUser = parseInt(budget.messagesPerMinutePerUser) || 20;
       if (!isLocked('messagesPerHourPerOrg')) payload.messagesPerHourPerOrg = parseInt(budget.messagesPerHourPerOrg) || 200;
       if (!isLocked('approvalMode')) payload.approvalMode = budget.approvalMode;
+      // Only when the user edited the ladder in this session: an untouched
+      // field is showing the effective (possibly inherited) value, and sending
+      // it back would write that value onto the org row as an explicit choice.
+      if (!isLocked('alertThresholdPercents') && thresholdsDirty) {
+        payload.alertThresholdPercents = budget.alertThresholdPercents ?? null;
+      }
 
       const res = await fetchWithAuth('/ai/budget', {
         method: 'PUT',
@@ -177,6 +215,13 @@ export default function AiUsagePage() {
       <div>
         <h1 className="text-xl font-semibold tracking-tight">{t('aiUsagePage.aIUsageBudget')}</h1>
         <p className="text-muted-foreground">{t('aiUsagePage.monitorAIAssistantUsageAndConfigureBudgetLimits')}</p>
+        {usage?.billedTo === 'partner_key' && (
+          <p className="mt-1 text-sm text-muted-foreground" data-testid="ai-usage-billed-to-note">
+            {usage.catalogEndpointName
+              ? t('aiUsagePage.billedToPartnerKeyViaEndpoint', { name: usage.catalogEndpointName })
+              : t('aiUsagePage.billedToPartnerKey')}
+          </p>
+        )}
       </div>
 
       {error && (
@@ -213,7 +258,27 @@ export default function AiUsagePage() {
             output: formatTokens(usage?.monthly.outputTokens ?? 0)
           })}
         />
+        {usage?.credits && (
+          <StatCard
+            icon={Coins}
+            label={t('aiUsagePage.creditsRemaining')}
+            value={formatNumber(usage.credits.remaining)}
+          />
+        )}
       </div>
+
+      {usage?.alerts?.fired?.length ? (
+        <p data-testid="ai-budget-fired-rungs" className="text-xs text-muted-foreground">
+          {usage.alerts.fired.map((f) => {
+            const periodKey = PERIOD_LABEL_KEYS[f.period as keyof typeof PERIOD_LABEL_KEYS];
+            return t('aiUsagePage.firedRung', {
+              pct: f.thresholdPct,
+              period: periodKey ? t(/* i18n-dynamic */ periodKey) : f.period,
+              date: formatDate(f.createdAt),
+            });
+          }).join(' · ')}
+        </p>
+      ) : null}
 
       {/* Budget configuration */}
       <div className="rounded-lg border bg-card p-6">
@@ -292,6 +357,22 @@ export default function AiUsagePage() {
             )}
           </label>
           <label className="block">
+            <span className="text-sm text-muted-foreground">{t('aiUsagePage.alertThresholds')}</span>
+            <AiBudgetThresholdsInput
+              value={budget.alertThresholdPercents}
+              onChange={(v) => { setThresholdsDirty(true); setBudget({ ...budget, alertThresholdPercents: v }); }}
+              onValidityChange={setThresholdsValid}
+              disabled={isLocked('alertThresholdPercents')}
+              placeholder={DEFAULT_THRESHOLDS_PLACEHOLDER}
+              testId="ai-budget-thresholds"
+            />
+            {isLocked('alertThresholdPercents') && (
+              <span className="mt-1 flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400 italic">
+                <Lock className="h-3 w-3" /> {t('aiUsagePage.managedByPartner')}</span>
+            )}
+            <span className="mt-1 block text-xs text-muted-foreground">{t('aiUsagePage.alertThresholdsHelp')}</span>
+          </label>
+          <label className="block">
             <span className="text-sm text-muted-foreground">{t('aiUsagePage.maxTurnsPerSession')}</span>
             <input
               type="number"
@@ -336,8 +417,9 @@ export default function AiUsagePage() {
         </div>
         <div className="mt-4 flex items-center gap-3">
           <button
+            data-testid="ai-budget-save"
             onClick={handleSaveBudget}
-            disabled={saving || allFieldsLocked}
+            disabled={saving || allFieldsLocked || !thresholdsValid}
             className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}

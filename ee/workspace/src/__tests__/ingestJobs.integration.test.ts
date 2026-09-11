@@ -10,6 +10,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { drizzle } from 'drizzle-orm/postgres-js';
+import { DrizzleQueryError, sql } from 'drizzle-orm';
+import { pgErrorCode } from '@breeze/shared/pgErrors';
 import type { WorkspaceDatabase } from '../hostTypes';
 import { createIngestJobsService } from '../services/ingestJobsService';
 import { createIngestJobRunner } from '../services/ingestJobRunner';
@@ -43,10 +45,10 @@ beforeAll(async () => {
               VALUES (${partnerA}, 'wsp-ingest-jobs-a', ${`wsp-ingest-jobs-a-${sfx}`}),
                      (${partnerB}, 'wsp-ingest-jobs-b', ${`wsp-ingest-jobs-b-${sfx}`}),
                      (${partnerC}, 'wsp-ingest-jobs-c', ${`wsp-ingest-jobs-c-${sfx}`})`;
-  await admin`INSERT INTO organizations (id, partner_id, name, slug)
-              VALUES (${orgA}, ${partnerA}, 'wsp-ingest-jobs-org-a', ${`wsp-ingest-jobs-org-a-${sfx}`}),
-                     (${orgB}, ${partnerB}, 'wsp-ingest-jobs-org-b', ${`wsp-ingest-jobs-org-b-${sfx}`}),
-                     (${orgC}, ${partnerC}, 'wsp-ingest-jobs-org-c', ${`wsp-ingest-jobs-org-c-${sfx}`})`;
+  await admin`INSERT INTO organizations (id, partner_id, name, slug, currency_code)
+              VALUES (${orgA}, ${partnerA}, 'wsp-ingest-jobs-org-a', ${`wsp-ingest-jobs-org-a-${sfx}`}, 'USD'),
+                     (${orgB}, ${partnerB}, 'wsp-ingest-jobs-org-b', ${`wsp-ingest-jobs-org-b-${sfx}`}, 'USD'),
+                     (${orgC}, ${partnerC}, 'wsp-ingest-jobs-org-c', ${`wsp-ingest-jobs-org-c-${sfx}`}, 'USD')`;
 });
 
 afterAll(async () => {
@@ -145,6 +147,54 @@ describe('workspace_ingest_jobs RLS (W3, cross-tenant as breeze_app)', () => {
 
 describe('ingestJobsService lifecycle (W3, real PG as breeze_app)', () => {
   const svc = (db: WorkspaceDatabase) => createIngestJobsService(db);
+
+  it('recovers a real wrapped 23505 without aborting the outer org transaction', async () => {
+    await admin`DELETE FROM workspace_ingest_jobs WHERE org_id = ${orgC}`;
+    const winner = await withOrg(orgC, partnerC, (db) => svc(db).ensureJob(orgC, { trigger: 'manual' }));
+    let firstExecute = true;
+    let insertError: unknown;
+    // Deterministically model losing the NOT EXISTS race: replace only the
+    // first INSERT with an unconditional duplicate, but execute it on the real
+    // Drizzle connection/savepoint. PostgreSQL itself raises and aborts 23505.
+    function losingRacer(db: WorkspaceDatabase): WorkspaceDatabase {
+      return new Proxy(db, {
+        get(target, property) {
+          if (property === 'transaction') {
+            return (fn: (tx: WorkspaceDatabase) => Promise<unknown>) =>
+              target.transaction((tx) => fn(losingRacer(tx)));
+          }
+          if (property === 'execute') {
+            return async (query: Parameters<WorkspaceDatabase['execute']>[0]) => {
+              if (!firstExecute) return target.execute(query);
+              firstExecute = false;
+              try {
+                return await target.execute(sql`INSERT INTO workspace_ingest_jobs (org_id, trigger)
+                  VALUES (${orgC}::uuid, 'manual') RETURNING *`);
+              } catch (error) {
+                insertError = error;
+                throw error;
+              }
+            };
+          }
+          return Reflect.get(target, property);
+        },
+      });
+    }
+    try {
+      await withOrg(orgC, partnerC, async (db) => {
+        const result = await svc(losingRacer(db)).ensureJob(orgC, { trigger: 'manual', force: true });
+        expect(insertError).toBeInstanceOf(DrizzleQueryError);
+        expect(pgErrorCode(insertError)).toBe('23505');
+        expect(result.created).toBe(false);
+        expect(result.job.id).toBe(winner.job.id);
+        expect(result.job.force).toBe(true);
+        // A fresh statement on the outer transaction must remain usable.
+        expect((await svc(db).get(orgC, winner.job.id))?.force).toBe(true);
+      });
+    } finally {
+      await admin`DELETE FROM workspace_ingest_jobs WHERE org_id = ${orgC}`;
+    }
+  });
 
   it('drives ensure → claim → progress → yield → transient backoff → phase_complete → complete', async () => {
     // ensure: a fresh org-wide job is created pending in the ingest phase

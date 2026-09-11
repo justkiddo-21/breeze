@@ -1,6 +1,6 @@
 ---
 title: Network Baselines
-description: Establish subnet baselines and detect new, changed, disappeared, or rogue devices on your network.
+description: Snapshot subnet devices into baselines and detect new, changed, disappeared, or rogue devices with scheduled rescans, change events, and alerts.
 ---
 
 import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
@@ -8,6 +8,14 @@ import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 Network Baselines let you snapshot the devices on a subnet and continuously compare future scans against that snapshot. When something changes -- a new device appears, a known device disappears, a host swaps MAC address, or an unauthorized device joins the network -- Breeze records a change event and optionally raises an alert. Baselines are scoped to a specific organization, site, and CIDR subnet, and they integrate directly with the Network Discovery engine so that scan results automatically feed into baseline comparisons.
 
 Each baseline stores a list of known devices with their IP, MAC, hostname, asset type, manufacturer, and first/last-seen timestamps. A background worker (BullMQ) periodically rescans the subnet on a configurable schedule, compares the results, deduplicates events within a 24-hour window, and updates the known-device list. Alerts are created using the platform's alert template system with severity mapped to event type, and events are published to the real-time event bus.
+
+---
+
+## In the console
+
+<Aside type="caution">
+  There is currently no console UI for creating baselines, triggering scans, or reviewing change events -- everything on this page is done through the API shown below. Use the **Known Guests** section (Settings > Partner > Regional) to manage the guest MAC allowlist described further down this page.
+</Aside>
 
 ---
 
@@ -219,35 +227,7 @@ This also updates the associated alert's device reference.
 
 ## API Reference
 
-### Baselines
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/v1/network/baselines` | List baselines with optional org, site, and subnet filters |
-| `POST` | `/api/v1/network/baselines` | Create a new baseline for an org/site/subnet |
-| `GET` | `/api/v1/network/baselines/:id` | Get a single baseline by ID |
-| `PATCH` | `/api/v1/network/baselines/:id` | Update scan schedule or alert settings |
-| `DELETE` | `/api/v1/network/baselines/:id` | Delete a baseline (optionally with its change events) |
-| `POST` | `/api/v1/network/baselines/:id/scan` | Trigger an immediate baseline scan |
-| `GET` | `/api/v1/network/baselines/:id/changes` | List change events for a specific baseline |
-
-### Network Changes
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/v1/network/changes` | List change events across baselines with filters |
-| `GET` | `/api/v1/network/changes/:id` | Get a single change event with baseline subnet |
-| `POST` | `/api/v1/network/changes/:id/acknowledge` | Acknowledge a change event |
-| `POST` | `/api/v1/network/changes/:id/link-device` | Link a change event to a managed device |
-| `POST` | `/api/v1/network/changes/bulk-acknowledge` | Bulk acknowledge up to 200 events |
-
-### Known Guests
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/v1/partner/known-guests` | List known guest MAC addresses for the partner |
-| `POST` | `/api/v1/partner/known-guests` | Add a known guest MAC address |
-| `DELETE` | `/api/v1/partner/known-guests/:id` | Remove a known guest |
+The full endpoint tables for baselines, network changes, and known guests live in [Network Intelligence](/features/network-intelligence/#api-reference) -- this page and that one cover the same endpoints, so they aren't repeated here.
 
 ---
 

@@ -1,9 +1,16 @@
 {
+  "lists": {
+    "separator": ", "
+  },
   "nav": {
     "fleetPosture": "Postura da frota",
     "dashboard": "Painel",
     "devices": "Dispositivos",
     "alerts": "Alertas",
+    "approvals": "Aprovações",
+    "pendingApprovals": "{{count}} aprovações pendentes",
+    "pendingApprovals_one": "{{count}} aprovação pendente",
+    "pendingApprovals_other": "{{count}} aprovações pendentes",
     "tickets": "Chamados",
     "incidents": "Incidentes",
     "remoteAccess": "Acesso Remoto",
@@ -11,19 +18,15 @@
     "patches": "Correções",
     "vulnerabilities": "Vulnerabilidades",
     "oneDrive": "OneDrive",
-    "fleet": "Frota",
-    "aiWorkspace": "Espaço de Trabalho de IA",
     "aiForOffice": "IA para Office",
     "networkMonitor": "Monitoramento de Rede",
     "networkDiscovery": "Descoberta de Rede",
-    "security": "Segurança",
     "edr": "EDR",
     "dnsSecurity": "Segurança de DNS",
     "pam": "PAM",
     "userRisk": "Risco do Usuário",
     "sensitiveData": "Dados Confidenciais",
     "peripherals": "Periféricos",
-    "aiRiskEngine": "Mecanismo de Risco de IA",
     "cisBenchmarks": "Referenciais CIS",
     "complianceBaselines": "Linhas de Base de Conformidade",
     "quotes": "Orçamentos",
@@ -31,12 +34,9 @@
     "contracts": "Contratos",
     "timesheets": "Folhas de Horas",
     "productCatalog": "Catálogo de Produtos",
-    "softwareLibrary": "Biblioteca de Software",
-    "softwarePolicies": "Políticas de Software",
     "deviceGroups": "Grupos de dispositivos",
     "configPolicies": "Políticas de Configuração",
     "integrations": "Integrações",
-    "backup": "Backup",
     "cloudBackup": "Backup em Nuvem",
     "disasterRecovery": "Recuperação de Desastres",
     "reports": "Relatórios",
@@ -44,8 +44,12 @@
     "auditTrail": "Trilha de Auditoria",
     "eventLogs": "Logs de Eventos",
     "partner": "Parceiro",
+    "billing": "Faturamento",
     "organizations": "Organizações",
     "aiUsageBudget": "Uso e Orçamento de IA",
+    "aiAgents": "Agentes de IA",
+    "aiAgentRuns": "Execuções de Agentes de IA",
+    "aiImpact": "Impacto da IA",
     "customFields": "Campos Personalizados",
     "savedFilters": "Filtros Salvos",
     "users": "Usuários",
@@ -56,16 +60,27 @@
     "deletionRequests": "Solicitações de Exclusão",
     "quarantinedDevices": "Dispositivos em Quarentena",
     "thirdPartyCatalog": "Catálogo de Terceiros",
-    "connectedAppsAdmin": "Aplicativos Conectados (admin)",
-    "sectionAiFleet": "IA e Frota",
-    "sectionMonitoring": "Monitoramento",
+    "connectedAppsAdmin": "Aplicativos Conectados",
     "sectionSecurity": "Segurança",
-    "sectionOperations": "Operações",
     "sectionBackup": "Backup",
     "sectionReporting": "Relatórios",
     "sectionSettings": "Configurações",
     "sectionExtensions": "Extensões",
-    "variables": "Variáveis"
+    "variables": "Variáveis",
+    "llmProviderCatalog": "Catálogo de Provedores de LLM",
+    "aiKillSwitch": "Interruptor de emergência de IA",
+    "sectionAi": "IA",
+    "sectionFleetManagement": "Gestão de Frota",
+    "sectionBilling": "Faturamento",
+    "sectionAdministration": "Administração",
+    "fleetOrchestration": "Orquestração de Frota",
+    "aiAssistant": "Assistente de IA",
+    "software": "Software",
+    "securityOverview": "Visão Geral",
+    "aiRisk": "Risco de IA",
+    "deviceBackup": "Backup de Dispositivos",
+    "sectionServiceDesk": "Central de serviços",
+    "serviceManagement": "Gestão de serviços"
   },
   "documentTitles": {
     "dashboard": "Painel",
@@ -156,6 +171,19 @@
     "none": "Nenhum",
     "optional": "Opcional",
     "required": "Obrigatório"
+  },
+  "runContext": {
+    "label": "Executar como",
+    "scriptDefault": "Padrão do script",
+    "scriptDefaultNamed": "Padrão do script ({{context}})",
+    "system": "Sistema",
+    "user": "Usuário conectado",
+    "elevated": "Elevado",
+    "unknown": "Não registrado",
+    "userInSession": "Usuário conectado (sessão {{session}})",
+    "sessionLabel": "Sessão de destino",
+    "sessionAny": "Qualquer sessão ativa",
+    "effectiveLabel": "Contexto de execução"
   },
   "shared": {
     "accessDenied": {
@@ -347,6 +375,9 @@
       "criticalPending": "{{count}} patches críticos pendentes",
       "criticalPending_one": "{{count}} patch crítico pendente",
       "criticalPending_other": "{{count}} patches críticos pendentes",
+      "unratedPending": "{{count}} patches não avaliados pendentes (não serão aprovados automaticamente)",
+      "unratedPending_one": "{{count}} patch não avaliado pendente (não será aprovado automaticamente)",
+      "unratedPending_other": "{{count}} patches não avaliados pendentes (não serão aprovados automaticamente)",
       "empty": "Ainda sem dados de patches"
     },
     "vuln": {
@@ -487,6 +518,9 @@
         "days": "dias",
         "weeks": "semanas",
         "months": "meses"
+      },
+      "enumOverrides": {
+        "decommissioned": "Removido"
       }
     }
   },
@@ -699,7 +733,20 @@
       "recently": "Recentemente",
       "markUnread": "Marcar como não lida",
       "markRead": "Marcar como lida",
-      "preferences": "Preferências de notificações"
+      "preferences": "Preferências de notificações",
+      "types": {
+        "alert": "Alerta",
+        "device": "Dispositivo",
+        "script": "Rotina",
+        "automation": "Automação",
+        "system": "Sistema",
+        "user": "Usuário",
+        "security": "Segurança",
+        "ticket": "Chamado",
+        "approval": "Aprovação",
+        "ai": "IA",
+        "unknown": "Notificação"
+      }
     },
     "sidebar": {
       "autoHide": "Ocultar barra lateral automaticamente",
@@ -745,7 +792,8 @@
           "service": "Serviço"
         },
         "noResults": "Nenhum item de catálogo correspondente.",
-        "placeholder": "Pesquisar catálogo por nome ou SKU"
+        "placeholder": "Pesquisar catálogo por nome ou SKU",
+        "noPriceInCurrency": "Sem preço em {{currency}}"
       },
       "PolishButton": {
         "actions": {
@@ -1604,6 +1652,12 @@
         "editEntry": "Editar entrada {{id}}",
         "total": "Total: {{duration}}",
         "billableTotal": "Faturável: {{duration}}"
+      },
+      "sourceBadge": {
+        "timer": "Cronômetro",
+        "location": "De localização",
+        "remote_session": "De sessão remota",
+        "support_session": "De Quick Support"
       }
     },
     "snmp": {
@@ -1990,9 +2044,10 @@
         "skipReasons": {
           "siteDenied": "Site não acessível para você",
           "notMember": "Não é mais afetado por esta constatação",
-          "decommissioned": "Dispositivo está descomissionado",
+          "decommissioned": "O dispositivo foi removido",
           "timeout": "Expirou após 30 minutos",
-          "dispatchEnqueueFailed": "Nunca despachado — falha ao enfileirar"
+          "dispatchEnqueueFailed": "Nunca despachado — falha ao enfileirar",
+          "maintenanceWindow": "Dispositivo em uma janela de manutenção"
         },
         "viewProgress": "Ver progresso",
         "errors": {
@@ -2380,5 +2435,13 @@
     "later": "Mostrar mais tarde",
     "learnMore": "Saiba mais",
     "link": "Novidades"
+  },
+  "money": {
+    "approximateTotal": "≈ {{amount}} aproximado · taxas de {{rateDate}}",
+    "approximateFailed": "≈ total indisponível — não foi possível carregar as taxas de câmbio",
+    "approximateUnavailableMissing": "≈ total indisponível — sem taxa de câmbio para {{target}} em {{codes}}",
+    "approximateUnavailableStale": "≈ total indisponível — a taxa de câmbio para {{target}} em {{codes}} está desatualizada",
+    "approximateUnavailableMixed": "≈ total indisponível — não foi possível converter {{codes}} em {{target}}",
+    "approximateUnavailableCodesOverflow": "{{codes}} e mais {{more}}"
   }
 }

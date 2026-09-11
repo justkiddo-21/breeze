@@ -9,7 +9,9 @@ import { portalBranding, portalUsers } from '../../db/schema';
 import { hashPassword, isPasswordStrong, verifyPassword } from '../../services/password';
 import { getEmailService } from '../../services/email';
 import { getRedis } from '../../services/redis';
+import { getActiveOrgTenant } from '../../services/tenantStatus';
 import { rateLimitIpKey } from '../../services/clientIp';
+import { resolveOrgTimezone } from '../../services/portal/timezone';
 import {
   loginSchema,
   forgotPasswordSchema,
@@ -49,6 +51,20 @@ import { isSelfManagedDbContextRoute } from '../../middleware/selfManagedDbConte
 
 export const authRoutes = new Hono();
 const ALLOW_IN_MEMORY_PORTAL_STATE = !PORTAL_USE_REDIS;
+
+/** `code` on the account-status 403 (sweep 2026-09-08 G5-6) — see the gate
+ *  below and apps/portal/src/lib/accountStatus.ts, which mirrors this string. */
+export const PORTAL_ACCOUNT_INACTIVE_CODE = 'PORTAL_ACCOUNT_INACTIVE';
+
+/**
+ * Paths a disabled portal user is still permitted to hit despite failing the
+ * account-status gate. Kept intentionally tight — pure session teardown only.
+ * `c.req.path` is the absolute request path (e.g. `/api/v1/portal/auth/logout`),
+ * so match on suffix rather than assuming any particular mount prefix.
+ */
+function isPortalAuthGateExemptPath(path: string): boolean {
+  return path.endsWith('/auth/logout');
+}
 
 async function isPortalPasswordResetEnabled(orgId: string): Promise<boolean> {
   const [row] = await withSystemDbAccessContext(() =>
@@ -119,20 +135,36 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
   // but the portal_users row lives behind org-forced RLS. Run this lookup
   // under system scope so it resolves under the unprivileged breeze_app pool —
   // the same pattern authMiddleware uses for its pre-auth users lookup.
-  const [user] = await withSystemDbAccessContext(() =>
-    db
+  const { user, timezone } = await withSystemDbAccessContext(async () => {
+    const [user] = await db
       .select({
         id: portalUsers.id,
         orgId: portalUsers.orgId,
         email: portalUsers.email,
         name: portalUsers.name,
+        // #3258 W03: the CONTACT this login belongs to. Portal ticket
+        // ownership is `submitted_by = me OR requester_contact_id = my
+        // contact` — without this hydration a customer who emailed support
+        // and then logged in would see none of their own tickets, because an
+        // emailed ticket has no `submitted_by` at all.
+        contactId: portalUsers.contactId,
         receiveNotifications: portalUsers.receiveNotifications,
         status: portalUsers.status
       })
       .from(portalUsers)
       .where(and(eq(portalUsers.id, sessionData.portalUserId), eq(portalUsers.orgId, sessionData.orgId)))
-      .limit(1)
-  );
+      .limit(1);
+
+    return {
+      user,
+      // Resolved here (not per-route/per-read-model) so every portal read
+      // model can consume `auth.timezone` without its own DB round trip —
+      // see services/portal/timezone.ts.
+      timezone: user
+        ? await resolveOrgTimezone(sessionData.orgId)
+        : null,
+    };
+  });
 
   if (!user) {
     if (PORTAL_USE_REDIS) {
@@ -149,7 +181,52 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
   }
 
   if (user.status !== 'active') {
-    return c.json({ error: 'Account is not active' }, 403);
+    // `/auth/logout` is exempt: a disabled portal user must still be able to
+    // sign out and clear their session cookie (sweep 2026-09-08 G5-6). Without
+    // this, a disabled user was trapped logged-in-but-blocked — every request
+    // (including logout) 403'd, the cookie never cleared, and `/login` bounced
+    // them straight back to a page that 403'd the same way. Sign-out is pure
+    // teardown with no DB reads, so we skip the org-status gate and the
+    // request-transaction wrapper below entirely rather than special-casing
+    // them too.
+    if (!isPortalAuthGateExemptPath(c.req.path)) {
+      // `code` lets the portal app distinguish a deliberate account-disable
+      // from a generic load failure (e.g. an outage) and route to its own
+      // "access disabled" page instead of rendering the outage copy.
+      return c.json({ error: 'Account is not active', code: PORTAL_ACCOUNT_INACTIVE_CODE }, 403);
+    }
+    c.set('portalAuth', { user, token, authMethod, timezone: timezone ?? 'UTC' });
+    if (authMethod === 'cookie') {
+      setPortalSessionCookies(c, token);
+    }
+    return next();
+  }
+
+  // Org-status gate. Portal sessions live in Redis and were validated against
+  // the portal_users row only — nothing here ever consulted the ORG's
+  // lifecycle state, so a portal user kept full read/write access to an org
+  // that had been suspended, offboarded, archived, or (org-lifecycle Wave 2)
+  // fenced into `merging` for a merge. During a merge that is not merely a
+  // stale read: a portal write landing under the loser org after the fence is
+  // either stranded by the re-tenant or destroyed by the erasure that follows.
+  //
+  // `getActiveOrgTenant` is the same machinery the agent and API ingress paths
+  // use — it applies `isUsableOrgStatus`, the `deleted_at` check and the owning
+  // partner's status in one system-context read, so this gate cannot drift
+  // from theirs.
+  const activeOrg = await getActiveOrgTenant(user.orgId);
+  if (!activeOrg) {
+    if (PORTAL_USE_REDIS) {
+      const redis = getRedis();
+      if (redis) await redis.del(PORTAL_REDIS_KEYS.session(token));
+    }
+    if (ALLOW_IN_MEMORY_PORTAL_STATE) {
+      portalSessions.delete(token);
+    }
+    if (cookieToken) {
+      clearPortalSessionCookies(c);
+    }
+    return c.json({ error: 'Organization is not available' }, 403);
   }
 
   // Sliding session timeout: any authenticated activity pushes expiry forward.
@@ -180,7 +257,7 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
     setPortalSessionCookies(c, token);
   }
 
-  c.set('portalAuth', { user, token, authMethod });
+  c.set('portalAuth', { user, token, authMethod, timezone: timezone ?? 'UTC' });
 
   // #1448 — a small set of routes (the Stripe pay route) opt OUT of the auto
   // request-transaction so a slow outbound HTTP call (Checkout sessions.create)

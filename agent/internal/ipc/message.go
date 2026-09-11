@@ -237,12 +237,21 @@ type IPCCommandResult struct {
 }
 
 // NotifyRequest asks the user helper to show a desktop notification.
+//
+// Actions turns it into an interactive prompt: a helper that understands them
+// renders a modal dialog with those buttons and answers with the clicked label
+// in NotifyResult.ActionClicked. Both Actions and TimeoutMs are optional and
+// omitempty, so an OLD helper still unmarshals the request and shows its plain
+// toast, and a NEW helper on an old agent simply never receives any actions.
 type NotifyRequest struct {
 	Title   string   `json:"title"`
 	Body    string   `json:"body"`
 	Icon    string   `json:"icon,omitempty"`
 	Urgency string   `json:"urgency,omitempty"`
 	Actions []string `json:"actions,omitempty"`
+	// TimeoutMs is how long the helper should hold an interactive prompt open
+	// before giving up and reporting no decision. Ignored when Actions is empty.
+	TimeoutMs int `json:"timeoutMs,omitempty"`
 }
 
 // NotifyResult is the user helper's response after showing a notification.
@@ -353,8 +362,17 @@ type SASResponse struct {
 // DesktopPeerDisconnectedNotice is sent by the user helper to the service
 // when a WebRTC peer connection drops (Failed or Closed). The service relays
 // this to the API so it can mark the session as disconnected.
+//
+// Reason (#5300) is the session's LastStopReason() at the time it stopped —
+// e.g. the Win32 error the no-video watchdog's capturer swallowed — so a
+// mid-session capture failure reaches the technician the same way the
+// startup probe path already does. Empty for every other stop path (peer
+// disconnect grace timeout, lifetime policy, operator stop). Older helpers
+// omit this field entirely; the service treats a missing Reason the same as
+// an empty one.
 type DesktopPeerDisconnectedNotice struct {
 	SessionID string `json:"sessionId"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // LaunchProcessRequest asks the user-role helper to launch a binary.
@@ -452,6 +470,13 @@ type StateSync struct {
 	ConfigHash    string `json:"configHash"`
 	Connected     bool   `json:"connected"`
 	LastHeartbeat string `json:"lastHeartbeat"`
+	// ActiveBackupRuns is the number of backup_run commands the backup
+	// helper is currently executing (sessionbroker.Broker.ActiveBackupRunCount).
+	// The watchdog's CheckIPC (internal/watchdog/checks.go) uses this to veto
+	// an IPC-failure escalation while a backup is in flight and this sync is
+	// recent (D3): killing the backup helper mid-run on a transient IPC
+	// hiccup previously had no guard at all.
+	ActiveBackupRuns int `json:"activeBackupRuns,omitempty"`
 }
 
 // IntegrityCheck asks the agent to verify the integrity of the given targets.

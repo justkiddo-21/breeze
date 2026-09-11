@@ -1,14 +1,19 @@
-import { and, asc, desc, eq, gt, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, ne, sql } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
-import { tickets, ticketComments, ticketAlertLinks, organizations, alerts, devices, users, ticketCategories, portalUsers, ticketStatusEnum, ticketSourceEnum } from '../db/schema';
+import { matchContactByEmail } from './contacts/crud';
+import { tickets, ticketComments, ticketAlertLinks, organizations, alerts, devices, users, ticketCategories, portalUsers, contacts, ticketStatusEnum, ticketSourceEnum, ticketOutbox, ticketDrafts, actionIntents, aiAgentRuns, deviceVulnerabilities, type TicketOutboxEvent } from '../db/schema';
 import { allocateInternalTicketNumber } from './ticketNumbers';
 import { emitTicketEvent } from './ticketEvents';
 import { createAuditLogAsync } from './auditService';
 import { resolveSlaTargets } from './ticketSla';
 import { getOrgSlaOverride, getPartnerPrioritySla, getSystemStatusId, getTicketStatusById } from './ticketConfigService';
+import { readOrgStampingDefaultsMany } from './orgCurrencyCore';
 import { emitTicketTriageFeedback } from './mlFeedbackEmitters';
 import { applyIntakeForm, getTicketFormForOrg, TicketFormError } from './ticketFormService';
+import { assertTicketMoveCurrencyCompatible, type MoveCurrencyGuardDetails } from './ticketMoveCurrencyGuard';
+import { TICKET_ORG_DENORMALIZED_TABLES } from './ticketOrgMoveLockOrder';
+import { ServiceManagementOffError, assertTicketCreationAllowed } from './serviceManagement';
 import type { AddinTicketSummary } from '@breeze/shared';
 
 export type TicketStatus = (typeof ticketStatusEnum.enumValues)[number];
@@ -35,6 +40,10 @@ export type TicketServiceErrorCode =
   | 'ASSIGNEE_WRONG_PARTNER'
   | 'REQUESTER_NOT_FOUND'
   | 'REQUESTER_WRONG_ORG'
+  // #3258 W03: the requester CONTACT (the canonical person), distinct from the
+  // portal LOGIN codes above so a caller can tell which of the two it fumbled.
+  | 'REQUESTER_CONTACT_NOT_FOUND'
+  | 'REQUESTER_CONTACT_WRONG_ORG'
   | 'CATEGORY_NOT_FOUND'
   | 'CATEGORY_WRONG_PARTNER'
   | 'TICKET_PARTNER_UNRESOLVABLE'
@@ -42,7 +51,15 @@ export type TicketServiceErrorCode =
   | 'CONCURRENT_MODIFICATION'
   | 'STATUS_NOT_FOUND'
   | 'STATUS_INACTIVE'
-  | 'INVALID_INPUT';
+  | 'INVALID_INPUT'
+  // W08 #3902: one or more attachmentIds were not pending, not this user's,
+  // or not on this ticket. The comment transaction is rolled back.
+  | 'ATTACHMENT_NOT_CLAIMABLE'
+  // #5075 W04 — the partner has Service Management switched off; no new
+  // tickets. Lowercase to match the wire code the web/AI surfaces branch on
+  // (`ServiceManagementOffError.code`), unlike the UPPER_SNAKE codes above,
+  // which are internal to the ticket service.
+  | 'service_management_off';
 
 export class TicketServiceError extends Error {
   constructor(
@@ -61,6 +78,18 @@ export interface TicketActor {
   email?: string;
   triageFeedbackSource?: 'manual' | 'suggestion';
   triageFeedbackMetadata?: Record<string, unknown>;
+  /**
+   * P2-4 (#4191): who is actually behind this write, for `tickets.field_provenance`
+   * stamping in `updateTicketFields`. Defaults to 'user' — every existing caller
+   * (human staff, attended chat auto-executing under the caller's own session)
+   * is unaffected. An 'ai_agent'/'system' actor is never routed through
+   * `updateTicketFields` today (the AI ticket-triage release path uses the
+   * dedicated `applyAiFieldUpdates`, which is CAS-guarded and never overwrites
+   * a 'user' stamp) — this field exists so `updateTicketFields` stamps
+   * correctly if a future caller ever does pass a non-human actor here,
+   * without that caller having to know the stamping mechanics.
+   */
+  principalKind?: 'user' | 'ai_agent' | 'system';
 }
 
 // Legacy display identifier (NOT NULL UNIQUE), retry loop dropped when creation
@@ -75,6 +104,32 @@ async function getTicketOrThrow(ticketId: string) {
   const ticket = rows[0];
   if (!ticket) throw new TicketServiceError('Ticket not found', 404);
   return ticket;
+}
+
+/**
+ * Transactional outbox write (#3828 wave-6-3 task 2 —
+ * docs/superpowers/plans/ai-mcp/2026-08-28-ai-agents-wave6-3-ticket-shadow.md).
+ * Deliberately a PLAIN `db.insert` through the ambient `db` handle — the same
+ * one every other write in this file uses — so the row lands in whatever
+ * transaction the caller is already inside (the request's `withDbAccessContext`
+ * transaction). It must NEVER be wrapped in `runOutsideDbContext` /
+ * `withSystemDbAccessContext` (that is what `createAuditLogAsync` does, and is
+ * exactly why an audit row survives a request rollback while this one must
+ * NOT): if the surrounding transaction later rolls back, this row must roll
+ * back with it, or a published event could announce a ticket mutation that
+ * never actually committed.
+ *
+ * `payload` is id-only by construction (never subject/description/content/
+ * resolutionNote — see ticketOutbox.ts's export-policy note) — callers pass
+ * only structured ids/enum labels, never ticket free-text.
+ */
+async function writeTicketOutbox(
+  orgId: string,
+  ticketId: string,
+  eventType: TicketOutboxEvent,
+  payload: Record<string, unknown> = {}
+): Promise<void> {
+  await db.insert(ticketOutbox).values({ orgId, ticketId, eventType, payload });
 }
 
 /**
@@ -150,11 +205,15 @@ async function assertAssigneeInPartner(assigneeId: string, partnerId: string | n
  */
 export async function getPortalUserForValidation(
   portalUserId: string
-): Promise<{ id: string; orgId: string; name: string | null; email: string } | null> {
+): Promise<{ id: string; orgId: string; name: string | null; email: string; contactId: string | null } | null> {
   const rows = await runOutsideDbContext(() =>
     withSystemDbAccessContext(() =>
       db
-        .select({ id: portalUsers.id, orgId: portalUsers.orgId, name: portalUsers.name, email: portalUsers.email })
+        // contactId (#3258 W03): a portal login is a login ATTACHED to a
+        // contact, and the ticket's canonical requester is that contact — so
+        // every path that resolves a portal user for a ticket write also
+        // carries the link it should stamp.
+        .select({ id: portalUsers.id, orgId: portalUsers.orgId, name: portalUsers.name, email: portalUsers.email, contactId: portalUsers.contactId })
         .from(portalUsers)
         .where(eq(portalUsers.id, portalUserId))
         .limit(1)
@@ -276,6 +335,100 @@ async function assertRequesterInOrg(portalUserId: string, orgId: string) {
 }
 
 /**
+ * Tenant guard: a requester CONTACT must belong to the ticket's org (#3258 W03).
+ *
+ * Deliberately the same shape as assertRequesterInOrg above — a same-org
+ * equality check on a system-context read, 404 for missing and 400 for the
+ * wrong org. `contacts.org_id` scopes a contact to exactly one organization,
+ * so the equality IS the complete cross-tenant boundary. The composite FK
+ * `tickets_requester_contact_org_fk` makes a cross-org link unrepresentable at
+ * the DB level too; this check exists so the caller gets a typed 400 instead
+ * of a raw constraint violation.
+ *
+ * Deliberately reads on the CURRENT DB context, NOT through the
+ * `runOutsideDbContext(withSystemDbAccessContext(...))` escape the portal-user
+ * guard above uses. That escape opens a second pooled connection, which cannot
+ * see rows written by the caller's still-open transaction — and the inbound
+ * path creates the contact and the ticket in ONE transaction, so the escape
+ * would fail every emailed ticket from a first-time sender with a spurious
+ * "Requester contact not found". (It did: the integration suite caught it.)
+ *
+ * Reading in-context is also no weaker. `contacts` is org-axis RLS, so a
+ * system context sees everything and a request context sees exactly the orgs
+ * the caller can reach; an invisible row degrades to 404 rather than a wrong-org
+ * 400, which is the stricter of the two. The explicit comparison below remains
+ * the security boundary either way.
+ */
+async function assertRequesterContactInOrg(contactId: string, orgId: string) {
+  const rows = await db
+    .select({ id: contacts.id, orgId: contacts.orgId, name: contacts.name, email: contacts.email })
+    .from(contacts)
+    .where(eq(contacts.id, contactId))
+    .limit(1);
+  const contact = rows[0];
+  if (!contact) throw new TicketServiceError('Requester contact not found', 404, 'REQUESTER_CONTACT_NOT_FOUND');
+  if (contact.orgId !== orgId) {
+    throw new TicketServiceError('Requester contact must belong to the ticket organization', 400, 'REQUESTER_CONTACT_WRONG_ORG');
+  }
+  return contact;
+}
+
+/**
+ * The CONTACT behind a portal LOGIN, and the login's org (#3258 W03).
+ *
+ * Reads on the CURRENT DB context for exactly the reason
+ * `assertRequesterContactInOrg` above spells out, and which
+ * `getPortalUserForValidation` violates: that helper wraps its read in
+ * `runOutsideDbContext(withSystemDbAccessContext(...))`, which opens a SECOND
+ * pooled connection. A second connection cannot see rows the caller's
+ * still-open transaction has written — and the create paths that reach this
+ * derivation (inbound email, the portal) write inside one transaction. Using
+ * the escape here would make the derivation depend on commit timing.
+ *
+ * Reading in-context is not weaker: `portal_users` is org-axis RLS, so a
+ * system context sees everything and a request context sees exactly the orgs
+ * the caller can reach — an invisible row degrades to "no link", which is the
+ * stricter outcome. The explicit org comparison at the call site remains the
+ * security boundary either way.
+ *
+ * `contactId` needs no org of its own: `portal_users_contact_org_fk`
+ * (contact_id, org_id) -> contacts (id, org_id) makes the contact's org
+ * IDENTICAL to the `orgId` returned here (#3258 follow-up), so comparing that
+ * one value against the ticket's org settles both.
+ */
+async function readPortalUserContactLink(
+  portalUserId: string
+): Promise<{ orgId: string; contactId: string | null } | null> {
+  const rows = await db
+    .select({ orgId: portalUsers.orgId, contactId: portalUsers.contactId })
+    .from(portalUsers)
+    .where(eq(portalUsers.id, portalUserId))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+/**
+ * Re-resolve a ticket's requester CONTACT from a free-text email address
+ * (#3258 W03). Exactly one contact on that address in the ticket's org links;
+ * zero, several (a shared mailbox) or an unusable address leave the ticket
+ * unlinked — the same rule inbound email applies, through the same core
+ * (`matchContactByEmail`).
+ *
+ * Deliberately takes NO advisory lock, unlike the inbound path. That lock
+ * exists to stop two concurrent first-time senders from each CREATING a
+ * contact for the same address; nothing is created here (a staff requester
+ * edit is not an onboarding action, and silently minting a contact from a
+ * typed-in address would be a surprise), so there is nothing to serialise.
+ */
+async function resolveRequesterContactByEmail(
+  orgId: string,
+  email: string | null | undefined
+): Promise<string | null> {
+  const match = await matchContactByEmail(db, orgId, email);
+  return match.kind === 'contact' ? match.contactId : null;
+}
+
+/**
  * Tenant guard: a ticket's category must belong to the ticket's partner.
  * The read runs in a system-scope DB context for the same reason as
  * getAssigneeForValidation: ticket_categories is partner-axis RLS, invisible
@@ -308,6 +461,14 @@ export async function assertCategoryInPartner(categoryId: string, partnerId: str
 
 interface BaseCreateTicketInput {
   orgId: string;
+  /**
+   * The canonical requester PERSON (#3258 W03). Independent of `submittedBy`,
+   * which names the optional portal LOGIN: an inbound email has a contact and
+   * no login at all, a portal submission has both, and a manual ticket may
+   * have neither. When omitted and a portal user IS named, it is DERIVED from
+   * that login's `contact_id` — so a ticket never silently loses the person.
+   */
+  requesterContactId?: string;
   subject?: string;
   description?: string;
   deviceId?: string;
@@ -342,6 +503,22 @@ export async function createTicket(input: CreateTicketInput, actor: TicketActor)
     .limit(1);
   const org = orgRows[0];
   if (!org) throw new TicketServiceError('Organization not found', 404);
+
+  // #5075 W04 — Service Management 'off' withdraws NEW ticket creation for the
+  // whole partner. This is the ONE gate: every native creation surface (the
+  // alert dialog, the manage_tickets AI tool, the portal, the Office add-in,
+  // email-to-ticket) routes through createTicket, so no per-route mode check is
+  // needed — nor wanted, since a second check could drift from this one.
+  // Placed after the org resolve (it needs org.partnerId) but before any
+  // ticket-number allocation, so a refused create burns no counter value.
+  try {
+    await assertTicketCreationAllowed(org.partnerId);
+  } catch (err) {
+    if (err instanceof ServiceManagementOffError) {
+      throw new TicketServiceError(err.message, 409, 'service_management_off');
+    }
+    throw err;
+  }
 
   // Intake form (spec 2026-07-10): resolve + validate first so the composed
   // category feeds the existing assertCategoryInPartner guard below.
@@ -396,23 +573,41 @@ export async function createTicket(input: CreateTicketInput, actor: TicketActor)
   // Resolve the requester before number allocation (a rejected requester must
   // not burn a counter value). Portal/email sources carry it via their required
   // fields. Other sources may name one: a picked portal user (validated same-org,
-  // backfills name/email) and/or free text; otherwise the acting staff member's
-  // name is stamped with NO email (preserves "no external requester" semantics —
-  // the notify worker emails submitterEmail on every public comment/resolution).
+  // backfills name/email), a named CONTACT (`namedContact` below — the #3258 W03
+  // requesterContactId input, tenant-validated first and used to backfill the
+  // name/email snapshot when there is no login), and/or free text; otherwise the
+  // acting staff member's name is stamped with NO email (preserves "no external
+  // requester" semantics — the notify worker emails submitterEmail on every
+  // public comment/resolution).
   const isPortalOrEmail = input.source === 'portal' || input.source === 'email';
+
+  // #3258 W03: an explicitly named contact is tenant-validated FIRST, before
+  // number allocation and any write, so a cross-org link is rejected without
+  // burning a counter value (same ordering rationale as the device guard).
+  const namedContact = input.requesterContactId
+    ? await assertRequesterContactInOrg(input.requesterContactId, input.orgId)
+    : null;
+
   let resolvedSubmittedBy: string | null;
   let resolvedSubmitterName: string | null;
   let resolvedSubmitterEmail: string | null;
+  // Non-null only on the branch that already loaded it, so the contact
+  // derivation below never issues a second read for the same row.
+  let validatedPortalUser: Awaited<ReturnType<typeof assertRequesterInOrg>> | null = null;
   if (isPortalOrEmail) {
     resolvedSubmittedBy = input.submittedBy ?? null;
     resolvedSubmitterName = input.submitterName ?? null;
     resolvedSubmitterEmail = input.submitterEmail ?? null;
   } else if (input.submittedBy) {
     const portalUser = await assertRequesterInOrg(input.submittedBy, input.orgId);
+    validatedPortalUser = portalUser;
     resolvedSubmittedBy = portalUser.id;
     resolvedSubmitterName = input.submitterName ?? portalUser.name ?? null;
     resolvedSubmitterEmail = input.submitterEmail ?? portalUser.email ?? null;
-  } else if (input.submitterName || input.submitterEmail) {
+  } else if (input.submitterName || input.submitterEmail || namedContact) {
+    // `namedContact` joins this branch so a contact-backed ticket with no free
+    // text does NOT fall through to the acting staff member's name below — it
+    // has a real requester, and the snapshot is backfilled from them.
     resolvedSubmittedBy = null;
     resolvedSubmitterName = input.submitterName ?? null;
     resolvedSubmitterEmail = input.submitterEmail ?? null;
@@ -420,6 +615,44 @@ export async function createTicket(input: CreateTicketInput, actor: TicketActor)
     resolvedSubmittedBy = null;
     resolvedSubmitterName = actor.name ?? null;
     resolvedSubmitterEmail = null;
+  }
+
+  // Derive the person from the login when the caller named no contact. A
+  // portal login IS a contact's login, so this is the link the ticket should
+  // have carried all along — it makes `requester_contact_id` the one column
+  // every person-backed ticket has, whatever the source.
+  let resolvedRequesterContactId: string | null = namedContact?.id ?? null;
+  if (!resolvedRequesterContactId && resolvedSubmittedBy) {
+    // `validatedPortalUser` was already read (and org-checked) by
+    // assertRequesterInOrg on the staff branch; the portal/email branch trusts
+    // its caller's submittedBy and has not read anything yet.
+    const link = validatedPortalUser ?? (await readPortalUserContactLink(resolvedSubmittedBy));
+    // A login from another org carries a contact from that other org —
+    // `portal_users_contact_org_fk` makes login-org and contact-org provably
+    // equal (#3258 follow-up), so this ONE comparison is the complete
+    // cross-tenant boundary for the derived link, not an approximation of it.
+    // Kept as an explicit guard rather than left to the database: without it
+    // the write reaches `tickets_requester_contact_org_fk` and comes back as a
+    // raw 23503 (a 500 carrying a Postgres message) instead of the typed 400
+    // every other requester tenant guard returns. A MISSING login is not an
+    // error — it simply yields no link, matching the pre-existing behaviour.
+    if (link && link.orgId !== input.orgId) {
+      throw new TicketServiceError(
+        'Requester contact must belong to the ticket organization',
+        400,
+        'REQUESTER_CONTACT_WRONG_ORG'
+      );
+    }
+    resolvedRequesterContactId = link?.contactId ?? null;
+  }
+
+  // Snapshot backfill from the contact, only when there is no portal login to
+  // take it from (that branch already backfilled). The snapshot is what the
+  // notify worker mails and what threadMatcher binds on, so it stays a
+  // point-in-time copy — never re-read from the contact later.
+  if (namedContact && !resolvedSubmittedBy) {
+    resolvedSubmitterName = resolvedSubmitterName ?? namedContact.name ?? null;
+    resolvedSubmitterEmail = resolvedSubmitterEmail ?? namedContact.email ?? null;
   }
 
   const priority = input.priority ?? intake?.defaultPriority ?? 'normal';
@@ -459,6 +692,7 @@ export async function createTicket(input: CreateTicketInput, actor: TicketActor)
     statusId: statusId ?? null,
     source: input.source,
     submittedBy: resolvedSubmittedBy,
+    requesterContactId: resolvedRequesterContactId,
     submitterEmail: resolvedSubmitterEmail,
     submitterName: resolvedSubmitterName,
     category: null,
@@ -481,8 +715,9 @@ export async function createTicket(input: CreateTicketInput, actor: TicketActor)
     orgId: input.orgId,
     partnerId: org.partnerId ?? null,
     actorUserId: actor.userId,
-    payload: { internalNumber, subject, assigneeId: input.assigneeId ?? null, source: input.source }
+    payload: { internalNumber, assigneeId: input.assigneeId ?? null, source: input.source }
   });
+  await writeTicketOutbox(input.orgId, ticket.id, 'ticket.created');
   await createAuditLogAsync({
     orgId: input.orgId,
     actorId: actor.userId,
@@ -498,11 +733,74 @@ export async function createTicket(input: CreateTicketInput, actor: TicketActor)
 export interface ChangeStatusOptions {
   resolutionNote?: string;
   pendingReason?: string;
+  /**
+   * P2-4 (#4191), Task A10 — an active `resolution_note`-kind `ticket_drafts`
+   * row to apply as the resolution note (the web resolve modal's "use the AI
+   * draft" prefill, PR B). Only valid alongside a resolve (`status:
+   * 'resolved'`/a statusId resolving to `resolved`) — the schema-level
+   * refinement in `changeTicketStatusSchema` also relaxes `resolutionNote`'s
+   * required-ness whenever this is present, since the draft supplies the
+   * text. Locked and consumed (`state: 'consumed'`) in the SAME per-request
+   * transaction as the ticket's status CAS update below, via `SELECT ... FOR
+   * UPDATE` (mirrors `sendTicketDraft`'s locking contract) — a draft that is
+   * missing, the wrong kind, or no longer `active` fails the whole resolve
+   * with a 404/409 rather than silently resolving without it.
+   *
+   * Review fix (#4191 final review, C1) — this draft is ALWAYS consumed when
+   * supplied, but it does not always win: a non-empty `resolutionNote` on the
+   * same call is the technician's (possibly edited) text and takes priority
+   * over the draft's content. The draft is treated as a fallback/default,
+   * never a silent override of caller-supplied text.
+   */
+  aiDraftId?: string;
 }
 
 export interface ChangeStatusTarget {
   status?: TicketStatus;
   statusId?: string;
+}
+
+/**
+ * P2-4 (#4191) — shared by every `changeTicketStatus` branch that can apply
+ * an `aiDraftId` (the full FSM transition AND the same-core-status paths
+ * that skip FSM validation — a review fix: those used to return before ever
+ * looking at `aiDraftId`, silently dropping it). Locks the draft row for
+ * the rest of this transaction (`for('update')`) so a concurrent
+ * send/discard/resolve racing the SAME draft blocks here until this
+ * transaction commits or rolls back, then observes the now-committed state.
+ */
+async function lockAndValidateResolutionDraft(
+  ticketId: string,
+  draftId: string
+): Promise<{ id: string; content: string }> {
+  const [draft] = await db
+    .select()
+    .from(ticketDrafts)
+    .where(and(eq(ticketDrafts.id, draftId), eq(ticketDrafts.ticketId, ticketId)))
+    .limit(1)
+    .for('update');
+  if (!draft) throw new TicketServiceError('Draft not found', 404);
+  if (draft.kind !== 'resolution_note') {
+    throw new TicketServiceError('Only resolution-note drafts can be applied when resolving', 409);
+  }
+  if (draft.state !== 'active') {
+    throw new TicketServiceError('Draft is no longer active', 409);
+  }
+  return { id: draft.id, content: draft.content };
+}
+
+/** Companion to `lockAndValidateResolutionDraft` — CAS `active -> consumed` in the
+ *  SAME transaction as the caller's ticket update, so a failure here rolls back
+ *  that update too (defense-in-depth: unreachable while the lock above holds). */
+async function consumeResolutionDraft(draftId: string, consumedBy: string): Promise<void> {
+  const consumed = await db
+    .update(ticketDrafts)
+    .set({ state: 'consumed', consumedBy, consumedAt: new Date() })
+    .where(and(eq(ticketDrafts.id, draftId), eq(ticketDrafts.state, 'active')))
+    .returning({ id: ticketDrafts.id });
+  if (consumed.length === 0) {
+    throw new TicketServiceError('Draft was already consumed', 409);
+  }
 }
 
 export async function changeTicketStatus(
@@ -541,13 +839,48 @@ export async function changeTicketStatus(
     customStatusName = undefined;
   }
 
-  // No-op: same core status AND same statusId
-  if (toStatus === fromStatus && resolvedStatusId === ticket.statusId) return ticket;
+  // Review fix (#4191): this must run BEFORE every early-return branch below
+  // (no-op, same-status statusId relabel, AND the full FSM transition) — an
+  // aiDraftId on a non-resolve target must always 400, never be silently
+  // swallowed by a branch that returns before reaching a later check.
+  if (opts.aiDraftId && toStatus !== 'resolved') {
+    throw new TicketServiceError('aiDraftId is only accepted when resolving a ticket', 400, 'INVALID_INPUT');
+  }
 
-  // Same core status but different statusId — update statusId only (skip FSM validation)
+  // Review fix (#4191): the same-core-status branches below (no-op and the
+  // statusId-only relabel) skip FSM validation entirely and used to return
+  // BEFORE the full-transition path's aiDraftId handling ever ran — an
+  // aiDraftId supplied while relabeling an ALREADY-resolved ticket (or
+  // no-op-resolving it) was silently dropped: no error, no consumption, no
+  // resolutionNote write. Lock + validate it HERE, unconditionally, whenever
+  // the target core status is 'resolved' and the core status isn't changing.
+  let sameStatusDraft: { id: string; content: string } | null = null;
+  if (toStatus === fromStatus && toStatus === 'resolved' && opts.aiDraftId) {
+    sameStatusDraft = await lockAndValidateResolutionDraft(ticketId, opts.aiDraftId);
+  }
+
+  // No-op: same core status AND same statusId AND nothing else to apply —
+  // a draft still needing to be applied/consumed is real, explicit intent,
+  // never a silent no-op.
+  if (toStatus === fromStatus && resolvedStatusId === ticket.statusId && !sameStatusDraft) {
+    return ticket;
+  }
+
+  // Same core status but a statusId change and/or a draft to apply — update
+  // statusId/resolutionNote only (skip FSM validation; core status is
+  // unchanged either way).
   if (toStatus === fromStatus) {
     const now = new Date();
     const patch: Partial<typeof tickets.$inferInsert> = { statusId: resolvedStatusId ?? null, updatedAt: now };
+    // C1 (#4191 final review): a non-empty caller-supplied resolutionNote
+    // (e.g. the technician edited the prefilled AI draft before submitting)
+    // wins over the draft's content — the draft is still consumed below.
+    const appliedResolutionNote = sameStatusDraft
+      ? (opts.resolutionNote?.trim() ? opts.resolutionNote : sameStatusDraft.content)
+      : undefined;
+    if (sameStatusDraft) {
+      patch.resolutionNote = appliedResolutionNote;
+    }
     const updated = await db
       .update(tickets)
       .set(patch)
@@ -560,27 +893,37 @@ export async function changeTicketStatus(
     if (updated.length === 0) {
       throw new TicketServiceError('Ticket was modified concurrently', 409, 'CONCURRENT_MODIFICATION');
     }
-    // Only write a feed entry when there is meaningful content — i.e. the caller
-    // supplied a custom status name (statusId path).  A legacy {status} call that
-    // happens to resolve to the same core value but swaps the statusId back to the
-    // system row produces an empty content and identical oldValue/newValue, which
-    // would be a no-op noise row in the feed.
-    if (customStatusName) {
+
+    // Consume in the SAME transaction as the ticket update above — a failure
+    // here rolls the whole thing back (mirrors the full-transition path).
+    if (sameStatusDraft) {
+      await consumeResolutionDraft(sameStatusDraft.id, actor.userId);
+    }
+
+    // Only write a feed entry when there is meaningful content — i.e. the
+    // caller supplied a custom status name (statusId path) or an aiDraftId
+    // was applied. A legacy {status} call that happens to resolve to the
+    // same core value but swaps the statusId back to the system row (and
+    // carries no draft) produces an empty content and identical
+    // oldValue/newValue, which would be a no-op noise row in the feed.
+    const feedContent = sameStatusDraft ? appliedResolutionNote : customStatusName;
+    if (feedContent) {
       await db.insert(ticketComments).values({
         ticketId,
         userId: actor.userId,
         authorName: actor.name ?? null,
         authorType: 'internal',
         commentType: 'status_change',
-        content: customStatusName,
+        content: feedContent,
         isPublic: false,
         oldValue: fromStatus,
         newValue: toStatus
       });
     }
     // Do NOT emit ticket.status_changed — core status is unchanged; only the
-    // custom-status label (statusId) differs.  Emitting with identical from/to
-    // would produce noise and confuse downstream consumers.
+    // custom-status label (statusId) and/or resolutionNote differ.  Emitting
+    // with identical from/to would produce noise and confuse downstream
+    // consumers.
     await createAuditLogAsync({
       orgId: ticket.orgId,
       actorId: actor.userId,
@@ -596,8 +939,22 @@ export async function changeTicketStatus(
   if (!TICKET_STATUS_TRANSITIONS[fromStatus]?.includes(toStatus)) {
     throw new TicketServiceError(`Cannot transition ticket from ${fromStatus} to ${toStatus}`, 409, 'INVALID_TRANSITION');
   }
-  if (toStatus === 'resolved' && !opts.resolutionNote) {
+  if (toStatus === 'resolved' && !opts.resolutionNote && !opts.aiDraftId) {
     throw new TicketServiceError('A resolution note is required to resolve a ticket', 400);
+  }
+
+  // Lock + validate the `resolution_note` draft BEFORE the ticket's own CAS
+  // update below: a missing/wrong-kind/inactive draft must fail the whole
+  // resolve, not silently resolve without it.
+  let resolutionNote = opts.resolutionNote;
+  let draftToConsume: { id: string } | null = null;
+  if (toStatus === 'resolved' && opts.aiDraftId) {
+    const draft = await lockAndValidateResolutionDraft(ticketId, opts.aiDraftId);
+    // C1 (#4191 final review): a non-empty caller-supplied resolutionNote
+    // (e.g. the technician edited the prefilled AI draft before submitting)
+    // wins over the draft's content — the draft is still consumed below.
+    resolutionNote = opts.resolutionNote?.trim() ? opts.resolutionNote : draft.content;
+    draftToConsume = { id: draft.id };
   }
 
   const now = new Date();
@@ -605,7 +962,7 @@ export async function changeTicketStatus(
 
   if (toStatus === 'resolved') {
     patch.resolvedAt = ticket.resolvedAt ?? now;
-    patch.resolutionNote = opts.resolutionNote;
+    patch.resolutionNote = resolutionNote;
     patch.pendingReason = null;
   } else if (toStatus === 'closed') {
     patch.closedAt = now;
@@ -650,13 +1007,20 @@ export async function changeTicketStatus(
     throw new TicketServiceError('Ticket was modified concurrently', 409, 'CONCURRENT_MODIFICATION');
   }
 
+  // Consume the draft in the SAME transaction as the ticket's own CAS update
+  // above — a failure here throws and rolls back the whole request
+  // transaction, including the status change just written.
+  if (draftToConsume) {
+    await consumeResolutionDraft(draftToConsume.id, actor.userId);
+  }
+
   await db.insert(ticketComments).values({
     ticketId,
     userId: actor.userId,
     authorName: actor.name ?? null,
     authorType: 'internal',
     commentType: 'status_change',
-    content: opts.resolutionNote ?? opts.pendingReason ?? customStatusName ?? '',
+    content: resolutionNote ?? opts.pendingReason ?? customStatusName ?? '',
     isPublic: false,
     oldValue: fromStatus,
     newValue: toStatus
@@ -668,8 +1032,9 @@ export async function changeTicketStatus(
     orgId: ticket.orgId,
     partnerId: ticket.partnerId ?? null,
     actorUserId: actor.userId,
-    payload: { from: fromStatus, to: toStatus, resolutionNote: opts.resolutionNote ?? null }
+    payload: { from: fromStatus, to: toStatus }
   });
+  await writeTicketOutbox(ticket.orgId, ticketId, 'ticket.status_changed', { from: fromStatus, to: toStatus });
   await createAuditLogAsync({
     orgId: ticket.orgId,
     actorId: actor.userId,
@@ -699,11 +1064,20 @@ export interface UpdateTicketFieldsInput {
   submittedBy?: string | null;
   submitterName?: string | null;
   submitterEmail?: string | null;
+  /**
+   * #5367: name the requester CONTACT explicitly, instead of letting the link
+   * be derived from the login/address rules below. Tenant-validated against
+   * the ticket's org before any write; `null` clears the link.
+   */
+  requesterContactId?: string | null;
 }
 
-// Fields handled by the generic diff loop. The requester triple is excluded —
-// it's resolved/diffed separately (portal-user backfill, single "requester" label).
-type DiffFieldKey = Exclude<keyof UpdateTicketFieldsInput, 'submittedBy' | 'submitterName' | 'submitterEmail'>;
+// Fields handled by the generic diff loop. The requester fields are excluded —
+// they're resolved/diffed separately (portal-user backfill, single "requester" label).
+type DiffFieldKey = Exclude<
+  keyof UpdateTicketFieldsInput,
+  'submittedBy' | 'submitterName' | 'submitterEmail' | 'requesterContactId'
+>;
 
 /** Humanized labels for the system feed entry, in canonical field order. */
 const UPDATE_FIELD_LABELS: Record<DiffFieldKey, string> = {
@@ -779,25 +1153,104 @@ export async function updateTicketFields(
   const requesterEdit =
     fields.submittedBy !== undefined ||
     fields.submitterName !== undefined ||
-    fields.submitterEmail !== undefined;
-  const requesterPatch: { submittedBy?: string | null; submitterName?: string | null; submitterEmail?: string | null } = {};
+    fields.submitterEmail !== undefined ||
+    fields.requesterContactId !== undefined;
+  //
+  // #3258 W03: `requester_contact_id` is kept COHERENT with that triple rather
+  // than editable on its own — a requester edit either names a portal login
+  // (re-derive the person from that login's contact_id) or replaces the
+  // requester with free text (the ticket no longer points at a contact). A
+  // stale link left behind would silently keep the old person's portal
+  // ownership over the ticket (routes/portal/tickets.ts reads it).
+  const requesterPatch: {
+    submittedBy?: string | null;
+    submitterName?: string | null;
+    submitterEmail?: string | null;
+    requesterContactId?: string | null;
+  } = {};
+  const tRow = ticket as Record<string, unknown>;
   if (requesterEdit) {
     if (typeof fields.submittedBy === 'string') {
       const portalUser = await assertRequesterInOrg(fields.submittedBy, ticket.orgId);
       requesterPatch.submittedBy = portalUser.id;
+      requesterPatch.requesterContactId = portalUser.contactId ?? null;
       requesterPatch.submitterName = fields.submitterName !== undefined ? fields.submitterName : (portalUser.name ?? null);
       requesterPatch.submitterEmail = fields.submitterEmail !== undefined ? fields.submitterEmail : (portalUser.email ?? null);
     } else {
       if (fields.submittedBy === null) requesterPatch.submittedBy = null;
       if (fields.submitterName !== undefined) requesterPatch.submitterName = fields.submitterName;
       if (fields.submitterEmail !== undefined) requesterPatch.submitterEmail = fields.submitterEmail;
+
+      // The link is NOT cleared just because this branch was taken. The old
+      // rule did exactly that, and it is how a customer's emailed ticket
+      // disappeared from their portal: the web requester editor renders an
+      // emailed ticket as "someone else" (there is no portal login to select)
+      // and its Save posts this exact shape, so opening the editor and saving
+      // it UNCHANGED silently unlinked the requester, with no way back through
+      // the UI. `requester_contact_id` now moves only when something that
+      // actually determines it moved.
+      const hadLogin = (tRow.submittedBy ?? null) !== null;
+      const losesLogin = hadLogin && fields.submittedBy === null;
+      const emailChanged =
+        fields.submitterEmail !== undefined &&
+        (fields.submitterEmail ?? null) !== (tRow.submitterEmail ?? null);
+
+      if (!hadLogin || losesLogin) {
+        // No login owns the link after this patch, so the ADDRESS is the only
+        // thing left that identifies the person.
+        if (emailChanged) {
+          requesterPatch.requesterContactId = await resolveRequesterContactByEmail(
+            ticket.orgId,
+            fields.submitterEmail
+          );
+        } else if (losesLogin) {
+          // The link was DERIVED from the login being removed and nothing
+          // replaces it.
+          requesterPatch.requesterContactId = null;
+        }
+        // else: nothing that determines the link changed — leave it absent
+        // from the patch entirely, so a concurrent re-link is not clobbered.
+      }
+      // A ticket that KEEPS its portal login keeps the link derived from it;
+      // an address correction does not re-attribute a login-backed ticket.
+    }
+
+    // #5367: an explicitly named CONTACT overrides whatever the login/address
+    // rules above derived — the caller is stating who the requester IS, which
+    // is strictly more information than either derivation. Same precedence
+    // createTicket gives `namedContact`, and tenant-validated the same way
+    // (before any write, so a cross-org link never reaches the update).
+    if (fields.requesterContactId !== undefined) {
+      if (fields.requesterContactId === null) {
+        // Only the link is dropped. The name/email snapshot is what the notify
+        // worker mails and what threadMatcher binds on, so unlinking a person
+        // must not silently strip the ticket's reply-to identity as well.
+        requesterPatch.requesterContactId = null;
+      } else {
+        const contact = await assertRequesterContactInOrg(fields.requesterContactId, ticket.orgId);
+        requesterPatch.requesterContactId = contact.id;
+        // Backfill mirrors createTicket exactly: the snapshot comes from the
+        // contact only when no portal login owns it, and never over free text
+        // the caller supplied in the same patch.
+        const keepsLogin =
+          'submittedBy' in requesterPatch
+            ? requesterPatch.submittedBy !== null
+            : (tRow.submittedBy ?? null) !== null;
+        if (!keepsLogin) {
+          if (fields.submitterName === undefined) requesterPatch.submitterName = contact.name ?? null;
+          if (fields.submitterEmail === undefined) requesterPatch.submitterEmail = contact.email ?? null;
+        }
+      }
     }
   }
-  const tRow = ticket as Record<string, unknown>;
   const requesterChanged =
     ('submittedBy' in requesterPatch && (requesterPatch.submittedBy ?? null) !== (tRow.submittedBy ?? null)) ||
     ('submitterName' in requesterPatch && (requesterPatch.submitterName ?? null) !== (tRow.submitterName ?? null)) ||
-    ('submitterEmail' in requesterPatch && (requesterPatch.submitterEmail ?? null) !== (tRow.submitterEmail ?? null));
+    ('submitterEmail' in requesterPatch && (requesterPatch.submitterEmail ?? null) !== (tRow.submitterEmail ?? null)) ||
+    // A re-derivation that changes ONLY the contact link is still a change:
+    // without this the coherence rule above would compute the right value and
+    // then discard it as a no-op edit.
+    ('requesterContactId' in requesterPatch && (requesterPatch.requesterContactId ?? null) !== (tRow.requesterContactId ?? null));
 
   // Compute the actually-changed fields; ignore no-op keys so the feed and
   // event stream don't accumulate noise from idempotent saves.
@@ -819,6 +1272,21 @@ export async function updateTicketFields(
     (patch as Record<string, unknown>)[key] = fields[key] ?? null;
   }
   if (requesterChanged) Object.assign(patch, requesterPatch);
+
+  // P2-4 (#4191): stamp field_provenance, in the SAME transaction/statement
+  // as the field write itself — the human-set-field authority the release-
+  // time CAS in applyAiFieldUpdates relies on. A human write here (the only
+  // caller today; principalKind defaults 'user') ALWAYS overwrites whatever
+  // was there before, including an 'ai_agent' stamp — humans always win, no
+  // CAS needed on this path (unlike applyAiFieldUpdates, which is the one
+  // that must never overwrite a 'user' stamp).
+  if (changed.length > 0) {
+    const provenanceStamp = Object.fromEntries(
+      changed.map((field) => [field, actor.principalKind ?? 'user']),
+    );
+    (patch as Record<string, unknown>).fieldProvenance =
+      sql`${tickets.fieldProvenance} || ${JSON.stringify(provenanceStamp)}::jsonb`;
+  }
 
   const updated = await db
     .update(tickets)
@@ -847,6 +1315,7 @@ export async function updateTicketFields(
     actorUserId: actor.userId,
     payload: { changed: changedForLog }
   });
+  await writeTicketOutbox(ticket.orgId, ticketId, 'ticket.updated');
   await createAuditLogAsync({
     orgId: ticket.orgId,
     actorId: actor.userId,
@@ -932,6 +1401,7 @@ export async function assignTicket(ticketId: string, assigneeId: string | null, 
     actorUserId: actor.userId,
     payload: { assigneeId }
   });
+  await writeTicketOutbox(ticket.orgId, ticketId, 'ticket.assigned', { assigneeId });
   await createAuditLogAsync({
     orgId: ticket.orgId,
     actorId: actor.userId,
@@ -959,32 +1429,88 @@ export async function assignTicket(ticketId: string, assigneeId: string | null, 
 export interface AddCommentInput {
   content: string;
   isPublic: boolean;
+  /**
+   * W08 #3902 — pending attachment ids to claim for this comment (spec D2).
+   * They are claimed inside the SAME transaction as the comment insert, so a
+   * foreign/already-claimed id rolls the comment back rather than posting a
+   * comment whose photos silently vanished.
+   */
+  attachmentIds?: string[];
 }
 
 export async function addTicketComment(ticketId: string, input: AddCommentInput, actor: TicketActor) {
   const ticket = await getTicketOrThrow(ticketId);
+  const attachmentIds = input.attachmentIds ?? [];
 
-  const inserted = await db.insert(ticketComments).values({
-    ticketId,
-    userId: actor.userId,
-    authorName: actor.name ?? null,
-    authorType: 'internal',
-    commentType: input.isPublic ? 'comment' : 'internal',
-    content: input.content,
-    isPublic: input.isPublic
-  }).returning();
-  const comment = inserted[0];
-  if (!comment) throw new TicketServiceError('Failed to add comment', 500);
+  // W08 #3902: this used to be four separate writes on the global `db`. The
+  // attachment claim must roll back with the comment, so the comment insert,
+  // the firstResponseAt stamp and the claim now share one transaction.
+  // emitTicketEvent / writeTicketOutbox / createAuditLogAsync stay AFTER the
+  // commit — publishing ticket.commented for a comment that may still roll
+  // back would be worse than a late event.
+  const { comment, firstResponseStamped, attachments } = await db.transaction(async (tx) => {
+    const inserted = await tx.insert(ticketComments).values({
+      ticketId,
+      userId: actor.userId,
+      authorName: actor.name ?? null,
+      authorType: 'internal',
+      commentType: input.isPublic ? 'comment' : 'internal',
+      content: input.content,
+      isPublic: input.isPublic
+    }).returning();
+    const row = inserted[0];
+    if (!row) throw new TicketServiceError('Failed to add comment', 500);
 
-  // First PUBLIC technician response stamps firstResponseAt (spec §2).
-  // Internal notes do NOT stamp it.
-  let firstResponseStamped = false;
-  if (input.isPublic && !ticket.firstResponseAt) {
-    await db.update(tickets)
-      .set({ firstResponseAt: new Date(), updatedAt: new Date() })
-      .where(eq(tickets.id, ticketId));
-    firstResponseStamped = true;
-  }
+    // First PUBLIC technician response stamps firstResponseAt (spec §2).
+    // Internal notes do NOT stamp it.
+    let stamped = false;
+    if (input.isPublic && !ticket.firstResponseAt) {
+      await tx.update(tickets)
+        .set({ firstResponseAt: new Date(), updatedAt: new Date() })
+        .where(eq(tickets.id, ticketId));
+      stamped = true;
+    }
+
+    // The claim. Every predicate is load-bearing:
+    //   ticket_id           — cannot attach another ticket's file
+    //   org_id              — belt with the RLS braces
+    //   comment_id IS NULL  — cannot re-claim an already-attached file
+    //   uploaded_by_user_id — cannot claim someone else's upload
+    // RETURNING lists the META columns only: `data` (up to 10 MiB of bytea)
+    // must never leave the row here (spec D10).
+    let claimed: Array<{
+      id: string; commentId: string | null; contentType: string;
+      byteSize: number; originalFilename: string; createdAt: Date;
+    }> = [];
+    if (attachmentIds.length > 0) {
+      const idList = sql.join(attachmentIds.map((aid) => sql`${aid}::uuid`), sql`, `);
+      const result = await tx.execute(sql`
+        UPDATE ticket_attachments
+           SET comment_id = ${row.id}::uuid, attached_at = now()
+         WHERE id IN (${idList})
+           AND ticket_id = ${ticketId}::uuid
+           AND org_id = ${ticket.orgId}::uuid
+           AND comment_id IS NULL
+           AND uploaded_by_user_id = ${actor.userId}::uuid
+        RETURNING id,
+                  comment_id        AS "commentId",
+                  content_type      AS "contentType",
+                  byte_size         AS "byteSize",
+                  original_filename AS "originalFilename",
+                  created_at        AS "createdAt"
+      `);
+      claimed = (Array.isArray(result) ? result : []) as typeof claimed;
+      if (claimed.length !== attachmentIds.length) {
+        throw new TicketServiceError(
+          'One or more attachments could not be attached to this comment',
+          409,
+          'ATTACHMENT_NOT_CLAIMABLE'
+        );
+      }
+    }
+
+    return { comment: row, firstResponseStamped: stamped, attachments: claimed };
+  });
 
   await emitTicketEvent({
     type: 'ticket.commented',
@@ -994,6 +1520,7 @@ export async function addTicketComment(ticketId: string, input: AddCommentInput,
     actorUserId: actor.userId,
     payload: { commentId: comment.id, isPublic: input.isPublic }
   });
+  await writeTicketOutbox(ticket.orgId, ticketId, 'ticket.commented', { commentId: comment.id, isPublic: input.isPublic });
   // Record the comment id + visibility only — the comment body can carry
   // sensitive/large content, so it stays out of the audit details (matching the
   // sibling pattern of keeping details lean).
@@ -1007,7 +1534,378 @@ export async function addTicketComment(ticketId: string, input: AddCommentInput,
     result: 'success'
   });
 
+  return { comment, firstResponseStamped, attachments };
+}
+
+/** Postgres unique-violation, however the driver happens to wrap it (mirrors tenantVariables.ts's isUniqueViolation). */
+function isUniqueViolation(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = (err as { code?: unknown }).code;
+  if (code === '23505') return true;
+  return isUniqueViolation((err as { cause?: unknown }).cause);
+}
+
+/**
+ * P2-4 (#4191): the first real writer of the 6.3 loop-guard columns
+ * (`originPrincipalKind` / `agentRunId`) — an AI-authored INTERNAL ticket
+ * note. `userId`/`portalUserId` are deliberately null: an ai_agent's identity
+ * (`aiAgents.id`) is not a `users.id` row, so writing it into
+ * `ticket_comments.user_id` (an FK to `users`) would violate the FK — the
+ * agent's display name goes into `authorName` for attribution instead
+ * (mirrors `remediationActResolver.ts`'s "never a synthetic users-FK id for
+ * an agent actor" precedent).
+ *
+ * Emits the SAME `ticket.commented` event/outbox row `addTicketComment`
+ * does — this does NOT re-trigger the 6.3 helpdesk subscriber's admission
+ * loop: the subscriber's own loop guard filters on
+ * `originPrincipalKind !== 'user'` (`ticketHelpdeskSubscriber.ts`), which
+ * this row satisfies by construction.
+ *
+ * Idempotent per run via `ticket_comments_one_ai_note_per_run_uq` (partial
+ * unique on `agent_run_id` WHERE `agent_run_id IS NOT NULL AND
+ * origin_principal_kind = 'ai_agent'`): a retry after a partial failure (the
+ * caller observed an error but the insert actually committed) returns the
+ * EXISTING row rather than erroring or duplicating the note.
+ */
+export async function addAiTriageNote(
+  ticketId: string,
+  runId: string,
+  content: string,
+  orgId: string,
+  agentName = 'AI Agent'
+): Promise<{ comment: { id: string } }> {
+  const ticket = await getTicketOrThrow(ticketId);
+  if (ticket.orgId !== orgId) {
+    throw new TicketServiceError('Ticket not found', 404);
+  }
+
+  try {
+    const inserted = await db.insert(ticketComments).values({
+      ticketId,
+      userId: null,
+      portalUserId: null,
+      authorName: agentName,
+      authorType: 'ai_agent',
+      commentType: 'internal',
+      content,
+      isPublic: false,
+      originPrincipalKind: 'ai_agent',
+      agentRunId: runId
+    }).returning({ id: ticketComments.id });
+    const comment = inserted[0];
+    if (!comment) throw new TicketServiceError('Failed to add AI triage note', 500);
+
+    await emitTicketEvent({
+      type: 'ticket.commented',
+      ticketId,
+      orgId: ticket.orgId,
+      partnerId: ticket.partnerId ?? null,
+      actorUserId: null,
+      payload: { commentId: comment.id, isPublic: false }
+    });
+    await writeTicketOutbox(ticket.orgId, ticketId, 'ticket.commented', { commentId: comment.id, isPublic: false });
+
+    return { comment };
+  } catch (err) {
+    if (isUniqueViolation(err)) {
+      const existing = await db
+        .select({ id: ticketComments.id })
+        .from(ticketComments)
+        .where(and(eq(ticketComments.agentRunId, runId), eq(ticketComments.originPrincipalKind, 'ai_agent')))
+        .limit(1);
+      const row = existing[0];
+      if (row) return { comment: row };
+    }
+    throw err;
+  }
+}
+
+export interface AiFieldUpdateSpec<T> {
+  value: T;
+  /** The value the caller last observed — the CAS predicate's comparison target. */
+  expectedCurrent: T | null;
+}
+
+export interface ApplyAiFieldUpdatesInput {
+  categoryId?: AiFieldUpdateSpec<string>;
+  priority?: AiFieldUpdateSpec<'low' | 'normal' | 'high' | 'urgent'>;
+}
+
+export type AiFieldUpdateOutcome =
+  | { applied: true }
+  | { applied: false; skipped: 'human_set' | 'concurrent_change' };
+
+/**
+ * P2-4 (#4191): the AI-triage release-path counterpart to `updateTicketFields`
+ * — CAS-guarded so an autonomous write can never clobber a field a human has
+ * since touched, or one that changed concurrently since the caller last
+ * observed it. One UPDATE, per-field `CASE WHEN <value unchanged since
+ * expectedCurrent> AND <no human stamp on this field> AND <new value actually
+ * differs> THEN <new value> ELSE <current value> END` — the CAS predicate is
+ * evaluated by Postgres against the row under the UPDATE's own row lock, so
+ * this is atomic without a separate `SELECT ... FOR UPDATE`. `field_provenance` is stamped to
+ * 'ai_agent' with the SAME predicate, so a skipped field's provenance is left
+ * exactly as it was (see `updateTicketFields`'s "AI writes never overwrite a
+ * 'user' stamp" contract this implements).
+ *
+ * The predicate also requires the write to be a REAL change
+ * (`<column> IS DISTINCT FROM <new value>`, #4466). The CAS half only proves
+ * the field has not MOVED since the caller observed it, so without this an AI
+ * that merely re-asserts the value already on the ticket satisfied the
+ * predicate and stamped 'ai_agent' anyway — silently taking ownership of a
+ * value a human had set through a path that left no provenance entry (an
+ * absent stamp COALESCEs to '' and sails past the `<> 'user'` guard). The
+ * guard sits in the shared predicate rather than only on the provenance arm so
+ * the stamp and the field write can never drift apart; on the value arm it is
+ * a no-op by construction, since writing a column the value it already holds
+ * changes nothing. This mirrors the human path, where `updateTicketFields`
+ * likewise stamps only the fields its own diff found changed.
+ *
+ * Read `applied: true` as "the field HOLDS the proposed value now", NOT as
+ * "this call wrote it" — the outcome is derived from the RETURNING row, which
+ * cannot distinguish a write from a field that already agreed. So a same-value
+ * confirmation reports `applied: true` having written and stamped nothing, and
+ * so does one against a field already stamped 'user' that happens to hold the
+ * proposed value. Anything asking "did the AI take ownership of this field?"
+ * must read `field_provenance`, never this flag.
+ *
+ * `categoryId`'s value is validated against `ticket_categories` for the
+ * ticket's PARTNER before the UPDATE runs — a cross-partner categoryId must
+ * fail closed exactly like the human `update_fields` path
+ * (`assertCategoryInPartner`), not silently write an orphaned id.
+ */
+export async function applyAiFieldUpdates(
+  ticketId: string,
+  orgId: string,
+  updates: ApplyAiFieldUpdatesInput,
+  runId: string
+): Promise<Partial<Record<'categoryId' | 'priority', AiFieldUpdateOutcome>>> {
+  // Reserved for forthcoming audit/observability wiring — not written
+  // anywhere yet (no brief-specified writer, and attributing an audit row
+  // correctly needs the run's agentId, which this signature doesn't carry;
+  // see the task report's Concerns).
+  void runId;
+
+  if (!updates.categoryId && !updates.priority) return {};
+
+  const [ticket] = await db
+    .select({ id: tickets.id, orgId: tickets.orgId, partnerId: tickets.partnerId })
+    .from(tickets)
+    .where(and(eq(tickets.id, ticketId), eq(tickets.orgId, orgId)))
+    .limit(1);
+  if (!ticket) {
+    throw new TicketServiceError('Ticket not found', 404);
+  }
+
+  if (updates.categoryId) {
+    await assertCategoryInPartner(updates.categoryId.value, await resolveTicketPartnerId(ticket));
+  }
+
+  // Three conjuncts, and all three are load-bearing: the CAS half (the value
+  // has not moved since the caller observed it), the human-stamp guard, and
+  // the real-change guard (#4466 — an AI re-asserting the value already on
+  // the ticket must not take ownership of it; see the doc block above).
+  const categoryCond = updates.categoryId
+    ? sql`(${tickets.categoryId} IS NOT DISTINCT FROM ${updates.categoryId.expectedCurrent} AND COALESCE(${tickets.fieldProvenance}->>'categoryId', '') <> 'user' AND ${tickets.categoryId} IS DISTINCT FROM ${updates.categoryId.value}::uuid)`
+    : null;
+  const priorityCond = updates.priority
+    ? sql`(${tickets.priority} IS NOT DISTINCT FROM ${updates.priority.expectedCurrent} AND COALESCE(${tickets.fieldProvenance}->>'priority', '') <> 'user' AND ${tickets.priority} IS DISTINCT FROM ${updates.priority.value}::ticket_priority)`
+    : null;
+
+  const setClause: Record<string, unknown> = { updatedAt: new Date() };
+  if (categoryCond) {
+    setClause.categoryId = sql`CASE WHEN ${categoryCond} THEN ${updates.categoryId!.value}::uuid ELSE ${tickets.categoryId} END`;
+  }
+  if (priorityCond) {
+    setClause.priority = sql`CASE WHEN ${priorityCond} THEN ${updates.priority!.value}::ticket_priority ELSE ${tickets.priority} END`;
+  }
+
+  const provenanceParts = [
+    categoryCond ? sql`CASE WHEN ${categoryCond} THEN '{"categoryId":"ai_agent"}'::jsonb ELSE '{}'::jsonb END` : null,
+    priorityCond ? sql`CASE WHEN ${priorityCond} THEN '{"priority":"ai_agent"}'::jsonb ELSE '{}'::jsonb END` : null,
+  ].filter((part): part is NonNullable<typeof part> => part !== null);
+  if (provenanceParts.length > 0) {
+    setClause.fieldProvenance = sql.join([sql`${tickets.fieldProvenance}`, ...provenanceParts], sql` || `);
+  }
+
+  const [after] = await db
+    .update(tickets)
+    .set(setClause)
+    .where(and(eq(tickets.id, ticketId), eq(tickets.orgId, orgId)))
+    .returning({ categoryId: tickets.categoryId, priority: tickets.priority, fieldProvenance: tickets.fieldProvenance });
+
+  if (!after) {
+    throw new TicketServiceError('Ticket was modified concurrently', 409, 'CONCURRENT_MODIFICATION');
+  }
+
+  const result: Partial<Record<'categoryId' | 'priority', AiFieldUpdateOutcome>> = {};
+  if (updates.categoryId) {
+    result.categoryId = after.categoryId === updates.categoryId.value
+      ? { applied: true }
+      : { applied: false, skipped: after.fieldProvenance?.categoryId === 'user' ? 'human_set' : 'concurrent_change' };
+  }
+  if (updates.priority) {
+    result.priority = after.priority === updates.priority.value
+      ? { applied: true }
+      : { applied: false, skipped: after.fieldProvenance?.priority === 'user' ? 'human_set' : 'concurrent_change' };
+  }
+  return result;
+}
+
+// Task A10 (#4191) — human draft routes (list / send / discard)
+
+export interface ActiveTicketDraftRow {
+  id: string;
+  kind: 'reply' | 'resolution_note';
+  content: string;
+  createdAt: Date;
+  runId: string | null;
+}
+
+/**
+ * The active drafts for a ticket (at most one per `kind` —
+ * `ticket_drafts_active_uq`). `runId` is a bare link to the producing
+ * `ai_agent_runs` row (the run-detail page), never the run's own outcome.
+ */
+export async function listActiveTicketDrafts(ticketId: string): Promise<ActiveTicketDraftRow[]> {
+  return db
+    .select({
+      id: ticketDrafts.id,
+      kind: ticketDrafts.kind,
+      content: ticketDrafts.content,
+      createdAt: ticketDrafts.createdAt,
+      runId: ticketDrafts.runId,
+    })
+    .from(ticketDrafts)
+    .where(and(eq(ticketDrafts.ticketId, ticketId), eq(ticketDrafts.state, 'active')))
+    .orderBy(desc(ticketDrafts.createdAt))
+    // Defensive bound only — ticket_drafts_active_uq caps this at one active
+    // row per (ticketId, kind), and there are two kinds, so the real result
+    // is never more than 2 rows.
+    .limit(10);
+}
+
+/**
+ * Post a `reply`-kind draft as a PUBLIC comment under the CALLING
+ * technician's own identity — sending is a human act, so this is
+ * `originPrincipalKind: 'user'` and `userId: actor.userId`, never an
+ * AI-attributed row (contrast `addAiTriageNote`). `content` overrides the
+ * draft's stored text when the technician edited it before sending;
+ * otherwise the draft's own content is posted verbatim.
+ *
+ * `SELECT ... FOR UPDATE` locks the draft row for the rest of this
+ * transaction: a concurrent second send/discard call blocks on the same row
+ * until this one commits or rolls back, then observes the now-committed
+ * `state` — so a double-send under a race is a clean 409 with ZERO duplicate
+ * comments, never two racing inserts. The final CAS `UPDATE ... WHERE
+ * state='active'` is defense-in-depth (unreachable while the lock above
+ * holds, since nothing else in this same transaction can have changed the
+ * row) rather than the load-bearing guard.
+ */
+export async function sendTicketDraft(
+  ticketId: string,
+  draftId: string,
+  content: string | undefined,
+  actor: TicketActor
+): Promise<{ comment: { id: string }; firstResponseStamped: boolean }> {
+  const ticket = await getTicketOrThrow(ticketId);
+
+  const [draft] = await db
+    .select()
+    .from(ticketDrafts)
+    .where(and(eq(ticketDrafts.id, draftId), eq(ticketDrafts.ticketId, ticketId)))
+    .limit(1)
+    .for('update');
+  if (!draft) throw new TicketServiceError('Draft not found', 404);
+  if (draft.kind !== 'reply') {
+    throw new TicketServiceError('Only reply drafts can be sent — a resolution-note draft is consumed by resolving the ticket', 409);
+  }
+  if (draft.state !== 'active') {
+    throw new TicketServiceError('Draft is no longer active', 409);
+  }
+
+  const body = content && content.trim().length > 0 ? content : draft.content;
+
+  const inserted = await db.insert(ticketComments).values({
+    ticketId,
+    userId: actor.userId,
+    authorName: actor.name ?? null,
+    authorType: 'internal',
+    commentType: 'comment',
+    content: body,
+    isPublic: true,
+    originPrincipalKind: 'user'
+  }).returning({ id: ticketComments.id });
+  const comment = inserted[0];
+  if (!comment) throw new TicketServiceError('Failed to send draft', 500);
+
+  const consumed = await db
+    .update(ticketDrafts)
+    .set({ state: 'consumed', consumedBy: actor.userId, consumedAt: new Date() })
+    .where(and(eq(ticketDrafts.id, draftId), eq(ticketDrafts.state, 'active')))
+    .returning({ id: ticketDrafts.id });
+  if (consumed.length === 0) {
+    throw new TicketServiceError('Draft was already consumed', 409);
+  }
+
+  // Same first-PUBLIC-response stamping rule as addTicketComment.
+  let firstResponseStamped = false;
+  if (!ticket.firstResponseAt) {
+    await db.update(tickets)
+      .set({ firstResponseAt: new Date(), updatedAt: new Date() })
+      .where(eq(tickets.id, ticketId));
+    firstResponseStamped = true;
+  }
+
+  await emitTicketEvent({
+    type: 'ticket.commented',
+    ticketId,
+    orgId: ticket.orgId,
+    partnerId: ticket.partnerId ?? null,
+    actorUserId: actor.userId,
+    payload: { commentId: comment.id, isPublic: true }
+  });
+  await writeTicketOutbox(ticket.orgId, ticketId, 'ticket.commented', { commentId: comment.id, isPublic: true });
+  await createAuditLogAsync({
+    orgId: ticket.orgId,
+    actorId: actor.userId,
+    action: 'ticket.comment',
+    resourceType: 'ticket',
+    resourceId: ticketId,
+    details: { commentId: comment.id, isInternal: false, fromAiDraft: draftId },
+    result: 'success'
+  });
+
   return { comment, firstResponseStamped };
+}
+
+/**
+ * CAS `active -> discarded`. Distinguishes "no such draft for this ticket"
+ * (404) from "found, but no longer active" (409) via a plain read before the
+ * CAS write — the write's own `WHERE state='active'` is what actually
+ * enforces the transition against a concurrent racer.
+ */
+export async function discardTicketDraft(ticketId: string, draftId: string): Promise<{ id: string }> {
+  const [draft] = await db
+    .select({ id: ticketDrafts.id, state: ticketDrafts.state })
+    .from(ticketDrafts)
+    .where(and(eq(ticketDrafts.id, draftId), eq(ticketDrafts.ticketId, ticketId)))
+    .limit(1);
+  if (!draft) throw new TicketServiceError('Draft not found', 404);
+  if (draft.state !== 'active') {
+    throw new TicketServiceError('Draft is no longer active', 409);
+  }
+
+  const updated = await db
+    .update(ticketDrafts)
+    .set({ state: 'discarded' })
+    .where(and(eq(ticketDrafts.id, draftId), eq(ticketDrafts.state, 'active')))
+    .returning({ id: ticketDrafts.id });
+  const row = updated[0];
+  if (!row) {
+    throw new TicketServiceError('Draft was already consumed or discarded', 409);
+  }
+  return row;
 }
 
 // Task 8 — Alert linking
@@ -1304,6 +2202,12 @@ export async function restoreTicket(ticketId: string, actor: TicketActor): Promi
     .returning();
   if (!updated) throw new TicketServiceError('Ticket is not deleted', 409);
 
+  // No emitTicketEvent here (restore never had a legacy-queue event — the
+  // notify worker has no ticket.restored branch). The outbox row is new for
+  // this PR: it exists purely so the durable-subscriber path (Task 3) and any
+  // future consumer can observe a restore, mirroring the other 5 sites.
+  await writeTicketOutbox(ticket.orgId, ticketId, 'ticket.restored');
+
   await createAuditLogAsync({
     orgId: ticket.orgId,
     actorId: actor.userId,
@@ -1318,13 +2222,23 @@ export async function restoreTicket(ticketId: string, actor: TicketActor): Promi
 
 // ─── Org re-assignment (Phase 6a) ─────────────────────────────────────────────
 
-// Child tables that denormalize org_id and reference a ticket. Mirrors the
-// device-move CUSTOM_ORG_REWRITE_TABLES set (core.ts) — keep in lockstep.
-// ticket_comments is intentionally absent: it has no org_id (child-via-parent).
-// invoice_lines is intentionally excluded: issued billing history must remain
-// stamped with the org that was billed (matches device CUSTOM_ORG_REWRITE_TABLES
-// exclusion); its ticket_id FK is ON DELETE SET NULL so moves do not orphan it.
-const TICKET_ORG_DENORMALIZED_TABLES = ['time_entries', 'ticket_parts', 'ticket_alert_links'] as const;
+// Child tables that denormalize org_id and reference a ticket, and the ORDER
+// this transaction must lock them in. Both the list and its order — including
+// which tables are deliberately absent (ticket_comments, invoice_lines) and
+// why — live in services/ticketOrgMoveLockOrder.ts, because the order is a
+// contract shared with the device-move path (routes/devices/moveOrg.ts,
+// CUSTOM_ORG_REWRITE_TABLES) rather than a local choice: the two movers reach
+// overlapping rows and deadlock with 40P01 if they disagree (#4657).
+// ticketOrgMoveLockOrder.test.ts fails on drift.
+//
+// ticket_email_links (#4643) is included: cross-channel email<->ticket
+// link/idempotency rows denormalize org_id from their ticket (shape 1, FORCE
+// RLS) and have no device_id — same shape as ticket_attachments. Appended
+// last, after ticket_attachments, on both axes.
+// findTicketInPartner / findTicketIdsByMessageIds (threadMatcher.ts) resolve
+// inbound-email threading by (partner_id, message_id) under a system context
+// and take tenancy from the live tickets.org_id, never from this row's
+// org_id, so re-stamping it here does not touch the idempotency contract.
 
 /**
  * Reassigns a ticket to another organization of the SAME partner.
@@ -1334,43 +2248,298 @@ const TICKET_ORG_DENORMALIZED_TABLES = ['time_entries', 'ticket_parts', 'ticket_
  * - Emits ticket.updated.
  * Rejects cross-partner moves with 400; unknown target with 404; same-org is a no-op.
  */
-export async function moveTicketOrg(ticketId: string, targetOrgId: string, actor: TicketActor): Promise<typeof tickets.$inferSelect> {
+export interface MoveTicketOrgOptions {
+  /**
+   * Multi-currency (#3776): allow a cross-currency move even though unbilled
+   * monetary time entries / parts will keep their OLD-currency snapshot under
+   * the new org. Route-gated on invoices:write; AI tools never set it.
+   */
+  acceptCurrencyMismatch?: boolean;
+}
+
+export async function moveTicketOrg(
+  ticketId: string,
+  targetOrgId: string,
+  actor: TicketActor | { kind: 'ai_agent'; agentId: string; name?: string },
+  opts: MoveTicketOrgOptions = {}
+): Promise<typeof tickets.$inferSelect> {
+  const isAgent = 'kind' in actor;
+  const userId = isAgent ? null : actor.userId;
+  const auditActor = isAgent
+    ? { actorType: 'ai_agent' as const, actorId: actor.agentId, initiatedBy: 'ai' as const }
+    : { actorId: actor.userId };
   const ticket = await getTicketOrThrow(ticketId);
   if (ticket.orgId === targetOrgId) return ticket;
 
-  const orgRows = await db
-    .select({ id: organizations.id, partnerId: organizations.partnerId, name: organizations.name })
-    .from(organizations)
-    .where(sql`${organizations.id} IN (${ticket.orgId}::uuid, ${targetOrgId}::uuid)`)
-    .limit(2);
-  const sourceOrg = orgRows.find((r) => r.id === ticket.orgId);
-  const targetOrg = orgRows.find((r) => r.id === targetOrgId);
-  if (!targetOrg) throw new TicketServiceError('Target organization not found', 404);
-  if (!sourceOrg || sourceOrg.partnerId !== targetOrg.partnerId) {
-    throw new TicketServiceError('Tickets can only be moved between organizations of the same partner', 400);
-  }
-
   let updated: typeof tickets.$inferSelect | undefined;
+  let guard: MoveCurrencyGuardDetails | null = null;
   await db.transaction(async (tx) => {
+    // #4596 W2. `time_entries_ticket_org_fk` and `ticket_parts_ticket_org_fk`
+    // are composite (ticket_id, org_id) -> tickets(id, org_id) and DEFERRABLE
+    // INITIALLY IMMEDIATE — i.e. checked at the end of EACH statement unless
+    // deferred here. The `tx.update(tickets)` below changes `tickets.org_id`
+    // while both children still point at the OLD org, so without this the
+    // ticket UPDATE 23503s the instant it completes.
+    //
+    // The children are rewritten a few statements later (the
+    // TICKET_ORG_DENORMALIZED_TABLES loop), so deferring to COMMIT is exactly
+    // right: at commit time every (ticket_id, org_id) pair resolves again.
+    //
+    // BY NAME, never `ALL`: `tickets_requester_contact_org_fk`,
+    // `ticket_drafts_ticket_org_fk` and `action_intents_scope_ticket_org_fk`
+    // are deliberately left IMMEDIATE here — the pre-UPDATE tombstone/delete
+    // statements below exist precisely so those fail fast and loudly if a new
+    // referencing row type is ever added without its own cleanup.
+    //
+    // Safe to precede the org lock below: SET CONSTRAINTS takes no table locks,
+    // so it does not participate in the lock order this transaction documents.
+    await tx.execute(
+      sql`SET CONSTRAINTS time_entries_ticket_org_fk, ticket_parts_ticket_org_fk DEFERRED`
+    );
+    // Lock order (global, #3778): organizations FOR SHARE (BOTH orgs, ascending
+    // UUID so two concurrent moves between the same pair cannot deadlock) →
+    // action_intents → ticket_drafts → ai_agent_runs → tickets → ticket_comments
+    // → the TICKET_ORG_DENORMALIZED_TABLES loop (time_entries, ticket_parts,
+    // ticket_alert_links, ticket_outbox, ticket_attachments, ticket_email_links).
+    //
+    // ai_agent_runs sits ahead of tickets (#4524) to match
+    // breeze_cascade_device_org_id(), which severs runs before re-stamping its
+    // child tables — `tickets` among them; the two paths must agree on that pair
+    // or a concurrent device-move and ticket-move over the same device-linked
+    // ticket deadlocks. action_intents is ordered the other way round from the
+    // device axis, which is safe only because the two can never contend for a
+    // row: action_intents_scope_device_chk / _scope_ticket_chk make
+    // scope_device_id and scope_ticket_id mutually exclusive, so the device
+    // axis's `WHERE scope_device_id = D` and this path's `WHERE scope_ticket_id`
+    // select disjoint rows.
+    //
+    // That disjointness argument does NOT cover ticket_alert_links: both axes
+    // can reach the same link row (device-move via `alert_id IN (… WHERE
+    // device_id = D)`, this path via `ticket_id = X`). #4657 closed that one by
+    // moving the DEVICE path's ticket_alert_links rewrite to sit after its
+    // time_entries/ticket_parts writes, matching the loop order here. The
+    // agreed order for every table the two movers share, and why it resolves
+    // this way round, is stated once in ./ticketOrgMoveLockOrder.ts — change it
+    // there, and on both paths together, never on one axis alone.
+    //
+    // The org lock is the FIRST statement of this transaction and is held to
+    // commit, so the source/target currency pair the guard compares cannot be
+    // restamped mid-move.
+    const lockedOrgs = await readOrgStampingDefaultsMany(tx, [ticket.orgId, targetOrgId]);
+    const orgRows = await tx
+      .select({ id: organizations.id, partnerId: organizations.partnerId, name: organizations.name })
+      .from(organizations)
+      .where(sql`${organizations.id} IN (${ticket.orgId}::uuid, ${targetOrgId}::uuid)`)
+      .limit(2);
+    const sourceMeta = orgRows.find((r) => r.id === ticket.orgId);
+    const targetMeta = orgRows.find((r) => r.id === targetOrgId);
+    if (!targetMeta) throw new TicketServiceError('Target organization not found', 404);
+    if (!sourceMeta || sourceMeta.partnerId !== targetMeta.partnerId) {
+      throw new TicketServiceError('Tickets can only be moved between organizations of the same partner', 400);
+    }
+    // Present by construction: the metadata rows above resolved, so the locks did too.
+    const sourceOrg = { ...sourceMeta, currencyCode: lockedOrgs.get(ticket.orgId)!.currencyCode };
+    const targetOrg = { ...targetMeta, currencyCode: lockedOrgs.get(targetOrgId)!.currencyCode };
+    // C1 fix (#4191 final review): both statements below MUST run BEFORE the
+    // `tx.update(tickets)` UPDATE just below — not after, despite every
+    // other cleanup here (the child-table org_id rewrites) following it.
+    // Both composite FKs below are DEFERRABLE INITIALLY IMMEDIATE (checked
+    // at the end of EACH statement, not deferred to COMMIT — the
+    // `SET CONSTRAINTS ... DEFERRED` at the top of this transaction names ONLY
+    // `time_entries_ticket_org_fk` and `ticket_parts_ticket_org_fk` (#4596 W2),
+    // so the two below remain immediate and this ordering stays load-bearing), and
+    // both reference `tickets(id, org_id)` — org_id is part of the key the
+    // ticket UPDATE below changes. Running the ticket UPDATE first (as a
+    // first attempt at this fix did) fails immediately with 23503 the
+    // instant that statement completes: a still-live ticket_drafts/
+    // action_intents row now points at (ticketId, OLD org_id), which no
+    // longer matches any row in `tickets` (there is only one row per id).
+    // These two must run first so no such row exists by the time the ticket
+    // UPDATE's own FK check runs.
+    //
+    // Both must live HERE (inside this transaction) rather than on either
+    // caller (the HTTP route at routes/tickets/moveOrg.ts, or the AI-tool
+    // executor at aiToolsTicketing.ts's move_org action) — this is the one
+    // path both call through, and the AI-tool path's own tombstone predates
+    // this fix and covered neither table nor every status (see below).
+    //
+    // 1. action_intents.scope_ticket_id: composite FK (scope_ticket_id,
+    // org_id) -> tickets(id, org_id) (action_intents_scope_ticket_org_fk,
+    // migrations/2026-09-25-ai-agents-ticket-triage.sql). action_intents rows
+    // keep the org_id of the actor who requested them — they do NOT move
+    // with the ticket — so once the ticket UPDATE below changes tickets.org_id,
+    // ANY remaining scope_ticket_id pointer (regardless of status) 23503s,
+    // and permanently: the composite pair (scope_ticket_id, targetOrgId)
+    // never resolves because the intent's own org_id never becomes
+    // targetOrgId. The immutability trigger
+    // (action_intents_block_content_update()) only special-cases a non-null
+    // -> NULL transition, so tombstoning is the only legal move, and it must
+    // cover every status, not just the live pre-release ones — a terminal
+    // (completed/failed/expired) intent still carries the same FK and would
+    // still 23503 on the next unrelated UPDATE to that row (audit backfills,
+    // moveOrg's own UPDATE below). All statuses, unconditionally.
+    await tx
+      .update(actionIntents)
+      .set({ scopeTicketId: null })
+      .where(eq(actionIntents.scopeTicketId, ticketId));
+    // 2. ticket_drafts: composite FK (ticket_id, org_id) -> tickets(id,
+    // org_id) (ticket_drafts_ticket_org_fk) would break the same way UNLESS
+    // we also repoint ticket_drafts.org_id — but ticket_drafts.run_id is
+    // ALSO composite-FK'd (run_id, org_id) -> ai_agent_runs(id, org_id)
+    // (ticket_drafts_run_org_fk), and the run stays behind in the source
+    // org, so repointing org_id would just trade one 23503 for another.
+    // Drafts are ephemeral (proposed content awaiting human
+    // consumption/discard, never itself the ticket_comments record — see
+    // ticketDrafts.ts's header comment), so deleting them on a cross-org
+    // move is the same accepted ruling used by the org-merge custom
+    // executor for the same run-pinning conflict.
+    await tx.delete(ticketDrafts).where(eq(ticketDrafts.ticketId, ticketId));
+    // #4524 — sever ai_agent_runs.ticket_id. Agent-run history stays with the
+    // SOURCE org (owner decision 2026-08-23): ai_agent_runs.org_id is
+    // trigger-immutable (ai_agent_runs_immutable_guard, 2026-09-06-a) and the
+    // table is deliberately absent from TICKET_ORG_DENORMALIZED_TABLES below.
+    // So a run that triggered on this ticket keeps org_id = SOURCE while the
+    // ticket it names becomes the TARGET org's — a cross-tenant pointer, and
+    // /ai-agents/:id/runs would serve that now-foreign ticket id back to the
+    // source org. This is the ticket-axis twin of the device-axis statement
+    // added by #4215.
+    //
+    // Nothing forces the issue the way it does for the two statements above:
+    // ai_agent_runs.ticket_id is a PLAIN single-column FK to tickets(id) with
+    // ON DELETE SET NULL (aiAgents.ts), not a composite (ticket_id, org_id)
+    // tenant FK, so the ticket UPDATE below would complete happily and the
+    // stale pointer would survive in silence. There is also no Postgres trigger
+    // on `UPDATE OF org_id ON tickets` (the device axis has
+    // breeze_cascade_device_org_id(); the ticket axis has no equivalent), so
+    // this service is the ONLY place the contract is enforced — see the note
+    // beside orgMergeRegistry's `tickets` entry for why the merge path is safe
+    // without one.
+    //
+    // Ordering — this must run BEFORE the tickets UPDATE, and that is a lock
+    // requirement, not a correctness one (the WHERE never reads `tickets`, and
+    // the plain FK cannot 23503 either way). breeze_cascade_device_org_id()
+    // severs ai_agent_runs FIRST and only then re-stamps its child tables, of
+    // which `tickets` is one, so the device axis takes ai_agent_runs BEFORE
+    // tickets. Taking them the other way round here would give a concurrent
+    // device-move and ticket-move over the same device-linked ticket a circular
+    // wait (each holding the lock the other needs) and one of them would die
+    // with 40P01. Matching the device axis's order is what keeps the pair
+    // consistent — see the global lock-order note at the top of this
+    // transaction.
+    await tx
+      .update(aiAgentRuns)
+      .set({ ticketId: null })
+      .where(eq(aiAgentRuns.ticketId, ticketId));
+    // device_vulnerabilities.ticket_id (#4645): the finding's remediation
+    // ticket link, the ticket-axis twin of #4642's ai_agent_runs detach just
+    // above and the reverse of moveOrg.ts's own device_vulnerabilities
+    // detach on the device axis (below). `device_vulnerabilities.org_id` is
+    // the DEVICE's org and does NOT move with the ticket — findings are
+    // device-scoped, and a device never moves as a side effect of a ticket
+    // move — so once `tickets.org_id` changes below, any finding still
+    // pointing at this ticket resolves to a now-foreign org under RLS (the
+    // link renders as a dead `/tickets#...` URL client-side; nothing
+    // dereferences it server-side today). Same plain single-column
+    // `ON DELETE SET NULL` FK shape as ai_agent_runs.ticket_id (not composite
+    // tenant-FK'd), so nothing here can 23503 — placed alongside the other
+    // ticket_id detach for readability, not because ordering is
+    // load-bearing.
+    //
+    // `org_id IS DISTINCT FROM targetOrgId` (device_vulnerabilities.org_id is
+    // NOT NULL, so this is equivalent to `<>`, kept for consistency with the
+    // identical guard on tickets.requester_contact_id below and on the
+    // device-axis mirror in moveOrg.ts): a finding whose device's org
+    // ALREADY equals the ticket's destination is not stale after the move
+    // and its link is left intact.
+    await tx
+      .update(deviceVulnerabilities)
+      .set({ ticketId: null })
+      .where(and(eq(deviceVulnerabilities.ticketId, ticketId), ne(deviceVulnerabilities.orgId, targetOrgId)));
+    // The UPDATE takes the ticket row lock; the currency guard then locks the
+    // unbilled monetary children, and the org_id rewrites follow. A throw here
+    // rolls this UPDATE back — nothing moves on a block.
+    // `requesterContactId: null` (#3258 W03 final review C1) is part of THIS
+    // statement, not a follow-up: `tickets_requester_contact_org_fk` is the
+    // composite (requester_contact_id, org_id) -> contacts(id, org_id), and it
+    // is DEFERRABLE INITIALLY IMMEDIATE and is NOT among the two constraints
+    // deferred at the top of this transaction (#4596 W2 names only the
+    // time_entries/ticket_parts ones) — so it is checked the instant this
+    // UPDATE finishes.
+    // A contact-linked ticket moved to another org would 23503 here, and
+    // permanently: contacts are org-pinned and the requester does NOT move with
+    // the ticket. Detaching is the same ruling as `deviceId: null` beside it —
+    // the person stays with their organization, and the ticket keeps the
+    // submitter name/email SNAPSHOT, so "who filed this" survives the move even
+    // though the link to the live contact row does not.
     const [row] = await tx
       .update(tickets)
-      .set({ orgId: targetOrgId, deviceId: null, updatedAt: new Date() })
+      .set({ orgId: targetOrgId, deviceId: null, requesterContactId: null, updatedAt: new Date() })
       .where(eq(tickets.id, ticketId))
       .returning();
     updated = row;
+    // #4524, reverse direction: ticket_comments has no org_id (child-via-parent
+    // tenancy — see the TICKET_ORG_DENORMALIZED_TABLES comment above), so every
+    // comment on this ticket travels into the target org while the run that
+    // authored it stays behind. A retained agent_run_id would then name a
+    // source-org run from a target-org row — the same reverse-pointer class
+    // #3828 fixed for metric_anomaly_incidents.agent_run_id on the device axis,
+    // just the other end of this ticket's link.
+    //
+    // Placement: after the ticket UPDATE, where ticket_comments' UPDATE policy
+    // (breeze_ticket_parent_update) EXISTS-joins the parent ticket's now-TARGET
+    // org_id. Running it earlier would also work — every caller holds access to
+    // both orgs for the whole transaction, so the source-org join would pass
+    // too — so this is placement for readability, not a constraint. There is no
+    // lock-order concern either way: the device axis never touches
+    // ticket_comments.
+    //
+    // Only the cross-org link is dropped: origin_principal_kind is untouched,
+    // and that (not agent_run_id) is what the helpdesk loop guard keys on when
+    // it refuses to re-admit non-user content, so severing here cannot open a
+    // feedback loop. Nulling also drops the row out of the partial unique index
+    // ticket_comments_one_ai_note_per_run_uq, whose predicate requires
+    // agent_run_id IS NOT NULL, so it can never collide.
+    //
+    // Scope note: the DEVICE axis has this same reverse-pointer gap — a device
+    // org-move re-stamps its tickets (tickets is in
+    // breeze_device_child_orgid_tables()) and their comments travel along while
+    // the runs stay put — and it is NOT closed here, because closing it means a
+    // new migration replacing breeze_cascade_device_org_id(). Neither axis leaks
+    // today: nothing writes agent_run_id yet (the autonomous-note lane is
+    // deferred; see the column comment in db/schema/portal.ts). Tracked in #4644
+    // so the contract is in place before that lane ships.
+    await tx
+      .update(ticketComments)
+      .set({ agentRunId: null })
+      .where(and(eq(ticketComments.ticketId, ticketId), isNotNull(ticketComments.agentRunId)));
+    guard = await assertTicketMoveCurrencyCompatible(tx, {
+      ticketIds: [ticketId],
+      sourceCurrency: sourceOrg.currencyCode,
+      targetCurrency: targetOrg.currencyCode,
+      targetOrgName: targetOrg.name,
+      acceptCurrencyMismatch: opts.acceptCurrencyMismatch === true
+    });
+    // SET org_id only — currency_code snapshots are never touched by a move.
     for (const table of TICKET_ORG_DENORMALIZED_TABLES) {
       await tx.execute(
         sql`UPDATE ${sql.identifier(table)} SET org_id = ${targetOrgId}::uuid WHERE ticket_id = ${ticketId}::uuid`
       );
     }
+    const strandedCount = guard?.accepted ? guard.unbilledTimeEntries + guard.unbilledParts : 0;
     // System feed entry on the moved ticket.
     await tx.insert(ticketComments).values({
       ticketId,
-      userId: actor.userId,
+      userId,
       authorName: actor.name ?? null,
-      authorType: 'internal',
+      authorType: isAgent ? 'ai_agent' : 'internal',
+      originPrincipalKind: isAgent ? 'ai_agent' : 'user',
+      // Runs remain in the source org; never link this destination comment
+      // back to a source-org run after the detach above.
+      agentRunId: null,
       commentType: 'system',
-      content: `Moved to ${targetOrg.name}`,
+      content: `Moved to ${targetOrg.name}` + (strandedCount > 0
+        ? ` — ${strandedCount} unbilled items stay in ${sourceOrg.currencyCode}`
+        : ''),
       isPublic: false
     });
   });
@@ -1381,13 +2550,20 @@ export async function moveTicketOrg(ticketId: string, targetOrgId: string, actor
     ticketId,
     orgId: targetOrgId,
     partnerId: ticket.partnerId ?? null,
-    actorUserId: actor.userId,
+    actorUserId: userId,
     payload: { changed: ['orgId'] }
   });
   // Audit on BOTH orgs so the move shows in source and target feeds (device precedent).
-  const details = { fromOrgId: ticket.orgId, toOrgId: targetOrgId, detachedDeviceId: ticket.deviceId ?? null };
-  await createAuditLogAsync({ orgId: ticket.orgId, actorId: actor.userId, action: 'ticket.move_org.source', resourceType: 'ticket', resourceId: ticketId, details, result: 'success' });
-  await createAuditLogAsync({ orgId: targetOrgId, actorId: actor.userId, action: 'ticket.move_org.target', resourceType: 'ticket', resourceId: ticketId, details, result: 'success' });
+  // (Cast: TS narrows the closure-assigned `let` to its initial null.)
+  const accepted = guard as MoveCurrencyGuardDetails | null;
+  const details = {
+    fromOrgId: ticket.orgId,
+    toOrgId: targetOrgId,
+    detachedDeviceId: ticket.deviceId ?? null,
+    ...(accepted?.accepted ? { currencyMismatchAccepted: accepted } : {})
+  };
+  await createAuditLogAsync({ orgId: ticket.orgId, ...auditActor, action: 'ticket.move_org.source', resourceType: 'ticket', resourceId: ticketId, details, result: 'success' });
+  await createAuditLogAsync({ orgId: targetOrgId, ...auditActor, action: 'ticket.move_org.target', resourceType: 'ticket', resourceId: ticketId, details, result: 'success' });
   return updated;
 }
 

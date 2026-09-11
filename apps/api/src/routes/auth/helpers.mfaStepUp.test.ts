@@ -27,7 +27,12 @@ const { selectLimit, db, getRedis, rateLimiter, consumeMFAToken, decryptMfaTotpS
 
 vi.mock('../../db', () => ({
   db,
-  withSystemDbAccessContext: undefined,
+  // Passthrough, matching production's real withSystemDbAccessContext when it
+  // is nested inside an existing context. NOT `undefined`: runWithSystemDbAccess
+  // now THROWS rather than silently running the probe contextless, because that
+  // fallback degraded a security read into a zero-row read whose answer is the
+  // permissive one (see the helper's doc comment).
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
 }));
 
 vi.mock('../../db/schema', () => ({
@@ -102,15 +107,24 @@ describe('requireFreshMfaStepUp', () => {
     consumeMFAToken.mockResolvedValue(false);
     const c = makeContext();
     const result = await requireFreshMfaStepUp(c, USER_ID, '000000');
-    expect(c.json).toHaveBeenCalledWith({ error: 'Invalid credentials' }, 401);
-    expect(result).toEqual({ __body: { error: 'Invalid credentials' }, __status: 401 });
+    expect(c.json).toHaveBeenCalledWith(
+      { error: 'Invalid credentials', message: 'Invalid credentials', code: 'invalid_credentials' },
+      401,
+    );
+    expect(result).toEqual({
+      __body: { error: 'Invalid credentials', message: 'Invalid credentials', code: 'invalid_credentials' },
+      __status: 401,
+    });
   });
 
   it('returns 401 when MFA is disabled', async () => {
     mockUserRow({ mfaEnabled: false, mfaSecret: 'enc-secret', mfaMethod: 'totp' });
     const c = makeContext();
     await requireFreshMfaStepUp(c, USER_ID, '123456');
-    expect(c.json).toHaveBeenCalledWith({ error: 'Invalid credentials' }, 401);
+    expect(c.json).toHaveBeenCalledWith(
+      { error: 'Invalid credentials', message: 'Invalid credentials', code: 'invalid_credentials' },
+      401,
+    );
     expect(consumeMFAToken).not.toHaveBeenCalled();
   });
 
@@ -118,7 +132,10 @@ describe('requireFreshMfaStepUp', () => {
     mockUserRow({ mfaEnabled: true, mfaSecret: 'enc-secret', mfaMethod: 'sms' });
     const c = makeContext();
     await requireFreshMfaStepUp(c, USER_ID, '123456');
-    expect(c.json).toHaveBeenCalledWith({ error: 'Invalid credentials' }, 401);
+    expect(c.json).toHaveBeenCalledWith(
+      { error: 'Invalid credentials', message: 'Invalid credentials', code: 'invalid_credentials' },
+      401,
+    );
     expect(consumeMFAToken).not.toHaveBeenCalled();
   });
 
@@ -126,7 +143,10 @@ describe('requireFreshMfaStepUp', () => {
     mockUserRow({ mfaEnabled: true, mfaSecret: 'enc-secret', mfaMethod: 'passkey' });
     const c = makeContext();
     await requireFreshMfaStepUp(c, USER_ID, '123456');
-    expect(c.json).toHaveBeenCalledWith({ error: 'Invalid credentials' }, 401);
+    expect(c.json).toHaveBeenCalledWith(
+      { error: 'Invalid credentials', message: 'Invalid credentials', code: 'invalid_credentials' },
+      401,
+    );
     expect(consumeMFAToken).not.toHaveBeenCalled();
   });
 
@@ -134,7 +154,10 @@ describe('requireFreshMfaStepUp', () => {
     mockUserRow({ mfaEnabled: true, mfaSecret: null, mfaMethod: 'totp' });
     const c = makeContext();
     await requireFreshMfaStepUp(c, USER_ID, '123456');
-    expect(c.json).toHaveBeenCalledWith({ error: 'Invalid credentials' }, 401);
+    expect(c.json).toHaveBeenCalledWith(
+      { error: 'Invalid credentials', message: 'Invalid credentials', code: 'invalid_credentials' },
+      401,
+    );
     expect(consumeMFAToken).not.toHaveBeenCalled();
   });
 
@@ -142,7 +165,10 @@ describe('requireFreshMfaStepUp', () => {
     decryptMfaTotpSecret.mockReturnValue(null);
     const c = makeContext();
     await requireFreshMfaStepUp(c, USER_ID, '123456');
-    expect(c.json).toHaveBeenCalledWith({ error: 'Invalid credentials' }, 401);
+    expect(c.json).toHaveBeenCalledWith(
+      { error: 'Invalid credentials', message: 'Invalid credentials', code: 'invalid_credentials' },
+      401,
+    );
     expect(consumeMFAToken).not.toHaveBeenCalled();
   });
 
@@ -150,7 +176,10 @@ describe('requireFreshMfaStepUp', () => {
     mockUserRow(undefined);
     const c = makeContext();
     await requireFreshMfaStepUp(c, USER_ID, '123456');
-    expect(c.json).toHaveBeenCalledWith({ error: 'Invalid credentials' }, 401);
+    expect(c.json).toHaveBeenCalledWith(
+      { error: 'Invalid credentials', message: 'Invalid credentials', code: 'invalid_credentials' },
+      401,
+    );
   });
 
   it('returns 429 when rate-limited', async () => {
@@ -169,7 +198,12 @@ describe('requireFreshMfaStepUp', () => {
     getRedis.mockReturnValue(null);
     const c = makeContext();
     await requireFreshMfaStepUp(c, USER_ID, '123456');
-    expect(c.json).toHaveBeenCalledWith({ error: 'Service temporarily unavailable' }, 503);
+    // #4746: `message` mirrors `error` on both non-rejection bodies, because
+    // the web profile form reads `data.message` only.
+    expect(c.json).toHaveBeenCalledWith(
+      { error: 'Service temporarily unavailable', message: 'Service temporarily unavailable' },
+      503,
+    );
     expect(rateLimiter).not.toHaveBeenCalled();
   });
 

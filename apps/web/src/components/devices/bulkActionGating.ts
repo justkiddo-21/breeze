@@ -72,6 +72,20 @@ export function isCommandQueueable(status: string): boolean {
  * `shutdown` / `lock` / `reboot_safe_mode` have no bulk button today, but
  * runBulkAction's switch already routes them through sendBulkCommand, so they are
  * classified up front: wiring a button later must not silently skip the gate.
+ *
+ * `decommission` (i.e. bulk Remove) is gated here too, but for a DIFFERENT
+ * reason than the agent-command actions above — read this before moving it back
+ * to INTENTIONALLY_UNGATED_BULK_ACTIONS. `bulkDecommissionDevices` fires one
+ * `DELETE /devices/:id` per selected device, and the API rejects that with
+ * `400 Device is already decommissioned` for a device whose status is already
+ * `decommissioned` — a distinct rejection from the agent-command one, but the
+ * same underlying fact (`isCommandQueueable` / `status !== 'decommissioned'`
+ * already answers it). Gating skips already-removed devices and proceeds with
+ * the rest; it does NOT skip `offline` devices — retiring an offline (dead)
+ * machine is still the intended use case, only retiring an ALREADY-retired one
+ * is not. Un-gating this reintroduces the doomed-request bug (#3987 fix wave):
+ * select several already-removed devices, hit "Remove Selected", and every one
+ * of them 400s into a "Bulk Remove Failed" toast instead of being skipped.
  */
 export const DECOMMISSION_BLOCKED_BULK_ACTIONS: ReadonlySet<string> = new Set([
   'reboot',
@@ -79,6 +93,7 @@ export const DECOMMISSION_BLOCKED_BULK_ACTIONS: ReadonlySet<string> = new Set([
   'shutdown',
   'lock',
   'run-script',
+  'decommission',
 ]);
 
 /**
@@ -94,7 +109,6 @@ export const DECOMMISSION_BLOCKED_BULK_ACTIONS: ReadonlySet<string> = new Set([
  *                     (b) it is not gated on `decommissioned` either — see the NOTE
  *                         below. That one is a deferral, not a principle.
  *   maintenance-*   — a DB flag, not an agent command. (Also see the NOTE.)
- *   decommission    — retiring dead machines IS the use case.
  *   deploy-software — navigates to /software; sends no command from here.
  *   link-*          — DB-only topology linkage; no agent involved.
  *   compare         — navigates to /devices/compare; read-only comparison
@@ -116,12 +130,60 @@ export const INTENTIONALLY_UNGATED_BULK_ACTIONS: ReadonlySet<string> = new Set([
   'wake',
   'maintenance-on',
   'maintenance-off',
-  'decommission',
   'deploy-software',
   'link-multiboot',
   'link-vm-host',
   'compare',
 ]);
+
+/**
+ * Bulk actions that ONLY a removed (decommissioned) device accepts — the exact
+ * inverse gate to `DECOMMISSION_BLOCKED_BULK_ACTIONS`.
+ *
+ * Why a third set rather than a boolean flip of the first one: the two gates
+ * answer different questions. `DECOMMISSION_BLOCKED_*` is "the API refuses this
+ * for a removed device, so skip those and proceed with the rest" — a per-device
+ * FILTER. This one is "these buttons must not be OFFERED at all unless the whole
+ * selection is removed" — a per-SELECTION visibility rule, because
+ * `POST /devices/bulk/restore` and `POST /devices/bulk/permanent-delete` both
+ * require `status = 'decommissioned'` and would reject every active device in a
+ * mixed batch.
+ *
+ * The contract test in DeviceList.test.tsx forces every action the bulk bar
+ * emits into exactly one of the three sets, in both selection states. Without
+ * that, adding a bulk button for removed devices and forgetting to classify it
+ * is silent — a gate's only failure mode is doing nothing.
+ */
+export const REMOVED_ONLY_BULK_ACTIONS: ReadonlySet<string> = new Set([
+  'restore',
+  'permanent-delete',
+]);
+
+/** What the current selection is made of, from the bulk bar's point of view. */
+export type BulkSelectionKind = 'active' | 'removed' | 'mixed';
+
+/**
+ * Classify a selection so the bulk bar can offer the right menu.
+ *
+ * `'mixed'` deliberately gets the ACTIVE menu (see DeviceList): the removed-only
+ * actions would reject every active device in the batch, whereas the active
+ * actions already skip removed devices through
+ * `DECOMMISSION_BLOCKED_BULK_ACTIONS`. So the mixed case degrades to "skips the
+ * removed ones" rather than "fails on most of them".
+ *
+ * An EMPTY selection is `'active'`, not `'removed'`: `every()` on an empty array
+ * is vacuously true, which would have made an empty selection offer "Delete
+ * permanently". The bar is hidden at size 0 today, so this only decides the
+ * instant between the last deselect and the unmount — but a vacuous truth
+ * pointing at the destructive branch is not a default worth inheriting.
+ */
+export function classifyBulkSelection(statuses: readonly string[]): BulkSelectionKind {
+  if (statuses.length === 0) return 'active';
+  const removed = statuses.filter((s) => s === 'decommissioned').length;
+  if (removed === 0) return 'active';
+  if (removed === statuses.length) return 'removed';
+  return 'mixed';
+}
 
 type DeviceTranslation = ReturnType<typeof useTranslation<'devices'>>['t'];
 
@@ -137,6 +199,11 @@ export const notOnlineTitleKeys: Record<Exclude<DeviceStatus, 'online'>, string>
   quarantined: 'deviceActions.unavailable.quarantined',
   updating: 'deviceActions.unavailable.updating',
   pending: 'deviceActions.unavailable.pending',
+  // A manual asset (#4622 W04) or an unprobed manual network asset (#5213)
+  // never reaches a live-session gate — neither has an agent, so these actions
+  // aren't offered for them at all (see DeviceList's manual Actions cell).
+  // Kept exhaustive rather than silently falling back to a generic tooltip.
+  unknown: 'deviceActions.unavailable.unknown',
 };
 
 /**

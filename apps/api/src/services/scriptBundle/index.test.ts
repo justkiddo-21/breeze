@@ -71,6 +71,8 @@ import {
   MAX_BUNDLE_CONTENT_LENGTH
 } from './schema';
 import { PARTNER_WIDE_WRITE_DENIED_MESSAGE } from '../partnerWideAccess';
+import { MAX_SECRET_ENV_ENTRIES } from '../scriptSecretEnvelope';
+import { MAX_SECRET_SCRIPT_PARAMETERS } from '@breeze/shared';
 
 function makeAuth(overrides: Partial<BundleAuth> = {}): BundleAuth {
   return {
@@ -260,6 +262,40 @@ describe('importBundle', () => {
     expect(values.createdBy).toBe('user-123');
   });
 
+  it('never honours a security acknowledgement from a bundle (#5129)', async () => {
+    // A bundle is an importable FILE. If an attacker-supplied entry could
+    // self-acknowledge its own risky patterns, importing one would hand it a
+    // standing exemption from the agent's Strict checks — the acknowledgement
+    // has to be a decision a human makes in the product, not a field a file
+    // asserts about itself. Two layers stop it: the entry schema strips the
+    // unknown key, and insertScriptRow clamps to (submitted \u2229 matched)
+    // with nothing submitted. Pinned here the same way isSystem is.
+    const bundle = {
+      bundleVersion: 1 as const,
+      scripts: [
+        {
+          ...baseEntry,
+          content: "Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Contoso' -Name Enabled -Value 1",
+          acknowledgedSecurityPatterns: ['PowerShell HKLM modification'],
+          securityAcknowledgedBy: 'attacker'
+        }
+      ]
+    };
+
+    h.state.selectQueue.push([]); // findExistingByName → none
+    const result = await importBundle(makeAuth(), bundle, { mode: 'skip', availability: 'org' });
+
+    expect('error' in result).toBe(false);
+    const values = h.state.inserts.find((i) => i.table === scripts)!.values as Record<string, unknown>;
+    expect(values.acknowledgedSecurityPatterns).toEqual([]);
+    expect(values.securityAcknowledgedBy).toBeNull();
+    expect(values.securityAcknowledgedAt).toBeNull();
+    // Guards the guard: the risky content really was imported, so the
+    // assertions above describe a refused acknowledgement rather than a
+    // script that had nothing to acknowledge.
+    expect(values.content).toContain('HKLM');
+  });
+
   it('lands scripts in the caller scope, ignoring tenancy in the bundle (org caller)', async () => {
     const bundle = validBundle([{ ...baseEntry, orgId: OTHER_ORG_ID }]);
     h.state.selectQueue.push([]); // no name conflict
@@ -370,6 +406,54 @@ describe('importBundle', () => {
     expect(set.content).toBe('new content');
     expect(set.version).toBe(5);
     if ('versioned' in result) expect(result.versioned).toBe(1);
+  });
+
+  it('new-version mode REVOKES the target row\u2019s security acknowledgement (#5129)', async () => {
+    // The bypass this guards: an entry named after an already-approved script
+    // replaces its content wholesale with unreviewed text from a FILE. If the
+    // acknowledgement carried forward, the new body would inherit an approval
+    // no human ever gave it — the same failure the description-set design
+    // exists to prevent, reached through a different door. The interactive PUT
+    // may carry forward (a person is looking at the editor); this path may not.
+    const bundle = validBundle([
+      {
+        ...baseEntry,
+        content: "Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Attacker' -Name Enabled -Value 1"
+      }
+    ]);
+    h.state.selectQueue.push([
+      {
+        id: SCRIPT_ID,
+        name: baseEntry.name,
+        version: 4,
+        content: "Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Approved' -Name Enabled -Value 1",
+        description: 'd',
+        category: null,
+        parameters: null,
+        exitCodeSeverityMapping: null,
+        // The target row was approved for exactly the pattern the incoming
+        // content also matches — the worst case, where a naive carry-forward
+        // would look correct.
+        acknowledgedSecurityPatterns: ['PowerShell HKLM modification'],
+        securityAcknowledgedBy: 'admin-who-approved-the-old-body',
+        securityAcknowledgedAt: new Date('2026-01-01T00:00:00.000Z')
+      }
+    ]);
+
+    const result = await importBundle(makeAuth(), bundle, {
+      mode: 'new-version',
+      availability: 'org'
+    });
+
+    expect('error' in result).toBe(false);
+    const set = h.state.updates.find((u) => u.table === scripts)!.values as Record<string, unknown>;
+    expect(set.acknowledgedSecurityPatterns).toEqual([]);
+    expect(set.securityAcknowledgedBy).toBeNull();
+    expect(set.securityAcknowledgedAt).toBeNull();
+    // Guards the guard: the content really was replaced with a body that
+    // matches a Strict pattern, so the revocation above is load-bearing rather
+    // than a statement about a harmless import.
+    expect(set.content).toContain('Attacker');
   });
 
   it('records per-entry failures and continues with the rest', async () => {
@@ -639,6 +723,241 @@ describe('importBundle', () => {
       expect(result.errors[0]!.error).toContain('p_secret');
     }
     expect(h.state.inserts).toHaveLength(0);
+  });
+
+  // ---------------------------------------------------------------------
+  // Save-time parameter-binding secret mismatch (#3409 PR4c-2, Task 6)
+  // ---------------------------------------------------------------------
+  const secretRow = { id: 'tv-1', key: 's1_token', value: 'shh', isSecret: true, version: 1, ownerOrgId: ORG_ID, forOrgId: ORG_ID };
+  const plainRow = { id: 'tv-2', key: 'repo_url', value: 'https://dl.example', isSecret: false, version: 1, ownerOrgId: ORG_ID, forOrgId: ORG_ID };
+
+  it('rejects a bundle entry whose tenantVariable parameter binds a SECRET variable, per-entry', async () => {
+    const bundle = validBundle([
+      { ...baseEntry, parameters: [{ name: 'p', type: 'string', source: 'tenantVariable', variableKey: 's1_token' }] },
+      { ...baseEntry, name: 'Second script' }
+    ]);
+    h.state.selectQueue.push(
+      [secretRow], // entry 1: content has no tokens → only the parameter lookup (loadTenantVariableScope)
+      [] // entry 2: findExistingByName → none
+    );
+    const result = await importBundle(makeAuth(), bundle, { mode: 'skip', availability: 'org' });
+    expect('error' in result).toBe(false);
+    if ('errors' in result) {
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]!.index).toBe(0);
+      expect(result.errors[0]!.error).toBe(
+        'Parameter "p" binds secret variable "s1_token" with source "From a variable"; use a secret parameter instead'
+      );
+      expect(result.imported).toBe(1);
+    }
+    expect(h.state.inserts.filter((i) => i.table === scripts)).toHaveLength(1);
+  });
+
+  it('rejects a bundle entry whose tenantSecret parameter binds a NON-secret variable, per-entry', async () => {
+    const bundle = validBundle([
+      { ...baseEntry, parameters: [{ name: 'p', type: 'string', source: 'tenantSecret', variableKey: 'repo_url' }] }
+    ]);
+    h.state.selectQueue.push([plainRow]);
+    const result = await importBundle(makeAuth(), bundle, { mode: 'skip', availability: 'org' });
+    expect('error' in result).toBe(false);
+    if ('errors' in result) {
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]!.error).toBe('Parameter "p" is a secret parameter but variable "repo_url" is not a secret');
+      expect(result.imported).toBe(0);
+    }
+    expect(h.state.inserts).toHaveLength(0);
+  });
+
+  it('imports a bundle entry whose bindings target UNKNOWN keys or match their targets', async () => {
+    const bundle = validBundle([
+      {
+        ...baseEntry,
+        parameters: [
+          { name: 'p', type: 'string', source: 'tenantVariable', variableKey: 'repo_url' },
+          { name: 'q', type: 'string', source: 'tenantSecret', variableKey: 's1_token' },
+          { name: 'r', type: 'string', source: 'tenantSecret', variableKey: 'not_yet_created' }
+        ]
+      }
+    ]);
+    h.state.selectQueue.push(
+      [secretRow, plainRow], // loadTenantVariableScope([ORG_ID])
+      [] // findExistingByName → none
+    );
+    const result = await importBundle(makeAuth(), bundle, { mode: 'skip', availability: 'org' });
+    expect('error' in result).toBe(false);
+    if ('errors' in result) expect(result.errors).toHaveLength(0);
+    if ('imported' in result) expect(result.imported).toBe(1);
+  });
+
+  it('still rejects on CONTENT secrets first, with the content message, when both content and parameters offend', async () => {
+    const bundle = validBundle([
+      {
+        ...baseEntry,
+        content: 'echo {{var.s1_token}}',
+        parameters: [{ name: 'p', type: 'string', source: 'tenantVariable', variableKey: 's1_token' }]
+      }
+    ]);
+    h.state.selectQueue.push([secretRow]); // content lookup short-circuits before the parameter lookup
+    const result = await importBundle(makeAuth(), bundle, { mode: 'skip', availability: 'org' });
+    expect('error' in result).toBe(false);
+    if ('errors' in result) {
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]!.error).toBe(
+        'Script content references secret variable(s): {{var.s1_token}}. Secret variables cannot be substituted into script content.'
+      );
+    }
+    expect(h.state.inserts).toHaveLength(0);
+  });
+
+  // ---------------------------------------------------------------------
+  // Ownership TIER of the secret vs. the SCRIPT (#3409 PR4c-2 review).
+  //
+  // A script may resolve a secret at or below its own ownership tier, never
+  // above: a partner-wide script (org_id NULL) may bind a partner-owned OR an
+  // org-owned secret; an ORG-scoped script may bind only an org-owned one.
+  // The rule is NOT a caller capability — a full-partner admin saving an
+  // org-scoped script is still denied, because that script is afterwards
+  // editable and runnable by the customer org's own admins.
+  //
+  // Dispatch is the authority (services/sourcedParameters.ts, `tenantSecret`
+  // arm); these cases pin the save-time FAST FAIL.
+  // ---------------------------------------------------------------------
+  // A partner-wide tenant_variables row: org_id IS NULL, hence ownerScope
+  // 'partner' once resolveForOrg attributes it to the target org.
+  const partnerSecretRow = {
+    id: 'tv-3',
+    key: 'psa_api_token',
+    value: 'shh',
+    isSecret: true,
+    version: 1,
+    ownerOrgId: null,
+    forOrgId: ORG_ID
+  };
+
+  const TIER_DENIED =
+    'Parameter "psa" binds partner-wide secret variable "psa_api_token"; an organization-scoped script cannot use one — make the script partner-wide, or use an organization-owned secret.';
+
+  const psaSecretParam = { name: 'psa', type: 'string', source: 'tenantSecret', variableKey: 'psa_api_token' };
+
+  it('rejects an ORG-scoped import binding a PARTNER-WIDE secret', async () => {
+    const bundle = validBundle([{ ...baseEntry, parameters: [psaSecretParam] }]);
+    h.state.selectQueue.push([partnerSecretRow]);
+    const result = await importBundle(makeAuth(), bundle, { mode: 'skip', availability: 'org' });
+    expect('error' in result).toBe(false);
+    if ('errors' in result) {
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]!.error).toBe(TIER_DENIED);
+    }
+    expect(h.state.inserts).toHaveLength(0);
+  });
+
+  // The rule is the SCRIPT's tier, not the caller's capability: a full-partner
+  // admin importing into ONE org is writing an org-scoped script, which that
+  // org's admins can then edit and run.
+  it('rejects an ORG-scoped import binding a PARTNER-WIDE secret even for a full-partner admin', async () => {
+    const auth = makeAuth({
+      scope: 'partner',
+      orgId: null,
+      partnerOrgAccess: 'all',
+      accessibleOrgIds: [ORG_ID]
+    });
+    const bundle = validBundle([{ ...baseEntry, parameters: [psaSecretParam] }]);
+    h.state.selectQueue.push([partnerSecretRow]);
+    const result = await importBundle(auth, bundle, { mode: 'skip', availability: 'org', orgId: ORG_ID });
+    expect('error' in result).toBe(false);
+    if ('errors' in result) {
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]!.error).toBe(TIER_DENIED);
+    }
+    expect(h.state.inserts).toHaveLength(0);
+  });
+
+  it("ALLOWS a PARTNER-WIDE import binding the partner's own secret", async () => {
+    const auth = makeAuth({
+      scope: 'partner',
+      orgId: null,
+      partnerOrgAccess: 'all',
+      accessibleOrgIds: [ORG_ID]
+    });
+    const bundle = validBundle([{ ...baseEntry, parameters: [psaSecretParam] }]);
+    h.state.selectQueue.push(
+      // Partner-wide branch: tenant_variables read directly (org_id IS NULL).
+      [{ key: 'psa_api_token', isSecret: true }],
+      [] // findConflictByName -> none
+    );
+    const result = await importBundle(auth, bundle, { mode: 'skip', availability: 'partner' });
+    expect('error' in result).toBe(false);
+    if ('errors' in result) expect(result.errors).toHaveLength(0);
+    if ('imported' in result) expect(result.imported).toBe(1);
+    const values = h.state.inserts.find((i) => i.table === scripts)!.values as Record<string, unknown>;
+    expect(values.orgId).toBeNull();
+  });
+
+  // The PRIMARY use case: one partner-wide script, each target org's OWN value
+  // resolved per device at dispatch. Save time sees no partner-wide row for the
+  // key, so it is "unknown" here — and must not be rejected on that basis.
+  it('ALLOWS a PARTNER-WIDE import binding a key that only exists as an ORG-owned secret', async () => {
+    const auth = makeAuth({
+      scope: 'partner',
+      orgId: null,
+      partnerOrgAccess: 'all',
+      accessibleOrgIds: [ORG_ID]
+    });
+    const bundle = validBundle([
+      { ...baseEntry, parameters: [{ name: 'q', type: 'string', source: 'tenantSecret', variableKey: 's1_token' }] }
+    ]);
+    h.state.selectQueue.push(
+      [], // no partner-wide row named s1_token
+      [] // findConflictByName -> none
+    );
+    const result = await importBundle(auth, bundle, { mode: 'skip', availability: 'partner' });
+    expect('error' in result).toBe(false);
+    if ('errors' in result) expect(result.errors).toHaveLength(0);
+    if ('imported' in result) expect(result.imported).toBe(1);
+  });
+
+  it('leaves an ORG-owned secret binding unaffected for the same org-scope caller', async () => {
+    const bundle = validBundle([
+      { ...baseEntry, parameters: [{ name: 'q', type: 'string', source: 'tenantSecret', variableKey: 's1_token' }] }
+    ]);
+    h.state.selectQueue.push(
+      [secretRow], // ownerOrgId === ORG_ID -> ownerScope 'organization'
+      [] // findConflictByName -> none
+    );
+    const result = await importBundle(makeAuth(), bundle, { mode: 'skip', availability: 'org' });
+    expect('error' in result).toBe(false);
+    if ('errors' in result) expect(result.errors).toHaveLength(0);
+    if ('imported' in result) expect(result.imported).toBe(1);
+  });
+
+  // A tenantVariable (non-secret source) binding to a partner-wide SECRET is
+  // still the pre-existing secretBoundAsPlain rejection, not the new one —
+  // the new kind must not swallow the older, more specific message.
+  it('still reports secretBoundAsPlain for a tenantVariable bound to a partner-wide secret', async () => {
+    const bundle = validBundle([
+      { ...baseEntry, parameters: [{ name: 'psa', type: 'string', source: 'tenantVariable', variableKey: 'psa_api_token' }] }
+    ]);
+    h.state.selectQueue.push([partnerSecretRow]);
+    const result = await importBundle(makeAuth(), bundle, { mode: 'skip', availability: 'org' });
+    if ('errors' in result) {
+      expect(result.errors[0]!.error).toBe(
+        'Parameter "psa" binds secret variable "psa_api_token" with source "From a variable"; use a secret parameter instead'
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Secret-parameter cap parity (#3409 PR4c-2, finding 3).
+//
+// `packages/shared` may not import from `apps/api`, so the save-time cap is a
+// restatement of the envelope's own bound. This assertion is the ONLY thing
+// stopping the two from drifting — if the envelope limit moves, the save-time
+// schema must move with it or scripts save that can never dispatch.
+// ---------------------------------------------------------------------------
+describe('secret-parameter cap parity', () => {
+  it('pins MAX_SECRET_SCRIPT_PARAMETERS to the envelope authority MAX_SECRET_ENV_ENTRIES', () => {
+    expect(MAX_SECRET_SCRIPT_PARAMETERS).toBe(MAX_SECRET_ENV_ENTRIES);
   });
 });
 

@@ -16,6 +16,8 @@ vi.mock('./scriptDispatch', () => ({
     deliveryOutcome: 'sent',
     executedAt: new Date('2026-08-11T00:00:00Z'),
     ignoredParameters: [],
+    runAs: 'system' as const,
+    targetSessionId: null,
   }),
 }));
 // See scriptExecution.test.ts for why the resolver itself is stubbed here
@@ -49,6 +51,8 @@ describe('automationRuntime', () => {
       deliveryOutcome: 'sent',
       executedAt: new Date('2026-08-11T00:00:00Z'),
       ignoredParameters: [],
+      runAs: 'system' as const,
+      targetSessionId: null,
     } as any);
     vi.mocked(loadTenantVariableScope).mockResolvedValue({ orgIds: new Set() } as any);
   });
@@ -107,13 +111,19 @@ describe('automationRuntime', () => {
     ]);
   });
 
+  it('normalizes an ai_triage action (wave 3d #3824)', () => {
+    expect(normalizeAutomationActions([{ type: 'ai_triage' }]))
+      .toEqual([{ type: 'ai_triage' }]);
+  });
+
   it('normalizes a run_script action carrying string/number/boolean parameters (#3409 PR2 Task 7)', () => {
     const actions = normalizeAutomationActions([
       { type: 'run_script', scriptId: 'script-1', parameters: { s: 'a', n: 3, b: true } },
     ]);
 
     expect(actions).toEqual([
-      { type: 'run_script', scriptId: 'script-1', parameters: { s: 'a', n: 3, b: true }, runAs: undefined },
+      // #5128 W4 — whenOffline is normalised to its default on every stored action.
+      { type: 'run_script', scriptId: 'script-1', parameters: { s: 'a', n: 3, b: true }, runAs: undefined, whenOffline: 'queue' },
     ]);
   });
 
@@ -173,7 +183,7 @@ describe('automationRuntime', () => {
         0,
         contextFor(deviceId, 'org-a', scope),
       );
-      expect(result.success).toBe(true);
+      expect(result.outcome.status).toBe('delivered');
     }
 
     expect(loadTenantVariableScope).not.toHaveBeenCalled();
@@ -213,6 +223,8 @@ describe('automationRuntime', () => {
       deliveryOutcome: 'sent',
       executedAt: new Date('2026-08-11T00:00:00Z'),
       ignoredParameters: ['api_key'],
+      runAs: 'system' as const,
+      targetSessionId: null,
     } as any);
 
     const result = await executeRunScriptAction(
@@ -221,7 +233,7 @@ describe('automationRuntime', () => {
       contextFor('device-1', 'org-a', { orgIds: new Set(['org-a']) }),
     );
 
-    expect(result.success).toBe(true);
+    expect(result.outcome.status).toBe('delivered');
     expect(result.log.details).toMatchObject({ ignoredParameterKeys: ['api_key'] });
     // KEYS ONLY — the configured value must not be copied into the run log.
     expect(JSON.stringify(result.log.details)).not.toContain('configured-in-the-automation');
@@ -234,7 +246,7 @@ describe('automationRuntime', () => {
       contextFor('device-1', 'org-a', { orgIds: new Set(['org-a']) }),
     );
 
-    expect(result.success).toBe(true);
+    expect(result.outcome.status).toBe('delivered');
     expect(result.log.details).not.toHaveProperty('ignoredParameterKeys');
   });
 

@@ -57,12 +57,12 @@ beforeEach(async () => {
     .returning({ id: partners.id });
   const [o] = await tdb
     .insert(organizations)
-    .values({ partnerId: p!.id, name: 'CP Run Org', slug: `cp-run-org-${sfx}` })
+    .values({ currencyCode: 'USD', partnerId: p!.id, name: 'CP Run Org', slug: `cp-run-org-${sfx}` })
     .returning({ id: organizations.id });
   orgId = o!.id;
   const [fo] = await tdb
     .insert(organizations)
-    .values({ partnerId: p!.id, name: 'CP Run Foreign Org', slug: `cp-run-forg-${sfx}` })
+    .values({ currencyCode: 'USD', partnerId: p!.id, name: 'CP Run Foreign Org', slug: `cp-run-forg-${sfx}` })
     .returning({ id: organizations.id });
   foreignOrgId = fo!.id;
 
@@ -118,6 +118,7 @@ describe('config policy automation run RLS visibility (#1855)', () => {
     // The worker inserts under system db context (automationWorker.ts).
     const run = await withSystemDbAccessContext(() =>
       createConfigPolicyAutomationRun({
+        configPolicyId: policyId,
         automation: automationRow,
         targetDeviceIds: ['dev-1', 'dev-2'],
         triggeredBy: 'scheduler',
@@ -193,6 +194,7 @@ describe('config policy automation run RLS visibility (#1855)', () => {
     await expect(
       withSystemDbAccessContext(() =>
         createConfigPolicyAutomationRun({
+          configPolicyId: policyId,
           automation: orphan,
           targetDeviceIds: ['dev-1'],
           triggeredBy: 'scheduler',
@@ -212,6 +214,7 @@ describe('config policy automation run RLS visibility (#1855)', () => {
   it('a foreign org cannot SELECT another org\'s config policy run', async () => {
     const run = await withSystemDbAccessContext(() =>
       createConfigPolicyAutomationRun({
+        configPolicyId: policyId,
         automation: automationRow,
         targetDeviceIds: ['dev-1'],
         triggeredBy: 'scheduler',

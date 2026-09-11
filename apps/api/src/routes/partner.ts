@@ -5,8 +5,27 @@ import { readWithPartnerAxisVisibility } from '../db/partnerAxisRead';
 import { organizations, devices, partners, partnerUsers } from '../db/schema';
 import { authMiddleware, requirePermission, requireScope } from '../middleware/auth';
 import { PERMISSIONS } from '../services/permissions';
+import { summarizeActiveContractMrrByOrg } from '../services/contractService';
 
 export const partnerRoutes = new Hono();
+
+/**
+ * Operator-configured scheduling link shown to inactive (pending) partners next
+ * to the billing CTA so the payment wall is never a dead end. Env-driven so the
+ * link can change without a deploy (same rationale as
+ * SIGNUP_BUSINESS_EMAIL_CONTACT_URL). Non-http(s) values are dropped here so no
+ * client has to trust the value.
+ */
+export function pendingAccountMeetingUrl(): string | null {
+  const raw = process.env.PENDING_ACCOUNT_MEETING_URL?.trim();
+  if (!raw) return null;
+  try {
+    const { protocol } = new URL(raw);
+    return protocol === 'http:' || protocol === 'https:' ? raw : null;
+  } catch {
+    return null;
+  }
+}
 const requirePartnerDashboardRead = requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action);
 const requirePartnerDeviceRead = requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action);
 
@@ -66,6 +85,8 @@ partnerRoutes.get('/me', async (c) => {
     statusMessage: (settings.statusMessage as string) ?? null,
     statusActionUrl: (settings.statusActionUrl as string) ?? null,
     statusActionLabel: (settings.statusActionLabel as string) ?? null,
+    statusMeetingUrl: pendingAccountMeetingUrl(),
+    statusMeetingLabel: process.env.PENDING_ACCOUNT_MEETING_LABEL?.trim() || null,
   });
 });
 
@@ -125,7 +146,16 @@ partnerRoutes.get(
       lastSeenAt: devices.lastSeenAt
     })
     .from(devices)
-    .where(and(inArray(devices.orgId, orgIdList), eq(devices.isEphemeral, false)));
+    // Removed devices are dropped alongside the ephemeral Quick Support ones
+    // (#5315). This feeds BOTH `deviceCount` and the per-org `devices` rollup
+    // on each dashboard card, and `GET /devices` — every other list a tech
+    // reads — already hides decommissioned rows by default, so leaving them in
+    // made this card disagree with the org record it links to.
+    .where(and(
+      inArray(devices.orgId, orgIdList),
+      eq(devices.isEphemeral, false),
+      ne(devices.status, 'decommissioned'),
+    ));
 
   const devicesByOrg = new Map<string, Array<{
     id: string;
@@ -149,6 +179,12 @@ partnerRoutes.get(
     devicesByOrg.set(row.orgId, list);
   }
 
+  // Wave 7 (#3779): real per-currency MRR. `mrr` was a hardcoded 0 that the web
+  // rendered with a hardcoded 'USD' label; it stays for ONE release so an
+  // already-loaded bundle keeps rendering, and is always 0 — mrrByCurrency is
+  // the truth. Never sum across currencies here or in the client.
+  const mrrByOrg = await summarizeActiveContractMrrByOrg(orgIdList);
+
   const data = orgRows.map((org) => {
     const orgDevices = devicesByOrg.get(org.id) ?? [];
     return {
@@ -158,7 +194,8 @@ partnerRoutes.get(
       deviceCount: orgDevices.length,
       alertCount: 0,
       compliance: 100,
-      mrr: 0,
+      mrr: 0, // deprecated (wave 7 #3779) — read mrrByCurrency
+      mrrByCurrency: mrrByOrg.get(org.id) ?? [],
       devices: orgDevices
     };
   });

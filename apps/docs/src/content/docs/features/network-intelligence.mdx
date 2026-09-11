@@ -1,6 +1,6 @@
 ---
 title: Network Intelligence
-description: Network baseline computation, change detection, known guest management, and anomaly alerting.
+description: Continuous network monitoring with per-subnet baselines, device change detection, known guest management, IP history tracking, and anomaly alerting.
 ---
 
 import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
@@ -8,6 +8,19 @@ import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 Network Intelligence extends Breeze's discovery engine with continuous monitoring of your network environment. While discovery answers "what is on this network right now?", Network Intelligence answers "what has changed, what is normal, and what is suspicious?" It tracks network baselines per subnet, detects when devices appear, disappear, or change characteristics, manages known guest devices that should not trigger alerts, records the full IP assignment history of every enrolled device, and fires anomaly alerts when deviations from established patterns occur.
 
 The system operates on three interconnected pillars: **baselines** that define what normal looks like for a given subnet, **change events** that record every deviation from those baselines, and **known guests** that whitelist expected transient devices so they do not generate noise.
+
+---
+
+## In the console
+
+Two of the three pillars have a console UI today:
+
+- **Known Guests** -- Settings > Partner > Regional (`/settings/partner#regional`). Lists guest MAC addresses, with a form to add one (MAC, label, optional notes) and a remove action per row. This is partner-level and applies across every managed organization.
+- **IP History** -- open a device's detail page and select the **IP History** tab. Shows every IP address ever assigned to that device (interface, IP, assignment type, MAC, first/last seen, active status), with search and paging.
+
+<Aside type="caution">
+  Baselines and change events (create/scan a baseline, view or acknowledge change events) have no console UI yet -- everything under "Network Baselines" and "Change Detection" below is done through the API.
+</Aside>
 
 ---
 

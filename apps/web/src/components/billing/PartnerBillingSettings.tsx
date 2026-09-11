@@ -7,6 +7,7 @@ import { navigateTo } from '@/lib/navigation';
 import { runAction, handleActionError } from '../../lib/runAction';
 import { pctFromFraction } from './invoiceTypes';
 import { isHttpUrl, httpUrlErrorMessage } from '@breeze/shared';
+import { resetPartnerCurrencyCache } from '@/lib/partnerCurrencyCache';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -17,6 +18,8 @@ interface PartnerBilling {
   invoiceTermsDays: number;
   defaultMarkupPercent: string | null;
   autoTaxHardware: boolean;
+  autoEmailInvoiceOnQuoteAccept: boolean;
+  invoiceDeviceAppendix: boolean;
   catalogAiStyle: string | null;
   invoiceFooter: string | null;
   documentTheme: 'classic' | 'condensed';
@@ -48,6 +51,9 @@ export default function PartnerBillingSettings() {
   const [markupPercent, setMarkupPercent] = useState('');
   // When true, hardware catalog items default to taxable on import.
   const [autoTaxHardware, setAutoTaxHardware] = useState(true);
+  // Default ON — same `!== false` read-back as the server-side accept gate.
+  const [autoEmailInvoice, setAutoEmailInvoice] = useState(true);
+  const [deviceAppendix, setDeviceAppendix] = useState(false);
   // Partner AI copy style for Auto-fill/Polish; empty = built-in house format.
   const [aiStyle, setAiStyle] = useState('');
   const [footer, setFooter] = useState('');
@@ -78,6 +84,8 @@ export default function PartnerBillingSettings() {
       setTermsDays(String(p.invoiceTermsDays ?? 30));
       setMarkupPercent(p.defaultMarkupPercent != null ? String(Number(p.defaultMarkupPercent)) : '');
       setAutoTaxHardware(p.autoTaxHardware ?? true);
+      setAutoEmailInvoice(p.autoEmailInvoiceOnQuoteAccept !== false);
+      setDeviceAppendix(p.invoiceDeviceAppendix === true);
       setAiStyle(p.catalogAiStyle ?? '');
       setFooter(p.invoiceFooter ?? '');
       setDocumentTheme(p.documentTheme ?? 'classic');
@@ -128,6 +136,8 @@ export default function PartnerBillingSettings() {
             invoiceTermsDays: Number(termsDays),
             defaultMarkupPercent,
             autoTaxHardware,
+            autoEmailInvoiceOnQuoteAccept: autoEmailInvoice,
+            invoiceDeviceAppendix: deviceAppendix,
             catalogAiStyle: aiStyle.trim() === '' ? null : aiStyle.trim(),
             invoiceFooter: footer.trim() === '' ? null : footer,
             documentTheme,
@@ -148,13 +158,20 @@ export default function PartnerBillingSettings() {
         successMessage: t('partnerBillingSettings.saveSuccess'),
         onUnauthorized: UNAUTHORIZED,
       });
+      // The reporting currency may have just changed. Both money caches key off
+      // this one: partnerCurrencyCache feeds every currency LABEL, and the
+      // approximate-total cache is bound to its generation, so its converted
+      // figures (denominated in the SERVER-derived reporting currency, which
+      // their key cannot name) are dropped in the same motion. Without this the
+      // tab renders the previous currency until logout.
+      resetPartnerCurrencyCache();
       void load();
     } catch (err) {
       handleActionError(err, t('partnerBillingSettings.saveError'));
     } finally {
       setSaving(false);
     }
-  }, [saving, websiteInvalid, currencyCode, taxPercent, prefix, termsDays, markupPercent, autoTaxHardware, aiStyle, footer,
+  }, [saving, websiteInvalid, currencyCode, taxPercent, prefix, termsDays, markupPercent, autoTaxHardware, autoEmailInvoice, deviceAppendix, aiStyle, footer,
       documentTheme, documentPageSize, companyName, phone, website, addr1, addr2, city, region, postal, country, terms, load]);
 
   if (loading) return <p className="text-sm text-muted-foreground">{t('partnerBillingSettings.loading')}</p>;
@@ -246,6 +263,38 @@ export default function PartnerBillingSettings() {
           </label>
           <p className="mt-1 text-xs text-muted-foreground">
             {t('partnerBillingSettings.defaults.autoTaxHardwareHelp')}
+          </p>
+        </div>
+        <div className="mt-4">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              id="pb-auto-email-invoice"
+              type="checkbox"
+              checked={autoEmailInvoice}
+              onChange={(e) => setAutoEmailInvoice(e.target.checked)}
+              data-testid="partner-billing-auto-email-invoice"
+              className="h-4 w-4 rounded border"
+            />
+            <span className="text-sm font-medium">{t('partnerBillingSettings.defaults.autoEmailInvoice')}</span>
+          </label>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {t('partnerBillingSettings.defaults.autoEmailInvoiceHelp')}
+          </p>
+        </div>
+        <div className="mt-4">
+          <label className="flex cursor-pointer items-center gap-2">
+            <input
+              id="pb-device-appendix"
+              type="checkbox"
+              checked={deviceAppendix}
+              onChange={(e) => setDeviceAppendix(e.target.checked)}
+              data-testid="partner-billing-device-appendix"
+              className="h-4 w-4 rounded border"
+            />
+            <span className="text-sm font-medium">{t('partnerBillingSettings.defaults.deviceAppendix')}</span>
+          </label>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {t('partnerBillingSettings.defaults.deviceAppendixHelp')}
           </p>
         </div>
         <div className="mt-4">

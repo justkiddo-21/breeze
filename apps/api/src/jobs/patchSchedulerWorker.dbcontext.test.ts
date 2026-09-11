@@ -65,7 +65,7 @@ vi.mock('../db', () => ({
 
 vi.mock('../db/schema', () => ({
   configurationPolicies: { id: 'cp.id', name: 'cp.name', orgId: 'cp.orgId', status: 'cp.status' },
-  configPolicyFeatureLinks: { id: 'fl.id', configPolicyId: 'fl.cpId', featureType: 'fl.type' },
+  configPolicyEffectiveFeatureLinks: { id: 'fl.id', configPolicyId: 'fl.cpId', featureType: 'fl.type' },
   configPolicyAssignments: { configPolicyId: 'a.cpId', level: 'a.level', targetId: 'a.targetId' },
   patchJobs: { id: 'pj.id', configPolicyId: 'pj.cpId', orgId: 'pj.orgId', createdAt: 'pj.createdAt' },
   devices: { id: 'devices.id', orgId: 'devices.orgId', siteId: 'devices.siteId' },
@@ -103,11 +103,16 @@ vi.mock('./patchJobExecutor', () => ({
 }));
 
 vi.mock('../services/redis', () => ({ getBullMQConnection: vi.fn(() => ({})) }));
+vi.mock('../services/patchJobFinalizer', () => ({ finalizePatchJobDevice: vi.fn() }));
+vi.mock('../services/sensitiveCommandPayload', () => ({
+  terminalPayloadErasureSet: vi.fn(() => ({ payload: null })),
+}));
 vi.mock('../services/sentry', () => ({ captureException: vi.fn() }));
 vi.mock('../services/patchJobSnapshot', () => ({ buildPatchesSnapshot: vi.fn(() => ({})) }));
 vi.mock('./workerObservability', () => ({ attachWorkerObservability: vi.fn() }));
 vi.mock('bullmq', () => ({ Queue: class {}, Worker: class {}, Job: class {} }));
 
+const { captureException } = await import('../services/sentry');
 const { __testOnly } = await import('./patchSchedulerWorker');
 
 const { scanAndCreateJobs } = __testOnly;
@@ -159,5 +164,35 @@ describe('patchSchedulerWorker.scanAndCreateJobs — DB context boundaries (#189
     expect(maxDepth).toBe(1);
     // Many SEPARATE short contexts were opened — not one spanning the whole scan.
     expect(contextOpenCount).toBeGreaterThanOrEqual(5);
+  });
+
+  // BREEZE-1A. A failed orphan-recovery read yields an EMPTY stale-jobs list,
+  // which downstream cannot tell apart from "nothing is orphaned" — so the
+  // sweep looked complete and cleared every reconcile streak, holding the
+  // stall escalation permanently out of reach under exactly the DB pressure
+  // that causes the read to fail. Reporting it to Sentry (which the previous
+  // revision did) does not fix that; the caller has to be TOLD the answer is
+  // incomplete.
+  it('marks the stale-jobs read incomplete when it fails, instead of returning a clean empty list', async () => {
+    selectResults = [[]]; // no due policies — we only care about the reconcile read
+    selectStaleScheduledJobIds.mockRejectedValueOnce(new Error('remaining connection slots'));
+
+    const result = await scanAndCreateJobs();
+
+    expect(result.staleScheduledJobs).toEqual([]);
+    expect(result.staleScheduledJobsComplete).toBe(false);
+    expect(captureException).toHaveBeenCalledWith(
+      expect.any(Error),
+      undefined,
+      { patch_reconcile_stage: 'stale_read_failed' },
+    );
+  });
+
+  it('marks the stale-jobs read complete on the happy path', async () => {
+    selectResults = [[]];
+
+    const result = await scanAndCreateJobs();
+
+    expect(result.staleScheduledJobsComplete).toBe(true);
   });
 });

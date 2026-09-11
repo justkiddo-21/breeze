@@ -1,13 +1,14 @@
 import { Hono } from 'hono';
+import { SUPPORTED_LOCALES, resolveTicketPushPrefs, updateTicketPushPreferencesSchema } from '@breeze/shared';
 import type { SupportedLocale } from '@breeze/shared';
 import { zValidator } from '../lib/validation';
 import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
-import { and, eq, or } from 'drizzle-orm';
+import { and, eq, inArray, isNull, or } from 'drizzle-orm';
 import { HTTPException } from 'hono/http-exception';
 import { nanoid } from 'nanoid';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
-import { users, partnerUsers, organizationUsers, roles, organizations, partners } from '../db/schema';
+import { users, userPasskeys, partnerUsers, organizationUsers, roles, organizations, partners, ticketPushPreferences } from '../db/schema';
 import { authMiddleware, requireMfa, requirePermission } from '../middleware/auth';
 import {
   MAX_AVATAR_SIZE_BYTES,
@@ -31,6 +32,7 @@ import {
   type ScopeContext,
 } from '../services/roleAssignment';
 import { createAuditLogAsync } from '../services/auditService';
+import { writeRouteAudit } from '../services/auditEvents';
 import { getTrustedClientIpOrUndefined } from '../services/clientIp';
 import { getEmailService } from '../services/email';
 import { captureException } from '../services/sentry';
@@ -39,13 +41,14 @@ import { INVITE_TOKEN_TTL_SECONDS } from './auth/schemas';
 import { enforceExistingFactorStepUp, hashInviteToken, inviteRedisKey, inviteUserRedisKey, requireCurrentPasswordStepUp, resolveUserAuditOrgId, userIsMfaProtected, userRequiresSetup } from './auth/helpers';
 import { isPasswordAuthDisabledBySso } from './auth/ssoPolicy';
 import { terminateUserRemoteSessions, TEARDOWN_FAILED } from '../services/remoteSessionTeardown';
-import { advanceUserEpochs, revokeAllRefreshFamilies, runPostCommitCleanup, type Tx } from '../services/authLifecycle';
-import { invalidateMfaAssuranceAfterFactorChange } from '../services/mfaAssurance';
+import { advanceUserEpochs, revokeAllRefreshFamilies, runPostCommitCleanup } from '../services/authLifecycle';
+import { resetAllFactorsAndInvalidate, sweepPendingFactorArtifacts } from '../services/mfaFactorReset';
+import { neutralizeUserIfOrphaned } from '../services/userNeutralization';
 import { getEffectiveMfaPolicy } from '../services/mfaPolicy';
 import { requestPendingEmailChange } from '../services/pendingEmail';
 
 export const userRoutes = new Hono();
-const supportedLocales = ['en', 'pt-BR', 'es-419', 'fr-FR', 'fr-CA', 'de-DE', 'it-IT', 'tr-TR'] as const satisfies readonly SupportedLocale[];
+const supportedLocales = SUPPORTED_LOCALES;
 
 userRoutes.use('*', authMiddleware);
 userRoutes.use('*', async (c, next) => {
@@ -55,14 +58,23 @@ userRoutes.use('*', async (c, next) => {
     return;
   }
 
-  // Self-service routes (own profile + own/displayed avatar) must stay accessible
-  // to EVERY partner user regardless of org-access level. This gate governs
-  // partner-wide user MANAGEMENT only — without this exemption a 'selected'/'none'
-  // partner admin would be 403'd on GET/PATCH /me and the top-bar avatar
-  // (GET /:id/avatar runs its own scope check in the handler).
+  // Self-service routes (own profile + own/displayed avatar + own notification
+  // preferences) must stay accessible to EVERY partner user regardless of
+  // org-access level. This gate governs partner-wide user MANAGEMENT only —
+  // without this exemption a 'selected'/'none' partner admin would be 403'd on
+  // GET/PATCH /me, the top-bar avatar (GET /:id/avatar runs its own scope check
+  // in the handler), and (W07, #3901) their own ticket push preferences, which
+  // is the field technician this feature exists for.
+  //
+  // A route may be added here ONLY if its subject is derived from auth.user.id
+  // and never from a path param or request body. Both /me/ticket-push-preferences
+  // handlers satisfy that: the id is auth.user.id and the PATCH schema is
+  // .strict(), so a smuggled `userId` is a 400. Do NOT widen this to
+  // /\/me(\/.*)?$/ — that would auto-exempt every future /me/* route,
+  // including ones whose subject is not auth.user.id. The allowlist is the point.
   const path = c.req.path;
   const isSelfServiceRoute =
-    /\/me(\/avatar)?$/.test(path) ||
+    /\/me(\/avatar|\/ticket-push-preferences)?$/.test(path) ||
     (c.req.method === 'GET' && /\/avatar$/.test(path));
   if (isSelfServiceRoute) {
     await next();
@@ -331,7 +343,11 @@ userRoutes.get('/me', async (c) => {
       lastLoginAt: users.lastLoginAt,
       setupCompletedAt: users.setupCompletedAt,
       passwordChangedAt: users.passwordChangedAt,
-      preferences: users.preferences
+      preferences: users.preferences,
+      // #4018: selected ONLY to derive the `hasPassword` boolean below. It is
+      // destructured OUT of the spread that builds this response, so the hash
+      // itself is never serialized — asserted by users.test.ts.
+      passwordHash: users.passwordHash
     })
     .from(users)
     .where(eq(users.id, auth.user.id))
@@ -340,6 +356,10 @@ userRoutes.get('/me', async (c) => {
   if (!user) {
     return c.json({ error: 'User not found' }, 404);
   }
+
+  // Never spread `user` directly into the response from here on: it carries the
+  // password hash. `userWithoutSecrets` is the only safe shape.
+  const { passwordHash, ...userWithoutSecrets } = user;
 
   const requiresSetup = userRequiresSetup(user);
 
@@ -388,7 +408,12 @@ userRoutes.get('/me', async (c) => {
   });
 
   return c.json({
-    ...user,
+    ...userWithoutSecrets,
+    // #4018: whether a password step-up is even possible for this account.
+    // False for an SSO-provisioned (JIT) user, which has no password — the web
+    // auth store carries this through so UI that today says "set up MFA and
+    // sign in again" can offer the IdP road instead of a dead end.
+    hasPassword: passwordHash != null,
     partnerId: auth.partnerId,
     orgId: auth.orgId,
     scope: auth.scope,
@@ -446,6 +471,62 @@ function validatePreferenceEnum(
   }
   return null;
 }
+
+// W07 (#3901): per-user ticket push preferences. Self-only by construction —
+// the user id is auth.user.id, never a param or body field (the schema is
+// .strict(), so a smuggled userId is a 400). Lives on the core user route, not
+// /mobile, so a web Settings toggle can reuse it later (spec D10).
+//
+// NOTE: these paths are exempted from the partner-wide MANAGEMENT gate at the
+// top of this file — see the isSelfServiceRoute predicate.
+userRoutes.get('/me/ticket-push-preferences', async (c) => {
+  const auth = c.get('auth');
+  const rows = await db
+    .select({
+      assignedEnabled: ticketPushPreferences.assignedEnabled,
+      slaScope: ticketPushPreferences.slaScope,
+    })
+    .from(ticketPushPreferences)
+    .where(eq(ticketPushPreferences.userId, auth.user.id))
+    .limit(1);
+  // Missing row = defaults; no insert on read.
+  return c.json({ settings: resolveTicketPushPrefs(rows[0] ?? null) });
+});
+
+userRoutes.patch(
+  '/me/ticket-push-preferences',
+  zValidator('json', updateTicketPushPreferencesSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const body = c.req.valid('json');
+    const set: { assignedEnabled?: boolean; slaScope?: 'off' | 'owned' | 'any'; updatedAt: Date } = {
+      updatedAt: new Date(),
+    };
+    if (body.assignedEnabled !== undefined) set.assignedEnabled = body.assignedEnabled;
+    if (body.slaScope !== undefined) set.slaScope = body.slaScope;
+
+    const [row] = await db
+      .insert(ticketPushPreferences)
+      .values({ userId: auth.user.id, ...set })
+      .onConflictDoUpdate({ target: ticketPushPreferences.userId, set })
+      .returning({
+        assignedEnabled: ticketPushPreferences.assignedEnabled,
+        slaScope: ticketPushPreferences.slaScope,
+      });
+
+    writeRouteAudit(c, {
+      // orgId is a REQUIRED property on RouteAuditInput (services/auditEvents.ts),
+      // so it cannot be omitted. A partner-scoped mobile token has no org.
+      orgId: auth.orgId ?? null,
+      action: 'user.ticket_push_preferences.update',
+      resourceType: 'user',
+      resourceId: auth.user.id,
+      details: { ...body },
+    });
+
+    return c.json({ settings: resolveTicketPushPrefs(row ?? set) });
+  }
+);
 
 userRoutes.patch('/me', zValidator('json', updateMeSchema), async (c) => {
   const auth = c.get('auth');
@@ -945,6 +1026,32 @@ userRoutes.get('/:id/avatar', async (c) => {
   });
 });
 
+/**
+ * RMM-QA-166 (D11): `mfaProtected` = mfa_enabled OR a live (non-disabled)
+ * user_passkeys row — the same predicate `userIsMfaProtected` applies — so the
+ * operator UI can offer "Reset MFA" for a passkey-only leftover whose
+ * mfa_enabled flag was already cleared. The passkey probe runs under system
+ * context (user_passkeys RLS is self-or-system) but ONLY over the ids the
+ * caller's own tenant-scoped membership join just returned — it never widens
+ * the row set (precedent: routes/sso.ts member passkey annotation).
+ */
+async function annotateMfaProtected<T extends { id: string; mfaEnabled: boolean }>(
+  rows: T[]
+): Promise<Array<T & { mfaProtected: boolean }>> {
+  if (rows.length === 0) return [];
+  const ids = rows.map((row) => row.id);
+  const passkeyRows = await runOutsideDbContext(() =>
+    withSystemDbAccessContext(() =>
+      db
+        .select({ userId: userPasskeys.userId })
+        .from(userPasskeys)
+        .where(and(inArray(userPasskeys.userId, ids), isNull(userPasskeys.disabledAt)))
+    )
+  );
+  const withPasskey = new Set(passkeyRows.map((row) => row.userId));
+  return rows.map((row) => ({ ...row, mfaProtected: row.mfaEnabled === true || withPasskey.has(row.id) }));
+}
+
 userRoutes.get(
   '/',
   requirePermission(PERMISSIONS.USERS_READ.resource, PERMISSIONS.USERS_READ.action),
@@ -971,7 +1078,7 @@ userRoutes.get(
         .innerJoin(roles, eq(partnerUsers.roleId, roles.id))
         .where(eq(partnerUsers.partnerId, scopeContext.partnerId));
 
-      return c.json({ data });
+      return c.json({ data: await annotateMfaProtected(data) });
     }
 
     const data = await db
@@ -992,7 +1099,7 @@ userRoutes.get(
       .innerJoin(roles, eq(organizationUsers.roleId, roles.id))
       .where(eq(organizationUsers.orgId, scopeContext.orgId));
 
-    return c.json({ data });
+    return c.json({ data: await annotateMfaProtected(data) });
   }
 );
 
@@ -1101,6 +1208,25 @@ userRoutes.post(
 
     const normalizedEmail = data.email.toLowerCase();
 
+    // RMM-QA-166 (D9): a neutralized tombstone (disabled + no password) may still
+    // carry factor rows — user_passkeys left by pre-fix neutralization or by the
+    // 2026-06-18 backfill, a verified phone, a stale secret. The invite
+    // transaction below runs in the caller's AMBIENT context, where a
+    // user_passkeys DELETE silently matches zero rows under RLS (and the reset
+    // service refuses to run). So sweep every factor through the system-context
+    // composite BEFORE opening the invite transaction. Same visibility as the
+    // in-tx lookup: both read `users` by email under the caller's context. A
+    // concurrent invite can resurrect the account after this read, so the
+    // composite rechecks the tombstone predicate under its user-row lock.
+    const [tombstone] = await db
+      .select({ id: users.id, status: users.status, passwordHash: users.passwordHash })
+      .from(users)
+      .where(eq(users.email, normalizedEmail))
+      .limit(1);
+    if (tombstone && tombstone.status === 'disabled' && tombstone.passwordHash === null) {
+      await resetAllFactorsAndInvalidate(tombstone.id, 'invite-resurrect', { onlyIfTombstone: true });
+    }
+
     const result = await db.transaction(async (tx) => {
       const [existingUser] = await tx
         .select()
@@ -1151,6 +1277,8 @@ userRoutes.post(
         // status='invited'), and re-home it under the inviting scope. We touch
         // ONLY tombstones (disabled + no password) — an active multi-membership
         // user being added to another scope keeps their credentials untouched.
+        // Factor rows (incl. passkeys) were already swept by the pre-flight
+        // above (RMM-QA-166).
         const tenancy = await resolveInviteTenancy();
         const [reset] = await tx
           .update(users)
@@ -1165,6 +1293,8 @@ userRoutes.post(
             mfaSecret: null,
             mfaMethod: null,
             mfaRecoveryCodes: null,
+            phoneNumber: null,
+            phoneVerified: false,
             updatedAt: new Date()
           })
           .where(eq(users.id, user.id))
@@ -1487,57 +1617,6 @@ userRoutes.patch(
   }
 );
 
-// A membership-only delete leaves the `users` row behind. If the user has no
-// membership left in EITHER axis, that row is an orphan, and left active it is
-// a problem two ways (#1367):
-//   1. SECURITY: the "deleted" user can still authenticate. login.ts only
-//      bounces on a null password_hash / non-active status, and
-//      resolveCurrentUserTokenContext returns a null-context system-scope token
-//      (instead of throwing) for a membership-less user — so a removed user who
-//      still knows their password logs straight back in.
-//   2. RESURRECTION: re-inviting the same email reuses the row with its stale
-//      active status + password, blocking the new invitee's magic link.
-// The row cannot be hard-deleted (dozens of created_by/approved_by FKs RESTRICT
-// it), so we neutralize it: disable + strip password and MFA secrets. A later
-// invite of this email resets it to a clean invited state (see /invite).
-//
-// MUST run under SYSTEM scope, not the caller's request scope: the orphan check
-// has to see the user's memberships across EVERY tenant. An org admin's RLS
-// view hides partner memberships and other orgs' rows, so a request-scoped
-// check would falsely report a still-active multi-org user as orphaned and
-// wrongly disable them. Takes the caller's `tx` (not the bare `db`) so the
-// just-deleted membership — still uncommitted on this connection — is visible
-// to the SELECTs below; a separate connection would not see it yet.
-async function neutralizeUserIfOrphaned(tx: Tx, userId: string): Promise<void> {
-  const [partnerLink] = await tx
-    .select({ id: partnerUsers.id })
-    .from(partnerUsers)
-    .where(eq(partnerUsers.userId, userId))
-    .limit(1);
-  if (partnerLink) return;
-
-  const [orgLink] = await tx
-    .select({ id: organizationUsers.id })
-    .from(organizationUsers)
-    .where(eq(organizationUsers.userId, userId))
-    .limit(1);
-  if (orgLink) return;
-
-  await tx
-    .update(users)
-    .set({
-      status: 'disabled',
-      disabledReason: 'removed',
-      passwordHash: null,
-      mfaEnabled: false,
-      mfaSecret: null,
-      mfaMethod: null,
-      mfaRecoveryCodes: null,
-      updatedAt: new Date()
-    })
-    .where(eq(users.id, userId));
-}
-
 /**
  * Remove a user's membership in the caller's tenant and, if it was their last
  * membership anywhere, neutralize the orphaned `users` row — in one
@@ -1549,10 +1628,11 @@ async function neutralizeUserIfOrphaned(tx: Tx, userId: string): Promise<void> {
  * dropping it (the #1375 0-row trap). Tenant safety is preserved by the
  * explicit membership-delete WHERE clause, scoped to the caller's own
  * partner/org from their authenticated context — exactly as the request-scoped
- * delete was before. The membership delete, orphan neutralize, epoch advance
- * and refresh-family revoke all run in ONE `db.transaction` inside the system
- * context so a rollback undoes all of them together, and so the just-deleted
- * membership is visible to the orphan check.
+ * delete was before. The membership delete, epoch advance, refresh-family
+ * revoke and orphan neutralize (incl. every MFA factor and passkey —
+ * RMM-QA-166) all run in ONE `db.transaction` inside the system context so a
+ * rollback undoes all of them together, and so the just-deleted membership is
+ * visible to the orphan check.
  */
 async function removeMembershipForScope(
   scopeContext: ScopeContext,
@@ -1576,9 +1656,14 @@ async function removeMembershipForScope(
           return { deleted: false };
         }
 
-        await neutralizeUserIfOrphaned(tx, userId);
-        await advanceUserEpochs(tx, userId, { auth: true });
+        // D3 (RMM-QA-166): epochs → families → factor rows. Both epochs advance:
+        // `auth` because the membership set changed, `mfa` because an orphan's
+        // factors are about to be stripped (kills epoch-bound step-up grants and
+        // pending logins by construction). neutralizeUserIfOrphaned runs LAST and
+        // never bumps epochs itself, so there is exactly one bump per removal.
+        await advanceUserEpochs(tx, userId, { auth: true, mfa: true });
         await revokeAllRefreshFamilies(tx, userId, 'membership-removed');
+        await neutralizeUserIfOrphaned(tx, userId);
         return { deleted: true };
       })
     )
@@ -1611,6 +1696,7 @@ userRoutes.delete(
       // the hot-path cleanup (Redis token cutoff, permission-cache clear,
       // OAuth-artifact revocation) after that commit.
       await runPostCommitCleanup(userId);
+      await sweepPendingFactorArtifacts(userId);
 
       return c.json({ success: true });
     }
@@ -1628,6 +1714,7 @@ userRoutes.delete(
     });
     // Task 9: see comment above — same rationale for org-scope users.
     await runPostCommitCleanup(userId);
+    await sweepPendingFactorArtifacts(userId);
 
     return c.json({ success: true });
   }
@@ -1649,6 +1736,8 @@ userRoutes.delete(
 //    bypass the code + password step-up the self-service flow requires).
 //  - requireMfa() forces the acting admin's session to have satisfied MFA, so a
 //    stolen access token alone cannot reset another user's second factor.
+//  - RMM-QA-166: gated on the factor inventory (userIsMfaProtected), not the
+//    mfa_enabled column, and strips passkeys too — a reset must leave NO factor.
 userRoutes.post(
   '/:id/mfa/reset',
   requirePermission(PERMISSIONS.USERS_WRITE.resource, PERMISSIONS.USERS_WRITE.action),
@@ -1673,50 +1762,55 @@ userRoutes.post(
       return c.json({ error: 'User not found' }, 404);
     }
 
-    const [mfaState] = await db
-      .select({ mfaEnabled: users.mfaEnabled, mfaMethod: users.mfaMethod })
-      .from(users)
-      .where(eq(users.id, userId))
-      .limit(1);
-
-    if (!mfaState?.mfaEnabled) {
+    // RMM-QA-166 (D6): the gate is the factor INVENTORY, not `users.mfa_enabled`.
+    // userIsMfaProtected = mfa_enabled OR a live user_passkeys row — the same
+    // predicate every enrollment gate uses. A passkey-only leftover (enabled
+    // flag already cleared, passkey rows still present) must be resettable,
+    // otherwise the account stays "protected" by a credential nobody holds.
+    //
+    // The read MUST escape the request's tenant context (same escape the
+    // `mfaProtected` list read uses above). `userIsMfaProtected` asks for a
+    // system context internally, but `withSystemDbAccessContext` JOINS an open
+    // context rather than escalating it (db/index.ts: `withDbAccessContext`
+    // short-circuits when a store exists), and `user_passkeys` RLS is
+    // `user_id = breeze_current_user_id() OR scope = 'system'`. Called bare
+    // from inside the admin's partner context the passkey half of the OR
+    // therefore counts ZERO for any target but the caller — the gate would
+    // silently collapse back to the `mfa_enabled` column it is meant to
+    // replace, and a passkey-only leftover would still be refused with 400.
+    const targetIsMfaProtected = await runOutsideDbContext(() => userIsMfaProtected(userId));
+    if (!targetIsMfaProtected) {
       return c.json({ error: 'MFA is not enabled for this user' }, 400);
     }
-    const previousMethod = mfaState.mfaMethod || 'totp';
 
-    // Cross-user write: clear the factor + advance mfa_epoch (kills the target's
-    // live access/refresh JWTs) + revoke refresh families + post-commit token/
-    // OAuth cutoff + remote-session teardown, via the same primitive the
-    // self-service disable uses. MUST run in system context — the target's
-    // `refresh_token_families` rows are user-scoped RLS and the admin's ambient
-    // context would revoke zero of them (see invalidateMfaAssuranceAfterFactorChange).
-    const result = await runOutsideDbContext(() =>
-      withSystemDbAccessContext(() =>
-        invalidateMfaAssuranceAfterFactorChange(userId, 'admin-mfa-reset', async (tx: Tx) => {
-          await tx
-            .update(users)
-            .set({
-              mfaSecret: null,
-              mfaEnabled: false,
-              mfaMethod: null,
-              mfaRecoveryCodes: null,
-              phoneNumber: null,
-              phoneVerified: false,
-              updatedAt: new Date()
-            })
-            .where(eq(users.id, userId));
-        })
-      )
-    );
+    // Cross-user write: clear EVERY factor (TOTP secret, method, recovery
+    // codes, phone, and all passkey rows) + advance mfa_epoch (kills the
+    // target's live access/refresh JWTs and epoch-bound step-up grants) +
+    // revoke refresh families + post-commit token/OAuth cutoff + remote-session
+    // teardown + pending-artifact sweep. The composite runs under system
+    // context — the target's `refresh_token_families` and `user_passkeys` rows
+    // are user-scoped RLS and the admin's ambient context would write zero of
+    // them (see services/mfaFactorReset.ts).
+    const result = await resetAllFactorsAndInvalidate(userId, 'admin-mfa-reset');
+    const { inventory } = result;
 
     writeUserAudit(c, auth, scopeContext, {
       action: 'user.mfa_reset',
       resourceId: userId,
       resourceName: record.email,
       details: {
-        method: previousMethod,
+        method: inventory.previousMethod ?? (inventory.passkeysDeleted > 0 ? 'passkey' : 'totp'),
+        factors: {
+          totp: inventory.hadTotp,
+          sms: inventory.hadSms,
+          recoveryCodes: inventory.hadRecoveryCodes,
+          phone: inventory.hadPhone,
+          passkeys: inventory.passkeys
+        },
+        passkeysDeleted: inventory.passkeysDeleted,
         mfaEpoch: result.mfaEpoch,
-        teardownFailed: result.remoteSessionsTerminated === TEARDOWN_FAILED
+        teardownFailed: result.remoteSessionsTerminated === TEARDOWN_FAILED,
+        pendingSweepOk: result.pendingSweepOk
       }
     });
 

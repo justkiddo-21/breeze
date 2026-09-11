@@ -717,9 +717,9 @@ async function reportBackupJobPredicateMiss(params: {
         `[BackupPersistence] Backup result for job ${jobId} (reported device ${deviceId}, source: ${source}) ` +
         `matched no job row — the job was deleted, or is not visible in this tenant context.`;
       console.warn(msg);
-      captureMessage(msg, 'warning', undefined, {
-        backup_result_drop: 'job-not-found',
-        backup_result_source: source,
+      captureMessage(msg, {
+        eventCode: 'backup_result_job_not_found',
+        tags: { backup_result_source: source },
       });
       return;
     }
@@ -1103,9 +1103,9 @@ export async function applyBackupCommandResultToJob(params: {
       `flight, or the caller passed an org that was never this job's. Attributing the snapshot to ` +
       `${effectiveOrgId} (the job row's current owner).`;
     console.warn(msg);
-    captureMessage(msg, 'warning', undefined, {
-      backup_result_org_divergence: 'true',
-      backup_result_source: source,
+    captureMessage(msg, {
+      eventCode: 'backup_result_org_divergence',
+      tags: { backup_result_source: source },
     });
   }
 
@@ -1189,7 +1189,16 @@ export async function applyBackupCommandResultToJob(params: {
       const BATCH_SIZE = 1000;
       const fileRows = result.snapshot.files.map((file) => ({
         snapshotDbId: snapshot.id,
-        sourcePath: file.sourcePath,
+        // D12: prefer the stable originalPath (e.g. C:\assure\src\x) over the
+        // transient VSS shadow-copy device path the agent uploaded from. The
+        // browse tree (snapshots.ts buildSnapshotTree) and selective-restore
+        // validation (restore.ts) both key off this column expecting a path
+        // that still means something after the snapshot completes — indexing
+        // the raw \\?\GLOBALROOT\...\HarddiskVolumeShadowCopyN\... path roots
+        // the browse tree at "?" and rejects every real selective-restore
+        // selection. No separate column for the raw shadow path: it has no
+        // browsing/restore value once the shadow copy is released.
+        sourcePath: file.originalPath ?? file.sourcePath,
         backupPath: file.backupPath,
         size: file.size ?? null,
         modifiedAt: file.modTime ? new Date(file.modTime) : null,

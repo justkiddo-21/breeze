@@ -22,6 +22,15 @@ function line(over: Partial<QuoteLineForContract>): QuoteLineForContract {
     taxable: false,
     catalogItemId: null,
     termMonths: null,
+    contractLineType: null,
+    deviceRoles: null,
+    deviceGroupId: null,
+    deviceGroupName: null,
+    siteId: null,
+    siteName: null,
+    includedQuantity: null,
+    overageMode: null,
+    overageUnitPrice: null,
     ...over,
   };
 }
@@ -126,6 +135,20 @@ describe('buildContractSpecsFromQuote', () => {
     expect(annual.lines).toHaveLength(1);
   });
 
+  it('carries the quote currency verbatim onto every cadence-split spec', () => {
+    const specs = buildContractSpecsFromQuote(
+      { ...quote, currencyCode: 'EUR' },
+      [
+        line({ recurrence: 'monthly', description: 'EDR' }),
+        line({ recurrence: 'annual', description: 'License', unitPrice: '1200.00' }),
+      ],
+      '2026-06-21',
+      'user-1',
+    );
+    expect(specs).toHaveLength(2);
+    expect(specs.map((s) => s.currencyCode)).toEqual(['EUR', 'EUR']);
+  });
+
   it('excludes non-customer-visible recurring lines', () => {
     const specs = buildContractSpecsFromQuote(
       quote,
@@ -173,16 +196,6 @@ describe('buildContractSpecsFromQuote', () => {
     expect(specs[0]!.endDate).toBeNull();
   });
 
-  it('falls back to USD when the quote has no currency', () => {
-    const specs = buildContractSpecsFromQuote(
-      { ...quote, currencyCode: null },
-      [line({ recurrence: 'monthly' })],
-      '2026-06-21',
-      'user-1',
-    );
-    expect(specs[0]!.currencyCode).toBe('USD');
-  });
-
   it('drops catalogItemId to keep the frozen quote price and carries an in-memory source reference', () => {
     const specs = buildContractSpecsFromQuote(
       quote,
@@ -210,5 +223,39 @@ describe('buildContractSpecsFromQuote', () => {
     const monthly = specs.find((s) => s.intervalMonths === 1)!;
     expect(annual.endDate).toBe(addMonthsToDate('2026-06-21', 12));
     expect(monthly.endDate).toBeNull();
+  });
+});
+
+// #3205 W05: a recurring line WITH a descriptor becomes the matching
+// auto-quantity contract line. Every other recurring line still becomes
+// 'manual', unchanged — that is the compatibility claim.
+describe('buildContractSpecsFromQuote — device-set lines (#3205 W05)', () => {
+  const quote = { orgId: 'o1', partnerId: 'p1', quoteNumber: 'Q-1', currencyCode: 'USD', terms: null };
+  const base = { sourceQuoteLineId: 'ql1', recurrence: 'monthly' as const, customerVisible: true,
+    name: 'Servers', description: null, unitPrice: '40.00', quantity: '12.00', taxable: true,
+    catalogItemId: 'cat-1', termMonths: null };
+
+  it('maps each of the four types, freezing the price and dropping the estimate', () => {
+    const lines = [
+      { ...base, contractLineType: 'per_device_role', deviceRoles: ['server'], siteId: 's1', siteName: 'Dallas' },
+      { ...base, sourceQuoteLineId: 'ql2', contractLineType: 'per_device_group', deviceGroupId: 'g1', deviceGroupName: 'VIP' },
+      { ...base, sourceQuoteLineId: 'ql3', contractLineType: 'per_seat', includedQuantity: '25.00', overageMode: 'bill', overageUnitPrice: '12.00' },
+      { ...base, sourceQuoteLineId: 'ql4', contractLineType: 'per_device' },
+    ];
+    const [spec] = buildContractSpecsFromQuote(quote as never, lines as never, '2026-09-01', null);
+    expect(spec!.lines).toEqual([
+      expect.objectContaining({ lineType: 'per_device_role', deviceRoles: ['server'], siteId: 's1', siteName: 'Dallas', deviceGroupId: null, manualQuantity: null, catalogItemId: null, unitPrice: '40.00' }),
+      expect.objectContaining({ lineType: 'per_device_group', deviceGroupId: 'g1', siteId: null, siteName: null, deviceRoles: null, manualQuantity: null }),
+      expect.objectContaining({ lineType: 'per_seat', includedQuantity: '25.00', overageMode: 'bill', overageUnitPrice: '12.00', siteId: null, siteName: null }),
+      expect.objectContaining({ lineType: 'per_device', deviceRoles: null, deviceGroupId: null, manualQuantity: null }),
+    ]);
+    // deviceGroupName is NOT passed: the contract writer re-stamps it from the
+    // LIVE group (W02), so a rename between send and accept is reflected.
+    expect(spec!.lines[1]).not.toHaveProperty('deviceGroupName');
+  });
+
+  it('a recurring line WITHOUT a descriptor still becomes manual with the quoted quantity', () => {
+    const [spec] = buildContractSpecsFromQuote(quote as never, [{ ...base, contractLineType: null }] as never, '2026-09-01', null);
+    expect(spec!.lines[0]).toMatchObject({ lineType: 'manual', manualQuantity: '12.00', catalogItemId: null });
   });
 });

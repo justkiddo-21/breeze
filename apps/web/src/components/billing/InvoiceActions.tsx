@@ -9,6 +9,7 @@ import { usePermissions } from '../../lib/permissions';
 import { showToast } from '../shared/Toast';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { usePdfDownload } from './shared/usePdfDownload';
+import InvoiceSendComposer, { type ComposedInvoiceEmail } from './InvoiceSendComposer';
 import { type InvoiceDetail as InvoiceDetailData, formatMoney } from './invoiceTypes';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
@@ -92,30 +93,52 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
   // about the order in which two effects happen to observe two independently
   // updated props.
   const [queued, setQueued] = useState<QueuedIssue | null>(null);
+  // Re-send composer. Distinct from `issuing`: a re-send touches no invoice
+  // state, so it never queues behind the editor and never confirms — the
+  // composer IS the confirmation.
+  const [resendOpen, setResendOpen] = useState(false);
+  const [resending, setResending] = useState(false);
+  const [copyingLink, setCopyingLink] = useState(false);
+  const [partnerDeviceAppendix, setPartnerDeviceAppendix] = useState(false);
+  const partnerDeviceAppendixLoaded = useRef(false);
   const refresh = useCallback(() => onChanged?.(), [onChanged]);
 
   const isDraft = invoice.status === 'draft';
   // An invoice with no customer-visible line can't be issued.
   const hasVisibleLines = lines.some((l) => l.customerVisible);
 
-  const issue = useCallback(async (alsoSend: boolean) => {
+  // The appendix override is draft-only. Resolve the partner default before
+  // opening the composer so a late read can never reset fields the operator has
+  // already started editing. A failed support read degrades to the server's
+  // false default; the send itself remains fully usable.
+  const openIssueSendComposer = useCallback(async () => {
+    if (!partnerDeviceAppendixLoaded.current) {
+      try {
+        const response = await fetchWithAuth('/orgs/partners/me');
+        if (response.ok) {
+          const partner = (await response.json()) as { invoiceDeviceAppendix?: boolean };
+          setPartnerDeviceAppendix(partner.invoiceDeviceAppendix === true);
+        }
+      } catch { /* keep the safe false default */ }
+      partnerDeviceAppendixLoaded.current = true;
+    }
+    setIssueSendOpen(true);
+  }, []);
+
+  const issue = useCallback(async (alsoSend: boolean, opts?: ComposedInvoiceEmail) => {
     if (issuing) return;
     setIssuing(true);
     try {
-      // Issue first; on success optionally send.
-      await runAction({
-        request: () => fetchWithAuth(`/invoices/${invoice.id}/issue`, { method: 'POST' }),
-        errorFallback: t('invoiceActions.issueError'),
-        successMessage: alsoSend ? undefined : t('invoiceActions.issueSuccess'),
-        onUnauthorized: UNAUTHORIZED,
-      });
       if (alsoSend) {
-        // /send is honest about whether an email actually went out. The invoice
-        // is issued either way; only claim "sent" when an email was dispatched,
-        // otherwise warn so the operator knows nothing was emailed. We suppress
-        // runAction's own success toast and post-process the result ourselves.
+        // /send owns draft issue + email as one lifecycle action. In particular,
+        // it persists includeDeviceAppendix while the invoice is still a draft,
+        // before issue freezes the PDF evidence choice.
         const result = await runAction<{ data: { emailed: boolean } }>({
-          request: () => fetchWithAuth(`/invoices/${invoice.id}/send`, { method: 'POST' }),
+          request: () => fetchWithAuth(`/invoices/${invoice.id}/send`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(opts ?? {}),
+          }),
           errorFallback: t('invoiceActions.issueSendError'),
           onUnauthorized: UNAUTHORIZED,
         });
@@ -124,6 +147,13 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
         } else {
           showToast({ type: 'warning', message: t('invoiceActions.issueNoEmailWarning') });
         }
+      } else {
+        await runAction({
+          request: () => fetchWithAuth(`/invoices/${invoice.id}/issue`, { method: 'POST' }),
+          errorFallback: t('invoiceActions.issueError'),
+          successMessage: t('invoiceActions.issueSuccess'),
+          onUnauthorized: UNAUTHORIZED,
+        });
       }
     } catch (err) {
       handleActionError(err, t('invoiceActions.issueError'));
@@ -185,8 +215,8 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
     // Plain Issue runs directly (it's reversible via Void); Issue & Send opens
     // its confirm dialog — the user still confirms the email before it sends.
     if (queued.kind === 'issue') void issue(false);
-    else setIssueSendOpen(true);
-  }, [queued, saveFailureNonce, savePending, unsavedFieldLabel, refuseForUnsaved, hasVisibleLines, issue, t]);
+    else void openIssueSendComposer();
+  }, [queued, saveFailureNonce, savePending, unsavedFieldLabel, refuseForUnsaved, hasVisibleLines, issue, openIssueSendComposer, t]);
 
   // Slow-save backstop: with failures handled above, the only way a queue waits
   // this long is a save that is genuinely still in flight (or a pending-state
@@ -201,6 +231,116 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
     }, 15_000);
     return () => clearTimeout(timer);
   }, [queued, t]);
+
+  // Whether this invoice has ever been emailed. `issueInvoice` deliberately
+  // leaves sent_at null (a plain Issue reads "Issued", not "Sent"), so the first
+  // email after a bare Issue is a genuine SEND — /send stamps sent_at and emits
+  // the invoice.sent lifecycle event. Every email after that is a RE-send, and
+  // /resend deliberately writes nothing: sent_at, the number and the issue-time
+  // snapshots stay pinned so our record and the customer's copy keep describing
+  // the same document.
+  const neverEmailed = invoice.sentAt == null;
+  // A part-paid invoice reads as "Request payment", not "Re-send" — the tech is
+  // chasing a balance, not resupplying a copy. Label only; the endpoint is
+  // decided by neverEmailed above.
+  const partiallyPaid = Number(invoice.amountPaid) > 0 && Number(invoice.balance) > 0;
+  const resendLabel = partiallyPaid
+    ? t('invoiceDetail.requestPayment.requestPayment')
+    : neverEmailed
+      ? t('invoiceDetail.requestPayment.sendInvoice')
+      : t('invoiceActions.resend');
+
+  // Shared by both composer intros. Spelled out per-key at the call sites (not
+  // via a computed key) so the key-usage scanner can still resolve them.
+  const composerIntroValues = {
+    customer: invoice.billToName ?? t('invoiceActions.issueSendConfirm.customerFallback'),
+    amount: formatMoney(invoice.total, currency),
+  };
+
+  const resend = useCallback(async (opts: ComposedInvoiceEmail) => {
+    if (resending) return;
+    setResending(true);
+    try {
+      // Suppress runAction's success toast: a 200 does NOT mean an email went
+      // out. Both routes swallow delivery failures into `reason`, so the
+      // outcome is post-processed below — `emailed !== true` (not `=== false`)
+      // so an unexpected response shape can't be read as success.
+      const result = await runAction<{ data?: { emailed?: boolean } }>({
+        request: () => fetchWithAuth(`/invoices/${invoice.id}/${neverEmailed ? 'send' : 'resend'}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(opts),
+        }),
+        errorFallback: t('invoiceDetail.requestPayment.sendError'),
+        onUnauthorized: UNAUTHORIZED,
+      });
+      setResendOpen(false);
+      // A first send stamps sent_at (which flips this very button's label), and
+      // even a re-send may reveal other stale detail — reconcile either way.
+      refresh();
+      if (result?.data?.emailed !== true) {
+        showToast({ type: 'warning', message: t('invoiceDetail.requestPayment.noEmailWarning') });
+      } else {
+        showToast({
+          type: 'success',
+          message: partiallyPaid
+            ? t('invoiceDetail.requestPayment.paymentRequestSent')
+            : neverEmailed
+              ? t('invoiceDetail.requestPayment.invoiceSent')
+              : t('invoiceActions.resendSuccess'),
+        });
+      }
+    } catch (err) {
+      // Leave the composer open on a failure so the typed recipients and note
+      // survive for a retry.
+      handleActionError(err, t('invoiceDetail.requestPayment.sendError'));
+    } finally {
+      setResending(false);
+    }
+  }, [resending, invoice.id, neverEmailed, partiallyPaid, refresh, t]);
+
+  // Copy the customer-facing DURABLE view-and-pay link without emailing
+  // anything — for pasting into a chat/SMS/reply by hand. Mirrors the quote's
+  // "Copy share link". The GET mints-or-reproduces, so repeated copies (and the
+  // emailed CTA) all hand out the SAME url — unlike the old one-shot Stripe
+  // checkout copy, which expired in ~24h and showed no invoice.
+  const copyInvoiceLink = useCallback(async () => {
+    if (copyingLink) return;
+    setCopyingLink(true);
+    try {
+      const result = await runAction<{ data?: { url?: string } }>({
+        request: () => fetchWithAuth(`/invoices/${invoice.id}/public-link`),
+        errorFallback: t('invoiceDetail.payments.linkError'),
+        onUnauthorized: UNAUTHORIZED,
+      });
+      const url = result?.data?.url;
+      if (!url) {
+        // A 200 with no link is a server-side surprise, not something the user
+        // can paste — say so rather than silently writing "undefined".
+        showToast({ type: 'error', message: t('invoiceDetail.payments.noLinkReturned') });
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(url);
+      } catch {
+        // Clipboard denied (insecure origin / permissions policy). Surface the
+        // URL in a long-lived toast so it can be selected by hand — a silent
+        // no-op here reads as a dead button. (A window.prompt would block every
+        // subsequent interaction on the page.)
+        showToast({
+          type: 'warning',
+          message: t('invoiceActions.paymentLinkCopyFailed', { url }),
+          duration: 15000,
+        });
+        return;
+      }
+      showToast({ type: 'success', message: t('invoiceDetail.payments.linkCopied') });
+    } catch (err) {
+      handleActionError(err, t('invoiceDetail.payments.linkError'));
+    } finally {
+      setCopyingLink(false);
+    }
+  }, [copyingLink, invoice.id, t]);
 
   const remove = useCallback(async () => {
     if (deleting) return;
@@ -232,9 +372,31 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
   const canIssue = can('invoices', 'send') && isDraft;
   const canDownload = can('invoices', 'export');
   const canDelete = can('invoices', 'write') && isDraft;
+  // Re-send is the counterpart of Issue & Send on a live invoice: available
+  // once there is an issued document to re-mail, and refused on a void one
+  // (never re-mail a demand we already cancelled). Matches the server's own
+  // gate in resendInvoiceEmail — a PAID invoice IS re-sendable, because "send
+  // me a copy for our records" is the commonest reason a customer asks.
+  // A paid-but-never-emailed invoice is excluded: the button would run the
+  // FIRST-send path (/send), which the server now refuses on 'paid' — there is
+  // no sensible "Send invoice" for a settled document that was never emailed.
+  // A paid invoice that WAS emailed keeps Re-send ("copy for our records").
+  const canResend = can('invoices', 'send') && !isDraft && invoice.status !== 'void'
+    && !(invoice.status === 'paid' && invoice.sentAt == null);
+  // The payment link is only meaningful while money is still owed, and only
+  // exists when the partner's Stripe is connected. Mirrors the gate the
+  // payments card uses for the record-payment form.
+  // The durable public view-and-pay link (2026-08-21 spec §9). Unlike the old
+  // one-shot Stripe checkout copy this needs no Stripe connection (the page
+  // itself degrades to view+PDF) and stays useful on a PAID invoice ("here's
+  // your receipt"); only drafts (no link exists) and void are excluded.
+  const canCopyInvoiceLink =
+    can('invoices', 'send') &&
+    !isDraft &&
+    invoice.status !== 'void';
 
   // Nothing to show (e.g. a viewer on an issued invoice) — render no empty container.
-  if (!canIssue && !canDownload && !canDelete) return null;
+  if (!canIssue && !canDownload && !canDelete && !canResend && !canCopyInvoiceLink) return null;
 
   const issueDisabled = issuing || !hasVisibleLines;
   // Why the money-buttons are held, if they are. 'saving' resolves on its own
@@ -290,7 +452,7 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
               onClick={() => {
                 if (savePending) { onIssueWhilePending?.(); setQueued({ kind: 'issueSend', atFailureNonce: saveFailureNonce }); return; }
                 if (unsavedFieldLabel) { refuseForUnsaved(); return; }
-                setIssueSendOpen(true);
+                void openIssueSendComposer();
               }}
               disabled={issueDisabled}
               aria-describedby={
@@ -318,6 +480,34 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
               </span>
             </button>
           </>
+        )}
+        {/* The email action on a live invoice — the slot Issue occupies on a
+            draft. Reads "Send invoice" before the first email, "Request payment"
+            once the customer has part-paid, and "Re-send" otherwise; it opens
+            the same style of composer the quote re-send uses, prefilled from the
+            org's billing contact. */}
+        {canResend && (
+          <button
+            type="button"
+            onClick={() => setResendOpen(true)}
+            disabled={resending}
+            data-testid="invoice-resend"
+            className={`${btnBase} border hover:bg-muted disabled:opacity-50`}
+          >
+            {resendLabel}
+          </button>
+        )}
+        {canCopyInvoiceLink && (
+          <button
+            type="button"
+            onClick={() => void copyInvoiceLink()}
+            disabled={copyingLink}
+            data-testid="invoice-pay-link"
+            title={t('invoiceActions.copyInvoiceLinkTitle')}
+            className={`${btnBase} border hover:bg-muted disabled:opacity-50`}
+          >
+            {copyingLink ? t('invoiceActions.copyingPaymentLink') : t('invoiceActions.copyInvoiceLink')}
+          </button>
         )}
         {/* PDF download is gated on the dedicated invoices:export permission. */}
         {canDownload && (
@@ -372,19 +562,26 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
         )}
       </div>
 
-      <ConfirmDialog
-        open={issueSendOpen}
-        onClose={() => setIssueSendOpen(false)}
-        onConfirm={() => void issue(true)}
-        isLoading={issuing}
-        variant="warning"
-        title={t('invoiceActions.issueSendConfirm.title')}
-        message={t('invoiceActions.issueSendConfirm.message', {
-          customer: invoice.billToName ?? t('invoiceActions.issueSendConfirm.customerFallback'),
-          amount: formatMoney(invoice.total, currency),
-        })}
-        confirmLabel={t('invoiceActions.issueAndSend')}
-        confirmTestId="invoice-issue-send-confirm"
+      <InvoiceSendComposer
+        open={isDraft ? issueSendOpen : resendOpen}
+        onClose={() => isDraft ? setIssueSendOpen(false) : setResendOpen(false)}
+        sending={isDraft ? issuing : resending}
+        onSend={(opts) => isDraft ? void issue(true, opts) : void resend(opts)}
+        orgId={invoice.orgId}
+        invoiceNumber={invoice.invoiceNumber}
+        isDraft={isDraft}
+        title={isDraft
+          ? t('invoiceActions.issueSendConfirm.title')
+          : neverEmailed ? t('invoiceActions.sendConfirm.title') : t('invoiceActions.resendConfirm.title')}
+        intro={isDraft
+          ? t('invoiceActions.issueSendConfirm.message', composerIntroValues)
+          : neverEmailed
+          ? t('invoiceActions.sendConfirm.message', composerIntroValues)
+          : t('invoiceActions.resendConfirm.message', composerIntroValues)}
+        confirmLabel={isDraft ? t('invoiceActions.issueAndSend') : resendLabel}
+        sendingLabel={isDraft ? t('invoiceActions.issuing') : t('invoiceActions.resending')}
+        partnerDeviceAppendix={partnerDeviceAppendix}
+        confirmTestId={isDraft ? 'invoice-issue-send-confirm' : 'invoice-send-confirm'}
       />
       <ConfirmDialog
         open={delOpen}

@@ -43,11 +43,19 @@ vi.mock('../db', () => {
 });
 
 vi.mock('../db/schema', () => ({
+  partners: {
+    _tableName: 'partners',
+    id: 'partners.id',
+    currencyCode: 'partners.currency_code',
+  },
   organizations: {
     _tableName: 'organizations',
     id: 'organizations.id',
     partnerId: 'organizations.partner_id',
     type: 'organizations.type',
+    // #3967 — the failure branch probes for whoever holds the slug.
+    name: 'organizations.name',
+    slug: 'organizations.slug',
   },
   sites: {
     _tableName: 'sites',
@@ -81,6 +89,7 @@ describe('getOrCreateQuickSupportOrg', () => {
 
   it('lazily creates the hidden org and its default site', async () => {
     queueSelect([]); // org lookup misses
+    queueSelect([{ currencyCode: 'CAD' }]); // partner currency lookup
     queueSelect([{ id: 'org-new' }]); // re-select after insert
     queueSelect([]); // site lookup misses
     insertReturns.push([]); // org insert (onConflictDoNothing)
@@ -92,6 +101,7 @@ describe('getOrCreateQuickSupportOrg', () => {
     expect(insertCalls[0]?.table).toBe('organizations');
     expect(insertCalls[0]?.values).toMatchObject({
       partnerId: PARTNER_ID,
+      currencyCode: 'CAD',
       type: 'quick_support',
       status: 'active',
     });
@@ -101,6 +111,7 @@ describe('getOrCreateQuickSupportOrg', () => {
 
   it('slugs with the full partner uuid so slugs cannot collide across partners', async () => {
     queueSelect([]);
+    queueSelect([{ currencyCode: 'CAD' }]);
     queueSelect([{ id: 'org-new' }]);
     queueSelect([{ id: 'site-1' }]);
     insertReturns.push([]);
@@ -112,6 +123,7 @@ describe('getOrCreateQuickSupportOrg', () => {
 
   it('lets the re-select win when a concurrent create took the unique index', async () => {
     queueSelect([]); // our lookup missed
+    queueSelect([{ currencyCode: 'CAD' }]); // partner currency lookup
     queueSelect([{ id: 'org-from-racer' }]); // the racer's row is visible now
     queueSelect([{ id: 'site-1' }]);
     insertReturns.push([]); // onConflictDoNothing swallowed our insert
@@ -123,11 +135,31 @@ describe('getOrCreateQuickSupportOrg', () => {
 
   it('throws rather than returning a bogus id when provisioning cannot converge', async () => {
     queueSelect([]); // lookup misses
+    queueSelect([{ currencyCode: 'CAD' }]); // partner currency lookup
     queueSelect([]); // re-select still misses
+    queueSelect([]); // #3967 slug-holder probe finds nobody -> generic message
     insertReturns.push([]);
 
     await expect(getOrCreateQuickSupportOrg(PARTNER_ID)).rejects.toThrow(
       /quick support org provisioning failed/i,
+    );
+  });
+
+  // #3967 — with organizations_partner_slug_uniq in place, an unconditional
+  // onConflictDoNothing can now be absorbing a SLUG conflict rather than the
+  // quick-support partial index. That wedges Quick Support for the partner
+  // until a human renames the squatter, so the throw has to say who it is.
+  it('names the organization squatting the slug when that is what blocked provisioning', async () => {
+    queueSelect([]); // lookup misses
+    queueSelect([{ currencyCode: 'CAD' }]); // partner currency lookup
+    queueSelect([]); // re-select still misses
+    queueSelect([{ id: 'org-squatter', name: 'Totally Legit Co' }]); // slug holder
+    insertReturns.push([]);
+
+    await expect(getOrCreateQuickSupportOrg(PARTNER_ID)).rejects.toThrow(
+      new RegExp(
+        `slug quick-support-${PARTNER_ID} is already held by organization org-squatter \\("Totally Legit Co"\\)`,
+      ),
     );
   });
 

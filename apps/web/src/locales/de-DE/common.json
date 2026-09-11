@@ -1,9 +1,16 @@
 {
+  "lists": {
+    "separator": ", "
+  },
   "nav": {
     "fleetPosture": "Flottenstatus",
     "dashboard": "Dashboard",
     "devices": "Geräte",
     "alerts": "Warnmeldungen",
+    "approvals": "Genehmigungen",
+    "pendingApprovals": "{{count}} ausstehende Genehmigungen",
+    "pendingApprovals_one": "{{count}} ausstehende Genehmigung",
+    "pendingApprovals_other": "{{count}} ausstehende Genehmigungen",
     "tickets": "Tickets",
     "incidents": "Vorfälle",
     "remoteAccess": "Fernzugriff",
@@ -11,19 +18,15 @@
     "patches": "Patches",
     "vulnerabilities": "Schwachstellen",
     "oneDrive": "OneDrive",
-    "fleet": "Gerätebestand",
-    "aiWorkspace": "KI-Arbeitsbereich",
     "aiForOffice": "KI für Office",
     "networkMonitor": "Netzwerküberwachung",
     "networkDiscovery": "Netzwerkerkennung",
-    "security": "Sicherheit",
     "edr": "EDR",
     "dnsSecurity": "DNS-Sicherheit",
     "pam": "PAM",
     "userRisk": "Benutzerrisiko",
     "sensitiveData": "Sensible Daten",
     "peripherals": "Peripheriegeräte",
-    "aiRiskEngine": "KI-Risiko-Engine",
     "cisBenchmarks": "CIS Benchmarks",
     "complianceBaselines": "Compliance-Baselines",
     "quotes": "Angebote",
@@ -31,12 +34,9 @@
     "contracts": "Verträge",
     "timesheets": "Zeiterfassungen",
     "productCatalog": "Produktkatalog",
-    "softwareLibrary": "Softwarebibliothek",
-    "softwarePolicies": "Softwarerichtlinien",
     "deviceGroups": "Gerätegruppen",
     "configPolicies": "Konfigurationsrichtlinien",
     "integrations": "Integrationen",
-    "backup": "Datensicherung",
     "cloudBackup": "Cloud-Backup",
     "disasterRecovery": "Notfallwiederherstellung",
     "reports": "Berichte",
@@ -44,8 +44,12 @@
     "auditTrail": "Audit-Protokoll",
     "eventLogs": "Ereignisprotokolle",
     "partner": "Partner",
+    "billing": "Abrechnung",
     "organizations": "Organisationen",
     "aiUsageBudget": "KI-Nutzung und Budget",
+    "aiAgents": "KI-Agenten",
+    "aiAgentRuns": "KI-Agenten-Läufe",
+    "aiImpact": "KI-Wirkung",
     "customFields": "Benutzerdefinierte Felder",
     "savedFilters": "Gespeicherte Filter",
     "users": "Benutzer",
@@ -56,16 +60,27 @@
     "deletionRequests": "Löschanfragen",
     "quarantinedDevices": "Geräte in Quarantäne",
     "thirdPartyCatalog": "Drittanbieterkatalog",
-    "connectedAppsAdmin": "Verbundene Apps (Admin)",
-    "sectionAiFleet": "KI und Gerätebestand",
-    "sectionMonitoring": "Überwachung",
+    "connectedAppsAdmin": "Verbundene Apps",
     "sectionSecurity": "Sicherheit",
-    "sectionOperations": "Betrieb",
     "sectionBackup": "Datensicherung",
     "sectionReporting": "Berichte",
     "sectionSettings": "Einstellungen",
     "sectionExtensions": "Erweiterungen",
-    "variables": "Variablen"
+    "variables": "Variablen",
+    "llmProviderCatalog": "LLM-Anbieterkatalog",
+    "aiKillSwitch": "KI-Notausschalter",
+    "sectionAi": "KI",
+    "sectionFleetManagement": "Flottenverwaltung",
+    "sectionBilling": "Abrechnung",
+    "sectionAdministration": "Administration",
+    "fleetOrchestration": "Flottenorchestrierung",
+    "aiAssistant": "KI-Assistent",
+    "software": "Software",
+    "securityOverview": "Übersicht",
+    "aiRisk": "KI-Risiko",
+    "deviceBackup": "Gerätesicherung",
+    "sectionServiceDesk": "Service-Desk",
+    "serviceManagement": "Service-Management"
   },
   "documentTitles": {
     "dashboard": "Dashboard",
@@ -156,6 +171,19 @@
     "none": "Keine",
     "optional": "Optional",
     "required": "Erforderlich"
+  },
+  "runContext": {
+    "label": "Ausführen als",
+    "scriptDefault": "Skript-Standard",
+    "scriptDefaultNamed": "Skript-Standard ({{context}})",
+    "system": "System",
+    "user": "Angemeldeter Benutzer",
+    "elevated": "Erhöht",
+    "unknown": "Nicht erfasst",
+    "userInSession": "Angemeldeter Benutzer (Sitzung {{session}})",
+    "sessionLabel": "Zielsitzung",
+    "sessionAny": "Beliebige aktive Sitzung",
+    "effectiveLabel": "Ausführungskontext"
   },
   "shared": {
     "accessDenied": {
@@ -347,6 +375,9 @@
       "criticalPending": "{{count}} kritische Patches ausstehend",
       "criticalPending_one": "{{count}} kritischer Patch ausstehend",
       "criticalPending_other": "{{count}} kritische Patches ausstehend",
+      "unratedPending": "{{count}} unbewertete Patches ausstehend (werden nicht automatisch genehmigt)",
+      "unratedPending_one": "{{count}} unbewerteter Patch ausstehend (wird nicht automatisch genehmigt)",
+      "unratedPending_other": "{{count}} unbewertete Patches ausstehend (werden nicht automatisch genehmigt)",
       "empty": "Noch keine Patch-Daten"
     },
     "vuln": {
@@ -487,6 +518,9 @@
         "days": "Tagen",
         "weeks": "Wochen",
         "months": "Monaten"
+      },
+      "enumOverrides": {
+        "decommissioned": "Entfernt"
       }
     }
   },
@@ -699,7 +733,20 @@
       "recently": "Kürzlich",
       "markUnread": "Als ungelesen markieren",
       "markRead": "Als gelesen markieren",
-      "preferences": "Benachrichtigungseinstellungen"
+      "preferences": "Benachrichtigungseinstellungen",
+      "types": {
+        "alert": "Warnmeldung",
+        "device": "Gerät",
+        "script": "Skript",
+        "automation": "Automatisierung",
+        "system": "Systemmeldung",
+        "user": "Benutzer",
+        "security": "Sicherheit",
+        "ticket": "Vorgang",
+        "approval": "Genehmigung",
+        "ai": "KI",
+        "unknown": "Benachrichtigung"
+      }
     },
     "sidebar": {
       "autoHide": "Seitenleiste automatisch ausblenden",
@@ -745,7 +792,8 @@
           "service": "Dienstleistung"
         },
         "noResults": "Keine passenden Katalogartikel.",
-        "placeholder": "Katalog nach Name oder SKU durchsuchen"
+        "placeholder": "Katalog nach Name oder SKU durchsuchen",
+        "noPriceInCurrency": "Kein Preis in {{currency}}"
       },
       "PolishButton": {
         "actions": {
@@ -1604,6 +1652,12 @@
         "editEntry": "Eintrag {{id}} bearbeiten",
         "total": "Gesamt: {{duration}}",
         "billableTotal": "Abrechnungsfähig: {{duration}}"
+      },
+      "sourceBadge": {
+        "timer": "Timer",
+        "location": "Aus Standort",
+        "remote_session": "Aus Remote-Sitzung",
+        "support_session": "Aus Quick Support"
       }
     },
     "snmp": {
@@ -1990,9 +2044,10 @@
         "skipReasons": {
           "siteDenied": "Standort für Sie nicht zugänglich",
           "notMember": "Von diesem Befund nicht mehr betroffen",
-          "decommissioned": "Gerät ist außer Betrieb genommen",
+          "decommissioned": "Gerät ist entfernt",
           "timeout": "Nach 30 Minuten abgelaufen",
-          "dispatchEnqueueFailed": "Nie gesendet – Einreihen in die Warteschlange fehlgeschlagen"
+          "dispatchEnqueueFailed": "Nie gesendet – Einreihen in die Warteschlange fehlgeschlagen",
+          "maintenanceWindow": "Gerät befindet sich in einem Wartungsfenster"
         },
         "viewProgress": "Fortschritt anzeigen",
         "errors": {
@@ -2380,5 +2435,13 @@
     "later": "Später anzeigen",
     "learnMore": "Mehr erfahren",
     "link": "Neuigkeiten"
+  },
+  "money": {
+    "approximateTotal": "≈ {{amount}} ungefähr · Kurse vom {{rateDate}}",
+    "approximateFailed": "≈ Summe nicht verfügbar — Wechselkurse konnten nicht geladen werden",
+    "approximateUnavailableMissing": "≈ Summe nicht verfügbar — kein {{target}}-Wechselkurs für {{codes}}",
+    "approximateUnavailableStale": "≈ Summe nicht verfügbar — {{target}}-Wechselkurs für {{codes}} ist zu alt",
+    "approximateUnavailableMixed": "≈ Summe nicht verfügbar — {{codes}} konnte nicht in {{target}} umgerechnet werden",
+    "approximateUnavailableCodesOverflow": "{{codes}} und {{more}} weitere"
   }
 }

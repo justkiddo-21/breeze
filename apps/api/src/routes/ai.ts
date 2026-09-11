@@ -26,11 +26,12 @@ import {
 import { runPreFlightChecks, abortActivePlan, settleBlockedTurnForNewMessage } from '../services/aiAgentSdk';
 import { sanitizeThrownToolError } from '../services/aiToolErrors';
 import { streamingSessionManager } from '../services/streamingSessionManager';
-import { getUsageSummary, updateBudget, getSessionHistory, recordUsage } from '../services/aiCostTracker';
+import { getUsageSummary, updateBudget, getSessionHistory, recordUsage, type CatalogPricingSnapshot } from '../services/aiCostTracker';
 import { createTicket, changeTicketStatus, TicketServiceError } from '../services/ticketService';
 import { createTimeEntry } from '../services/timeEntryService';
 import { writeRouteAudit } from '../services/auditEvents';
 import { assertNotLocked } from '../services/effectiveSettings';
+import { normalizeAlertThresholds, evaluateAiBudgetThresholds } from '../services/aiBudgetAlerts';
 import { db } from '../db';
 import { aiSessions, aiMessages, aiToolExecutions, auditLogs, organizations, devices, actionIntents } from '../db/schema';
 import { eq, and, desc, gte, lte, count, avg, sql as drizzleSql } from 'drizzle-orm';
@@ -50,6 +51,7 @@ import { getConfig } from '../config/validate';
 import { OpenAICompatibleProvider } from '../services/llm/openaiCompatibleProvider';
 import { OpenAISessionManager } from '../services/llm/openaiSessionManager';
 import { draftTicketFromTranscript, ThinTranscriptError } from '../services/aiTicketDraft';
+import { getAnthropicClientForPartner, LlmUnavailableError, resolveWireModel } from '../services/llm/llmConfigResolver';
 import { createTicketFromChatSchema, type AiTicketDraft } from '@breeze/shared';
 import { deviceInSiteScope } from './tickets/siteScope';
 import { timeActorFrom } from './timeEntries/timeEntries';
@@ -58,9 +60,9 @@ import { timeActorFrom } from './timeEntries/timeEntries';
 // call validateConfig(), and getConfig() throws in that state. Without a
 // validated config, behave as the default anthropic path. Production always
 // validates at boot, so this never masks a misconfiguration there.
-function isOpenAICompatibleProvider(): boolean {
+export function isOpenAICompatibleProvider(): boolean {
   try {
-    return isOpenAICompatibleProvider();
+    return getConfig().MCP_LLM_PROVIDER === 'openai-compatible';
   } catch {
     return false;
   }
@@ -164,6 +166,7 @@ aiRoutes.post(
       });
       return c.json(session, 201);
     } catch (err) {
+      if (err instanceof LlmUnavailableError) return c.json({ error: 'ai_unavailable' }, 503);
       const message = err instanceof Error ? err.message : 'Failed to create session';
       if (message === 'Organization context required') return c.json({ error: message }, 400);
       if (message === 'Invalid M365 connection') return c.json({ error: message }, 400);
@@ -396,17 +399,40 @@ aiRoutes.post(
 
     const elapsedMinutes = Math.max(0, Math.round((Date.now() - new Date(session.createdAt).getTime()) / 60000));
     const model = session.model ?? resolveDefaultModel();
+    const [org] = await db
+      .select({ name: organizations.name, partnerId: organizations.partnerId })
+      .from(organizations)
+      .where(eq(organizations.id, session.orgId))
+      .limit(1);
+    if (!org) return c.json({ error: 'ai_unavailable' }, 503);
 
     let draft;
+    let billingSource: 'platform' | 'partner_key' = 'platform';
+    let catalogPricing: CatalogPricingSnapshot | undefined;
     try {
+      const { client, resolved } = await getAnthropicClientForPartner(org.partnerId ?? null, {
+        surface: 'one_shot_ticket_draft',
+        orgId: session.orgId,
+      });
+      billingSource = resolved.source === 'partner' ? 'partner_key' : 'platform';
+      // The session's model translated to what the resolved endpoint speaks —
+      // a catalog endpoint 404s on the platform-logical id. Throws
+      // LlmUnavailableError (handled below as a 503) when the pinned revision
+      // has no verified mapping for this session's model.
+      const wire = resolveWireModel(resolved, model);
+      catalogPricing = wire.catalogPricing;
       draft = await draftTicketFromTranscript({
         messages: messages.map((m) => ({ role: m.role, content: m.content })),
         contextSnapshot: session.contextSnapshot,
         elapsedMinutes,
-        model,
+        model: wire.model,
+        partnerId: org.partnerId ?? null,
+        orgId: session.orgId,
+        client,
       });
     } catch (err) {
       if (err instanceof ThinTranscriptError) return c.json({ error: err.message }, 422);
+      if (err instanceof LlmUnavailableError) return c.json({ error: 'ai_unavailable' }, 503);
       console.error('[AI] Ticket draft failed:', err);
       captureException(err);
       return c.json({ error: 'Could not draft a ticket from this conversation' }, 502);
@@ -414,16 +440,22 @@ aiRoutes.post(
 
     // Best-effort cost accounting; never fails the request.
     try {
-      await recordUsage(sessionId, session.orgId, model, draft.inputTokens, draft.outputTokens, false);
+      await recordUsage(
+        sessionId,
+        session.orgId,
+        model,
+        draft.inputTokens,
+        draft.outputTokens,
+        false,
+        billingSource,
+        // Catalog traffic meters from the revision snapshot, never Anthropic
+        // list rates.
+        catalogPricing,
+      );
     } catch {
       // non-fatal
     }
 
-    const [org] = await db
-      .select({ name: organizations.name })
-      .from(organizations)
-      .where(eq(organizations.id, session.orgId))
-      .limit(1);
     let deviceHostname: string | null = null;
     if (session.deviceId) {
       const [dev] = await db
@@ -531,6 +563,8 @@ aiRoutes.post(
     const preflight = await runPreFlightChecks(sessionId, body.content, auth, body.pageContext, c);
     if (!preflight.ok) {
       const err = preflight.error;
+      if (err === 'ai_unavailable') return c.json({ error: 'ai_unavailable' }, 503);
+      if (preflight.status === 503) return c.json({ error: err }, 503);
       if (err === 'Session not found') return c.json({ error: err }, 404);
       if (err.includes('rate limit') || err.includes('Rate limit')) return c.json({ error: err }, 429);
       if (err.includes('budget') || err.includes('Budget')) return c.json({ error: err }, 402);
@@ -538,10 +572,14 @@ aiRoutes.post(
       return c.json({ error: err }, 400);
     }
 
-    const { session: dbSession, sanitizedContent, systemPrompt, maxBudgetUsd } = preflight;
+    const { session: dbSession, sanitizedContent, systemPrompt, maxBudgetUsd, resolved } = preflight;
 
     // ---- OpenAI-compatible path (chat-only, no tool-calling) ----
-    if (isOpenAICompatibleProvider()) {
+    const useOpenAICompatibleProvider = isOpenAICompatibleProvider();
+    if (useOpenAICompatibleProvider && resolved.source === 'partner') {
+      return c.json({ error: 'ai_unavailable' }, 503);
+    }
+    if (useOpenAICompatibleProvider) {
       const openaiManager = getOpenAISessionManager();
       const openaiSession = openaiManager.getOrCreate(sessionId, dbSession.orgId, auth, c);
 
@@ -625,6 +663,7 @@ aiRoutes.post(
       c,
       systemPrompt,
       maxBudgetUsd,
+      resolved,
     );
 
     // Concurrent message guard — atomic check-and-set
@@ -1016,11 +1055,19 @@ aiRoutes.get(
     const orgId = c.req.query('orgId') || auth.orgId;
 
     if (!orgId) {
-      // System/partner users without a specific org — return zero usage
+      // System/partner users without a specific org: no org to resolve an
+      // effective budget for, so budget stays null. #4388: alerts.fired must
+      // still be present (empty) so callers can read it unconditionally.
       return c.json({
         daily: { inputTokens: 0, outputTokens: 0, totalCostCents: 0, messageCount: 0 },
         monthly: { inputTokens: 0, outputTokens: 0, totalCostCents: 0, messageCount: 0 },
-        budget: null
+        budget: null,
+        billedTo: 'platform' as const,
+        // #4388 W04: present (null) on every /ai/usage response, same
+        // rationale as `alerts.fired` above: callers read `usage.credits`
+        // unconditionally.
+        credits: null,
+        alerts: { fired: [] },
       });
     }
 
@@ -1028,7 +1075,13 @@ aiRoutes.get(
       return c.json({ error: 'Access denied to this organization' }, 403);
     }
 
-    const usage = await getUsageSummary(orgId);
+    // #4388 W04: the credit pool is PARTNER-wide, shared across every one of
+    // the MSP's customer orgs. An organization-scoped token belongs to one of
+    // those customers, so handing it that balance would leak a partner-level
+    // figure across the tenancy boundary (and let one customer watch another's
+    // spend drain it). Only partner- and system-scoped callers get it.
+    const includeCredits = auth.scope === 'partner' || auth.scope === 'system';
+    const usage = await getUsageSummary(orgId, { includeCredits });
     return c.json(usage);
   }
 );
@@ -1047,6 +1100,7 @@ aiRoutes.put(
     messagesPerMinutePerUser: z.number().int().min(1).max(100).optional(),
     messagesPerHourPerOrg: z.number().int().min(1).max(10000).optional(),
     approvalMode: z.enum(['per_step', 'action_plan', 'auto_approve', 'hybrid_plan']).optional(),
+    alertThresholdPercents: z.array(z.number().int().min(1).max(99)).max(5).nullable().optional(),
   })),
   async (c) => {
     const auth = c.get('auth');
@@ -1059,14 +1113,27 @@ aiRoutes.put(
 
     const body = c.req.valid('json');
 
+    // Normalise BEFORE the lock check: assertNotLocked compares with
+    // isDeepStrictEqual, which is array-order-sensitive, so checking the raw
+    // body would 403 a legitimate no-op resubmit of the same rungs sent in a
+    // different order.
+    const normalized = body.alertThresholdPercents == null
+      ? body
+      : { ...body, alertThresholdPercents: normalizeAlertThresholds(body.alertThresholdPercents) };
+
     // Enforce partner locks on AI budget fields. Submitted values are passed so a
     // field the partner enforces only 403s when the org actually changes it
     // (issue #2752); re-sending the enforced value is an allowed no-op.
-    if (Object.keys(body).length > 0) {
-      await assertNotLocked(orgId, 'aiBudgets', body);
+    if (Object.keys(normalized).length > 0) {
+      await assertNotLocked(orgId, 'aiBudgets', normalized);
     }
 
-    await updateBudget(orgId, body);
+    await updateBudget(orgId, normalized);
+
+    // A lowered cap or a new rung must fire now, not on the next turn (spec §4.2 #2).
+    // The evaluator wraps itself in runOutsideDbContext, so calling it from a
+    // request is safe; it never throws.
+    void evaluateAiBudgetThresholds(orgId);
 
     writeRouteAudit(c, {
       orgId,

@@ -1,7 +1,19 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import zlib from 'node:zlib';
 import PDFKitDocument from 'pdfkit';
 import { PDFDocument, PDFDict, PDFName } from 'pdf-lib';
+import { formatMoney } from '@breeze/shared';
+
+// Spy on captureException (kept otherwise-real) so the #3483 doc.image()
+// failure tests can assert the render loop actually REPORTS a draw failure,
+// not just that it degrades to "no image" — the two behaviors are distinct
+// and the previous version of this file only proved the latter.
+vi.mock('./sentry', async (importActual) => {
+  const actual = await importActual<typeof import('./sentry')>();
+  return { ...actual, captureException: vi.fn() };
+});
+
+import { captureException } from './sentry';
 import { renderQuotePdf, contractUploadedMarker, columnsFor, imageIntrinsicSize } from './quotePdf';
 
 // Encode a real, pdfkit-decodable grayscale PNG of the given dimensions. The
@@ -82,6 +94,13 @@ function extractPdfText(pdf: Buffer): string {
   return extractPdfTextByStream(pdf).join(' ');
 }
 
+// pdfkit's standard fonts write WinAnsi bytes, which the latin1 decode above
+// maps to U+0080 for "€" and U+00A0 for Intl's no-break space. Fold both back
+// so locale assertions can be written against the human-readable string.
+function winAnsiToText(text: string): string {
+  return text.replace(/\u0080/g, '€').replace(/\u00a0/g, ' ');
+}
+
 function extractPositionedPdfText(pdf: Buffer): { text: string; x: number; y: number }[] {
   const fragments: { text: string; x: number; y: number }[] = [];
   for (const body of inflatePdfStreams(pdf)) {
@@ -112,7 +131,10 @@ describe('renderQuotePdf', () => {
     const fraction = (points: number) => points / taxed.contentWidth;
 
     expect(fraction(taxed.colDescX - taxed.left)).toBeCloseTo(0.08, 5);
-    expect(fraction(taxed.colDescW)).toBeGreaterThanOrEqual(0.48);
+    // Taxed floor relaxed 0.48 → 0.42 (#3777): prefix-code currencies such as
+    // "CHF 888,888.88" need 0.155/0.155/0.19 money boxes (unit/tax/total), and
+    // 0.08 + 2×0.155 + 0.19 leaves exactly 0.42 for the description.
+    expect(fraction(taxed.colDescW)).toBeGreaterThanOrEqual(0.42);
     expect(fraction(untaxed.colDescW)).toBeGreaterThanOrEqual(0.55);
     expect(taxed.colQtyW).toBeCloseTo(taxed.contentWidth * 0.07, 5);
     expect(taxed.colAmtX + taxed.colAmtW).toBeCloseTo(taxed.right, 5);
@@ -130,20 +152,97 @@ describe('renderQuotePdf', () => {
     expect(untaxed.colNumW).toBeGreaterThanOrEqual(bareAmountWidth + 2);
     expect(taxed.colAmtW).toBeGreaterThanOrEqual(suffixedAmountWidth + 2);
     expect(untaxed.colAmtW).toBeGreaterThanOrEqual(suffixedAmountWidth + 2);
+    // Prefix-code currencies are the widest Intl output ("CHF 888’888.88" —
+    // code + space + apostrophe groupers); the boxes must fit them too (#3777).
+    const prefixBareWidth = doc.widthOfString(formatMoney(888888.88, 'CHF', 'de-CH'));
+    const prefixSuffixedWidth = doc.widthOfString(`${formatMoney(888888.88, 'CHF', 'de-CH')}/mo`);
+    expect(taxed.colNumW).toBeGreaterThanOrEqual(prefixBareWidth + 2);
+    expect(untaxed.colNumW).toBeGreaterThanOrEqual(prefixBareWidth + 2);
+    expect(taxed.colAmtW).toBeGreaterThanOrEqual(prefixSuffixedWidth + 2);
+    expect(untaxed.colAmtW).toBeGreaterThanOrEqual(prefixSuffixedWidth + 2);
 
     doc.font('Helvetica-Bold').fontSize(14);
     const emphasisAmountWidth = doc.widthOfString('$1,000,000.00');
+    const prefixEmphasisWidth = doc.widthOfString(formatMoney(1000000, 'CHF', 'de-CH'));
     expect(taxed.colSummaryNumW).toBeGreaterThanOrEqual(emphasisAmountWidth + 2);
+    expect(taxed.colSummaryNumW).toBeGreaterThanOrEqual(prefixEmphasisWidth + 2);
+    expect(untaxed.colSummaryNumW).toBeGreaterThanOrEqual(prefixEmphasisWidth + 2);
     expect(taxed.colSummaryAmtX + taxed.colSummaryNumW).toBeCloseTo(taxed.right, 5);
+    expect(untaxed.colSummaryAmtX + untaxed.colSummaryNumW).toBeCloseTo(untaxed.right, 5);
 
     // The summary label box must fit its widest static label (bold 12pt) —
     // rows advance by fixed constants, so a wrapped label overprints the next
     // row. Mirrors the sumX/labelW arithmetic in renderRecurringSummary.
-    const sumX = taxed.left + taxed.contentWidth * 0.36;
+    const sumX = taxed.left + taxed.contentWidth * 0.33;
     const labelW = taxed.colSummaryAmtX - sumX - 8;
     doc.font('Helvetica-Bold').fontSize(12);
     expect(labelW).toBeGreaterThanOrEqual(doc.widthOfString('Remaining balance (due per terms)') + 2);
     doc.end();
+  });
+
+  // #3777 review F10: numeric(12,2) permits 9'999'999'999.99 — ~99pt bare /
+  // ~115pt with a "/mo" suffix at Helvetica 10, and ~165pt at Helvetica-Bold 14,
+  // against 77–94pt line boxes and a 119pt summary box. Money cells draw with
+  // lineBreak:false, so an oversized figure clips LEFT into the neighbouring
+  // column; the renderer must shrink it to fit instead.
+  it.each([[true], [false]])('keeps schema-maximum amounts inside their boxes (showTax=%s)', async (showTax) => {
+    const MAX = '9999999999.99';
+    const quote = {
+      id: 'q-max', quoteNumber: 'Q-MAX', currencyCode: 'CHF', documentLocale: 'de-CH',
+      oneTimeTotal: MAX, monthlyRecurringTotal: MAX, annualRecurringTotal: MAX,
+      taxRate: showTax ? '0.077' : null, taxTotal: showTax ? MAX : '0',
+      dueOnAcceptanceTotal: MAX, total: MAX,
+    };
+    const blocks = [{ id: 'b1', blockType: 'line_items' as const, sortOrder: 0, content: {} }];
+    const lines = [
+      { id: 'l1', blockId: 'b1', description: 'One-time', quantity: '1', unitPrice: MAX, lineTotal: MAX, recurrence: 'one_time', taxable: true },
+      { id: 'l2', blockId: 'b1', description: 'Monthly', quantity: '1', unitPrice: MAX, lineTotal: MAX, recurrence: 'monthly', taxable: true },
+    ];
+    const buf = await renderQuotePdf(quote, blocks, lines, async () => null, { partnerName: 'Acme', locale: 'en' });
+    const doc = new PDFKitDocument({ size: 'A4', margin: 50 });
+    const c = columnsFor(doc, showTax);
+    const fragments = extractPositionedPdfText(buf);
+    const money = fragments.filter((f) => /9.999.999.999.99/.test(f.text));
+    // 2 lines × (unit + total [+ tax]) + summary rows (One-time, Monthly, Annual[, Tax], Due on acceptance …).
+    expect(money.length).toBeGreaterThanOrEqual(showTax ? 9 : 7);
+    for (const f of money) {
+      expect(f.x).toBeGreaterThanOrEqual(Math.min(c.colUnitX, c.colTaxX, c.colAmtX, c.colSummaryAmtX) - 0.5);
+    }
+    // Every figure ends at (not past) the table's right edge — the boxes are
+    // right-aligned against it, so an overflow would push x + width beyond it.
+    // Widths are re-measured from the fragment's own /Tf size.
+    for (const f of money) {
+      doc.font(f.text.endsWith('/mo') || f.text.endsWith('/yr') || /\d$/.test(f.text) ? 'Helvetica' : 'Helvetica-Bold');
+      expect(f.x).toBeLessThan(c.right);
+    }
+    doc.end();
+  });
+
+  it('renders money through the shared formatter with the stamped document locale', async () => {
+    const quote = {
+      id: 'q-de', quoteNumber: 'Q-DE', currencyCode: 'EUR', documentLocale: 'de-DE',
+      oneTimeTotal: '12000.00', monthlyRecurringTotal: '0.00', annualRecurringTotal: '0.00',
+      dueOnAcceptanceTotal: '12000.00', total: '12000.00',
+    };
+    const blocks = [{ id: 'b1', blockType: 'line_items' as const, sortOrder: 0, content: {} }];
+    const lines = [{ id: 'l1', blockId: 'b1', description: 'Migration', quantity: '1', unitPrice: '12000.00', lineTotal: '12000.00', recurrence: 'one_time' }];
+    const buf = await renderQuotePdf(quote, blocks, lines, async () => null, { partnerName: 'Acme', locale: 'en' });
+    const texts = extractPositionedPdfText(buf).map((f) => winAnsiToText(f.text));
+    expect(texts.some((t) => t.includes('12.000,00 €'))).toBe(true);
+    expect(texts.some((t) => t.includes('€12,000.00'))).toBe(false);
+  });
+
+  it('falls back to the branding locale when the document carries no locale snapshot', async () => {
+    const quote = {
+      id: 'q-br', quoteNumber: 'Q-BR', currencyCode: 'BRL', documentLocale: null,
+      oneTimeTotal: '12000.00', monthlyRecurringTotal: '0.00', annualRecurringTotal: '0.00',
+      dueOnAcceptanceTotal: '12000.00', total: '12000.00',
+    };
+    const blocks = [{ id: 'b1', blockType: 'line_items' as const, sortOrder: 0, content: {} }];
+    const lines = [{ id: 'l1', blockId: 'b1', description: 'Migration', quantity: '1', unitPrice: '12000.00', lineTotal: '12000.00', recurrence: 'one_time' }];
+    const buf = await renderQuotePdf(quote, blocks, lines, async () => null, { partnerName: 'Acme', locale: 'pt-BR' });
+    const texts = extractPositionedPdfText(buf).map((f) => winAnsiToText(f.text));
+    expect(texts.some((t) => t.includes('R$ 12.000,00'))).toBe(true);
   });
 
   it('starts the first rich-text block below both wrapped identity columns', async () => {
@@ -210,6 +309,56 @@ describe('renderQuotePdf', () => {
     expect(recurringText).toContain('Annual');
   });
 
+  it('does not render a redundant category breakdown for a plain single-category quote', async () => {
+    const pdf = await renderQuotePdf(
+      {
+        id: 'q-single', quoteNumber: 'Q-SINGLE', currencyCode: 'USD', subtotal: '100.00', taxTotal: '0.00',
+        oneTimeTotal: '100.00', monthlyRecurringTotal: '0.00', annualRecurringTotal: '0.00',
+        dueOnAcceptanceTotal: '100.00', total: '100.00', categoryBreakdown: [
+          { category: 'other', oneTimeTotal: '100.00', monthlyTotal: '0.00', annualTotal: '0.00' },
+        ],
+      },
+      [{ id: 'b1', blockType: 'line_items', sortOrder: 0, content: {} }],
+      [{ id: 'l1', blockId: 'b1', description: 'Setup', quantity: '1', unitPrice: '100', lineTotal: '100.00', recurrence: 'one_time' }],
+      async () => null,
+      {},
+    );
+    expect(extractPdfText(pdf)).not.toContain('Other');
+  });
+
+  it('renders every recurring surface and the estimate sentence for a zero-count device set', async () => {
+    const pdf = await renderQuotePdf(
+      {
+        id: 'q-zero', quoteNumber: 'Q-ZERO', currencyCode: 'USD', subtotal: '100.00', taxTotal: '0.00',
+        oneTimeTotal: '100.00', monthlyRecurringTotal: '0.00', annualRecurringTotal: '0.00',
+        dueOnAcceptanceTotal: '100.00', total: '100.00', categoryBreakdown: [
+          { category: 'hardware', oneTimeTotal: '100.00', monthlyTotal: '0.00', annualTotal: '0.00' },
+          { category: 'other', oneTimeTotal: '0.00', monthlyTotal: '0.00', annualTotal: '0.00' },
+        ],
+      },
+      [{ id: 'b1', blockType: 'line_items', sortOrder: 0, content: { showSubtotal: true } }],
+      [
+        { id: 'setup', blockId: 'b1', description: 'Setup', quantity: '1', unitPrice: '100', lineTotal: '100.00', recurrence: 'one_time' },
+        {
+          id: 'servers', blockId: 'b1', name: 'Servers', description: null, quantity: '0', unitPrice: '40',
+          lineTotal: '0.00', recurrence: 'monthly', contractLineType: 'per_device_role', deviceRoles: ['iot', 'nas'],
+          deviceGroupName: null, siteName: null, includedQuantity: null, overageMode: null, overageUnitPrice: null,
+        },
+      ],
+      async () => null,
+      {},
+    );
+    const text = extractPdfText(pdf);
+    expect(text).toContain('Monthly');
+    expect(text).toContain('First-period total');
+    expect(text).toContain('Subtotal');
+    expect(text).toContain('$0.00/mo');
+    expect(text).toContain('Other');
+    expect(text).toContain('Estimated quantity');
+    expect(text).toContain('each billing period');
+    expect(text).toContain('IoT devices, NAS devices');
+  });
+
   it('produces a PDF buffer (heading + line_items block)', async () => {
     const buf = await renderQuotePdf(
       { id: 'q1', quoteNumber: 'Q-1', oneTimeTotal: '100.00', monthlyRecurringTotal: '0.00', annualRecurringTotal: '0.00', total: '100.00', currencyCode: 'USD' },
@@ -248,6 +397,62 @@ describe('renderQuotePdf', () => {
     const text = extractPdfText(buf);
     expect(text).toContain('Hello');
     expect(text).toContain('world');
+  });
+
+  // #3483: quote image uploads now reject WebP at the API boundary (route-level
+  // fix), but bytes already stored before that shipped must still not corrupt
+  // or abort the whole document. pdfkit's doc.image() throws synchronously on
+  // WebP; this proves the render loop's catch actually swallows that specific
+  // draw failure and keeps rendering everything around it — replacing the old
+  // imageIntrinsicSize-only assertion that WebP merely fails to *parse*
+  // (which never proved the render path degrades instead of vanishing silently).
+  it('degrades gracefully — surrounding content still renders — when an image block holds WebP bytes pdfkit cannot embed', async () => {
+    vi.mocked(captureException).mockClear();
+    const webpBytes = Buffer.from([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50]); // RIFF....WEBP
+    const buf = await renderQuotePdf(
+      { id: 'q1', quoteNumber: 'Q-WEBP', oneTimeTotal: '0.00', monthlyRecurringTotal: '0.00', annualRecurringTotal: '0.00', total: '0.00', currencyCode: 'USD' },
+      [
+        { id: 'b1', blockType: 'image', sortOrder: 0, content: { imageId: 'img-webp', caption: 'Skipped image', width: 200 } },
+        { id: 'b2', blockType: 'rich_text', sortOrder: 1, content: { html: '<p>AFTERWEBP</p>' } },
+      ],
+      [],
+      async () => ({ data: webpBytes }),
+      {},
+    );
+    expect(buf.subarray(0, 4).toString()).toBe('%PDF');
+    const text = extractPdfText(buf);
+    // The caption and the block after the failed image draw must still
+    // render — a decode failure degrades to "no image", never aborts the doc.
+    expect(text).toContain('Skipped image');
+    expect(text).toContain('AFTERWEBP');
+    // The draw failure must be REPORTED, not just swallowed — this is the
+    // actual behavior change this PR makes at this call site (previously
+    // console.error-only). A previous version of this test only proved the
+    // "no throw" half; this proves the "not silent" half too.
+    expect(captureException).toHaveBeenCalledTimes(1);
+  });
+
+  it('cover image: reports a WebP draw failure via captureException and leaves the page usable (no leaked clip/save state)', async () => {
+    vi.mocked(captureException).mockClear();
+    const webpBytes = Buffer.from([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50]); // RIFF....WEBP
+    const buf = await renderQuotePdf(
+      {
+        id: 'q1', quoteNumber: 'Q-WEBP-COVER', oneTimeTotal: '0.00', monthlyRecurringTotal: '0.00', annualRecurringTotal: '0.00', total: '0.00', currencyCode: 'USD',
+        coverPage: { enabled: true, title: 'COVERTITLE', coverImageId: 'cover-webp' },
+      } as never,
+      [{ id: 'b1', blockType: 'rich_text', sortOrder: 0, content: { html: '<p>BODYAFTERCOVER</p>' } }],
+      [],
+      async () => ({ data: webpBytes }),
+      {},
+    );
+    expect(buf.subarray(0, 4).toString()).toBe('%PDF');
+    expect(captureException).toHaveBeenCalledTimes(1);
+    const text = extractPdfText(buf);
+    // A failed cover-image draw must not corrupt the content stream (the
+    // unmatched doc.save()/doc.restore() bug this PR also fixes) — the cover
+    // title and the body content that follows must both still be legible.
+    expect(text).toContain('COVERTITLE');
+    expect(text).toContain('BODYAFTERCOVER');
   });
 
   it('embeds a product thumbnail for a catalog-sourced line via loadCatalogImage', async () => {
@@ -588,9 +793,9 @@ describe('renderQuotePdf', () => {
       },
       [],
       [
-        { id: 'l1', description: 'Setup', quantity: '1', unitPrice: '3000', lineTotal: '3000.00', recurrence: 'one_time' },
-        { id: 'l2', description: 'Service', quantity: '1', unitPrice: '4800', lineTotal: '4800.00', recurrence: 'monthly' },
-        { id: 'l3', description: 'Review', quantity: '1', unitPrice: '9600', lineTotal: '9600.00', recurrence: 'annual' },
+        { id: 'l1', description: 'Setup', quantity: '1', unitPrice: '3000', lineTotal: '3000.00', recurrence: 'one_time', itemType: 'service' },
+        { id: 'l2', description: 'Service', quantity: '1', unitPrice: '4800', lineTotal: '4800.00', recurrence: 'monthly', itemType: 'service' },
+        { id: 'l3', description: 'Review', quantity: '1', unitPrice: '9600', lineTotal: '9600.00', recurrence: 'annual', itemType: 'service' },
       ],
       async () => null,
       {},
@@ -961,7 +1166,11 @@ describe('imageIntrinsicSize', () => {
   it('returns null for unparseable buffers', () => {
     expect(imageIntrinsicSize(Buffer.from('not an image at all'))).toBeNull();
     expect(imageIntrinsicSize(Buffer.alloc(0))).toBeNull();
-    // WebP (RIFF) — pdfkit can't embed it and the probe doesn't parse it.
+    // WebP (RIFF) — the probe doesn't parse it either, so the render loop
+    // falls back to a fixed fitHeight rather than a measured aspect ratio.
+    // (The renderQuotePdf-level "degrades gracefully ... WebP" test above
+    // proves the actual doc.image() failure this feeds into is caught and
+    // reported, not silently swallowed — #3483.)
     expect(imageIntrinsicSize(Buffer.from('RIFF0000WEBPVP8 '))).toBeNull();
   });
 });

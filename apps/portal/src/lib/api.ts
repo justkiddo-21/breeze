@@ -7,7 +7,8 @@ import { navigateTo } from './navigation';
 // Invoice-domain enum SSOT lives in @breeze/shared (billing-enums.ts). Imported
 // into local scope for the InvoiceSummary/InvoiceDetail types below and re-exported
 // (type-only, erased at build) so '@/lib/api' consumers are unaffected.
-import type { InvoiceStatus, PublicQuoteHeader, QuotePresentation, TicketFormField } from '@breeze/shared';
+import type { BackupDevicesDto, BackupOverviewDto, DashboardDto, DocumentPageSize, DocumentThemeId, EnrichedPortalDevice, InvoiceStatus, PublicQuoteHeader, QuotePresentation, SecurityDevicesDto, SecurityOverviewDto, SlaDto, SupportUsageDto, TicketFormField } from '@breeze/shared';
+import type { PortalRunDto, PortalRunsDto } from '@breeze/shared';
 
 // Client API base. Empty (the default) → same-origin **relative** requests
 // (`/api/v1/...`), which the reverse proxy routes to the API under `/api/*`. This
@@ -99,20 +100,36 @@ function buildQueryString(query?: Record<string, string | number | undefined>): 
   return serialized ? `?${serialized}` : '';
 }
 
+/**
+ * Browser-facing API path for hrefs, image `src`, and download links that end
+ * up IN the rendered HTML. Always same-origin relative (`/api/v1/...`), so the
+ * reverse proxy routes it. `buildPortalApiUrl` below resolves the SSR-internal
+ * base (e.g. http://api:3001) for server-side fetches — rendering THAT into an
+ * href leaked the internal hostname into customer HTML and tripped a hydration
+ * mismatch on every document page.
+ */
+export type PublicApiPath = string & { readonly __brand: 'PublicApiPath' };
+
+function stripApiPrefix(path: string): string {
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  return normalizedPath === '/api'
+    ? ''
+    : normalizedPath.startsWith('/api/')
+      ? normalizedPath.slice(4)
+      : normalizedPath;
+}
+
+export function publicApiPath(path: string): PublicApiPath {
+  return `/api/v1${stripApiPrefix(path)}` as PublicApiPath;
+}
+
 export function buildPortalApiUrl(path: string): string {
   if (path.startsWith('http://') || path.startsWith('https://')) {
     return path;
   }
 
-  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-  const cleanPath = normalizedPath === '/api'
-    ? ''
-    : normalizedPath.startsWith('/api/')
-      ? normalizedPath.slice(4)
-      : normalizedPath;
-
   const apiBase = resolveApiBase();
-  return `${apiBase}/api/v1${cleanPath}`;
+  return `${apiBase}/api/v1${stripApiPrefix(path)}`;
 }
 
 export function buildServerForwardHeaders(request: Request): Headers {
@@ -133,6 +150,12 @@ export function buildServerForwardHeaders(request: Request): Headers {
 export interface ApiRequestConfig {
   headers?: HeadersInit;
   redirectOnUnauthorized?: boolean;
+  /** Abort the request after this many ms, falling into the existing
+   *  network-error catch path below (so callers that already fail closed on
+   *  a network error — e.g. loadPortalBranding — also fail closed on a
+   *  hang, not just a hard error). Undefined = no bound, matching prior
+   *  behavior for every other call site. */
+  timeoutMs?: number;
 }
 
 export interface ApiResponse<T> {
@@ -140,6 +163,12 @@ export interface ApiResponse<T> {
   error?: string;
   /** Machine-readable error code from the API body (e.g. PORTAL_TICKETS_DISABLED). */
   code?: string;
+  /** The `data` payload carried BY AN ERROR body, kept separate from `data` so
+   *  presence of `data` still means "the request succeeded". Some errors are
+   *  renderable rather than fatal — a 410 QUOTE_SUPERSEDED carries the partner's
+   *  branding so a replaced proposal can show a branded notice instead of a bare
+   *  failure. */
+  errorData?: unknown;
   statusCode?: number;
   headers?: Headers;
 }
@@ -175,7 +204,8 @@ export async function apiRequest<T>(
     const response = await fetch(url, {
       ...options,
       headers,
-      credentials: 'include'
+      credentials: 'include',
+      signal: config.timeoutMs !== undefined ? AbortSignal.timeout(config.timeoutMs) : options.signal
     });
 
     if (response.status === 401) {
@@ -208,8 +238,9 @@ export async function apiRequest<T>(
     const body = await response.json().catch(() => ({}));
     if (!response.ok) {
       return {
-        error: body?.error || 'Request failed',
+        error: body?.error || 'That didn\'t go through. Nothing was lost — try again in a moment.',
         code: typeof body?.code === 'string' ? body.code : undefined,
+        errorData: body?.data,
         statusCode: response.status,
         headers: response.headers
       };
@@ -275,17 +306,17 @@ export interface PaginatedResult<T> extends ApiResponse<T[]> {
   pagination?: Pagination;
 }
 
-export interface Device {
-  id: string;
-  hostname: string;
-  displayName: string | null;
-  osType: string | null;
-  osVersion: string | null;
-  status: 'online' | 'offline' | 'warning';
-  lastSeenAt: string | null;
+export interface PortalRunsResult extends PaginatedResult<PortalRunDto> {
+  timezone?: string;
 }
 
-export type TicketStatus = 'open' | 'in_progress' | 'resolved' | 'closed';
+export type Device = EnrichedPortalDevice;
+
+/** Mirrors the API's ticket_status enum. A freshly submitted ticket is 'new'
+ *  (it becomes 'open' when a technician picks it up); 'pending' is waiting on
+ *  the customer, 'on_hold' on something else. Keep in sync with
+ *  apps/api/src/db/schema/portal.ts ticketStatusEnum. */
+export type TicketStatus = 'new' | 'open' | 'pending' | 'on_hold' | 'resolved' | 'closed';
 export type TicketPriority = 'low' | 'normal' | 'high' | 'urgent';
 
 export interface TicketSummary {
@@ -296,13 +327,47 @@ export interface TicketSummary {
   priority: TicketPriority;
   createdAt: string;
   updatedAt: string;
+  sla: SlaDto;
+}
+
+export type CreatedPortalTicket = Omit<TicketSummary, 'sla'> & {
+  description: string;
+};
+
+/**
+ * Attachment metadata on a PUBLIC ticket comment (W08 #3902). Render-only in
+ * v1 — the portal cannot upload. Never carries the storage key, backend,
+ * digest or bytes; those are server-only.
+ */
+export interface TicketCommentAttachment {
+  id: string;
+  commentId: string | null;
+  contentType: string;
+  byteSize: number;
+  originalFilename: string;
+  createdAt: string;
 }
 
 export interface TicketComment {
   id: string;
   authorName: string;
+  /** 'portal' is the customer's own reply; anything else came from the IT team. */
+  authorType: string | null;
   content: string;
   createdAt: string;
+  /** Absent on a reply the customer just posted locally. */
+  attachments?: TicketCommentAttachment[];
+}
+
+/**
+ * Browser-facing path for an attachment's bytes. Same-origin and relative so
+ * the reverse proxy routes it and the SSR-internal API host never reaches
+ * customer HTML (see `publicApiPath`). The portal session cookie authenticates
+ * the request; the API 404s anything not on a public comment of a ticket this
+ * session submitted.
+ */
+export function portalAttachmentContentPath(ticketId: string, attachmentId: string): PublicApiPath {
+  return publicApiPath(`/portal/tickets/${ticketId}/attachments/${attachmentId}/content`);
 }
 
 export interface TicketDetails extends TicketSummary {
@@ -350,6 +415,10 @@ export type { InvoiceStatus, PublicQuoteHeader };
 export interface InvoiceSummary {
   id: string;
   invoiceNumber: string | null;
+  /** Derived human handle: the accepted proposal's title, else the first
+   *  customer-visible line's name. Always present on list rows; null for a
+   *  bare invoice. */
+  title: string | null;
   status: InvoiceStatus;
   currencyCode: string;
   issueDate: string | null;
@@ -381,6 +450,7 @@ export interface SellerSnapshot {
 }
 
 export interface InvoiceLine {
+  ticketNumber: string | null;
   /** Line title; NULL on legacy lines where `description` holds the title (#3319). */
   name: string | null;
   description: string;
@@ -391,7 +461,9 @@ export interface InvoiceLine {
 }
 
 export interface InvoiceDetail {
-  invoice: InvoiceSummary & {
+  // The detail header is a separate serialization boundary on the API and
+  // does not carry the list's derived `title`.
+  invoice: Omit<InvoiceSummary, 'title'> & {
     subtotal: string;
     taxTotal: string;
     taxRate: string | null;
@@ -401,6 +473,10 @@ export interface InvoiceDetail {
     termsAndConditions?: string | null;
   };
   lines: InvoiceLine[];
+  /** Partner branding for the document shell, matching QuoteDetail. Optional:
+   *  older API responses and fixtures predate it, in which case the view falls
+   *  back to GET /portal/branding. */
+  branding?: QuoteBranding;
 }
 
 export type QuoteStatus =
@@ -410,12 +486,18 @@ export type QuoteStatus =
   | 'accepted'
   | 'declined'
   | 'expired'
-  | 'converted';
+  | 'converted'
+  // The portal list returns every non-draft quote, so it will receive this the
+  // moment quotes can be superseded. Declared here to keep the union honest;
+  // the dedicated "replaced" rendering lands with the rest of the portal work.
+  | 'superseded';
 
 export interface QuoteSummary {
   id: string;
   quoteNumber: string | null;
-  status: string;
+  /** The proposal's own title (quotes.title); null when the MSP gave it none. */
+  title: string | null;
+  status: QuoteStatus;
   currencyCode: string;
   issueDate: string | null;
   expiryDate: string | null;
@@ -485,6 +567,16 @@ export interface QuoteLine {
   recurrence: string;
   customerVisible: boolean;
   sortOrder: number;
+  contractLineType?: 'per_device' | 'per_device_role' | 'per_device_group' | 'per_seat' | null;
+  deviceRoles?: string[] | null;
+  deviceGroupId?: string | null;
+  deviceGroupName?: string | null;
+  siteId?: string | null;
+  siteName?: string | null;
+  includedQuantity?: string | null;
+  overageMode?: 'bill' | 'flag' | null;
+  overageUnitPrice?: string | null;
+  descriptorUnresolved?: boolean;
   /** Server-built relative path to this line's product thumbnail (uploaded image
    *  or its catalog item's), or null when the line has no image. Resolve via
    *  buildPortalApiUrl before use. */
@@ -518,10 +610,20 @@ export interface QuoteBranding {
   partnerName: string;
   logoUrl: string | null;
   primaryColor: string | null;
+  /** The MSP's published support contact, so the PUBLIC proposal page can offer
+   *  a prospect a way to reach the company asking them to sign. Optional: older
+   *  API responses and fixtures predate these fields. */
+  supportEmail?: string | null;
+  supportPhone?: string | null;
 }
 
 export interface QuoteDetail {
-  quote: QuoteHeader;
+  quote: QuoteHeader & {
+    /** Set when a NON-DRAFT revision has replaced this quote. The API withholds
+     *  draft successors on purpose — a customer must not learn a revision is
+     *  being prepared for them. */
+    supersededByQuoteId?: string | null;
+  };
   blocks: QuoteBlock[];
   lines: QuoteLine[];
   /** Optional for API responses that predate the branding field. */
@@ -539,6 +641,45 @@ export interface PublicQuoteDetail {
   /** Resolved document theme/pageSize (Task 12). Optional: fixtures/older
    *  payloads omit it, which must read as 'classic' (documentShell's fallback). */
   presentation?: QuotePresentation;
+}
+
+/** The public (token-gated) invoice payload — /invoices/public/:token. A VOID
+ *  invoice deliberately carries only identity fields (no amounts), so most
+ *  money fields are optional here. */
+export interface PublicInvoiceDetail {
+  invoice: {
+    id: string;
+    invoiceNumber: string | null;
+    status: InvoiceStatus;
+    /** Present only on the void payload: an updated invoice exists. */
+    replaced?: boolean;
+    currencyCode?: string;
+    issueDate?: string | null;
+    dueDate?: string | null;
+    subtotal?: string;
+    taxRate?: string | null;
+    taxTotal?: string;
+    total?: string;
+    amountPaid?: string;
+    balance?: string;
+    depositDue?: string | null;
+    billToName?: string | null;
+    notes?: string | null;
+    sellerSnapshot?: SellerSnapshot | null;
+    termsAndConditions?: string | null;
+    paidAt?: string | null;
+  };
+  lines: InvoiceLine[];
+  chargeNow: { amount: string; isDeposit: boolean } | null;
+  payable: boolean;
+  branding: {
+    partnerName: string;
+    contactEmail: string | null;
+    logoUrl: string | null;
+    primaryColor: string | null;
+    theme: DocumentThemeId;
+    pageSize: DocumentPageSize;
+  };
 }
 
 export interface Profile {
@@ -572,6 +713,11 @@ export interface BrandingConfig {
   enableAssetCheckout?: boolean;
   enableSelfService?: boolean;
   enablePasswordReset?: boolean;
+  enableDashboard?: boolean;
+  enableSecurity?: boolean;
+  enableBackups?: boolean;
+  enableReports?: boolean;
+  enableSupportUsage?: boolean;
 }
 
 export interface ListParams {
@@ -603,13 +749,14 @@ export const portalApi = {
   getDevices: async (
     params: ListParams = {},
     config: ApiRequestConfig = {}
-  ): Promise<PaginatedResult<Device>> => {
+  ): Promise<PaginatedResult<EnrichedPortalDevice>> => {
     const query = buildQueryString({ page: params.page ?? 1, limit: params.limit ?? 50 });
-    const response = await apiGet<{ data: Device[]; pagination: Pagination }>(
-      `/portal/devices${query}`,
-      config
+    return mapPaginatedData(
+      await apiGet<{
+        data: EnrichedPortalDevice[];
+        pagination: Pagination;
+      }>(`/portal/devices${query}`, config)
     );
-    return mapPaginatedData(response);
   },
 
   getTickets: async (
@@ -671,8 +818,8 @@ export const portalApi = {
   createTicket: async (
     data: CreateTicketInput,
     config: ApiRequestConfig = {}
-  ): Promise<ApiResponse<TicketSummary & { description: string }>> => {
-    const response = await apiPost<{ ticket: TicketSummary & { description: string } }>(
+  ): Promise<ApiResponse<CreatedPortalTicket>> => {
+    const response = await apiPost<{ ticket: CreatedPortalTicket }>(
       '/portal/tickets',
       data,
       config
@@ -687,6 +834,33 @@ export const portalApi = {
 
     return {
       data: response.data.ticket,
+      statusCode: response.statusCode,
+      headers: response.headers
+    };
+  },
+
+  /** Customer reply on their own ticket. The API (POST /portal/tickets/:id/comments)
+   *  only accepts comments on tickets the session's portal user submitted, caps
+   *  content at 5,000 chars, and returns the created public comment. */
+  addTicketComment: async (
+    ticketId: string,
+    content: string,
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<TicketComment>> => {
+    const response = await apiPost<{ comment: TicketComment }>(
+      `/portal/tickets/${ticketId}/comments`,
+      { content },
+      config
+    );
+    if (!response.data) {
+      return {
+        error: response.error,
+        statusCode: response.statusCode,
+        headers: response.headers
+      };
+    }
+    return {
+      data: response.data.comment,
       statusCode: response.statusCode,
       headers: response.headers
     };
@@ -792,6 +966,37 @@ export const portalApi = {
     if (!response.data) {
       return {
         error: response.error,
+        // `code` (sweep 2026-09-08 G5-6) used to be dropped here — the
+        // account-disabled 403's code never reached loadPortalBranding, so
+        // the middleware's login-redirect guard had no way to tell a disabled
+        // account apart from any other branding-load failure.
+        code: response.code,
+        statusCode: response.statusCode,
+        headers: response.headers
+      };
+    }
+
+    return {
+      data: response.data.branding,
+      statusCode: response.statusCode,
+      headers: response.headers
+    };
+  },
+
+  // Public (unauthenticated) branding lookup by custom domain / forwarded host —
+  // used for the anonymous landing/redirect path before a portal session exists.
+  getBrandingByDomain: async (
+    domain: string,
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<BrandingConfig>> => {
+    const response = await apiGet<{ branding: BrandingConfig }>(
+      `/portal/branding/${encodeURIComponent(domain)}`,
+      config
+    );
+    if (!response.data) {
+      return {
+        error: response.error,
+        code: response.code,
         statusCode: response.statusCode,
         headers: response.headers
       };
@@ -871,8 +1076,8 @@ export const portalApi = {
     token: string,
     signerName: string,
     signerEmail?: string
-  ): Promise<ApiResponse<{ data: { status: string; invoiceNumber: string | null; payUrl: string | null; payDeferred?: boolean } }>> => {
-    return apiPost<{ data: { status: string; invoiceNumber: string | null; payUrl: string | null; payDeferred?: boolean } }>(
+  ): Promise<ApiResponse<{ data: { status: string; invoiceNumber: string | null; invoiceUrl: string | null; payDeferred?: boolean } }>> => {
+    return apiPost<{ data: { status: string; invoiceNumber: string | null; invoiceUrl: string | null; payDeferred?: boolean } }>(
       `/quotes/public/${encodeURIComponent(token)}/accept`,
       { signerName, signerEmail },
       { redirectOnUnauthorized: false }
@@ -888,5 +1093,149 @@ export const portalApi = {
       { reason },
       { redirectOnUnauthorized: false }
     );
-  }
+  },
+
+  // Public, token-gated invoice access — the durable no-login view-and-pay link.
+  // These hit /invoices/public/* (NOT /portal/*): no auth cookie, and a 401 must
+  // never bounce an anonymous customer to the portal login.
+  getPublicInvoice: async (
+    token: string,
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<{ data: PublicInvoiceDetail }>> => {
+    return apiGet<{ data: PublicInvoiceDetail }>(
+      `/invoices/public/${encodeURIComponent(token)}`,
+      config
+    );
+  },
+
+  payPublicInvoice: async (
+    token: string
+  ): Promise<ApiResponse<{ data: { url: string } }>> => {
+    return apiPost<{ data: { url: string } }>(
+      `/invoices/public/${encodeURIComponent(token)}/pay`,
+      {},
+      { redirectOnUnauthorized: false }
+    );
+  },
+
+  // Checkout verify-on-return WITHOUT the invoice token: exchanges the Stripe
+  // session id for settlement + the canonical public page url (the return urls
+  // deliberately carry no bearer token — see the API route).
+  settlePublicReturn: async (
+    sessionId: string
+  ): Promise<ApiResponse<{ data: { settled: boolean; publicUrl: string | null } }>> => {
+    return apiPost<{ data: { settled: boolean; publicUrl: string | null } }>(
+      '/invoices/public/settle-return',
+      { sessionId },
+      { redirectOnUnauthorized: false }
+    );
+  },
+
+  // W04 — portal dashboard
+  getDashboard: (
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<DashboardDto>> =>
+    apiGet<DashboardDto>('/portal/dashboard', config),
+
+  // ---- W05 — security ----
+  getSecurityOverview: (
+    days = 30,
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<SecurityOverviewDto>> =>
+    apiGet<SecurityOverviewDto>(
+      `/portal/security/overview${buildQueryString({ days })}`,
+      config
+    ),
+
+  getSecurityDevices: (
+    params: ListParams = {},
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<SecurityDevicesDto>> =>
+    apiGet<SecurityDevicesDto>(
+      `/portal/security/devices${buildQueryString({
+        page: params.page ?? 1,
+        limit: params.limit ?? 50
+      })}`,
+      config
+    ),
+
+  // W06 — backups
+  getBackupOverview: (
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<BackupOverviewDto>> =>
+    apiGet<BackupOverviewDto>('/portal/backups/overview', config),
+
+  getBackupDevices: (
+    params: ListParams = {},
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<BackupDevicesDto>> =>
+    apiGet<BackupDevicesDto>(
+      `/portal/backups/devices${buildQueryString({
+        page: params.page ?? 1,
+        limit: params.limit ?? 50,
+      })}`,
+      config
+    ),
+
+  // ---------------------------------------------------------------------------
+  // W08 — support usage
+  // ---------------------------------------------------------------------------
+  getSupportUsage: (
+    month?: string,
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<SupportUsageDto>> =>
+    apiGet<SupportUsageDto>(
+      `/portal/tickets/usage${buildQueryString({ month })}`,
+      config
+    ),
+
+  // W10 — customer reports
+  getReportRuns: async (
+    params: ListParams = {},
+    config: ApiRequestConfig = {},
+  ): Promise<PortalRunsResult> => {
+    const query = buildQueryString({
+      page: params.page ?? 1,
+      limit: params.limit ?? 20,
+    });
+    const response = await apiGet<PortalRunsDto>(
+      `/portal/reports/runs${query}`,
+      config,
+    );
+    return {
+      ...mapPaginatedData(response),
+      timezone: response.data?.timezone,
+    };
+  },
+
+  generateReport: async (
+    type: 'security_compliance_posture' | 'executive_summary',
+    config: ApiRequestConfig = {},
+  ): Promise<ApiResponse<PortalRunDto>> => {
+    const response = await apiPost<{ data: PortalRunDto }>(
+      '/portal/reports/generate',
+      { type },
+      config,
+    );
+    if (!response.data) {
+      return {
+        error: response.error,
+        code: response.code,
+        errorData: response.errorData,
+        statusCode: response.statusCode,
+        headers: response.headers,
+      };
+    }
+    return {
+      data: response.data.data,
+      statusCode: response.statusCode,
+      headers: response.headers,
+    };
+  },
+
+  reportArtifactUrl: (
+    runId: string,
+    format: 'pdf' | 'csv',
+  ): PublicApiPath =>
+    publicApiPath(`/portal/reports/runs/${runId}/${format}`),
 };

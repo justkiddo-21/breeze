@@ -587,6 +587,7 @@
     "startScan": "Avvia scansione",
     "startScansWatchProgressAndReviewScan": "Avvia scansioni, segui l'avanzamento e consulta la cronologia delle scansioni sui dispositivi.",
     "started": "Avviata {{time}}",
+    "startedColumn": "Avviata",
     "status": "Stato: {{status}}",
     "status2": "Stato",
     "type": "Tipo"
@@ -1069,6 +1070,11 @@
       "title": "Elimina regola PAM",
       "message": "Eliminare la regola \"{{name}}\"? Le richieste di elevazione non corrisponderanno più a questa regola.",
       "confirm": "Elimina regola"
+    },
+    "staleTierBadge": {
+      "label": "Obsoleto",
+      "tooltip": "Il livello di rischio {{tier}} non corrisponde più a nulla che questa regola possa selezionare, quindi non potrà mai più corrispondere.",
+      "tooltipWithTiers": "Il livello di rischio {{tier}} non corrisponde più a nulla che questa regola possa selezionare, quindi non potrà mai più corrispondere. Livelli attualmente in uso: {{tiers}}."
     }
   },
   "pamPamSignerGroupsTab": {
@@ -1139,7 +1145,7 @@
       "noPolicy": "Nessun criterio (configurazione manuale)",
       "deviceIds": "ID dispositivi",
       "deviceIdsHelp": "Un UUID per riga, oppure separati da virgole.",
-      "deviceIdsPlaceholder": "device-uuid-1&#10;device-uuid-2",
+      "deviceIdsPlaceholder": "device-uuid-1\ndevice-uuid-2",
       "detectionClasses": "Classi di rilevamento"
     },
     "actions": {

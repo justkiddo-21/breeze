@@ -1,4 +1,6 @@
 export * from './formatBytes';
+export * from './currency';
+export * from './locale';
 export * from './docsMapping';
 export * from './semverCompare';
 export * from './timezone';
@@ -12,6 +14,12 @@ export * from './reportSchedule';
 export * from './s3Region';
 export * from './s3Endpoint';
 export * from './softwareFileType';
+export * from './cron';
+export * from './approvalBatchGrouping';
+export * from './agentOutcome';
+export * from './aiToolHandoff';
+export * from './aiToolLabels';
+export * from './scriptSecurityPatterns';
 // Deliberately NOT `export *`. `compileExcludeMatcher` is a code-point port of
 // the agent's matcher and knowingly diverges from Go on mid-rune byte offsets
 // and Unicode special-casing (see matcherPortLimitations in

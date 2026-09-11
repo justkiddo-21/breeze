@@ -101,6 +101,39 @@ describe('Action intents migration', () => {
     'approval_scope',
     'classification_version',
     'effect_digest',
+    // 2026-09-05-a: the originating agent run is part of the intent's
+    // immutable content, for the same reason as the origin fields above — an
+    // intent whose attributed run could be swapped after approval would
+    // defeat release revalidation.
+    'requesting_agent_run_id',
+    // 2026-09-23 (P2-2, #4189): typed target scope. scope_kind is a plain
+    // deny-listed column (never changes post-creation). scope_device_id's
+    // guard is actually conditional — `NEW.scope_device_id IS DISTINCT FROM
+    // OLD.scope_device_id AND NEW.scope_device_id IS NOT NULL` — so a
+    // non-null->NULL tombstone (the device-delete FK's ON DELETE SET NULL)
+    // is allowed through, but the regex parser can't see the AND clause and
+    // lists it as a plain deny-listed column regardless. That is fine: this
+    // list's job is drift detection, and the column genuinely is guarded.
+    'scope_kind',
+    'scope_device_id',
+    // 2026-09-25 (P2-4, #4191): same conditional-guard shape as
+    // scope_device_id above — `NEW.scope_ticket_id IS DISTINCT FROM
+    // OLD.scope_ticket_id AND NEW.scope_ticket_id IS NOT NULL` permits only
+    // the non-null->NULL tombstone transition (the ticket-delete FK's ON
+    // DELETE SET NULL, or a moveOrg detach step), never a retarget.
+    'scope_ticket_id',
+    // 2026-10-14-100200 (#5205 W04, #5209): AI Operator operation identity.
+    // UNCONDITIONAL, unlike the two scope columns above — there is no
+    // tombstone direction to permit. `action_intents_task_org_fk` is ON DELETE
+    // RESTRICT precisely because SET NULL would strand `task_step_key` /
+    // `operation_key` and instantly violate `action_intents_task_link_chk`, so
+    // all three are set at INSERT and never written again. They are the
+    // identity `ai_operator_operations` is keyed on: an editable `task_id`
+    // would let a live intent be re-pointed at a different task after
+    // approval.
+    'task_id',
+    'task_step_key',
+    'operation_key',
   ] as const;
 
   // Deliberately MUTABLE. release_by is written by the approve fan-in

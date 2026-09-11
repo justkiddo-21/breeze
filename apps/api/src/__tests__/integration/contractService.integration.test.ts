@@ -21,11 +21,11 @@ import { partners, organizations, sites, devices, users, organizationUsers, role
 import {
   createContract, getContract, addContractLineToContract, updateContract, listContracts,
   activateContract, pauseContract, resumeContract, cancelContract, generateDueInvoice,
-  type ContractActorT
+  computeContractEstimate, type ContractActorT
 } from '../../services/contractService';
 import { ContractServiceError } from '../../services/contractTypes';
 
-async function seedOrg(): Promise<{ actor: ContractActorT; orgId: string }> {
+async function seedOrg(orgCurrencyCode = 'USD'): Promise<{ actor: ContractActorT; orgId: string }> {
   const sfx = Math.random().toString(36).slice(2, 8);
   let orgId = ''; let partnerId = '';
   await withSystemDbAccessContext(async () => {
@@ -34,6 +34,7 @@ async function seedOrg(): Promise<{ actor: ContractActorT; orgId: string }> {
     }).returning({ id: partners.id });
     partnerId = p!.id;
     const [o] = await db.insert(organizations).values({
+      currencyCode: orgCurrencyCode,
       partnerId, name: 'COrg', slug: `co-${sfx}`
     }).returning({ id: organizations.id });
     orgId = o!.id;
@@ -52,6 +53,23 @@ describe('contractService CRUD', () => {
     const got = await withSystemDbAccessContext(() => getContract(c.id, actor));
     expect(got.contract.name).toBe('Acme MSP');
     expect(got.lines).toHaveLength(0);
+  });
+
+  it('stamps the org currency when no currencyCode input is given', async () => {
+    const { actor, orgId } = await seedOrg('EUR');
+    const c = await withSystemDbAccessContext(() => createContract({
+      orgId, name: 'Euro MSP', billingTiming: 'advance', intervalMonths: 1, startDate: '2026-07-01'
+    }, actor));
+    expect(c.currencyCode).toBe('EUR');
+  });
+
+  it('explicit currencyCode input wins over the org currency', async () => {
+    const { actor, orgId } = await seedOrg('EUR');
+    const c = await withSystemDbAccessContext(() => createContract({
+      orgId, name: 'GBP override', billingTiming: 'advance', intervalMonths: 1, startDate: '2026-07-01',
+      currencyCode: 'GBP'
+    }, actor));
+    expect(c.currencyCode).toBe('GBP');
   });
 
   it('adds flat + per_device lines to a draft', async () => {
@@ -165,6 +183,114 @@ describe('contractService CRUD', () => {
     // Actor A must NOT see Actor B's contract (compare contract IDs, not orgId).
     expect(ids).not.toContain(cB.id);
     expect(rows.every((r) => r.orgId === a.orgId)).toBe(true);
+  });
+});
+
+describe('per_device_role lines (#3205)', () => {
+  async function seedOrgWithUser(): Promise<{ actor: ContractActorT; orgId: string }> {
+    const { orgId } = await seedOrg();
+    const sfx = Math.random().toString(36).slice(2, 8);
+    let partnerId = '';
+    let userId = '';
+    await withSystemDbAccessContext(async () => {
+      const [org] = await db.select({ partnerId: organizations.partnerId })
+        .from(organizations).where(eq(organizations.id, orgId)).limit(1);
+      partnerId = org!.partnerId;
+      const [u] = await db.insert(users).values({
+        partnerId, orgId, email: `role-gen-${sfx}@x.io`, name: 'Role Gen User', status: 'active'
+      }).returning({ id: users.id });
+      userId = u!.id;
+    });
+    return { actor: { userId, partnerId, accessibleOrgIds: [orgId] }, orgId };
+  }
+
+  async function seedSitesAndDevices(orgId: string) {
+    const sfx = Math.random().toString(36).slice(2, 8);
+    return withSystemDbAccessContext(async () => {
+      const [sA] = await db.insert(sites).values({ orgId, name: `A-${sfx}` }).returning({ id: sites.id });
+      const base = { orgId, osType: 'linux' as const, osVersion: '22.04', architecture: 'x86_64', agentVersion: '1.0.0', status: 'online' as const };
+      await db.insert(devices).values([
+        { ...base, siteId: sA!.id, agentId: `w-${sfx}`, hostname: 'w', deviceRole: 'workstation' },
+        { ...base, siteId: sA!.id, agentId: `s-${sfx}`, hostname: 's', deviceRole: 'server' },
+        { ...base, siteId: sA!.id, agentId: `u-${sfx}`, hostname: 'u' }, // unknown
+      ]);
+      return { siteAId: sA!.id };
+    });
+  }
+
+  it('persists deviceRoles and a site-scoped role line', async () => {
+    const { actor, orgId } = await seedOrg();
+    const { siteAId } = await seedSitesAndDevices(orgId);
+    const c = await withSystemDbAccessContext(() => createContract({
+      orgId, name: 'Roles', billingTiming: 'advance', intervalMonths: 1, startDate: '2026-07-01'
+    }, actor));
+    const line = await withSystemDbAccessContext(() => addContractLineToContract(c.id, {
+      lineType: 'per_device_role', description: 'Servers at A', unitPrice: '40.00', taxable: false,
+      deviceRoles: ['server', 'nas'], siteId: siteAId,
+    }, actor));
+    const [row] = await withSystemDbAccessContext(() =>
+      db.select().from(contractLines).where(eq(contractLines.id, line.id)));
+    expect(row!.deviceRoles).toEqual(['server', 'nas']);
+    expect(row!.siteId).toBe(siteAId);
+  });
+
+  it('rejects a site that belongs to another org with SITE_NOT_IN_ORG', async () => {
+    const { actor, orgId } = await seedOrg();
+    const other = await seedOrg();
+    const { siteAId: foreignSite } = await seedSitesAndDevices(other.orgId);
+    const c = await withSystemDbAccessContext(() => createContract({
+      orgId, name: 'Foreign', billingTiming: 'advance', intervalMonths: 1, startDate: '2026-07-01'
+    }, actor));
+    await expect(withSystemDbAccessContext(() => addContractLineToContract(c.id, {
+      lineType: 'per_device', description: 'Devices', unitPrice: '10.00', taxable: false, siteId: foreignSite,
+    }, actor))).rejects.toMatchObject({ code: 'SITE_NOT_IN_ORG', status: 400 });
+  });
+
+  it('estimate resolves the role quantity and reports uncovered devices', async () => {
+    const { actor, orgId } = await seedOrg();
+    await seedSitesAndDevices(orgId);
+    const c = await withSystemDbAccessContext(() => createContract({
+      orgId, name: 'Est', billingTiming: 'advance', intervalMonths: 1, startDate: '2026-07-01'
+    }, actor));
+    await withSystemDbAccessContext(() => addContractLineToContract(c.id, {
+      lineType: 'per_device_role', description: 'Servers', unitPrice: '40.00', taxable: false, deviceRoles: ['server'],
+    }, actor));
+    const est = await withSystemDbAccessContext(() => computeContractEstimate(c.id, actor));
+    expect(est.lines[0]).toMatchObject({ lineType: 'per_device_role', quantity: 1, value: '40.00', live: true });
+    expect(est.uncoveredDevices).toEqual({ total: 2, byRole: { workstation: 1, unknown: 1 } });
+  });
+
+  it('estimate uncoveredDevices is null for a contract with only flat lines', async () => {
+    const { actor, orgId } = await seedOrg();
+    await seedSitesAndDevices(orgId);
+    const c = await withSystemDbAccessContext(() => createContract({
+      orgId, name: 'Flat', billingTiming: 'advance', intervalMonths: 1, startDate: '2026-07-01'
+    }, actor));
+    await withSystemDbAccessContext(() => addContractLineToContract(c.id, {
+      lineType: 'flat', description: 'Fee', unitPrice: '100.00', taxable: false,
+    }, actor));
+    const est = await withSystemDbAccessContext(() => computeContractEstimate(c.id, actor));
+    expect(est.uncoveredDevices).toBeNull();
+  });
+
+  it('generateDueInvoice bills the role quantity and returns uncoveredDevices', async () => {
+    const { actor, orgId } = await seedOrgWithUser();
+    await seedSitesAndDevices(orgId);
+    const c = await withSystemDbAccessContext(() => createContract({
+      orgId, name: 'RoleGen', billingTiming: 'advance', intervalMonths: 1, startDate: '2026-07-01'
+    }, actor));
+    await withSystemDbAccessContext(() => addContractLineToContract(c.id, {
+      lineType: 'per_device_role', description: 'Servers', unitPrice: '40.00', taxable: false, deviceRoles: ['server'],
+    }, actor));
+    await withSystemDbAccessContext(() => activateContract(c.id, actor, new Date('2026-07-01T08:00:00Z')));
+
+    const res = await withSystemDbAccessContext(() => generateDueInvoice(c.id, new Date('2026-07-01T08:00:00Z')));
+    expect(res.generated).toBe(true);
+    expect(res.uncoveredDevices).toEqual({ total: 2, byRole: { workstation: 1, unknown: 1 } });
+    const rows = await withSystemDbAccessContext(() =>
+      db.select({ quantity: invoiceLines.quantity, description: invoiceLines.description })
+        .from(invoiceLines).where(eq(invoiceLines.invoiceId, res.invoiceId!)));
+    expect(rows).toEqual([{ quantity: '1.00', description: 'Servers' }]);
   });
 });
 
@@ -320,6 +446,7 @@ describe('contractService generation', () => {
       }).returning({ id: partners.id });
       partnerId = p!.id;
       const [o] = await db.insert(organizations).values({
+        currencyCode: 'USD',
         partnerId, name: `SysOrg-${sfx}`, slug: `so-${sfx}`
       }).returning({ id: organizations.id });
       orgId = o!.id;

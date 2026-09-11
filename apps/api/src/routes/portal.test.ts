@@ -7,6 +7,14 @@ const { sendPasswordResetMock, createTicketMock } = vi.hoisted(() => ({
   createTicketMock: vi.fn()
 }));
 
+const { supportUsageForOrgMock } = vi.hoisted(() => ({
+  supportUsageForOrgMock: vi.fn(),
+}));
+
+vi.mock('../services/portal/supportUsage', () => ({
+  supportUsageForOrg: supportUsageForOrgMock,
+}));
+
 vi.mock('nanoid', () => ({
   nanoid: vi.fn(() => 'nanoid-token')
 }));
@@ -51,6 +59,33 @@ vi.mock('../db', () => ({
 
 // Portal ticket creation routes through the ticket service (stamps partner_id,
 // allocates internal numbers, emits lifecycle events) — mock the service here.
+// Org-status gate (org-lifecycle Wave 2): `portalAuthMiddleware` now refuses a
+// session whose ORG is not usable — suspended, offboarded, archived, or fenced
+// into `merging` for a merge. It delegates that question to
+// `services/tenantStatus`, which opens its own system-scope DB read, so these
+// suites' `../db` mock cannot satisfy it (the real module reaches for
+// `getCurrentDbAccessContext`, which the mock does not export, and its query
+// would return no rows anyway and 403 every request).
+//
+// Mock the tenant-status BOUNDARY, exactly as `middleware/clientAiAuth.test.ts`
+// does for the sibling gate: default to "usable" so these tests keep asserting
+// what they are about. Do NOT relax the gate itself — it is covered directly by
+// `routes/portal/authOrgStatusGate.test.ts`.
+vi.mock('../services/tenantStatus', () => ({
+  getActiveOrgTenant: vi.fn(async (orgId: string) => ({ orgId, partnerId: 'partner-1' })),
+}));
+
+// portalAuthMiddleware resolves the org's timezone once during hydration
+// (services/portal/timezone.ts) via a real DB left-join query this suite's
+// generic `../db` mock cannot satisfy, and `../db/schema` here doesn't export
+// `organizations`/`partners` at all. Mock the resolver BOUNDARY, same pattern
+// as the tenantStatus mock immediately above — the resolver itself is covered
+// directly by `services/portal/timezone.test.ts` and the hydration contract by
+// `routes/portal/authOrgStatusGate.test.ts`.
+vi.mock('../services/portal/timezone', () => ({
+  resolveOrgTimezone: vi.fn(async () => 'UTC'),
+}));
+
 vi.mock('../services/ticketService', () => ({
   createTicket: createTicketMock,
   TicketServiceError: class TicketServiceError extends Error {
@@ -65,13 +100,25 @@ vi.mock('../services/ticketService', () => ({
 
 vi.mock('../db/schema', () => ({
   assetCheckouts: {},
+  backupConfigs: {},
+  backupJobs: {},
+  backupSlaEvents: {},
+  backupVerifications: {},
+  devicePatches: {},
+  deviceWarranty: {},
   devices: {},
   // The portal route graph transitively imports networkBaseline.ts, which reads
   // discoveredAssetTypeEnum.enumValues at module load — the full-module mock must
   // provide it or the whole suite fails to load.
   discoveredAssetTypeEnum: { enumValues: [] },
+  huntressAgents: {},
+  organizations: {},
   portalBranding: {},
   portalUsers: {},
+  recoveryReadiness: {},
+  RESTORABLE_BACKUP_JOB_STATUSES: ['completed', 'partial'],
+  s1Agents: {},
+  securityStatus: {},
   ticketComments: {},
   tickets: {},
   ticketStatuses: {}
@@ -103,14 +150,13 @@ const makeWhereChain = (result: any) =>
     orderBy: vi.fn().mockReturnValue(makeOrderChain(result))
   });
 
-const mockSelectResult = (result: any) => ({
-  from: vi.fn().mockReturnValue({
+const mockSelectResult = (result: any) => {
+  const fromChain: Record<string, any> = {
     where: vi.fn().mockReturnValue(makeWhereChain(result)),
-    leftJoin: vi.fn().mockReturnValue({
-      where: vi.fn().mockReturnValue(makeWhereChain(result))
-    })
-  })
-});
+  };
+  fromChain.leftJoin = vi.fn().mockReturnValue(fromChain);
+  return { from: vi.fn().mockReturnValue(fromChain) };
+};
 
 const mockSelectLimit = mockSelectResult;
 const mockSelectWhere = mockSelectResult;
@@ -689,7 +735,10 @@ describe('portal routes', () => {
               createdAt: new Date()
             }
           ]) as any
-        );
+        )
+        // W08 #3902 — the detail handler now runs a 6th SELECT for the
+        // attachments hanging off the (already public/non-deleted) comment ids.
+        .mockReturnValueOnce(mockSelectWhere([]) as any);
 
       vi.mocked(db.update).mockReturnValueOnce({
         set: vi.fn().mockReturnValue({
@@ -707,6 +756,8 @@ describe('portal routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.ticket.comments).toHaveLength(1);
+      // Every comment carries an attachments array, empty here.
+      expect(body.ticket.comments[0].attachments).toEqual([]);
     });
 
     it('should return 404 when ticket is missing', async () => {
@@ -1225,6 +1276,88 @@ describe('portal routes', () => {
       });
 
       expect(res.status).toBe(400);
+    });
+  });
+
+  // Task 3.3 fix round 1 — real-router regression guard. The unit tests in
+  // routes/portal/featureFlags.test.ts build a throwaway Hono app and stub
+  // portalAuth directly, so they cannot detect a deleted/reordered
+  // `portalRoutes.use(prefix, portalAuthMiddleware)` line in
+  // routes/portal/index.ts. These drive the REAL portalRoutes mount (same
+  // pattern as the PORTAL_TICKETS_DISABLED "real mount" test above): one
+  // unauthenticated 401 per new prefix, and one authenticated-but-flag-false
+  // 403 per prefix proving the gate runs AFTER auth. dashboard/security/
+  // backups/reports have no handlers yet (later waves), so a
+  // passing gate would fall through to Hono's 404 — the 403 case alone still
+  // proves auth-then-gate ordering.
+  describe('W03 strict visibility gates (real mount)', () => {
+    const strictGateCases = [
+      { path: '/portal/dashboard', code: 'PORTAL_DASHBOARD_DISABLED', flag: 'enableDashboard' },
+      { path: '/portal/security', code: 'PORTAL_SECURITY_DISABLED', flag: 'enableSecurity' },
+      { path: '/portal/backups', code: 'PORTAL_BACKUPS_DISABLED', flag: 'enableBackups' },
+      { path: '/portal/reports', code: 'PORTAL_REPORTS_DISABLED', flag: 'enableReports' },
+      { path: '/portal/tickets/usage', code: 'PORTAL_SUPPORT_USAGE_DISABLED', flag: 'enableSupportUsage' }
+    ] as const;
+
+    it.each(strictGateCases)(
+      'GET $path returns 401 with no Authorization header',
+      async ({ path }) => {
+        const res = await app.request(path);
+        expect(res.status).toBe(401);
+      }
+    );
+
+    it.each(strictGateCases)(
+      'GET $path returns 403 $code when authenticated but the flag is false/missing',
+      async ({ path, code }) => {
+        vi.mocked(db.select)
+          .mockReturnValueOnce(mockSelectLimit([portalUser]) as any) // loginUser()'s own select
+          .mockReturnValueOnce(mockSelectLimit([portalUser]) as any) // portalAuthMiddleware hydration
+          .mockReturnValueOnce(mockSelectLimit([]) as any); // strict gate: no portal_branding row → fail closed
+
+        const token = await loginUser();
+
+        const res = await app.request(path, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        expect(res.status).toBe(403);
+        expect(await res.json()).toMatchObject({ code });
+      }
+    );
+
+    it('returns 200 through the real mount when enableSupportUsage is true even though enableTickets is false', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce(mockSelectLimit([portalUser]) as any) // loginUser()'s own select
+        .mockReturnValueOnce(mockSelectLimit([portalUser]) as any) // portalAuthMiddleware hydration
+        .mockReturnValueOnce(
+          mockSelectLimit([{ enableSupportUsage: true, enableTickets: false }]) as any
+        ); // strict gate row — enableTickets false proves independence from the ticketing gate
+
+      supportUsageForOrgMock.mockResolvedValue({
+        asOf: '2026-09-02T12:00:00.000Z',
+        month: '2026-09',
+        timezone: 'UTC',
+        dataStatus: 'no_data',
+        totals: {
+          billed: { minutes: 0, hours: 0 },
+          toBeBilled: { minutes: 0, hours: 0 },
+          coveredByContract: { minutes: 0, hours: 0 },
+          pendingReview: { minutes: 0, hours: 0 },
+        },
+        tickets: [],
+      });
+
+      const token = await loginUser();
+
+      const res = await app.request('/portal/tickets/usage?month=2026-09', {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      expect(res.status).toBe(200);
+      expect(supportUsageForOrgMock).toHaveBeenCalledWith(
+        expect.objectContaining({ month: '2026-09' })
+      );
     });
   });
 });

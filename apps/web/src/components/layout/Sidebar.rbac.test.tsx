@@ -14,6 +14,10 @@ const state = vi.hoisted(() => ({
 const fetchWithAuthMock = vi.hoisted(() => vi.fn());
 
 vi.mock('../../stores/auth', () => ({
+  // #5075 W04 — Sidebar now reads the Service Management mode from orgStore,
+  // whose module scope calls registerOrgIdProvider on import. Without this the
+  // whole suite dies at import time, before any test runs.
+  registerOrgIdProvider: vi.fn(),
   fetchWithAuth: fetchWithAuthMock,
   useAuthStore: Object.assign(
     (selector: (s: { user: typeof state.user }) => unknown) => selector({ user: state.user }),
@@ -75,7 +79,7 @@ beforeEach(() => {
   // Expand every section so collapsed children don't hide hrefs.
   localStorage.setItem(
     'sidebar-sections',
-    JSON.stringify({ 'ai-fleet': true, monitoring: true, security: true, operations: true, backup: true, reporting: true, settings: true }),
+    JSON.stringify({ ai: true, 'fleet-management': true, security: true, backup: true, billing: true, reporting: true, settings: true, administration: true }),
   );
   window.matchMedia = vi.fn().mockImplementation((query: string) => ({
     matches: false, media: query,
@@ -111,15 +115,16 @@ describe('Sidebar — permission-aware nav for billing vs technician vs admin', 
     // #1629 follow-up: a section whose items are ALL permission-filtered out
     // must hide its header entirely — no empty "Monitoring/Security/Backup/
     // Reporting" group that expands to nothing.
-    expect(hasSectionHeader(container, 'Monitoring')).toBe(false);
+    expect(hasSectionHeader(container, 'Fleet Management')).toBe(false);
     expect(hasSectionHeader(container, 'Security')).toBe(false);
     expect(hasSectionHeader(container, 'Backup')).toBe(false);
     expect(hasSectionHeader(container, 'Reporting')).toBe(false);
+    expect(hasSectionHeader(container, 'Administration')).toBe(false);
     // Sections that still have at least one visible item keep their header:
-    // Operations holds the billing items it can access, and AI & Fleet has the
-    // always-visible Fleet landing item.
-    expect(hasSectionHeader(container, 'Operations')).toBe(true);
-    expect(hasSectionHeader(container, 'AI & Fleet')).toBe(true);
+    // Billing holds the items it can access, and AI has the always-visible
+    // Fleet Orchestration landing item.
+    expect(hasSectionHeader(container, 'Billing')).toBe(true);
+    expect(hasSectionHeader(container, 'AI')).toBe(true);
   });
 
   it('Partner Technician sees fleet/ops items but no billing and no user/role admin', async () => {
@@ -160,8 +165,9 @@ describe('Sidebar — permission-aware nav for billing vs technician vs admin', 
     expect(has(container, '/reports')).toBe(true);
     expect(has(container, '/backup')).toBe(true);
 
-    // Admin sees every section header (nothing filtered out).
-    expect(hasSectionHeader(container, 'Monitoring')).toBe(true);
+    // Admin sees every non-platform-admin section header (nothing filtered out).
+    expect(hasSectionHeader(container, 'Fleet Management')).toBe(true);
+    expect(hasSectionHeader(container, 'Billing')).toBe(true);
     expect(hasSectionHeader(container, 'Security')).toBe(true);
     expect(hasSectionHeader(container, 'Backup')).toBe(true);
     expect(hasSectionHeader(container, 'Reporting')).toBe(true);
@@ -216,5 +222,6 @@ describe('Sidebar — SSO (sso:admin) and platform-admin gating', () => {
 
     expect(has(container, '/admin/third-party-catalog')).toBe(true);
     expect(has(container, '/admin/connected-apps')).toBe(true);
+    expect(hasSectionHeader(container, 'Administration')).toBe(true);
   });
 });

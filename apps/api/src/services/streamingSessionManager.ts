@@ -14,28 +14,78 @@
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { Query, SDKResultMessage, SDKUserMessage, McpSdkServerConfigWithInstance } from '@anthropic-ai/claude-agent-sdk';
-import { db, withDbAccessContext, runOutsideDbContext } from '../db';
+import { db, withDbAccessContext, withSystemDbAccessContext, runOutsideDbContext } from '../db';
+import { dbWriteExpectingRows } from '../db/dbWriteExpectingRows';
 import { aiSessions, aiMessages, aiBudgets } from '../db/schema';
-import { eq, and, isNull } from 'drizzle-orm';
+import { eq, and, isNull, inArray } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import { buildOrgAccessClosures } from '../middleware/auth';
 import type { AiStreamEvent, AiApprovalMode } from '@breeze/shared/types/ai';
 import { AsyncEventQueue } from '../utils/asyncQueue';
-import { recordUsageFromSdkResult, calculateCostCents, sumInputTokens } from './aiCostTracker';
+import {
+  recordUsageFromSdkResult,
+  calculateCostCents,
+  calculateCatalogCostCents,
+  sumInputTokens,
+  type CatalogPricingSnapshot,
+} from './aiCostTracker';
 import { sanitizeErrorForClient } from './aiAgent';
-import { captureException } from './sentry';
+import { captureException, captureMessage } from './sentry';
 import { createBreezeMcpServer, BREEZE_MCP_TOOL_NAMES } from './aiAgentSdkTools';
 import { createSessionPreToolUse, createSessionPostToolUse, settleApprovalWaits } from './aiAgentSdk';
 import type { RequestLike } from './auditEvents';
 import { getTrustedClientIpOrUndefined } from './clientIp';
 import { redactAiToolOutputText, redactSensitiveToolInput } from './aiToolOutput';
 import { isRecognizedSelfHostSignal } from '../config/env';
+import { resolveWireModel, type ResolvedLlmEndpoint, type UsableLlmConfig } from './llm/llmConfigResolver';
+import { getLlmEgressProxy } from './llm/llmEgressProxy';
+import { recordLlmEgressEvent } from './llm/llmEgressRecorder';
 
 const SESSION_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2h idle eviction (aligned with pre-flight check)
 const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24h hard limit
 const EVICTION_INTERVAL_MS = 60 * 1000; // Check every 60s
 const MAX_ACTIVE_SESSIONS = 200;
 const EVENT_RING_BUFFER_SIZE = 100;
+/**
+ * How long a `processing` session may go without stream progress before
+ * eviction stops treating it as a live turn.
+ *
+ * Eviction protects an in-flight turn (see `isTurnInFlight`), and `state` alone
+ * would make that protection unbounded: `runBackgroundProcessor` can leave a
+ * session in `processing` after a throw or an aborted subprocess, and a hung
+ * provider never emits another event — so a wedged session would be pinned in
+ * memory forever, and under cap pressure a handful of them would wedge the
+ * whole manager. `lastActivityAt` is refreshed when a turn starts and on every
+ * assistant-message boundary and text delta, so a live stream never approaches
+ * this window; anything past it is a dead turn, and reclaiming it costs
+ * nothing.
+ *
+ * Sized against this path's real worst case, which is longer than the OpenAI
+ * twin's: a tier-3 tool can block on `waitForApproval` (300s, aiAgentSdk.ts)
+ * and then execute under a 120s vision budget without emitting a single text
+ * delta, i.e. ~7 min of legitimate silence — see SDK_TURN_TIMEOUT_MS above.
+ * 10 min clears that with headroom while still bounding a wedge.
+ */
+export const PROCESSING_STALL_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** Throttle for the all-in-flight capacity alarm, so it cannot flood Sentry. */
+const CAPACITY_ALARM_THROTTLE_MS = 5 * 60 * 1000;
+
+/**
+ * Bucket how far past MAX_ACTIVE_SESSIONS the manager has been pushed, for the
+ * capacity alarm's only scrubber-surviving channel (a tag).
+ *
+ * Closed four-value set by construction, carrying no tenant, device or session
+ * identifier — the shape ALLOWED_TAG_NAMES requires. The raw count would be
+ * unbounded cardinality; the bucket still separates "one turn over" from "the
+ * manager is wedged", which is the distinction that decides whether to page.
+ */
+function bucketSessionOvershoot(size: number): string {
+  if (size <= MAX_ACTIVE_SESSIONS) return 'at-cap';
+  if (size <= MAX_ACTIVE_SESSIONS * 1.25) return 'over-cap';
+  if (size <= MAX_ACTIVE_SESSIONS * 2) return 'far-over-cap';
+  return 'runaway';
+}
 /**
  * 6 min per-turn timeout. Sized to accept a single approval wait
  * (`waitForApproval`, aiAgentSdk.ts, 300_000ms = 5 min) plus headroom for
@@ -99,17 +149,95 @@ const SDK_CHILD_ENV_ALLOWLIST = [
   'COMSPEC',
 ] as const;
 
-export function buildClaudeSdkChildEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
+const SDK_CHILD_ENV_CREDENTIAL_KEYS = new Set<string>([
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+]);
+
+/**
+ * Proxy configuration the parent process may carry. Forwarded as-is for
+ * platform and direct-Anthropic partner sessions (an operator's outbound proxy
+ * is legitimate there), but DROPPED wholesale for a catalog session: those must
+ * traverse the grant-scoped CONNECT proxy, and a parent `NO_PROXY=*` (or a
+ * lowercase `https_proxy` shadowing our uppercase one) would quietly restore
+ * direct, unpinned egress to the provider (#3922, quorum P4).
+ */
+const SDK_CHILD_ENV_PROXY_KEYS = new Set<string>([
+  'HTTPS_PROXY',
+  'HTTP_PROXY',
+  'NO_PROXY',
+  'https_proxy',
+  'http_proxy',
+  'no_proxy',
+]);
+
+/** The catalog endpoint of a partner session, or null for every other shape. */
+function catalogEndpointOf(
+  resolved: UsableLlmConfig,
+): Extract<ResolvedLlmEndpoint, { kind: 'catalog' }> | null {
+  return resolved.source === 'partner' && resolved.endpoint.kind === 'catalog'
+    ? resolved.endpoint
+    : null;
+}
+
+export function buildClaudeSdkChildEnv(
+  resolved: UsableLlmConfig,
+  source: NodeJS.ProcessEnv = process.env,
+  options: { egressProxyUrl?: string } = {},
+): Record<string, string> {
+  const catalogEndpoint = catalogEndpointOf(resolved);
+
   const env: Record<string, string> = {
     CI: 'true',
     CLAUDE_AGENT_SDK_CLIENT_APP: source.CLAUDE_AGENT_SDK_CLIENT_APP ?? 'breeze-api/ai-agent',
   };
 
   for (const key of SDK_CHILD_ENV_ALLOWLIST) {
+    if (resolved.source === 'partner' && SDK_CHILD_ENV_CREDENTIAL_KEYS.has(key)) continue;
+    if (catalogEndpoint && SDK_CHILD_ENV_PROXY_KEYS.has(key)) continue;
     const value = source[key];
     if (typeof value === 'string' && value.length > 0) {
       env[key] = value;
     }
+  }
+
+  // `resolved.source === 'partner'` is implied by a catalog endpoint existing;
+  // it is restated so `resolved.apiKey` narrows to a required string.
+  if (catalogEndpoint && resolved.source === 'partner') {
+    const { egressProxyUrl } = options;
+    // No proxy URL means no grant, and no grant means the child would dial the
+    // provider itself with none of the allowlisting, DNS pinning, or egress
+    // audit this whole path exists for. Refuse to build such an environment
+    // rather than start a subprocess that silently egresses unguarded.
+    if (!egressProxyUrl) {
+      throw new Error(
+        'A catalog LLM session requires an egress proxy URL; refusing to build an unproxied child environment.',
+      );
+    }
+    // The endpoint's own URL — deliberately NOT the parent's
+    // ANTHROPIC_BASE_URL, which is never in the allowlist and stays irrelevant
+    // here whatever IS_HOSTED says (#1412 governs the PLATFORM path only).
+    env.ANTHROPIC_BASE_URL = catalogEndpoint.baseUrl;
+    // Exactly one credential var; the other was already excluded above with the
+    // rest of the parent's credentials, so the SDK cannot fall back to a
+    // platform key and leak it to a third party.
+    if (catalogEndpoint.authMode === 'bearer') {
+      env.ANTHROPIC_AUTH_TOKEN = resolved.apiKey;
+    } else {
+      env.ANTHROPIC_API_KEY = resolved.apiKey;
+    }
+    env.HTTPS_PROXY = egressProxyUrl;
+    env.HTTP_PROXY = egressProxyUrl;
+    // Explicit and empty: an unset NO_PROXY would let the parent's (already
+    // dropped) value or a library default exempt hosts from the proxy.
+    env.NO_PROXY = '';
+    return env;
+  }
+
+  if (resolved.source === 'partner') {
+    env.ANTHROPIC_API_KEY = resolved.apiKey;
+    return env;
   }
 
   // ANTHROPIC_BASE_URL (#1412): forward ONLY when self-host is affirmatively
@@ -282,6 +410,49 @@ export interface AuditSnapshot {
   userAgent: string | undefined;
 }
 
+export interface LlmConfigSnapshot {
+  readonly source: UsableLlmConfig['source'];
+  readonly configId?: string;
+  readonly configVersion?: number;
+  /**
+   * Catalog revision this session's subprocess was built against (#3922 phase
+   * 2). Revisions are immutable, so a changed id means the base URL, auth mode,
+   * model map or pricing moved — everything the child env and the cost snapshot
+   * were derived from. Absent for direct-Anthropic and platform sessions.
+   */
+  readonly revisionId?: string;
+  /** Wire model id the child sends; moves with the revision's model map. */
+  readonly providerModel?: string;
+}
+
+function llmConfigSnapshot(resolved: UsableLlmConfig): LlmConfigSnapshot {
+  if (resolved.source !== 'partner') return { source: resolved.source };
+  const base = {
+    source: resolved.source,
+    configId: resolved.configId,
+    configVersion: resolved.configVersion,
+  };
+  return resolved.endpoint.kind === 'catalog'
+    ? {
+        ...base,
+        revisionId: resolved.endpoint.revisionId,
+        providerModel: resolved.endpoint.providerModel,
+      }
+    : base;
+}
+
+function llmConfigSnapshotsMatch(snapshot: LlmConfigSnapshot, resolved: UsableLlmConfig): boolean {
+  const fresh = llmConfigSnapshot(resolved);
+  return snapshot.source === fresh.source
+    && snapshot.configId === fresh.configId
+    && snapshot.configVersion === fresh.configVersion
+    // A revision bump (or a swap between direct and catalog, which flips these
+    // between a value and undefined) rotates the session exactly as a key
+    // rotation does — the subprocess cannot be re-pointed in place.
+    && snapshot.revisionId === fresh.revisionId
+    && snapshot.providerModel === fresh.providerModel;
+}
+
 export interface ActiveSession {
   readonly breezeSessionId: string;
   /**
@@ -303,6 +474,20 @@ export interface ActiveSession {
    * tokens for cost tracking when the SDK fails to report total_cost_usd.
    */
   readonly model: string;
+  readonly llmConfigSnapshot: LlmConfigSnapshot;
+  /**
+   * Per-million-token rates from the catalog revision this session runs on.
+   * Present only for catalog sessions, where the SDK's self-reported
+   * `total_cost_usd` describes Anthropic list pricing rather than what the
+   * partner is actually charged and must be ignored (#3922 W2 Task 2.4).
+   */
+  readonly catalogPricing?: CatalogPricingSnapshot;
+  /**
+   * Releases this session's CONNECT-proxy grant. Set for catalog sessions only;
+   * invoked by `remove()` so a torn-down, rotated or evicted session stops
+   * being able to reach the provider immediately.
+   */
+  revokeEgressGrant?: () => void;
   sdkSessionId: string | null;
   query: Query;
   abortController: AbortController;
@@ -456,7 +641,18 @@ export class StreamingSessionManager {
   private sessions = new Map<string, ActiveSession>();
   private evictionTimer: ReturnType<typeof setInterval> | null = null;
 
+  private lastCapacityAlarmAt = 0;
+
   constructor() {
+    // No `runOutsideDbContext` wrapper around this `setInterval`, unlike the
+    // OpenAI twin (llm/openaiSessionManager.ts). That manager is a LAZY
+    // singleton first constructed inside an AI request handler, so its timer
+    // would inherit the requester's AsyncLocalStorage scope on every tick for
+    // the life of the process. This one is a MODULE-LEVEL singleton
+    // (bottom of file), constructed at import time with no ambient context, so
+    // the sweep starts clean. `markSessionsExpired` still re-enters the escape
+    // per statement — that is what actually guarantees the write's context,
+    // and it does not depend on this construction-order accident holding.
     this.evictionTimer = setInterval(() => this.evictStaleSessions(), EVICTION_INTERVAL_MS);
   }
 
@@ -471,6 +667,11 @@ export class StreamingSessionManager {
       return false;
     }
     session.state = 'processing';
+    // The state and its staleness clock move together: eviction reads
+    // lastActivityAt to tell a live turn from a wedged one, and before this the
+    // stamp was refreshed only in getOrCreate() — so a session that had been
+    // sitting idle stayed the LRU victim for the whole turn it was streaming.
+    session.lastActivityAt = Date.now();
     return true;
   }
 
@@ -484,7 +685,7 @@ export class StreamingSessionManager {
     dbSession: {
       orgId: string;
       sdkSessionId: string | null;
-      model: string;
+      model?: string | null;
       maxTurns: number;
       turnCount: number;
       systemPrompt: string | null;
@@ -500,6 +701,7 @@ export class StreamingSessionManager {
     requestContext: RequestLike | undefined,
     systemPrompt: string,
     maxBudgetUsd: number | undefined,
+    resolved: UsableLlmConfig,
     allowedTools?: string[],
     mcpServerFactory?: (
       getAuth: () => AuthContext,
@@ -516,21 +718,50 @@ export class StreamingSessionManager {
 
     const existing = this.sessions.get(breezeSessionId);
     if (existing && existing.state !== 'closed') {
-      // Update per-request context. Device-bound sessions re-narrow the fresh
-      // request auth to the session org every time (#3087) — `toolAuth` must
-      // never revert to the raw login scope on a follow-up message. Narrow
-      // against the freshly-loaded `dbSession.orgId`, not the possibly-stale
-      // `existing.orgId` snapshot captured at session creation — this is the
-      // current DB value, so it survives the device being moved to a
-      // different org mid-session.
-      existing.auth = auth;
-      existing.toolAuth = existing.deviceId
-        ? buildDeviceBoundSessionAuth(auth, dbSession.orgId)
-        : auth;
-      existing.auditSnapshot = snapshot;
-      existing.allowedTools = allowedTools;
-      existing.lastActivityAt = Date.now();
-      return existing;
+      if (!llmConfigSnapshotsMatch(existing.llmConfigSnapshot, resolved)) {
+        if (existing.state === 'processing') {
+          // Rotation applies on the next turn. Reusing the live session here
+          // lets the route's existing concurrent-message guard return a 409
+          // without killing an in-flight stream mid-response.
+        } else if (existing.state === 'idle') {
+          const oldConfigVersion = existing.llmConfigSnapshot.source === 'partner'
+            ? existing.llmConfigSnapshot.configVersion
+            : null;
+          const newSnapshot = llmConfigSnapshot(resolved);
+          const newConfigVersion = newSnapshot.source === 'partner'
+            ? newSnapshot.configVersion
+            : null;
+          console.info(
+            '[StreamingSessionManager] rotating idle AI session after provider configuration change',
+            { breezeSessionId, oldConfigVersion, newConfigVersion },
+          );
+          existing.eventBus.publish({
+            type: 'error',
+            message: 'AI provider configuration changed — please resend your message',
+          });
+          existing.eventBus.publish({ type: 'done' });
+          this.remove(breezeSessionId);
+        }
+      }
+
+      const reusable = this.sessions.get(breezeSessionId);
+      if (reusable && reusable.state !== 'closed') {
+        // Update per-request context. Device-bound sessions re-narrow the fresh
+        // request auth to the session org every time (#3087) — `toolAuth` must
+        // never revert to the raw login scope on a follow-up message. Narrow
+        // against the freshly-loaded `dbSession.orgId`, not the possibly-stale
+        // `existing.orgId` snapshot captured at session creation — this is the
+        // current DB value, so it survives the device being moved to a
+        // different org mid-session.
+        reusable.auth = auth;
+        reusable.toolAuth = reusable.deviceId
+          ? buildDeviceBoundSessionAuth(auth, dbSession.orgId)
+          : auth;
+        reusable.auditSnapshot = snapshot;
+        reusable.allowedTools = allowedTools;
+        reusable.lastActivityAt = Date.now();
+        return reusable;
+      }
     }
 
     // Create new session components
@@ -558,6 +789,8 @@ export class StreamingSessionManager {
       console.error('[StreamingSessionManager] Failed to load approval mode, defaulting to per_step:', err);
     }
 
+    const catalogEndpoint = catalogEndpointOf(resolved);
+
     // Device-bound sessions execute tools under the DEVICE's org, not the
     // login org (#3087). `toolAuth` (MCP tool handlers + their RLS context)
     // is narrowed to the session org; `auth` stays raw so RBAC, rate limits,
@@ -568,11 +801,24 @@ export class StreamingSessionManager {
     // Build partial session object so callbacks can reference it.
     // query and processorPromise are filled in after creation.
     const now = Date.now();
+    const effectiveModel = dbSession.model || resolved.model;
+    // `ai_sessions.model` is a free-form, client-supplied string and can also
+    // be stale (created before the partner changed `default_model`), while the
+    // resolver's `model_unverified` gate keys on the partner DEFAULT only. So
+    // translate THIS session's model — and fail closed (LlmUnavailableError)
+    // when the pinned revision has not mapped and verified it, rather than
+    // silently re-pointing the run at the default model's wire id while the
+    // ledger records a model that never ran.
+    const wire = resolveWireModel(resolved, effectiveModel);
     const session: ActiveSession = {
       breezeSessionId,
       orgId: dbSession.orgId,
       deviceId,
-      model: dbSession.model,
+      model: effectiveModel,
+      llmConfigSnapshot: llmConfigSnapshot(resolved),
+      // The pricing for the model THIS session runs, not the partner default's.
+      catalogPricing: wire.catalogPricing,
+      revokeEgressGrant: undefined,
       sdkSessionId: dbSession.sdkSessionId,
       query: null as unknown as Query, // set below
       abortController,
@@ -635,46 +881,164 @@ export class StreamingSessionManager {
       effectiveSystemPrompt += modeInstructions[approvalMode] ?? '';
     }
 
+    // ── Catalog egress grant (#3922 phase 2) ────────────────────────────────
+    // A catalog session's subprocess may open exactly one destination, through
+    // the local allowlisting CONNECT proxy. The grant must exist BEFORE the
+    // child env is built (it carries the proxy URL) and before query() spawns
+    // the subprocess. Any failure here propagates: fail loud, never start an
+    // unproxied child (phase-1 invariant).
+    //
+    // Taken as late as possible, immediately before the try/catch that
+    // releases it: anything that throws between the grant and that catch —
+    // `mcpServerFactory`, `createBreezeMcpServer` — would otherwise leak the
+    // grant until the process restarted, since `remove()` never runs for a
+    // session that was never registered.
+    let egressProxyUrl: string | undefined;
+    let revokeEgressGrant: (() => void) | undefined;
+    if (catalogEndpoint && resolved.source === 'partner') {
+      const host = new URL(catalogEndpoint.baseUrl).hostname;
+      const partnerId = resolved.partnerId;
+      const provenance = {
+        orgId: dbSession.orgId,
+        partnerId,
+        catalogEntryId: catalogEndpoint.catalogEntryId,
+        revisionId: catalogEndpoint.revisionId,
+        aiSessionId: breezeSessionId,
+      };
+      const proxy = await getLlmEgressProxy();
+      egressProxyUrl = proxy.grant(
+        breezeSessionId,
+        { host, port: 443 },
+        // Every CONNECT the child makes under this grant — tunnelled or
+        // refused — becomes one audit row. Synchronous and fire-and-forget by
+        // the recorder's contract; it runs inside the proxy's socket handler.
+        (attempt) => {
+          recordLlmEgressEvent({
+            ...provenance,
+            surface: 'sdk_proxy_connect',
+            host: attempt.host,
+            resolvedIp: attempt.resolvedIp,
+            blocked: attempt.blocked,
+          });
+        },
+      ).proxyUrl;
+      revokeEgressGrant = () => proxy.revoke(breezeSessionId);
+      session.revokeEgressGrant = revokeEgressGrant;
+      // One row per session create, so the audit shows which provider a session
+      // was pointed at even if the child never manages a single CONNECT.
+      recordLlmEgressEvent({
+        ...provenance,
+        surface: 'sdk_session_create',
+        host,
+        resolvedIp: null,
+        blocked: false,
+      });
+    }
+
+    // Durable per-session provenance (#3922 phase 2). `billing_source` stays
+    // 'partner_key' for direct and catalog BYOK alike, so these two columns are
+    // the only record in the ledger of WHICH third party processed a session's
+    // content — and of which immutable revision's URL/model map/pricing it ran
+    // under. Written on every create (including back to NULL when a partner
+    // unpins and the session rotates) so the row can never describe a routing
+    // the session is no longer using. Best-effort: provenance bookkeeping must
+    // not take AI away from a partner whose traffic is already correctly pinned
+    // and already audited in `llm_egress_events`.
+    //
+    // Self-contexted (#2190/#1375, mirroring `recordUsage`): the ambient
+    // request context can be closed or org-scoped by the time this runs, and a
+    // contextless write under forced RLS matches 0 rows SILENTLY. Wrapped in
+    // `dbWriteExpectingRows` so that 0-row case is loud, because the two
+    // directions of this write fail asymmetrically: a lost STAMP leaves a row
+    // with no claim (under-reported), while a lost CLEAR leaves a row still
+    // claiming a catalog the session no longer uses — a FALSE provenance
+    // claim, and the worse of the two. The row count is the only thing that
+    // makes either detectable.
+    try {
+      await withSystemDbAccessContext(() => dbWriteExpectingRows(
+        'streamingSessionManager.stampCatalogProvenance',
+        () => db
+          .update(aiSessions)
+          .set({
+            catalogEntryId: catalogEndpoint?.catalogEntryId ?? null,
+            catalogRevisionId: catalogEndpoint?.revisionId ?? null,
+          })
+          .where(eq(aiSessions.id, breezeSessionId))
+          .returning({ id: aiSessions.id }),
+      ));
+    } catch (err) {
+      // `org_id` and `cas_label`, NOT `service`/`orgId`/`sessionId`:
+      // `setCallerTags` drops every key outside ALLOWED_TAG_NAMES, so a
+      // camelCase tag is a silent no-op. `cas_label` is the allowlist's
+      // designated call-site discriminator (hardcoded literal, no identifiers)
+      // and is what keeps this out of the manager's shared bare-capture bucket;
+      // the session id is high-cardinality and stays in the log line only.
+      captureException(err, undefined, {
+        org_id: dbSession.orgId,
+        cas_label: 'streamingSessionManager.stampCatalogProvenance',
+      });
+      console.error(
+        '[StreamingSessionManager] Failed to stamp catalog provenance on session:',
+        breezeSessionId,
+        err,
+      );
+    }
+
     // CRITICAL: Create SDK query and background processor OUTSIDE the request's
     // AsyncLocalStorage DB context. The auth middleware wraps requests in a
     // transaction (via withDbAccessContext). Without this escape hatch, the SDK's
     // tool handlers inherit the transaction context and hang after the HTTP
     // request completes and the transaction commits.
-    runOutsideDbContextSafe(() => {
-      const sdkQuery = query({
-        prompt: inputController.getInputStream(),
-        options: {
-          systemPrompt: effectiveSystemPrompt,
-          model: dbSession.model,
-          maxTurns,
-          maxBudgetUsd,
-          tools: [],
-          allowedTools: allowedTools ?? BREEZE_MCP_TOOL_NAMES,
-          mcpServers: { [mcpServerName]: mcpServer },
-          includePartialMessages: true,
-          abortController,
-          env: buildClaudeSdkChildEnv(),
-          resume: dbSession.sdkSessionId ?? undefined,
-          persistSession: true,
-          settingSources: [],
-          thinking: { type: 'disabled' },
-          stderr: (data: string) => {
-            if (data.includes('error') || data.includes('Error') || data.includes('FATAL')) {
-              console.error('[SDK-stderr]', breezeSessionId, redactClaudeSdkStderr(data));
-            }
-          },
-        }
-      });
+    try {
+      runOutsideDbContextSafe(() => {
+        const sdkQuery = query({
+          prompt: inputController.getInputStream(),
+          options: {
+            systemPrompt: effectiveSystemPrompt,
+            // A catalog endpoint speaks its own model ids (`anthropic/…` on
+            // OpenRouter, a deployment name on a self-hosted gateway). The wire
+            // id is THIS session's model translated through the revision's
+            // model map; `session.model` keeps the platform-logical id for
+            // provenance and pricing fallback.
+            model: wire.model,
+            maxTurns,
+            maxBudgetUsd,
+            tools: [],
+            allowedTools: allowedTools ?? BREEZE_MCP_TOOL_NAMES,
+            mcpServers: { [mcpServerName]: mcpServer },
+            includePartialMessages: true,
+            abortController,
+            env: buildClaudeSdkChildEnv(resolved, process.env, { egressProxyUrl }),
+            resume: dbSession.sdkSessionId ?? undefined,
+            persistSession: true,
+            settingSources: [],
+            thinking: { type: 'disabled' },
+            stderr: (data: string) => {
+              if (data.includes('error') || data.includes('Error') || data.includes('FATAL')) {
+                console.error('[SDK-stderr]', breezeSessionId, redactClaudeSdkStderr(data));
+              }
+            },
+          }
+        });
 
-      (session as { query: Query }).query = sdkQuery;
+        (session as { query: Query }).query = sdkQuery;
 
-      // Start background processor (inherits the clean context)
-      (session as { processorPromise: Promise<void> }).processorPromise = this.runBackgroundProcessor(session);
-      session.processorPromise.catch((err) => {
-        captureException(err);
-        console.error('[StreamingSessionManager] Background processor error:', err);
+        // Start background processor (inherits the clean context)
+        (session as { processorPromise: Promise<void> }).processorPromise = this.runBackgroundProcessor(session);
+        session.processorPromise.catch((err) => {
+          captureException(err);
+          console.error('[StreamingSessionManager] Background processor error:', err);
+        });
       });
-    });
+    } catch (err) {
+      // The subprocess never started (a rejected child env, a query() throw).
+      // Release the egress grant here — the session was never registered in
+      // `this.sessions`, so `remove()` will never run for it and the grant
+      // would leak until the process restarted. The grant is taken immediately
+      // above this block precisely so there is no un-covered window.
+      try { revokeEgressGrant?.(); } catch { /* teardown must not mask err */ }
+      throw err;
+    }
 
     // Enforce max active sessions via LRU eviction
     if (this.sessions.size >= MAX_ACTIVE_SESSIONS) {
@@ -713,6 +1077,12 @@ export class StreamingSessionManager {
     }
     try { session.query.close(); } catch (err) {
       captureException(err); console.error('[StreamingSessionManager] Failed to close SDK query:', sessionId, err);
+    }
+    // Release the CONNECT-proxy allowance (catalog sessions only). Done on
+    // every teardown path — rotation, eviction, processor exit — so a session
+    // that is going away cannot keep a tunnel to the provider open.
+    try { session.revokeEgressGrant?.(); } catch (err) {
+      captureException(err); console.error('[StreamingSessionManager] Failed to revoke LLM egress grant:', sessionId, err);
     }
     session.eventBus.closeAll();
     session.state = 'closed';
@@ -809,6 +1179,13 @@ export class StreamingSessionManager {
   private async runBackgroundProcessor(session: ActiveSession): Promise<void> {
     let currentMessageId = crypto.randomUUID();
     let messageStarted = false;
+    // #5106: whether a text content block has already started for the
+    // CURRENT assistant message. A turn can be text -> tool_use -> text (the
+    // model narrates, calls a tool, then reports back) — without a separator
+    // between the two text blocks, every client concatenates them raw
+    // ("...last night.Here's a summary"). Reset at message_start, alongside
+    // `messageStarted` above.
+    let sawTextBlockThisMessage = false;
 
     try {
       for await (const message of session.query) {
@@ -843,15 +1220,35 @@ export class StreamingSessionManager {
             if (event.type === 'message_start') {
               currentMessageId = crypto.randomUUID();
               messageStarted = true;
+              sawTextBlockThisMessage = false;
               // Reset turn timeout — SDK is actively producing output
               this.startTurnTimeout(session);
+              // Same signal, for eviction: a new assistant message is stream
+              // progress. Unlike the OpenAI twin, a turn here can run entirely
+              // through tool_use blocks and emit no text delta at all, so the
+              // message boundary is the only keepalive some turns ever get.
+              session.lastActivityAt = Date.now();
               session.eventBus.publish({ type: 'message_start', messageId: currentMessageId });
             } else if (event.type === 'content_block_delta') {
               if ('delta' in event && event.delta.type === 'text_delta') {
+                // Stream progress keeps the turn alive for eviction purposes.
+                session.lastActivityAt = Date.now();
                 session.eventBus.publish({ type: 'content_delta', delta: event.delta.text });
               }
             } else if (event.type === 'content_block_start') {
-              if ('content_block' in event && event.content_block.type === 'tool_use') {
+              if ('content_block' in event && event.content_block.type === 'text') {
+                // #5106: every text content_block_start AFTER the first one in
+                // this assistant message means a tool_use block sat between
+                // two text blocks (text -> tool_use -> text). Emit a
+                // paragraph-break delta so streamed clients don't concatenate
+                // them raw; `assistantContent` below joins with the SAME
+                // separator so persisted history matches the stream
+                // byte-for-byte.
+                if (sawTextBlockThisMessage) {
+                  session.eventBus.publish({ type: 'content_delta', delta: '\n\n' });
+                }
+                sawTextBlockThisMessage = true;
+              } else if ('content_block' in event && event.content_block.type === 'tool_use') {
                 const block = event.content_block;
 
                 // Track toolUseId for postToolUse correlation.
@@ -905,10 +1302,13 @@ export class StreamingSessionManager {
               session.pendingTurnUsage.cacheCreationInputTokens += apiUsage.cache_creation_input_tokens ?? 0;
             }
 
+            // #5106: joined with the SAME "\n\n" separator the stream emits
+            // at each non-first text content_block_start, so persisted
+            // history is byte-for-byte identical to what streamed clients saw.
             const assistantContent = message.message.content
               .filter((b: { type: string }) => b.type === 'text')
               .map((b: { type: string; text?: string }) => b.text ?? '')
-              .join('');
+              .join('\n\n');
 
             try {
               await withDbAccessContext(
@@ -1074,7 +1474,16 @@ export class StreamingSessionManager {
               try {
                 await withDbAccessContext(
                   { scope: 'organization', orgId: session.orgId, accessibleOrgIds: [session.orgId] },
-                  () => recordUsageFromSdkResult(session.breezeSessionId, orgId, usageData)
+                  () => recordUsageFromSdkResult(
+                    session.breezeSessionId,
+                    orgId,
+                    usageData,
+                    session.llmConfigSnapshot.source === 'partner' ? 'partner_key' : 'platform',
+                    // Catalog traffic is priced from the revision snapshot; the
+                    // SDK's own total_cost_usd reflects Anthropic list pricing
+                    // for a request that never went to Anthropic.
+                    session.catalogPricing,
+                  ),
                 );
               } catch (err) {
                 captureException(err);
@@ -1095,7 +1504,16 @@ export class StreamingSessionManager {
               try {
                 await withDbAccessContext(
                   { scope: 'organization', orgId: session.orgId, accessibleOrgIds: [session.orgId] },
-                  () => recordUsageFromSdkResult(session.breezeSessionId, orgId, usageData)
+                  () => recordUsageFromSdkResult(
+                    session.breezeSessionId,
+                    orgId,
+                    usageData,
+                    session.llmConfigSnapshot.source === 'partner' ? 'partner_key' : 'platform',
+                    // Catalog traffic is priced from the revision snapshot; the
+                    // SDK's own total_cost_usd reflects Anthropic list pricing
+                    // for a request that never went to Anthropic.
+                    session.catalogPricing,
+                  ),
                 );
               } catch (err) {
                 captureException(err);
@@ -1105,7 +1523,19 @@ export class StreamingSessionManager {
 
             // Per-user usage hook (AI for Office): runs alongside the org-level
             // recordUsageFromSdkResult above, never instead of it.
-            const turnCostCents = Math.round(usageData.total_cost_usd * 100 * 100) / 100;
+            // Catalog sessions price from the revision snapshot, matching what
+            // recordUsageFromSdkResult wrote to the ledger — otherwise the
+            // per-user buckets and the client's turn summary would quote
+            // Anthropic list pricing for third-party traffic.
+            const turnCostCents = session.catalogPricing
+              ? calculateCatalogCostCents(
+                  session.catalogPricing,
+                  usageData.usage.input_tokens,
+                  usageData.usage.output_tokens,
+                  usageData.usage.cache_read_input_tokens,
+                  usageData.usage.cache_creation_input_tokens,
+                )
+              : Math.round(usageData.total_cost_usd * 100 * 100) / 100;
             // Cache-read and cache-creation tokens are input tokens — they are
             // split out for PRICING only. Reporting the uncached slice alone made
             // per-user ledgers and the client's turn summary read near-zero on
@@ -1168,18 +1598,24 @@ export class StreamingSessionManager {
         try {
           await withDbAccessContext(
             { scope: 'organization', orgId: session.orgId, accessibleOrgIds: [session.orgId] },
-            () => recordUsageFromSdkResult(session.breezeSessionId, session.orgId, {
-              total_cost_usd: 0,
-              usage: {
-                input_tokens: abandoned.inputTokens,
-                output_tokens: abandoned.outputTokens,
-                cache_read_input_tokens: abandoned.cacheReadInputTokens,
-                cache_creation_input_tokens: abandoned.cacheCreationInputTokens,
+            () => recordUsageFromSdkResult(
+              session.breezeSessionId,
+              session.orgId,
+              {
+                total_cost_usd: 0,
+                usage: {
+                  input_tokens: abandoned.inputTokens,
+                  output_tokens: abandoned.outputTokens,
+                  cache_read_input_tokens: abandoned.cacheReadInputTokens,
+                  cache_creation_input_tokens: abandoned.cacheCreationInputTokens,
+                },
+                num_turns: 1,
+                model: session.model,
+                toolExecutionCount: abandonedToolExecutionCount,
               },
-              num_turns: 1,
-              model: session.model,
-              toolExecutionCount: abandonedToolExecutionCount,
-            })
+              session.llmConfigSnapshot.source === 'partner' ? 'partner_key' : 'platform',
+              session.catalogPricing,
+            ),
           );
         } catch (err) {
           captureException(err);
@@ -1193,13 +1629,21 @@ export class StreamingSessionManager {
             await session.recordExtraUsage({
               inputTokens: abandoned.inputTokens,
               outputTokens: abandoned.outputTokens,
-              costCents: calculateCostCents(
-                session.model,
-                abandoned.inputTokens,
-                abandoned.outputTokens,
-                abandoned.cacheReadInputTokens,
-                abandoned.cacheCreationInputTokens
-              ),
+              costCents: session.catalogPricing
+                ? calculateCatalogCostCents(
+                    session.catalogPricing,
+                    abandoned.inputTokens,
+                    abandoned.outputTokens,
+                    abandoned.cacheReadInputTokens,
+                    abandoned.cacheCreationInputTokens,
+                  )
+                : calculateCostCents(
+                    session.model,
+                    abandoned.inputTokens,
+                    abandoned.outputTokens,
+                    abandoned.cacheReadInputTokens,
+                    abandoned.cacheCreationInputTokens
+                  ),
             });
           } catch (err) {
             captureException(err);
@@ -1210,7 +1654,7 @@ export class StreamingSessionManager {
 
       // Always clean up the session from the map after the processor exits
       this.clearTurnTimeout(session);
-      if (this.sessions.has(session.breezeSessionId)) {
+      if (this.sessions.get(session.breezeSessionId) === session) {
         this.remove(session.breezeSessionId);
       }
     }
@@ -1316,14 +1760,125 @@ export class StreamingSessionManager {
   // Eviction
   // ============================================
 
+  /**
+   * True while a turn is actively streaming for this session.
+   *
+   * Eviction must never take such a session: `remove()` aborts its
+   * AbortController, closes the SDK query and closes the event bus mid-turn, so
+   * the client's SSE stream ends on a capacity error in place of the answer it
+   * was already receiving, and the assistant text produced so far is lost
+   * without ever being persisted.
+   *
+   * Liveness is `state` AND recent progress, never `state` alone — see
+   * PROCESSING_STALL_TIMEOUT_MS for why a wedged turn must stay reclaimable.
+   */
+  private isTurnInFlight(session: ActiveSession, now: number): boolean {
+    return (
+      session.state === 'processing'
+      && now - session.lastActivityAt <= PROCESSING_STALL_TIMEOUT_MS
+    );
+  }
+
+  /**
+   * Retire the DB rows for sessions that staleness eviction has just dropped.
+   *
+   * An evicted session is gone from memory and its client has been told to
+   * start a new one, so leaving `status = 'active'` strands the row and every
+   * caller keyed on active sessions overcounts. This mirrors what
+   * `runPreFlightChecks` would have written lazily on the next request
+   * (services/aiAgentSdk.ts) — eviction just stops deferring it.
+   *
+   * `runOutsideDbContextSafe` is re-entered on EVERY iteration, never once
+   * around the loop. `withDbAccessContext` JOINS an already-open context
+   * instead of replacing it (db/index.ts), and `AsyncLocalStorage.exit()`
+   * covers the synchronous call plus what it schedules — but an iteration
+   * resuming after `await` sees the caller's ambient context live again, so a
+   * single hoisted escape would leave orgs 2..N running under someone else's
+   * GUCs, matching zero rows under RLS while reporting success. Today the only
+   * caller is the module-level eviction timer, which has no ambient context and
+   * makes this a no-op; the escape is here so that stays true if this is ever
+   * reached from a request path (issue #4514 calls that dependence out
+   * explicitly).
+   *
+   * The `status = 'active'` guard keeps a row already closed by the user from
+   * being re-stamped as expired.
+   */
+  private markSessionsExpired(sessionIdsByOrg: Map<string, string[]>): void {
+    if (sessionIdsByOrg.size === 0) return;
+    void (async () => {
+      // One org per statement, one statement at a time. A single tick can
+      // retire a whole cohort that idled out together, and a transaction per
+      // session would put up to MAX_ACTIVE_SESSIONS (200) of them against a
+      // pool of DB_POOL_MAX (30) shared with live request traffic. Eviction is
+      // background work with no deadline, so it yields to that traffic.
+      for (const [orgId, sessionIds] of sessionIdsByOrg) {
+        try {
+          // `.returning()` + dbWriteExpectingRows because an UPDATE evaluated
+          // under the WRONG tenant's GUCs does not raise under forced RLS — it
+          // matches zero rows and reports success. That is exactly the failure
+          // the context escape exists to prevent, so it has to be observable
+          // rather than assumed. A partial count is normal (the
+          // status='active' guard skips rows the user already closed); zero
+          // across a whole batch is the RLS signature.
+          await runOutsideDbContextSafe(() =>
+            withDbAccessContext(
+              { scope: 'organization', orgId, accessibleOrgIds: [orgId] },
+              () => dbWriteExpectingRows(
+                'streamingSessionManager.expireEvictedSessions',
+                () => db.update(aiSessions)
+                  .set({ status: 'expired', updatedAt: new Date() })
+                  .where(and(
+                    inArray(aiSessions.id, sessionIds),
+                    eq(aiSessions.status, 'active'),
+                  ))
+                  .returning({ id: aiSessions.id }),
+              ),
+            ),
+          );
+        } catch (err) {
+          // Never abandon the remaining orgs: a failure here strands rows as
+          // 'active', which is the very defect this helper exists to fix.
+          //
+          // `org_id` IS in sentry.ts's ALLOWED_TAG_NAMES and survives the
+          // scrubber, so it goes on the event — without it every org's failure
+          // collapses into one untriageable Sentry issue and the on-call has to
+          // go log-diving to learn which tenant is stranded. The SESSION ids are
+          // the part the allowlist voids, so those stay in the log line only.
+          captureException(err, undefined, { org_id: orgId });
+          console.error(
+            `[StreamingSessionManager] Failed to expire ${sessionIds.length} session(s) for org ${orgId} (${sessionIds.join(', ')}):`,
+            err,
+          );
+        }
+      }
+    })().catch((err) => {
+      // The loop body is fully guarded, so arriving here means the guard itself
+      // threw. Terminate the promise regardless: this helper's whole purpose is
+      // that an eviction never silently leaves a row 'active'.
+      captureException(err);
+      console.error('[StreamingSessionManager] Expire sweep failed:', err);
+    });
+  }
+
   private evictStaleSessions(): void {
     const now = Date.now();
+    const expiredByOrg = new Map<string, string[]>();
 
-    for (const [sessionId, session] of [...this.sessions.entries()]) {
-      const idle = now - session.lastActivityAt;
-      const age = now - session.createdAt;
+    try {
+      for (const [sessionId, session] of [...this.sessions.entries()]) {
+        const idle = now - session.lastActivityAt;
+        const age = now - session.createdAt;
 
-      if (idle > SESSION_IDLE_TIMEOUT_MS || age > SESSION_MAX_AGE_MS) {
+        if (idle <= SESSION_IDLE_TIMEOUT_MS && age <= SESSION_MAX_AGE_MS) continue;
+
+        // Applies to the 24h hard cap too: a session that reaches it mid-stream
+        // is evicted on the first tick after its turn ends (bounded by
+        // SDK_TURN_TIMEOUT_MS, not by this interval). Turns cannot chain to
+        // hold it open indefinitely — runPreFlightChecks enforces the same 24h
+        // cap before any NEW turn starts, so the slip is one turn at most.
+        // Deferring briefly beats cutting an answer off mid-sentence.
+        if (this.isTurnInFlight(session, now)) continue;
+
         console.log(`[StreamingSessionManager] Evicting session ${sessionId} (idle=${idle}ms, age=${age}ms)`);
 
         // Notify connected SSE clients before removing
@@ -1337,37 +1892,75 @@ export class StreamingSessionManager {
 
         this.remove(sessionId);
 
-        if (age > SESSION_MAX_AGE_MS) {
-          withDbAccessContext(
-            { scope: 'organization', orgId: session.orgId, accessibleOrgIds: [session.orgId] },
-            () =>
-              db.update(aiSessions)
-                .set({ status: 'expired', updatedAt: new Date() })
-                .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.status, 'active')))
-          ).catch((err) => { captureException(err); console.error('[StreamingSessionManager] Failed to expire session:', err); });
-        }
+        // BOTH staleness paths retire the row, not just the 24h one. An
+        // idle-evicted session is as dead to the client as an aged-out one, and
+        // preflight would have stamped it 'expired' on the next request anyway.
+        const forOrg = expiredByOrg.get(session.orgId);
+        if (forOrg) forOrg.push(sessionId);
+        else expiredByOrg.set(session.orgId, [sessionId]);
       }
+    } finally {
+      // In a `finally` so a throw mid-sweep still retires the sessions already
+      // dropped from the Map. Losing them here would strand exactly the
+      // 'active' rows this method exists to clean up, with no record of which.
+      this.markSessionsExpired(expiredByOrg);
     }
   }
 
   private evictLeastRecentlyActive(): void {
+    const now = Date.now();
     let oldest: { id: string; lastActivity: number } | null = null;
 
     for (const [id, session] of this.sessions) {
+      // Under cap pressure the least-recently-active session is often the one
+      // mid-stream: its stamp predates the turn it is currently serving.
+      if (this.isTurnInFlight(session, now)) continue;
       if (!oldest || session.lastActivityAt < oldest.lastActivity) {
         oldest = { id, lastActivity: session.lastActivityAt };
       }
     }
 
-    if (oldest) {
-      console.log(`[StreamingSessionManager] LRU evicting session ${oldest.id}`);
-      const session = this.sessions.get(oldest.id);
-      if (session) {
-        session.eventBus.publish({ type: 'error', message: 'Session evicted due to server capacity. Please start a new session.' });
-        session.eventBus.publish({ type: 'done' });
+    if (!oldest) {
+      // Every session is mid-turn. Overshooting the soft cap is self-correcting
+      // — the next getOrCreate reclaims space as soon as any turn ends — while
+      // corrupting a live turn is not. But the cap IS being breached and the
+      // caller proceeds to add anyway, so this is a resource-exhaustion signal
+      // and must reach more than stdout. Throttled: under sustained pressure
+      // this fires once per window rather than once per request.
+      console.warn(
+        `[StreamingSessionManager] LRU eviction skipped: all ${this.sessions.size} sessions have a turn in flight; cap ${MAX_ACTIVE_SESSIONS} exceeded`,
+      );
+      if (now - this.lastCapacityAlarmAt >= CAPACITY_ALARM_THROTTLE_MS) {
+        this.lastCapacityAlarmAt = now;
+        // The magnitude has to ride on a TAG: `scrubEvent` deletes `message`
+        // from every outbound event, so without this a single-request blip and a
+        // sustained runaway produce byte-identical Sentry issues — and the
+        // difference is exactly what decides whether anyone should be paged.
+        captureMessage('AI session cap exceeded: every session mid-turn', {
+          eventCode: 'ai_session_cap_all_in_flight',
+          tags: { ai_session_cap_bucket: bucketSessionOvershoot(this.sessions.size) },
+        });
       }
-      this.remove(oldest.id);
+      return;
     }
+
+    console.log(`[StreamingSessionManager] LRU evicting session ${oldest.id}`);
+    const session = this.sessions.get(oldest.id);
+    if (session) {
+      session.eventBus.publish({ type: 'error', message: 'Session evicted due to server capacity. Please start a new session.' });
+      session.eventBus.publish({ type: 'done' });
+    }
+    this.remove(oldest.id);
+    // Deliberately NOT expired, matching the OpenAI twin (#4406). Unlike the
+    // staleness paths, an LRU victim is a perfectly usable conversation dropped
+    // for OUR capacity reasons: history lives in ai_messages and the session
+    // resumes from `sdkSessionId`, so the user's next message transparently
+    // recreates it — exactly like a deploy, which shutdown() is likewise
+    // careful not to expire. Stamping 'expired' here would turn a transient
+    // server condition into a hard 410 for a conversation minutes old, since
+    // runPreFlightChecks rejects on status before getOrCreate ever runs. The
+    // row stays truthful: 'active' means resumable, and preflight still expires
+    // it lazily once it genuinely goes idle or ages out.
   }
 }
 

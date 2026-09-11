@@ -6,17 +6,12 @@
 // lines (no blockId) fall into a trailing default pricing table — same as the
 // PDF, which appends un-blocked lines after the block walk.
 import { Fragment } from 'react';
+import { DEVICE_ROLE_NOUNS, type BillableDeviceRole } from '@breeze/shared';
 import type { QuoteBlock, QuoteCalloutContent, QuoteContractBlockContent, QuoteLine, QuoteTableContent } from '@/lib/api';
 
-export function money(value: string | number, currencyCode: string): string {
-  const n = Number(value);
-  const safe = Number.isFinite(n) ? n : 0;
-  try {
-    return safe.toLocaleString('en-US', { style: 'currency', currency: currencyCode || 'USD' });
-  } catch {
-    return `${safe.toFixed(2)} ${currencyCode || ''}`.trim();
-  }
-}
+import { money } from '@/lib/format';
+import type { PublicApiPath } from '@/lib/api';
+export { money };
 
 /** Per-line tax amount for the Tax column: taxable lines get lineTotal × rate
  *  rounded to cents; non-taxable lines / a non-positive rate return null (shown
@@ -47,6 +42,27 @@ function lineBlurb(l: QuoteLine): string | null {
   return b || null;
 }
 
+function deviceSetCustomerText(raw: QuoteLine, currency: string): string[] {
+  const line = raw;
+  if (!line.contractLineType) return [];
+  let set = 'devices';
+  if (line.contractLineType === 'per_device_role') {
+    set = (line.deviceRoles ?? []).map((r) => DEVICE_ROLE_NOUNS[r as BillableDeviceRole] ?? r).join(', ') || 'devices';
+  } else if (line.contractLineType === 'per_device_group') {
+    set = `devices in “${line.deviceGroupName ?? ''}”`;
+  } else if (line.contractLineType === 'per_seat') {
+    set = 'seats';
+  }
+  if (line.siteName) set = `${set} at ${line.siteName}`;
+  const result = [`Estimated quantity — billed at the actual number of ${set} each billing period.`];
+  if (line.includedQuantity != null && line.overageMode === 'bill' && line.overageUnitPrice != null) {
+    result.push(`Includes ${Number(line.includedQuantity)}; additional units billed at ${money(line.overageUnitPrice, currency)} each.`);
+  } else if (line.includedQuantity != null && line.overageMode === 'flag') {
+    result.push(`Includes ${Number(line.includedQuantity)}; additional units are reported for review, not billed automatically.`);
+  }
+  return result;
+}
+
 function PricingTable({
   lines,
   currency,
@@ -63,7 +79,7 @@ function PricingTable({
   taxRate: number;
   showTax: boolean;
   /** Resolves a server-built relative line-image path into a fetchable URL. */
-  buildUrl: (path: string) => string;
+  buildUrl: (path: string) => PublicApiPath;
 }) {
   if (lines.length === 0) return null;
   // Preserve sortOrder within each recurrence group, in the canonical group order.
@@ -96,13 +112,14 @@ function PricingTable({
               <Fragment key={g.key}>
                 {grouped.length > 1 && (
                   <tr className="bg-muted/20">
-                    <td colSpan={groupColSpan} className="px-4 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground sm:px-5">
+                    <td colSpan={groupColSpan} className="px-4 py-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground sm:px-5">
                       {g.label}
                     </td>
                   </tr>
                 )}
                 {g.rows.map((l) => {
                   const tax = showTax ? lineTax(l.lineTotal, l.taxable, taxRate) : null;
+                  const descriptor = deviceSetCustomerText(l, currency);
                   return (
                   <tr key={l.id} data-testid={`quote-line-${l.id}`} className="border-b align-top last:border-0">
                     <td className="w-full px-4 py-3 text-foreground sm:px-5">
@@ -124,6 +141,11 @@ function PricingTable({
                           <span className="font-medium">{lineTitle(l)}</span>
                           {lineBlurb(l) && (
                             <p className="mt-0.5 whitespace-pre-line text-xs text-muted-foreground">{lineBlurb(l)}</p>
+                          )}
+                          {descriptor.length > 0 && (
+                            <div className="mt-0.5 space-y-0.5 text-xs text-muted-foreground" data-testid={`quote-line-device-set-${l.id}`}>
+                              {descriptor.map((text, i) => <p key={i}>{text}</p>)}
+                            </div>
                           )}
                         </div>
                       </div>
@@ -152,6 +174,16 @@ function PricingTable({
   );
 }
 
+/** Author-chosen column alignment as a utility class (never an inline
+ *  `textAlign` — see lib/docAccent.ts for the CSP rule). */
+function alignClass(align?: string | null): string {
+  switch (align) {
+    case 'center': return 'text-center';
+    case 'right': return 'text-right';
+    default: return 'text-left';
+  }
+}
+
 export function QuoteBlocks({
   blocks,
   lines,
@@ -165,14 +197,14 @@ export function QuoteBlocks({
   lines: QuoteLine[];
   currency: string;
   // Builds the (authed or token-scoped) URL to fetch a quote image by id.
-  imageUrl: (imageId: string) => string;
+  imageUrl: (imageId: string) => PublicApiPath;
   // Resolves a server-returned relative route (e.g. a contract block's
   // `fileUrl`, already the full `/portal/quotes/:id/contract-file/:blockId` or
   // `/quotes/public/:token/contract-file/:blockId` path) into a fetchable URL —
-  // `buildPortalApiUrl` in both callers. Unlike `imageUrl`, the route itself
+  // `publicApiPath` in both callers. Unlike `imageUrl`, the route itself
   // (not just an id) comes from the API, since a contract block's fileUrl is
   // part of the serialization contract.
-  buildUrl: (path: string) => string;
+  buildUrl: (path: string) => PublicApiPath;
   /** Quote tax rate as a fraction (e.g. 0.085); used for the per-line Tax column. */
   taxRate?: number;
   /** Whether the quote carries tax — shows the per-line Tax column when true. */
@@ -223,8 +255,12 @@ export function QuoteBlocks({
             <img
               src={imageUrl(imageId)}
               alt={caption || 'Proposal image'}
-              className="rounded-lg border"
-              style={Number.isFinite(width) && width > 0 ? { maxWidth: `${width}px`, width: '100%' } : { maxWidth: '100%' }}
+              // The author's width rides on the `width` ATTRIBUTE rather than an
+              // inline style: attributes are presentational, not covered by
+              // `style-src-attr 'none'`, so the sizing survives in production.
+              // max-w-full keeps it from overflowing a narrow phone.
+              width={Number.isFinite(width) && width > 0 ? width : undefined}
+              className="h-auto max-w-full rounded-lg border"
             />
           ) : (
             <div className="rounded-lg border bg-muted/50 p-4 text-sm text-muted-foreground">Image unavailable</div>
@@ -289,8 +325,8 @@ export function QuoteBlocks({
                 {c.columns.map((col, i) => (
                   <th
                     key={i}
-                    style={{ textAlign: col.align ?? 'left' }}
-                    className="px-3 py-2 font-semibold text-foreground"
+                    scope="col"
+                    className={`px-3 py-2 font-semibold text-foreground ${alignClass(col.align)}`}
                     dangerouslySetInnerHTML={{ __html: col.label }}
                   />
                 ))}
@@ -302,8 +338,7 @@ export function QuoteBlocks({
                   {row.cells.map((cell, ci) => (
                     <td
                       key={ci}
-                      style={{ textAlign: c.columns?.[ci]?.align ?? 'left' }}
-                      className="px-3 py-2 align-top text-foreground/90"
+                      className={`px-3 py-2 align-top text-foreground/90 ${alignClass(c.columns?.[ci]?.align)}`}
                       dangerouslySetInnerHTML={{ __html: cell }}
                     />
                   ))}
@@ -323,12 +358,12 @@ export function QuoteBlocks({
       if (!c.html?.trim()) return null;
       const tone =
         c.variant === 'warn'
-          ? 'border-amber-500/40 bg-amber-500/10'
+          ? 'border-warning/40 bg-warning/10'
           : c.variant === 'accent'
             ? 'border-primary/40 bg-primary/10'
             : 'border-border bg-muted/40';
       return (
-        <div key={block.id} className={`rounded-lg border-l-4 p-4 ${tone}`} data-testid="quote-callout-block">
+        <div key={block.id} className={`rounded-lg border p-4 ${tone}`} data-testid="quote-callout-block">
           {c.title && <p className="mb-1 text-sm font-semibold text-foreground">{c.title}</p>}
           <div className="quote-rich-text text-sm leading-relaxed text-foreground" dangerouslySetInnerHTML={{ __html: c.html }} />
         </div>

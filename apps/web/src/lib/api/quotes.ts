@@ -99,6 +99,15 @@ export function cloneQuote(id: string, body?: { orgId?: string; title?: string }
   });
 }
 
+/** Create a linked draft revision of a sent quote. Unlike `cloneQuote` (which
+ *  starts an unrelated quote), the draft this returns is bound to its parent:
+ *  sending it retires the original and revokes the customer's link. Refuses
+ *  with 409 `REVISION_IN_PROGRESS` + `meta.revisionQuoteId` when one already
+ *  exists — only one open revision per quote. */
+export function reviseQuote(id: string): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/revise`, { method: 'POST' });
+}
+
 export function updateQuote(id: string, body: UpdateQuoteInput): Promise<Response> {
   return fetchWithAuth(`/quotes/${id}`, {
     method: 'PATCH',
@@ -109,6 +118,24 @@ export function updateQuote(id: string, body: UpdateQuoteInput): Promise<Respons
 
 export function deleteQuote(id: string): Promise<Response> {
   return fetchWithAuth(`/quotes/${id}`, { method: 'DELETE' });
+}
+
+/** Draft-only atomic change-currency op (#3774, mirrors changeContractCurrency
+ *  in lib/api/contracts.ts). `clearLines` and `reprice` are mutually
+ *  exclusive; the server 409s CURRENCY_LOCKED when monetary lines exist and
+ *  neither is set. */
+export interface ChangeQuoteCurrencyBody {
+  currencyCode: string;
+  clearLines?: boolean;
+  reprice?: boolean;
+}
+
+export function changeQuoteCurrency(id: string, body: ChangeQuoteCurrencyBody): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/currency`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
 }
 
 export function addBlock(id: string, body: QuoteBlockInput): Promise<Response> {

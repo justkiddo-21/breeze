@@ -1,19 +1,51 @@
-import { and, desc, eq, inArray, lt, or, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
-import { quotes, quoteLines, quoteBlocks, quoteImages } from '../db/schema/quotes';
+import { quotes, quoteLines, quoteBlocks, quoteImages, quoteRecipients } from '../db/schema/quotes';
 import { invoices } from '../db/schema/invoices';
-import { organizations, partners } from '../db/schema/orgs';
+import { organizations, partners, sites } from '../db/schema/orgs';
+import { deviceGroups } from '../db/schema/devices';
 import { contractTemplates, contractTemplateVersions } from '../db/schema/contractDocuments';
 import { catalogItems } from '../db/schema/catalog';
 import { pax8OrderLines, pax8Orders } from '../db/schema/pax8Orders';
 import { listQuoteOrders } from './quoteOrderService';
 import { computeLineTotal, resolveEffectiveTaxRate } from './invoiceMath';
 import { vendorIdentityFromAttributes } from './catalogVendorIdentity';
+import { resolvePrice, CatalogServiceError } from './catalogService';
 import { buildBillToAddress, type BillToAddress } from './sellerSnapshot';
 import { computeQuoteTotals, validateQuoteDeposit, toQuoteDepositConfig, type QuoteLineForMath } from './quoteMath';
-import { QuoteServiceError, assertOrg, assertSite, assertQuoteAccess, type QuoteActor } from './quoteTypes';
+import {
+  QuoteServiceError,
+  assertOrg,
+  assertSite,
+  assertQuoteAccess,
+  isSupersedable,
+  type QuoteActor,
+} from './quoteTypes';
 import { allocateQuoteCounter, formatQuoteNumber } from './quoteNumbers';
+import { readOrgStampingDefaults, OrgCurrencyServiceError, type DbExecutor as OrgLockExecutor } from './orgCurrencyCore';
+
+/**
+ * Boundary mapping for the org SHARE barrier (#3778, review finding 1).
+ * `orgCurrencyCore` is domain-neutral by design and throws its own
+ * `OrgCurrencyServiceError`; this service's route boundary rethrows anything it
+ * does not recognise, so an unmapped ORG_NOT_FOUND would surface as a 500
+ * instead of the 404 this path returned before the barrier existed. Only
+ * ORG_NOT_FOUND is translated — a serialization failure, a deadlock or a
+ * genuine helper bug must keep its own identity.
+ */
+async function lockOrgStampingDefaults(tx: OrgLockExecutor, orgId: string): Promise<{ currencyCode: string }> {
+  try {
+    return await readOrgStampingDefaults(tx, orgId);
+  } catch (err) {
+    if (err instanceof OrgCurrencyServiceError && err.code === 'ORG_NOT_FOUND') {
+      throw new QuoteServiceError('Organization not found', 404, 'ORG_NOT_FOUND');
+    }
+    throw err;
+  }
+}
+
+import { isPgUniqueViolation } from '../utils/pgErrors';
 import {
   sanitizeRichTextHtml,
   sanitizeRichTextHtmlWithReport,
@@ -23,11 +55,34 @@ import {
   type RichTextSanitizeReport,
   type RichTextStripWarning,
 } from './richTextSanitize';
-import { quoteTableContentSchema, quoteCalloutContentSchema } from '@breeze/shared';
+import {
+  quoteTableContentSchema,
+  quoteCalloutContentSchema,
+  isRepresentableInCurrency,
+  minorUnitExponent,
+  mergeQuoteLinePatch,
+  quoteLineDeviceSetIssues,
+  isQuoteLineSiteDeleted,
+} from '@breeze/shared';
 import type {
   CreateQuoteInput, CloneQuoteInput, UpdateQuoteInput, QuoteLineInput, QuoteBlockInput, ListQuotesQuery,
-  QuoteTableContent, QuoteCalloutContent,
+  QuoteTableContent, QuoteCalloutContent, QuoteDeviceSetType,
 } from '@breeze/shared';
+import {
+  countQuoteDeviceSetLines,
+  persistQuoteDeviceSetQuantities,
+  toQuoteDeviceSetLine,
+  type QuoteDeviceSetCount,
+} from './quoteDeviceSet';
+
+export interface QuoteDeviceSetDrift {
+  lineId: string;
+  description: string;
+  storedQuantity: string;
+  liveQuantity: number | null;
+  reason?: 'org_retargeted';
+  error?: 'GROUP_EVALUATION_FAILED' | 'GROUP_DELETED' | 'SITE_DELETED';
+}
 
 // ---------------------------------------------------------------------------
 // Actor guards. The RLS access context (withDbAccessContext) is established by
@@ -47,6 +102,8 @@ const CUSTOMER_LINE_FIELDS = [
   'name', 'description', 'quantity', 'unitPrice', 'taxable', 'customerVisible',
   'lineTotal', 'recurrence', 'termMonths', 'billingFrequency', 'depositEligible',
   'itemType', 'sku', 'partNumber', 'imageId', 'sortOrder', 'createdAt',
+  'contractLineType', 'deviceRoles', 'deviceGroupName', 'siteName',
+  'includedQuantity', 'overageMode', 'overageUnitPrice',
 ] as const;
 export type CustomerQuoteLine<T> = Pick<T & Record<string, unknown>, (typeof CUSTOMER_LINE_FIELDS)[number] & keyof T>;
 export function toCustomerLines<T extends Record<string, unknown>>(lines: T[]) {
@@ -206,6 +263,14 @@ function logStrippedMarkup(op: string, quoteId: string, blockId: string, warning
   });
 }
 
+const errorIds = {
+  QUOTE_LINEAGE_PARENT_MISSING: 'QUOTE_LINEAGE_PARENT_MISSING',
+} as const;
+
+function logError(errorId: typeof errorIds[keyof typeof errorIds], message: string, context: Record<string, unknown>): void {
+  console.error(`[quoteService] ${errorId} ${message}`, context);
+}
+
 function resolvePartner(actor: QuoteActor): string {
   if (!actor.partnerId) {
     throw new QuoteServiceError('Partner could not be resolved', 403, 'PARTNER_UNRESOLVABLE');
@@ -230,6 +295,7 @@ async function recomputeAndPersist(quoteId: string, dbc: Pick<typeof db, 'select
     taxRate: quotes.taxRate,
     depositType: quotes.depositType,
     depositPercent: quotes.depositPercent,
+    currencyCode: quotes.currencyCode,
   }).from(quotes).where(eq(quotes.id, quoteId)).limit(1);
   const lines = await dbc.select({
     quantity: quoteLines.quantity,
@@ -241,7 +307,7 @@ async function recomputeAndPersist(quoteId: string, dbc: Pick<typeof db, 'select
     itemType: quoteLines.itemType,
   }).from(quoteLines).where(eq(quoteLines.quoteId, quoteId));
   const deposit = toQuoteDepositConfig(q?.depositType, q?.depositPercent);
-  const totals = computeQuoteTotals(lines as QuoteLineForMath[], q?.taxRate ? parseFloat(q.taxRate) : null, deposit);
+  const totals = computeQuoteTotals(lines as QuoteLineForMath[], q?.taxRate ? parseFloat(q.taxRate) : null, deposit, q?.currencyCode);
   await dbc.update(quotes).set({
     subtotal: totals.subtotal,
     taxTotal: totals.taxTotal,
@@ -258,23 +324,50 @@ async function recomputeAndPersist(quoteId: string, dbc: Pick<typeof db, 'select
 
 /** Load a quote and assert it is owned/accessible AND still a draft (409 if not). */
 async function loadDraft(quoteId: string, actor: QuoteActor) {
-  const [q] = await db.select().from(quotes).where(eq(quotes.id, quoteId)).limit(1);
+  // FOR UPDATE: block/line/content mutators that use loadDraft share this lock,
+  // serializing their draft edits against a concurrent send. writeQuoteImage is
+  // the current exception: it inserts only an unreferenced image row, which is
+  // safe today because that cannot change the rendered document. Any new content
+  // mutator must come through loadDraft before writing.
+  const [q] = await db.select().from(quotes).where(eq(quotes.id, quoteId)).limit(1).for('update');
   if (!q) throw new QuoteServiceError('Quote not found', 404, 'QUOTE_NOT_FOUND');
   assertQuoteAccess(actor, q);
   if (q.status !== 'draft') throw new QuoteServiceError('Quote is not a draft', 409, 'NOT_A_DRAFT');
   return q;
 }
 
-async function nextBlockSortOrder(quoteId: string): Promise<number> {
-  const rows = await db
+type DbExecutor = typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/**
+ * Lock-order anchor (#3774, mirrors invoiceService.lockDraftInvoice): SELECT
+ * the QUOTE row FOR UPDATE as the FIRST statement of the enclosing
+ * transaction, assert access + draft, and return the locked row. Every draft
+ * line writer (add/update/remove, plus deleteBlock, which removes a section's
+ * lines) takes this lock before touching quote_lines, then recomputes totals
+ * inside the same transaction — and always computes lineTotal from the LOCKED
+ * row's currencyCode. changeQuoteCurrency takes the identical lock, so a
+ * restamp can never interleave between a writer's currency read and its line
+ * write (no JPY-stamped quote carrying a USD-rounded line), and a line can
+ * never phantom-insert past the restamp's "no monetary lines" check.
+ */
+async function lockDraftQuote(tx: DbExecutor, quoteId: string, actor: QuoteActor) {
+  const [q] = await tx.select().from(quotes).where(eq(quotes.id, quoteId)).limit(1).for('update');
+  if (!q) throw new QuoteServiceError('Quote not found', 404, 'QUOTE_NOT_FOUND');
+  assertQuoteAccess(actor, q);
+  if (q.status !== 'draft') throw new QuoteServiceError('Quote is not a draft', 409, 'NOT_A_DRAFT');
+  return q;
+}
+
+async function nextBlockSortOrder(quoteId: string, dbc: DbExecutor = db): Promise<number> {
+  const rows = await dbc
     .select({ max: sql<number>`COALESCE(MAX(${quoteBlocks.sortOrder}), -1)` })
     .from(quoteBlocks)
     .where(eq(quoteBlocks.quoteId, quoteId));
   return Number(rows[0]?.max ?? -1) + 1;
 }
 
-async function nextLineSortOrder(quoteId: string): Promise<number> {
-  const rows = await db
+async function nextLineSortOrder(quoteId: string, dbc: DbExecutor = db): Promise<number> {
+  const rows = await dbc
     .select({ max: sql<number>`COALESCE(MAX(${quoteLines.sortOrder}), -1)` })
     .from(quoteLines)
     .where(eq(quoteLines.quoteId, quoteId));
@@ -315,19 +408,17 @@ export async function createQuote(input: CreateQuoteInput, actor: QuoteActor) {
   assertOrg(actor, input.orgId);
   assertSite(actor, input.siteId ?? null);
   const taxRate = await resolveQuoteTaxRate(input.orgId, partnerId);
-  // A new quote inherits the partner's configured currency unless the caller
-  // names one explicitly. The web and MCP create forms used to hardcode 'USD',
-  // so a non-USD partner's quotes (and their PDFs) were always minted in USD
-  // (#3200). The notNull DB default 'USD' remains the final backstop.
-  let currencyCode = input.currencyCode;
-  if (!currencyCode) {
-    const [partner] = await db
-      .select({ currencyCode: partners.currencyCode })
-      .from(partners)
-      .where(eq(partners.id, partnerId))
-      .limit(1);
-    currencyCode = partner?.currencyCode ?? 'USD';
-  }
+  // A new quote is stamped with its ORGANIZATION's currency unless the caller
+  // names one explicitly (spec §5 — the org, not the partner, owns document
+  // currency; the partner inheritance shipped for #3200 predates per-org
+  // currency, B3). No DB-default backstop: a missed stamp must fail loudly
+  // (23502 once wave 2 drops the column default), never mint a silent USD quote.
+  //
+  // Creation barrier (#3778): the default read happens under an org SHARE lock
+  // held until the INSERT commits (see readOrgStampingDefaults), so a
+  // concurrent changeOrgCurrency either counts this quote in its in-lock
+  // summary or this stamp is the NEW currency — never an old stamp committed
+  // unseen. An explicit `input.currencyCode` is a source copy: no org reread.
   // Number at creation (not at send): techs reference the number while drafting
   // and in the list. A deleted draft leaves a counter gap, which the numbering
   // contract explicitly tolerates (see allocateQuoteCounter). sendQuote keeps
@@ -335,20 +426,24 @@ export async function createQuote(input: CreateQuoteInput, actor: QuoteActor) {
   const year = new Date().getUTCFullYear();
   const counter = await allocateQuoteCounter(partnerId, year);
   const quoteNumber = formatQuoteNumber('Q', year, counter);
-  const [row] = await db.insert(quotes).values({
-    partnerId,
-    orgId: input.orgId,
-    siteId: input.siteId ?? null,
-    quoteNumber,
-    title: input.title?.trim() || null,
-    currencyCode,
-    taxRate,
-    expiryDate: input.expiryDate ?? null,
-    introNotes: input.introNotes ?? null,
-    terms: input.terms ?? null,
-    termsAndConditions: input.termsAndConditions ?? null,
-    createdBy: actor.userId,
-  }).returning();
+  const [row] = await db.transaction(async (tx) => {
+    const currencyCode = input.currencyCode
+      ?? (await lockOrgStampingDefaults(tx, input.orgId)).currencyCode;
+    return tx.insert(quotes).values({
+      partnerId,
+      orgId: input.orgId,
+      siteId: input.siteId ?? null,
+      quoteNumber,
+      title: input.title?.trim() || null,
+      currencyCode,
+      taxRate,
+      expiryDate: input.expiryDate ?? null,
+      introNotes: input.introNotes ?? null,
+      terms: input.terms ?? null,
+      termsAndConditions: input.termsAndConditions ?? null,
+      createdBy: actor.userId,
+    }).returning();
+  });
   return row!;
 }
 
@@ -372,6 +467,35 @@ function remapCoverPageImageId(coverPage: unknown, imageIds: Map<string, string>
   return { ...cp, coverImageId: imageIds.get(sourceImageId) ?? null };
 }
 
+/** Internal revision overrides for the clone core — never exposed on a route. */
+interface CloneRevisionOverrides {
+  quoteNumber: string;
+  revisionOfQuoteId: string;
+  revisionNumber: number;
+}
+
+type CloneLineagePair =
+  | { revisionOfQuoteId: null; revisionNumber: 1 }
+  | { revisionOfQuoteId: string; revisionNumber: number };
+
+/** Build the correlated lineage columns together so the DB CHECK is a backstop. */
+function cloneLineagePair(revision?: CloneRevisionOverrides): CloneLineagePair {
+  if (!revision) return { revisionOfQuoteId: null, revisionNumber: 1 };
+  if (!revision.revisionOfQuoteId || !Number.isInteger(revision.revisionNumber) || revision.revisionNumber < 2) {
+    throw new QuoteServiceError('Invalid quote revision lineage', 409, 'INVALID_STATE');
+  }
+  return {
+    revisionOfQuoteId: revision.revisionOfQuoteId,
+    revisionNumber: revision.revisionNumber,
+  };
+}
+
+function assertRevisionCloneTarget(input: CloneQuoteInput, revision?: CloneRevisionOverrides): void {
+  if (revision && input.orgId) {
+    throw new QuoteServiceError('A revision cannot be retargeted to another organization', 409, 'INVALID_STATE');
+  }
+}
+
 /**
  * Deep-copy an accessible quote into a new draft. Images and every aggregate
  * relationship receive fresh IDs because image rendering is constrained to
@@ -385,8 +509,16 @@ function remapCoverPageImageId(coverPage: unknown, imageIds: Map<string, string>
  * the same precedence createQuote uses — so totals are correct for the new
  * customer; a same-org clone keeps the source rate verbatim (it may have been
  * hand-set via the API).
+ *
+ * @param revision Module-private lineage fields used only by reviseQuote.
  */
-export async function cloneQuote(id: string, actor: QuoteActor, input: CloneQuoteInput = {}) {
+async function cloneQuoteCore(
+  id: string,
+  actor: QuoteActor,
+  input: CloneQuoteInput = {},
+  revision?: CloneRevisionOverrides,
+) {
+  assertRevisionCloneTarget(input, revision);
   const { quote: source, blocks, lines } = await getQuote(id, actor);
   const images = await db.select().from(quoteImages).where(eq(quoteImages.quoteId, id));
 
@@ -400,10 +532,20 @@ export async function cloneQuote(id: string, actor: QuoteActor, input: CloneQuot
     assertSite(actor, null);
     // Same-partner guard. RLS hides other partners' orgs from this context, so a
     // cross-partner id resolves to "not found" rather than leaking existence.
-    const [target] = await db.select({ id: organizations.id }).from(organizations)
+    const [target] = await db.select({ id: organizations.id, currencyCode: organizations.currencyCode })
+      .from(organizations)
       .where(and(eq(organizations.id, targetOrgId), eq(organizations.partnerId, source.partnerId)))
       .limit(1);
     if (!target) throw new QuoteServiceError('Organization not found', 404, 'ORG_NOT_FOUND');
+    // A clone carries its source's currency stamp verbatim, so a target org
+    // billed in a different currency is a hard 400 — never a silent restamp and
+    // never a conversion (spec §5; mirrors the §7 ticket-move guard).
+    if (target.currencyCode !== source.currencyCode) {
+      throw new QuoteServiceError(
+        `target organization uses ${target.currencyCode}; this quote is in ${source.currencyCode} — clone within the same currency or recreate the quote`,
+        400, 'CURRENCY_MISMATCH',
+      );
+    }
     // Re-validate carried contract blocks against the NEW org: an org-owned
     // template from the source org is invalid for the target org (422), which
     // also prevents cloning a block that would later mint a cross-org
@@ -415,9 +557,14 @@ export async function cloneQuote(id: string, actor: QuoteActor, input: CloneQuot
     : source.taxRate;
   const title = input.title !== undefined ? (input.title.trim() || null) : source.title;
 
-  const year = new Date().getUTCFullYear();
-  const counter = await allocateQuoteCounter(source.partnerId, year);
-  const quoteNumber = formatQuoteNumber('Q', year, counter);
+  let quoteNumber: string;
+  if (revision) {
+    quoteNumber = revision.quoteNumber;
+  } else {
+    const year = new Date().getUTCFullYear();
+    const counter = await allocateQuoteCounter(source.partnerId, year);
+    quoteNumber = formatQuoteNumber('Q', year, counter);
+  }
   const quoteId = randomUUID();
 
   const imageIds = new Map(images.map((image) => [image.id, randomUUID()]));
@@ -427,6 +574,7 @@ export async function cloneQuote(id: string, actor: QuoteActor, input: CloneQuot
     lines as QuoteLineForMath[],
     taxRate ? parseFloat(taxRate) : null,
     toQuoteDepositConfig(source.depositType, source.depositPercent),
+    source.currencyCode,
   );
 
   // A clone must never mint a NEW orphan. Two source shapes produce one:
@@ -461,12 +609,27 @@ export async function cloneQuote(id: string, actor: QuoteActor, input: CloneQuot
   }
 
   return db.transaction(async (tx) => {
+    let deviceSetDrift: QuoteDeviceSetDrift[] = [];
+    if (orgChanged) {
+      // #3778: re-verify the same-currency guard under the org SHARE barrier,
+      // the FIRST statement of this transaction. The pre-transaction read above
+      // is a fast-fail: a changeOrgCurrency committing between the two would
+      // otherwise let a clone land on an org billing in another currency.
+      const locked = await lockOrgStampingDefaults(tx, targetOrgId);
+      if (locked.currencyCode !== source.currencyCode) {
+        throw new QuoteServiceError(
+          `target organization uses ${locked.currencyCode}; this quote is in ${source.currencyCode} — clone within the same currency or recreate the quote`,
+          400, 'CURRENCY_MISMATCH',
+        );
+      }
+    }
     const [cloned] = await tx.insert(quotes).values({
       id: quoteId,
       partnerId: source.partnerId,
       orgId: targetOrgId,
       siteId: orgChanged ? null : source.siteId,
       quoteNumber,
+      ...cloneLineagePair(revision),
       title,
       status: 'draft',
       currencyCode: source.currencyCode,
@@ -491,6 +654,8 @@ export async function cloneQuote(id: string, actor: QuoteActor, input: CloneQuot
       introNotes: source.introNotes,
       terms: source.terms,
       sellerSnapshot: null,
+      // documentLocale deliberately NOT copied (stays NULL, like sellerSnapshot):
+      // it is a send-time snapshot, stamped fresh when the clone is sent (#3777).
       // Cover page is document presentation, not customer-specific — carried
       // over verbatim (title/enabled/preparedForName/showPreparedBy) on both a
       // same-org and a retargeted clone. Its coverImageId is the one exception:
@@ -573,12 +738,170 @@ export async function cloneQuote(id: string, actor: QuoteActor, input: CloneQuot
         vendorSku: line.vendorSku,
         manufacturer: line.manufacturer,
         imageId: line.imageId ? imageIds.get(line.imageId) ?? null : null,
+        contractLineType: line.contractLineType,
+        deviceRoles: line.deviceRoles,
+        // Stamps are KEPT on a retargeted clone: they are what the amber
+        // "re-select for this organization" chip renders, and what tells the
+        // operator which group the line used to price.
+        deviceGroupId: orgChanged ? null : line.deviceGroupId,
+        deviceGroupName: line.deviceGroupName,
+        siteId: orgChanged ? null : line.siteId,
+        siteName: line.siteName,
+        includedQuantity: line.includedQuantity,
+        overageMode: line.overageMode,
+        overageUnitPrice: line.overageUnitPrice,
         sortOrder: line.sortOrder,
       })));
     }
 
-    return cloned!;
+    if (orgChanged && lines.some((line) => line.contractLineType !== null && line.contractLineType !== undefined)) {
+      deviceSetDrift = lines
+        .filter((line) => line.deviceGroupId !== null || line.siteId !== null)
+        .map((line) => ({
+          lineId: lineIds.get(line.id)!,
+          description: line.name ?? line.description ?? '',
+          storedQuantity: line.quantity,
+          liveQuantity: null,
+          reason: 'org_retargeted' as const,
+        }));
+
+      const unscoped = await tx.select().from(quoteLines).where(and(
+        eq(quoteLines.quoteId, quoteId),
+        isNotNull(quoteLines.contractLineType),
+        isNull(quoteLines.deviceGroupId),
+        isNull(quoteLines.siteId),
+      ));
+      if (unscoped.length > 0) {
+        const counts = await countQuoteDeviceSetLines(targetOrgId, unscoped.map(toQuoteDeviceSetLine));
+        await persistQuoteDeviceSetQuantities(tx, quoteId, source.currencyCode, unscoped, counts);
+      }
+      await recomputeAndPersist(quoteId, tx);
+    }
+
+    return { ...cloned!, deviceSetDrift };
   });
+}
+
+/**
+ * Public clone surface. Revision overrides stay inside this module; the
+ * runtime check also rejects an untyped JavaScript caller attempting the old
+ * four-argument form.
+ */
+export async function cloneQuote(id: string, actor: QuoteActor, input: CloneQuoteInput = {}) {
+  const unsupportedRevision = arguments[3] as CloneRevisionOverrides | undefined;
+  assertRevisionCloneTarget(input, unsupportedRevision);
+  if (unsupportedRevision) {
+    throw new QuoteServiceError('Quote revision overrides are internal', 409, 'INVALID_STATE');
+  }
+  return cloneQuoteCore(id, actor, input);
+}
+
+/**
+ * Walk parent links to the lineage root with a 100-hop cycle guard. The ceiling
+ * is data-dependent: a legitimate lineage deeper than 100 revisions is also
+ * rejected rather than risking an unbounded walk through corrupt cyclic data.
+ */
+async function resolveQuoteLineageRoot(
+  quote: typeof quotes.$inferSelect,
+): Promise<typeof quotes.$inferSelect> {
+  let current = quote;
+  for (let hop = 0; hop < 100 && current.revisionOfQuoteId; hop++) {
+    const [parent] = await db.select().from(quotes)
+      .where(eq(quotes.id, current.revisionOfQuoteId)).limit(1);
+    if (!parent) throw new QuoteServiceError('Quote lineage is corrupt', 409, 'INVALID_STATE');
+    current = parent;
+  }
+  if (current.revisionOfQuoteId) {
+    throw new QuoteServiceError('Quote lineage is corrupt', 409, 'INVALID_STATE');
+  }
+  return current;
+}
+
+/**
+ * Create a linked draft revision without touching the live parent. The parent
+ * stays live until this revision is SENT — sendQuote flips it to 'superseded'
+ * atomically with the child's draft→sent claim.
+ */
+export async function reviseQuote(id: string, actor: QuoteActor) {
+  const { quote: parentRow } = await getQuote(id, actor);
+  // Lock the parent for the rest of this transaction and re-read its status.
+  // getQuote's snapshot is unlocked, so a customer accept committing between
+  // that read and the clone insert would otherwise let a revision draft attach
+  // to an ACCEPTED quote — precisely the state PARENT_CONVERTED exists to
+  // prevent, and one nothing downstream would flag. This row lock serializes
+  // the revision decision against acceptQuote and sendQuote's parent flip.
+  // Every gate below reads the LOCKED status, never the snapshot.
+  const [locked] = await db.select({ status: quotes.status }).from(quotes)
+    .where(eq(quotes.id, parentRow.id)).limit(1).for('update');
+  if (!locked) throw new QuoteServiceError('Quote not found', 404, 'QUOTE_NOT_FOUND');
+  const parent = { ...parentRow, status: locked.status };
+  if (parent.status === 'draft') {
+    throw new QuoteServiceError('This quote is still a draft — edit it directly', 409, 'INVALID_STATE');
+  }
+  if (parent.status === 'converted' || parent.status === 'accepted') {
+    throw new QuoteServiceError(
+      'This quote was accepted — changes go through its invoice or contract',
+      409,
+      'PARENT_CONVERTED',
+    );
+  }
+  if (parent.status === 'superseded') {
+    const [successor] = await db.select({ id: quotes.id }).from(quotes)
+      .where(eq(quotes.revisionOfQuoteId, parent.id)).limit(1);
+    throw new QuoteServiceError(
+      successor
+        ? 'This quote was already replaced — revise the newer version'
+        : 'This quote is marked as superseded, but its replacement could not be found',
+      409,
+      'ALREADY_SUPERSEDED',
+      successor ? { successorQuoteId: successor.id } : undefined,
+    );
+  }
+  // The shared revisable set deliberately excludes accepted/converted because
+  // those settled outcomes already have an invoice or contract behind them.
+  if (!isSupersedable(parent.status)) {
+    throw new QuoteServiceError(`Cannot revise a quote in status ${parent.status}`, 409, 'INVALID_STATE');
+  }
+  if (!parent.quoteNumber) {
+    throw new QuoteServiceError('This quote has no quote number and cannot be revised', 409, 'INVALID_STATE');
+  }
+  // Linearity is enforced by quotes_revision_of_uq. This pre-check is only a
+  // TOCTOU-racy convenience for a friendlier 409 carrying revisionQuoteId; the
+  // unique constraint remains the invariant under concurrent revision attempts.
+  const [existing] = await db.select({ id: quotes.id, status: quotes.status }).from(quotes)
+    .where(eq(quotes.revisionOfQuoteId, parent.id)).limit(1);
+  if (existing) {
+    throw new QuoteServiceError(
+      'A revision of this quote is already in progress',
+      409,
+      'REVISION_IN_PROGRESS',
+      { revisionQuoteId: existing.id },
+    );
+  }
+  const root = await resolveQuoteLineageRoot(parent);
+  if (!root.quoteNumber) {
+    throw new QuoteServiceError('The root quote has no quote number and cannot be revised', 409, 'INVALID_STATE');
+  }
+  const revisionNumber = parent.revisionNumber + 1;
+  try {
+    return await cloneQuoteCore(id, actor, {}, {
+      quoteNumber: `${root.quoteNumber}-R${revisionNumber}`,
+      revisionOfQuoteId: parent.id,
+      revisionNumber,
+    });
+  } catch (err) {
+    if (isPgUniqueViolation(err, 'quotes_revision_of_uq')) {
+      const [existingRevision] = await db.select({ id: quotes.id }).from(quotes)
+        .where(eq(quotes.revisionOfQuoteId, parent.id)).limit(1);
+      throw new QuoteServiceError(
+        'A revision of this quote is already in progress',
+        409,
+        'REVISION_IN_PROGRESS',
+        existingRevision ? { revisionQuoteId: existingRevision.id } : undefined,
+      );
+    }
+    throw err;
+  }
 }
 
 export async function getQuote(id: string, actor: QuoteActor) {
@@ -588,7 +911,24 @@ export async function getQuote(id: string, actor: QuoteActor) {
   const blocks = sanitizeQuoteBlocksForRead(
     await db.select().from(quoteBlocks).where(eq(quoteBlocks.quoteId, id)).orderBy(quoteBlocks.sortOrder)
   );
-  const lines = await db.select().from(quoteLines).where(eq(quoteLines.quoteId, id)).orderBy(quoteLines.sortOrder);
+  const joinedLines = await db.select({
+    line: quoteLines,
+    deviceGroup: { id: deviceGroups.id, name: deviceGroups.name, type: deviceGroups.type },
+    site: { id: sites.id, name: sites.name },
+  }).from(quoteLines)
+    .leftJoin(deviceGroups, and(eq(quoteLines.deviceGroupId, deviceGroups.id), eq(quoteLines.orgId, deviceGroups.orgId)))
+    .leftJoin(sites, and(eq(quoteLines.siteId, sites.id), eq(quoteLines.orgId, sites.orgId)))
+    .where(eq(quoteLines.quoteId, id)).orderBy(quoteLines.sortOrder);
+  const lines = joinedLines.map(({ line, deviceGroup, site }) => ({
+    ...line,
+    deviceGroup: deviceGroup?.id ? deviceGroup : null,
+    site: site?.id ? site : null,
+    // A stamped name with a null id: the thing this line prices is gone.
+    descriptorUnresolved: Boolean(
+      (line.deviceGroupId === null && line.deviceGroupName !== null)
+      || isQuoteLineSiteDeleted(line),
+    ),
+  }));
   // Quote acceptance returns the staged order id once, but the technician may
   // reload or open the converted quote later. Keep discoverability in the quote
   // read model itself. The quote access check runs first, and the lookup repeats
@@ -615,6 +955,37 @@ export async function getQuote(id: string, actor: QuoteActor) {
         eq(pax8OrderLines.orgId, q.orgId),
       ))
     : [];
+  const revisionOf = q.revisionOfQuoteId ? await (async () => {
+    const [parent] = await db.select({ id: quotes.id, quoteNumber: quotes.quoteNumber, siteId: quotes.siteId })
+      .from(quotes).where(eq(quotes.id, q.revisionOfQuoteId!)).limit(1);
+    if (!parent) {
+      logError(
+        errorIds.QUOTE_LINEAGE_PARENT_MISSING,
+        'linked quote parent could not be read',
+        { quoteId: q.id, revisionOfQuoteId: q.revisionOfQuoteId },
+      );
+      return null;
+    }
+    // Match assertSite semantics without turning an authorized read of q into a
+    // 403 for an inaccessible linked quote. Check before loading recipient PII.
+    if (actor.allowedSiteIds && (!parent.siteId || !actor.allowedSiteIds.includes(parent.siteId))) return null;
+    // The composite (revision_of_quote_id, org_id) FK guarantees same-org
+    // lineage under every DB context; no separate org-axis filter is needed.
+    const recipients = await db.select({ email: quoteRecipients.email }).from(quoteRecipients)
+      .where(eq(quoteRecipients.quoteId, parent.id)).orderBy(quoteRecipients.createdAt);
+    return { id: parent.id, quoteNumber: parent.quoteNumber, recipients: recipients.map((r) => r.email) };
+  })() : null;
+  const [successorRow] = await db.select({
+    id: quotes.id,
+    quoteNumber: quotes.quoteNumber,
+    status: quotes.status,
+    siteId: quotes.siteId,
+  })
+    .from(quotes).where(eq(quotes.revisionOfQuoteId, q.id)).limit(1);
+  const successor = successorRow
+    && (!actor.allowedSiteIds || (!!successorRow.siteId && actor.allowedSiteIds.includes(successorRow.siteId)))
+    ? { id: successorRow.id, quoteNumber: successorRow.quoteNumber, status: successorRow.status }
+    : null;
   // Procurement order tracking (Task 11): every PO header + its line-level
   // allocations recorded against this quote, so the editor can show fulfillment
   // status alongside the pax8 auto-order summary above.
@@ -628,6 +999,7 @@ export async function getQuote(id: string, actor: QuoteActor) {
     lines as QuoteLineForMath[],
     q.taxRate ? parseFloat(q.taxRate) : null,
     toQuoteDepositConfig(q.depositType, q.depositPercent),
+    q.currencyCode,
   );
   // Resolve the customer "bill to" for display. Keyed on quote STATUS, not on
   // whether the frozen fields happen to be populated:
@@ -693,6 +1065,8 @@ export async function getQuote(id: string, actor: QuoteActor) {
     pax8Order: pax8OrderSummary
       ? { id: pax8OrderSummary.pax8OrderId, status: pax8OrderSummary.status, lines: pax8LineRows }
       : null,
+    revisionOf,
+    successor,
   };
 }
 
@@ -740,6 +1114,7 @@ export async function listQuotes(query: ListQuotesQuery, actor: QuoteActor) {
  *  RLS-scoped readers never see a half-moved quote. */
 export async function updateQuote(id: string, input: UpdateQuoteInput, actor: QuoteActor) {
   const q = await loadDraft(id, actor);
+  let deviceSetDrift: QuoteDeviceSetDrift[] = [];
   // A site-restricted caller may not move the quote to a site it can't access
   // (nor clear it to null, which a restricted caller can never see).
   if (input.siteId !== undefined) assertSite(actor, input.siteId);
@@ -747,6 +1122,13 @@ export async function updateQuote(id: string, input: UpdateQuoteInput, actor: Qu
   // Re-resolved org tax default; undefined = org unchanged (keep current rate).
   let orgTaxRate: string | null | undefined;
   if (orgChanged) {
+    if (q.revisionOfQuoteId != null) {
+      throw new QuoteServiceError(
+        'A revision draft cannot be moved to another organization',
+        409,
+        'INVALID_STATE',
+      );
+    }
     const targetOrgId = input.orgId!;
     assertOrg(actor, targetOrgId);
     // Reassignment clears the site, and a site-restricted caller can never see a
@@ -754,10 +1136,20 @@ export async function updateQuote(id: string, input: UpdateQuoteInput, actor: Qu
     assertSite(actor, null);
     // Same-partner guard; RLS hides other partners' orgs so a cross-partner id
     // resolves to "not found" rather than leaking existence.
-    const [target] = await db.select({ id: organizations.id }).from(organizations)
+    const [target] = await db.select({ id: organizations.id, currencyCode: organizations.currencyCode })
+      .from(organizations)
       .where(and(eq(organizations.id, targetOrgId), eq(organizations.partnerId, q.partnerId)))
       .limit(1);
     if (!target) throw new QuoteServiceError('Organization not found', 404, 'ORG_NOT_FOUND');
+    // The draft keeps its currency stamp across an org move, so a target org
+    // billed in a different currency is a hard 400 — never a silent restamp and
+    // never a conversion (spec §5; mirrors the §7 ticket-move guard).
+    if (target.currencyCode !== q.currencyCode) {
+      throw new QuoteServiceError(
+        `target organization uses ${target.currencyCode}; this quote is in ${q.currencyCode} — reassign within the same currency or recreate the quote`,
+        400, 'CURRENCY_MISMATCH',
+      );
+    }
     if (input.taxRate === undefined) orgTaxRate = await resolveQuoteTaxRate(targetOrgId, q.partnerId);
   }
   const set: Record<string, unknown> = { updatedAt: new Date() };
@@ -805,6 +1197,7 @@ export async function updateQuote(id: string, input: UpdateQuoteInput, actor: Qu
       lines as QuoteLineForMath[],
       effectiveTaxRate === null ? null : Number(effectiveTaxRate),
       toQuoteDepositConfig(nextType, nextPercent),
+      q.currencyCode,
     );
     if (!check.ok) throw new QuoteServiceError(check.message, 400, check.code);
     set.depositType = nextType;
@@ -830,12 +1223,64 @@ export async function updateQuote(id: string, input: UpdateQuoteInput, actor: Qu
       .from(quoteBlocks)
       .where(and(eq(quoteBlocks.quoteId, id), eq(quoteBlocks.blockType, 'contract')));
     await db.transaction(async (tx) => {
+      // #3205 W05 decision 7: defer THIS constraint BY NAME, never ALL. The
+      // parent's org_id update and the children's are separate statements, and
+      // quote_lines_quote_org_fk is checked at end-of-statement. Naming the one
+      // constraint keeps every other deferrable FK checking at statement
+      // boundaries, so unrelated tenancy violations fail where they happen.
+      await tx.execute(sql`SET CONSTRAINTS quote_lines_quote_org_fk DEFERRED`);
+      // #3778: re-verify the same-currency guard under the org SHARE barrier as
+      // the first data read of this transaction (the pre-transaction check above
+      // is a fast-fail only). SET CONSTRAINTS above takes no row/table lock.
+      const lockedTarget = await lockOrgStampingDefaults(tx, targetOrgId);
+      if (lockedTarget.currencyCode !== q.currencyCode) {
+        throw new QuoteServiceError(
+          `target organization uses ${lockedTarget.currencyCode}; this quote is in ${q.currencyCode} — reassign within the same currency or recreate the quote`,
+          400, 'CURRENCY_MISMATCH',
+        );
+      }
       await assertContractBlocksValidForOrg(contractBlocks, { orgId: targetOrgId, partnerId: q.partnerId }, tx);
       await tx.update(quotes).set(set).where(eq(quotes.id, id));
       // Move the denormalized org_id on every child row in the same transaction.
       await tx.update(quoteBlocks).set({ orgId: targetOrgId }).where(eq(quoteBlocks.quoteId, id));
+      // Scoped ids belong to the OLD org. Clear them in the SAME statement that
+      // moves org_id so the two immediate descriptor FKs never observe a
+      // cross-org pair; stamps and quantities deliberately survive.
+      const cleared = await tx.update(quoteLines)
+        .set({ orgId: targetOrgId, deviceGroupId: null, siteId: null })
+        .where(and(
+          eq(quoteLines.quoteId, id),
+          or(isNotNull(quoteLines.deviceGroupId), isNotNull(quoteLines.siteId)),
+        ))
+        .returning({
+          id: quoteLines.id,
+          name: quoteLines.name,
+          description: quoteLines.description,
+          quantity: quoteLines.quantity,
+        });
+      deviceSetDrift = cleared.map((line) => ({
+        lineId: line.id,
+        description: line.name ?? line.description ?? '',
+        storedQuantity: line.quantity,
+        liveQuantity: null,
+        reason: 'org_retargeted' as const,
+      }));
+      // The remaining lines carry no org-owned descriptor ids and can now move.
       await tx.update(quoteLines).set({ orgId: targetOrgId }).where(eq(quoteLines.quoteId, id));
       await tx.update(quoteImages).set({ orgId: targetOrgId }).where(eq(quoteImages.quoteId, id));
+
+      // Unscoped descriptors name nothing org-owned, so their count from the
+      // previous organization is meaningless. Re-derive in the target org.
+      const unscoped = await tx.select().from(quoteLines).where(and(
+        eq(quoteLines.quoteId, id),
+        isNotNull(quoteLines.contractLineType),
+        isNull(quoteLines.deviceGroupId),
+        isNull(quoteLines.siteId),
+      ));
+      if (unscoped.length > 0) {
+        const counts = await countQuoteDeviceSetLines(targetOrgId, unscoped.map(toQuoteDeviceSetLine));
+        await persistQuoteDeviceSetQuantities(tx, id, q.currencyCode, unscoped, counts);
+      }
       // Recompute INSIDE the transaction: a failure here must roll back the org
       // move too, never commit the quote onto the new org with totals still
       // computed under the old tax rate.
@@ -846,12 +1291,123 @@ export async function updateQuote(id: string, input: UpdateQuoteInput, actor: Qu
     await recomputeAndPersist(id);
   }
   const [updated] = await db.select().from(quotes).where(eq(quotes.id, id)).limit(1);
-  return updated!;
+  return { ...updated!, deviceSetDrift };
 }
 
 export async function deleteDraftQuote(id: string, actor: QuoteActor) {
   await loadDraft(id, actor);
   await db.delete(quotes).where(eq(quotes.id, id)); // blocks/lines cascade
+}
+
+/**
+ * Draft-only atomic change-currency operation (multi-currency wave 2, #3774).
+ * A draft's stamped currency is immutable through every other mutation path —
+ * updateQuoteSchema never admitted currencyCode — so this is the ONLY way the
+ * stamp moves, and only while the quote is a draft. With monetary lines
+ * present the change is refused (CURRENCY_LOCKED 409) unless the caller opts
+ * into `clearLines`, which deletes the quote's lines (blocks stay — an empty
+ * line-items block is valid) and restamps in ONE transaction, or into
+ * `reprice` (wave 3, #3775), which re-resolves catalog-sourced lines from the
+ * price book in the new currency (see repriceQuoteCatalogLines). Amounts are
+ * never converted or reinterpreted.
+ */
+export async function changeQuoteCurrency(
+  quoteId: string,
+  input: { currencyCode: string; clearLines?: boolean; reprice?: boolean },
+  actor: QuoteActor
+) {
+  return db.transaction(async (tx) => {
+    // Quote row lock FIRST (document → lines, the same order the accept path
+    // takes). Every line writer takes the same lock via lockDraftQuote, so a
+    // concurrent send/accept/line write serializes against the restamp
+    // instead of observing a half-changed draft.
+    const q = await lockDraftQuote(tx, quoteId, actor);
+    if (q.currencyCode === input.currencyCode) return q; // no-op restamp
+
+    const lineRows = await tx.select({
+      id: quoteLines.id, sourceType: quoteLines.sourceType, catalogItemId: quoteLines.catalogItemId,
+      parentLineId: quoteLines.parentLineId, quantity: quoteLines.quantity,
+    }).from(quoteLines).where(eq(quoteLines.quoteId, quoteId)).orderBy(quoteLines.id);
+    // #3205 W05 / W04 decision 15: repriceQuoteCatalogLines writes only
+    // unit_price, line_total and unit_cost — it cannot re-derive a hand-entered
+    // overage rate, which would otherwise survive the restamp in the OLD
+    // currency.
+    // clearLines deletes every line (the stamped one included), so the lock
+    // only matters when lines survive the restamp (reprice / no-op paths).
+    const [stamped] = input.clearLines
+      ? [undefined]
+      : await tx.select({ id: quoteLines.id }).from(quoteLines)
+        .where(and(eq(quoteLines.quoteId, quoteId), isNotNull(quoteLines.overageUnitPrice))).limit(1);
+    if (stamped) {
+      throw new QuoteServiceError(
+        'This quote has a hand-entered overage price; clear it before changing the currency',
+        409,
+        'CURRENCY_LOCKED',
+      );
+    }
+    if (lineRows.length > 0) {
+      if (input.reprice) {
+        await repriceQuoteCatalogLines(tx, q, lineRows, input.currencyCode, actor);
+      } else if (!input.clearLines) {
+        throw new QuoteServiceError(
+          `Quote has ${lineRows.length} line(s) priced in ${q.currencyCode} — pass clearLines to remove them, or delete the draft`,
+          409, 'CURRENCY_LOCKED'
+        );
+      } else {
+        await tx.delete(quoteLines).where(eq(quoteLines.quoteId, quoteId));
+      }
+    }
+
+    await tx.update(quotes).set({ currencyCode: input.currencyCode, updatedAt: new Date() }).where(eq(quotes.id, quoteId));
+    // Lines are either gone, never existed, or already repriced in the NEW
+    // currency: totals recompute inside the same transaction as the restamp.
+    await recomputeAndPersist(quoteId, tx);
+    const [updated] = await tx.select().from(quotes).where(eq(quotes.id, quoteId)).limit(1);
+    return updated!;
+  });
+}
+
+/**
+ * Multi-currency wave 3 (#3775): `reprice` re-resolves every catalog-sourced
+ * line from the price book in the TARGET currency on the already-locked tx
+ * (quote row → lines → catalog plain SELECTs — no new lock edge). Only
+ * `sourceType === 'catalog'` lines with a catalog item are repriceable: bundle
+ * parents/children and manual lines carry amounts the price book cannot
+ * re-derive, so their presence refuses the whole operation (CURRENCY_LOCKED —
+ * the caller must clearLines instead). A single price-book gap aborts the
+ * transaction (NO_PRICE_FOR_CURRENCY, naming the item) — never a partial
+ * reprice, never a converted number.
+ */
+async function repriceQuoteCatalogLines(
+  tx: DbExecutor,
+  q: { orgId: string; partnerId: string },
+  lines: Array<{ id: string; sourceType: string; catalogItemId: string | null; parentLineId: string | null; quantity: string }>,
+  currencyCode: string,
+  actor: QuoteActor
+): Promise<void> {
+  const repriceable = lines.filter((l) => l.sourceType === 'catalog' && l.catalogItemId !== null && l.parentLineId === null);
+  const rest = lines.length - repriceable.length;
+  if (rest > 0) {
+    throw new QuoteServiceError(`${rest} non-catalog line(s) have no price in the new currency — remove all lines first, or keep the current currency`, 409, 'CURRENCY_LOCKED');
+  }
+  const catalogActor = { userId: actor.userId, partnerId: q.partnerId, accessibleOrgIds: actor.accessibleOrgIds };
+  for (const line of repriceable) {
+    let resolved;
+    try {
+      resolved = await resolvePrice(line.catalogItemId!, currencyCode, q.orgId, catalogActor, tx);
+    } catch (err) {
+      if (err instanceof CatalogServiceError && (err.code === 'NO_PRICE_FOR_CURRENCY' || err.code === 'PRICE_NOT_REPRESENTABLE')) {
+          throw new QuoteServiceError(err.message, 409, err.code);
+      }
+      throw err;
+    }
+    await tx.update(quoteLines).set({
+      unitPrice: resolved.unitPrice,
+      lineTotal: computeLineTotal(line.quantity, resolved.unitPrice, currencyCode),
+      // Cost is only meaningful in the line's currency (no conversion).
+      unitCost: resolved.marginAvailable ? resolved.costBasis : null,
+    }).where(eq(quoteLines.id, line.id));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -983,10 +1539,12 @@ export async function updateBlock(quoteId: string, blockId: string, input: Quote
  * header totals from the lines that remain.
  */
 export async function deleteBlock(quoteId: string, blockId: string, actor: QuoteActor) {
-  await loadDraft(quoteId, actor);
-  await db.delete(quoteLines).where(and(eq(quoteLines.quoteId, quoteId), eq(quoteLines.blockId, blockId)));
-  await db.delete(quoteBlocks).where(and(eq(quoteBlocks.id, blockId), eq(quoteBlocks.quoteId, quoteId)));
-  await recomputeAndPersist(quoteId);
+  await db.transaction(async (tx) => {
+    await lockDraftQuote(tx, quoteId, actor); // removes lines + recomputes → takes the quote lock first
+    await tx.delete(quoteLines).where(and(eq(quoteLines.quoteId, quoteId), eq(quoteLines.blockId, blockId)));
+    await tx.delete(quoteBlocks).where(and(eq(quoteBlocks.id, blockId), eq(quoteBlocks.quoteId, quoteId)));
+    await recomputeAndPersist(quoteId, tx);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1004,57 +1562,130 @@ export async function deleteBlock(quoteId: string, blockId: string, actor: Quote
  * only walks line_items blocks). The result was a quote showing a real dollar
  * total while the builder said "No content yet", uneditable from the UI (#2553).
  */
-async function resolveLineBlockId(quoteId: string, orgId: string, blockId: string | null | undefined): Promise<string> {
+async function resolveLineBlockId(quoteId: string, orgId: string, blockId: string | null | undefined, dbc: DbExecutor = db): Promise<string> {
   if (blockId) return blockId;
-  const [existing] = await db
+  const [existing] = await dbc
     .select({ id: quoteBlocks.id })
     .from(quoteBlocks)
     .where(and(eq(quoteBlocks.quoteId, quoteId), eq(quoteBlocks.blockType, 'line_items')))
     .orderBy(quoteBlocks.sortOrder)
     .limit(1);
   if (existing) return existing.id;
-  const sortOrder = await nextBlockSortOrder(quoteId);
-  const [block] = await db
+  const sortOrder = await nextBlockSortOrder(quoteId, dbc);
+  const [block] = await dbc
     .insert(quoteBlocks)
     .values({ quoteId, orgId, blockType: 'line_items', content: {}, sortOrder })
     .returning({ id: quoteBlocks.id });
   return block!.id;
 }
 
+/**
+ * Wave-6 release gate (W6-G2-1): hand-entered money on a quote line must be
+ * representable in the QUOTE's stamped currency (¥100.50 is refused, never
+ * silently rounded — owner-fixed: no conversion, snapshots rule).
+ */
+function assertRepresentable(value: string, currencyCode: string): void {
+  if (!isRepresentableInCurrency(value, currencyCode)) {
+    throw new QuoteServiceError(
+      `${value} is not representable in ${currencyCode} — this currency has ${minorUnitExponent(currencyCode)} decimal place(s)`,
+      400, 'PRICE_NOT_REPRESENTABLE'
+    );
+  }
+}
+
+/** #3205 W05: resolve and STAMP a device group in the quote's org. Same shape as
+ *  contractService's assertGroupInOrg — the stamp is what survives the FK's
+ *  ON DELETE SET NULL and lets a deleted reference be detected. */
+async function assertQuoteGroupInOrg(tx: DbExecutor, groupId: string, orgId: string) {
+  const [row] = await tx.select({ id: deviceGroups.id, name: deviceGroups.name, type: deviceGroups.type })
+    .from(deviceGroups).where(and(eq(deviceGroups.id, groupId), eq(deviceGroups.orgId, orgId))).limit(1);
+  if (!row) throw new QuoteServiceError('Device group does not belong to this organization', 400, 'GROUP_NOT_IN_ORG');
+  return row;
+}
+
+async function assertQuoteSiteInOrg(tx: DbExecutor, siteId: string, orgId: string) {
+  const [row] = await tx.select({ id: sites.id, name: sites.name })
+    .from(sites).where(and(eq(sites.id, siteId), eq(sites.orgId, orgId))).limit(1);
+  if (!row) throw new QuoteServiceError('Site does not belong to this organization', 400, 'SITE_NOT_IN_ORG');
+  return row;
+}
+
 export async function addManualLine(quoteId: string, input: QuoteLineInput, actor: QuoteActor) {
-  const q = await loadDraft(quoteId, actor);
-  const quantity = String(input.quantity);
-  const unitPrice = Number(input.unitPrice).toFixed(2);
-  const blockId = await resolveLineBlockId(quoteId, q.orgId, input.blockId);
-  const sortOrder = await nextLineSortOrder(quoteId);
-  const [row] = await db.insert(quoteLines).values({
-    quoteId,
-    orgId: q.orgId,
-    blockId,
-    sourceType: input.sourceType,
-    catalogItemId: input.catalogItemId ?? null,
-    name: input.name ?? null,
-    description: input.description ?? null,
-    quantity,
-    unitPrice,
-    taxable: input.taxable,
-    customerVisible: input.customerVisible,
-    lineTotal: computeLineTotal(quantity, unitPrice),
-    recurrence: input.recurrence,
-    termMonths: input.termMonths ?? null,
-    billingFrequency: input.billingFrequency ?? null,
-    unitCost: input.unitCost != null ? Number(input.unitCost).toFixed(2) : null,
-    sku: input.sku ?? null,
-    partNumber: input.partNumber ?? null,
-    procurementSource: input.procurementSource ?? null,
-    vendorSku: input.vendorSku ?? null,
-    manufacturer: input.manufacturer ?? null,
-    depositEligible: input.depositEligible ?? false,
-    itemType: null,
-    sortOrder,
-  }).returning();
-  await recomputeAndPersist(quoteId);
-  return row!;
+  return db.transaction(async (tx) => {
+    const q = await lockDraftQuote(tx, quoteId, actor);
+    const unitPrice = Number(input.unitPrice).toFixed(2);
+    assertRepresentable(unitPrice, q.currencyCode);
+    // #3205 W05: the device-set descriptor. Resolve + stamp the references, then
+    // DERIVE the quantity from the same helpers that will bill it (decision 5).
+    const setType = input.contractLineType ?? null;
+    const group = setType === 'per_device_group' && input.deviceGroupId
+      ? await assertQuoteGroupInOrg(tx, input.deviceGroupId, q.orgId) : null;
+    const site = setType && input.siteId ? await assertQuoteSiteInOrg(tx, input.siteId, q.orgId) : null;
+    const overageUnitPrice = input.overageUnitPrice != null ? Number(input.overageUnitPrice).toFixed(2) : null;
+    if (overageUnitPrice != null) assertRepresentable(overageUnitPrice, q.currencyCode);
+    const includedQuantity = input.includedQuantity != null ? Number(input.includedQuantity).toFixed(2) : null;
+
+    let quantity = String(input.quantity);
+    if (setType) {
+      const [count] = await countQuoteDeviceSetLines(q.orgId, [{
+        id: 'new', description: input.name ?? input.description ?? '',
+        contractLineType: setType, deviceRoles: input.deviceRoles ?? null,
+        deviceGroupId: group?.id ?? null, deviceGroupName: group?.name ?? null,
+        siteId: site?.id ?? null, siteName: site?.name ?? null,
+        includedQuantity, overageMode: input.overageMode ?? null, overageUnitPrice,
+      }]);
+      // Refusing to create a line whose number cannot be computed is better than
+      // creating one at zero: a zero from a FAILED count is indistinguishable
+      // from the legitimate new-customer zero.
+      if (count!.error) {
+        throw new QuoteServiceError(
+          'This device set could not be counted right now — check the device group and try again',
+          400, 'DEVICE_SET_UNCOUNTABLE', { reason: count!.error, groupName: group?.name ?? null },
+        );
+      }
+      quantity = count!.billed.toFixed(2);
+    }
+    if (input.unitCost != null) assertRepresentable(Number(input.unitCost).toFixed(2), q.currencyCode);
+    const blockId = await resolveLineBlockId(quoteId, q.orgId, input.blockId, tx);
+    const sortOrder = await nextLineSortOrder(quoteId, tx);
+    const [row] = await tx.insert(quoteLines).values({
+      quoteId,
+      orgId: q.orgId,
+      blockId,
+      sourceType: input.sourceType,
+      catalogItemId: input.catalogItemId ?? null,
+      name: input.name ?? null,
+      description: input.description ?? null,
+      quantity,
+      unitPrice,
+      taxable: input.taxable,
+      customerVisible: input.customerVisible,
+      lineTotal: computeLineTotal(quantity, unitPrice, q.currencyCode),
+      recurrence: input.recurrence,
+      termMonths: input.termMonths ?? null,
+      billingFrequency: input.billingFrequency ?? null,
+      contractLineType: setType,
+      deviceRoles: setType === 'per_device_role' ? (input.deviceRoles ?? null) : null,
+      deviceGroupId: group?.id ?? null,
+      deviceGroupName: group?.name ?? null,
+      siteId: site?.id ?? null,
+      siteName: site?.name ?? null,
+      includedQuantity,
+      overageMode: input.overageMode ?? null,
+      overageUnitPrice,
+      unitCost: input.unitCost != null ? Number(input.unitCost).toFixed(2) : null,
+      sku: input.sku ?? null,
+      partNumber: input.partNumber ?? null,
+      procurementSource: input.procurementSource ?? null,
+      vendorSku: input.vendorSku ?? null,
+      manufacturer: input.manufacturer ?? null,
+      depositEligible: input.depositEligible ?? false,
+      itemType: null,
+      sortOrder,
+    }).returning();
+    await recomputeAndPersist(quoteId, tx);
+    return row!;
+  });
 }
 
 /**
@@ -1072,63 +1703,88 @@ export async function addCatalogLine(
   actor: QuoteActor,
   options?: { partNumber?: string | null }
 ) {
-  const q = await loadDraft(quoteId, actor);
-  // Scope the catalog lookup to the quote's OWN partner. catalog_items is
-  // partner-axis RLS, which contains a foreign item for a partner-scope caller —
-  // but under SYSTEM scope the partner predicate short-circuits, so without this
-  // explicit filter a system-scope request could snapshot another partner's
-  // catalog item (name/price/taxable/billingType) into the quote line and bind a
-  // foreign catalog_item_id FK. Mirrors invoiceService → catalogService's
-  // getOwnedItemOr404(id, partnerId): a foreign item resolves to not-found
-  // regardless of read scope.
-  const [item] = await db.select().from(catalogItems)
-    .where(and(eq(catalogItems.id, catalogItemId), eq(catalogItems.partnerId, q.partnerId)))
-    .limit(1);
-  if (!item) throw new QuoteServiceError('Catalog item not found', 404, 'CATALOG_ITEM_NOT_FOUND');
-  const vendor = vendorIdentityFromAttributes(item.attributes);
-  // Phase 1 recurrence is monthly|annual only; quarterly is not offered (dropped
-  // from the catalog Zod enum). The DB enum retains 'quarterly' for a future phase.
-  const recurrence = item.billingType === 'recurring'
-    ? (item.billingFrequency === 'annual' ? 'annual' : 'monthly')
-    : 'one_time';
-  const qty = String(quantity);
-  const resolvedBlockId = await resolveLineBlockId(quoteId, q.orgId, blockId);
-  const sortOrder = await nextLineSortOrder(quoteId);
-  const [row] = await db.insert(quoteLines).values({
-    quoteId,
-    orgId: q.orgId,
-    blockId: resolvedBlockId,
-    sourceType: 'catalog',
-    catalogItemId,
-    // Mirror the catalog item: its name is the line title, its description the blurb.
-    name: item.name,
-    description: item.description ?? null,
-    quantity: qty,
-    unitPrice: item.unitPrice,
-    taxable: item.taxable,
-    customerVisible: true,
-    lineTotal: computeLineTotal(qty, item.unitPrice),
-    recurrence,
-    termMonths: item.commitmentTermMonths ?? null,
-    billingFrequency: item.billingFrequency ?? null,
-    // Snapshot internal economics from the catalog item at add-time so a later
-    // catalog edit never mutates existing quote line cost/sku data.
-    unitCost: item.costBasis ?? null,
-    sku: item.sku ?? null,
-    partNumber: options?.partNumber ?? vendor.mfgPartNo,
-    procurementSource: vendor.procurementSource,
-    vendorSku: vendor.vendorSku,
-    manufacturer: vendor.manufacturer,
-    // Deposit eligibility defaults from the catalog item's type — hardware is the
-    // one category a deposit typically secures (custom order, restocking risk).
-    // itemType is snapshotted at add-time so a later catalog recategorization
-    // never reshuffles an existing quote's category breakdown or deposit math.
-    depositEligible: item.itemType === 'hardware',
-    itemType: item.itemType,
-    sortOrder,
-  }).returning();
-  await recomputeAndPersist(quoteId);
-  return row!;
+  return db.transaction(async (tx) => {
+    const q = await lockDraftQuote(tx, quoteId, actor);
+    // Scope the catalog lookup to the quote's OWN partner. catalog_items is
+    // partner-axis RLS, which contains a foreign item for a partner-scope caller —
+    // but under SYSTEM scope the partner predicate short-circuits, so without this
+    // explicit filter a system-scope request could snapshot another partner's
+    // catalog item (name/price/taxable/billingType) into the quote line and bind a
+    // foreign catalog_item_id FK. Mirrors invoiceService → catalogService's
+    // getOwnedItemOr404(id, partnerId): a foreign item resolves to not-found
+    // regardless of read scope.
+    const [item] = await tx.select().from(catalogItems)
+      .where(and(eq(catalogItems.id, catalogItemId), eq(catalogItems.partnerId, q.partnerId)))
+      .limit(1);
+    if (!item) throw new QuoteServiceError('Catalog item not found', 404, 'CATALOG_ITEM_NOT_FOUND');
+    // Multi-currency wave 3 (#3775, B3): the sell price comes from the price book
+    // (org override in the quote's currency → catalog_item_prices row for that
+    // currency), never from the deprecated catalog_items.unit_price mirror and
+    // never converted. Resolved on the already-locked tx (quote → lines → catalog
+    // plain SELECTs — no new lock edge). A gap is a typed 409 so the caller can
+    // fall back to a manual line.
+    let resolved;
+    try {
+      resolved = await resolvePrice(
+        catalogItemId,
+        q.currencyCode,
+        q.orgId,
+        { userId: actor.userId, partnerId: q.partnerId, accessibleOrgIds: actor.accessibleOrgIds },
+        tx
+      );
+    } catch (err) {
+      if (err instanceof CatalogServiceError && (err.code === 'NO_PRICE_FOR_CURRENCY' || err.code === 'PRICE_NOT_REPRESENTABLE')) {
+          throw new QuoteServiceError(err.message, 409, err.code);
+      }
+      throw err;
+    }
+    const vendor = vendorIdentityFromAttributes(item.attributes);
+    // Phase 1 recurrence is monthly|annual only; quarterly is not offered (dropped
+    // from the catalog Zod enum). The DB enum retains 'quarterly' for a future phase.
+    const recurrence = item.billingType === 'recurring'
+      ? (item.billingFrequency === 'annual' ? 'annual' : 'monthly')
+      : 'one_time';
+    const qty = String(quantity);
+    const resolvedBlockId = await resolveLineBlockId(quoteId, q.orgId, blockId, tx);
+    const sortOrder = await nextLineSortOrder(quoteId, tx);
+    const [row] = await tx.insert(quoteLines).values({
+      quoteId,
+      orgId: q.orgId,
+      blockId: resolvedBlockId,
+      sourceType: 'catalog',
+      catalogItemId,
+      // Mirror the catalog item: its name is the line title, its description the blurb.
+      name: item.name,
+      description: item.description ?? null,
+      quantity: qty,
+      unitPrice: resolved.unitPrice,
+      taxable: resolved.taxable,
+      customerVisible: true,
+      lineTotal: computeLineTotal(qty, resolved.unitPrice, q.currencyCode),
+      recurrence,
+      termMonths: item.commitmentTermMonths ?? null,
+      billingFrequency: item.billingFrequency ?? null,
+      // Snapshot internal economics from the catalog item at add-time so a later
+      // catalog edit never mutates existing quote line cost/sku data. Cost is
+      // only meaningful in the line's currency: when the item's cost_currency
+      // differs from the quote currency the margin is unavailable (no conversion).
+      unitCost: resolved.marginAvailable ? resolved.costBasis : null,
+      sku: item.sku ?? null,
+      partNumber: options?.partNumber ?? vendor.mfgPartNo,
+      procurementSource: vendor.procurementSource,
+      vendorSku: vendor.vendorSku,
+      manufacturer: vendor.manufacturer,
+      // Deposit eligibility defaults from the catalog item's type — hardware is the
+      // one category a deposit typically secures (custom order, restocking risk).
+      // itemType is snapshotted at add-time so a later catalog recategorization
+      // never reshuffles an existing quote's category breakdown or deposit math.
+      depositEligible: item.itemType === 'hardware',
+      itemType: item.itemType,
+      sortOrder,
+    }).returning();
+    await recomputeAndPersist(quoteId, tx);
+    return row!;
+  });
 }
 
 export async function updateLine(
@@ -1143,57 +1799,211 @@ export async function updateLine(
     procurementSource?: string | null; vendorSku?: string | null; manufacturer?: string | null;
     imageId?: string | null;
     depositEligible?: boolean;
+    deviceRoles?: string[];
+    deviceGroupId?: string;
+    siteId?: string | null;
+    includedQuantity?: number | null;
+    overageMode?: 'bill' | 'flag' | null;
+    overageUnitPrice?: number | null;
   },
   actor: QuoteActor
 ) {
-  await loadDraft(quoteId, actor);
-  const [existing] = await db.select().from(quoteLines)
-    .where(and(eq(quoteLines.id, lineId), eq(quoteLines.quoteId, quoteId))).limit(1);
-  if (!existing) throw new QuoteServiceError('Line not found', 404, 'LINE_NOT_FOUND');
-  const quantity = input.quantity != null ? String(input.quantity) : existing.quantity;
-  const unitPrice = input.unitPrice != null ? Number(input.unitPrice).toFixed(2) : existing.unitPrice;
-  const set: Record<string, unknown> = {
-    // name/description are independently patchable; undefined leaves them as-is,
-    // an explicit null clears them (the refine on the route schema keeps ≥1 set).
-    name: input.name !== undefined ? input.name : existing.name,
-    description: input.description !== undefined ? input.description : existing.description,
-    quantity,
-    unitPrice,
-    taxable: input.taxable ?? existing.taxable,
-    customerVisible: input.customerVisible ?? existing.customerVisible,
-    recurrence: input.recurrence ?? existing.recurrence,
-    lineTotal: computeLineTotal(quantity, unitPrice),
-  };
-  if (input.termMonths !== undefined) set.termMonths = input.termMonths;
-  if (input.sortOrder !== undefined) set.sortOrder = input.sortOrder;
-  if (input.unitCost !== undefined) set.unitCost = input.unitCost != null ? Number(input.unitCost).toFixed(2) : null;
-  if (input.sku !== undefined) set.sku = input.sku;
-  if (input.partNumber !== undefined) set.partNumber = input.partNumber;
-  if (input.procurementSource !== undefined) set.procurementSource = input.procurementSource;
-  if (input.vendorSku !== undefined) set.vendorSku = input.vendorSku;
-  if (input.manufacturer !== undefined) set.manufacturer = input.manufacturer;
-  if (input.depositEligible !== undefined) set.depositEligible = input.depositEligible;
-  if (input.imageId !== undefined) {
-    // Ownership check: the image must be a quote_images row on THIS quote, or a
-    // caller could point a line at another tenant's image and exfiltrate its
-    // bytes through the customer document/PDF.
-    if (input.imageId !== null) {
-      const [img] = await db.select({ id: quoteImages.id }).from(quoteImages)
-        .where(and(eq(quoteImages.id, input.imageId), eq(quoteImages.quoteId, quoteId))).limit(1);
-      if (!img) throw new QuoteServiceError('Image not found on this quote', 404, 'IMAGE_NOT_FOUND');
+  return db.transaction(async (tx) => {
+    const q = await lockDraftQuote(tx, quoteId, actor);
+    const [existing] = await tx.select().from(quoteLines)
+      .where(and(eq(quoteLines.id, lineId), eq(quoteLines.quoteId, quoteId))).limit(1);
+    if (!existing) throw new QuoteServiceError('Line not found', 404, 'LINE_NOT_FOUND');
+    // #3205 W05. A patch naming contractLineType is already a 400 at the
+    // .strict() schema edge, so the service never sees one.
+    if (existing.contractLineType && input.quantity !== undefined) {
+      // The schema cannot enforce this stateful rule because a PATCH carries no
+      // contractLineType and only the service knows what the stored line IS.
+      throw new QuoteServiceError(
+        'quantity is derived from the live device count on a device-set line — use POST /quotes/:id/lines/refresh-device-counts',
+        400, 'INVALID_LINE_PATCH', { issues: [{ path: 'quantity', message: 'quantity is server-derived on a device-set line' }] },
+      );
     }
-    set.imageId = input.imageId;
-  }
-  await db.update(quoteLines).set(set).where(eq(quoteLines.id, lineId));
-  await recomputeAndPersist(quoteId);
-  const [updated] = await db.select().from(quoteLines).where(eq(quoteLines.id, lineId)).limit(1);
-  return updated!;
+    const descriptorKeys = [
+      'deviceRoles', 'deviceGroupId', 'siteId', 'includedQuantity', 'overageMode', 'overageUnitPrice',
+    ] as const;
+    if (!existing.contractLineType) {
+      const invalidDescriptorKeys = descriptorKeys.filter((key) =>
+        Object.prototype.hasOwnProperty.call(input, key));
+      if (invalidDescriptorKeys.length > 0) {
+        throw new QuoteServiceError(
+          'this line has no device set',
+          400,
+          'INVALID_LINE_PATCH',
+          {
+            issues: invalidDescriptorKeys.map((path) => ({
+              path,
+              message: 'device-set fields are only valid on a device-set line',
+            })),
+          },
+        );
+      }
+    }
+    const quantity = input.quantity != null ? String(input.quantity) : existing.quantity;
+    const unitPrice = input.unitPrice != null ? Number(input.unitPrice).toFixed(2) : existing.unitPrice;
+    if (input.unitPrice != null) assertRepresentable(unitPrice, q.currencyCode);
+    if (input.unitCost != null) assertRepresentable(Number(input.unitCost).toFixed(2), q.currencyCode);
+    const set: Record<string, unknown> = {
+      // name/description are independently patchable; undefined leaves them as-is,
+      // an explicit null clears them (the refine on the route schema keeps ≥1 set).
+      name: input.name !== undefined ? input.name : existing.name,
+      description: input.description !== undefined ? input.description : existing.description,
+      quantity,
+      unitPrice,
+      taxable: input.taxable ?? existing.taxable,
+      customerVisible: input.customerVisible ?? existing.customerVisible,
+      recurrence: input.recurrence ?? existing.recurrence,
+      lineTotal: computeLineTotal(quantity, unitPrice, q.currencyCode),
+    };
+    if (input.termMonths !== undefined) set.termMonths = input.termMonths;
+    if (input.sortOrder !== undefined) set.sortOrder = input.sortOrder;
+    if (input.unitCost !== undefined) set.unitCost = input.unitCost != null ? Number(input.unitCost).toFixed(2) : null;
+    if (input.sku !== undefined) set.sku = input.sku;
+    if (input.partNumber !== undefined) set.partNumber = input.partNumber;
+    if (input.procurementSource !== undefined) set.procurementSource = input.procurementSource;
+    if (input.vendorSku !== undefined) set.vendorSku = input.vendorSku;
+    if (input.manufacturer !== undefined) set.manufacturer = input.manufacturer;
+    if (input.depositEligible !== undefined) set.depositEligible = input.depositEligible;
+    if (existing.contractLineType) {
+      const persisted = {
+        ...existing,
+        includedQuantity: existing.includedQuantity == null ? null : Number(existing.includedQuantity),
+        overageUnitPrice: existing.overageUnitPrice == null ? null : Number(existing.overageUnitPrice),
+      };
+      const merged = mergeQuoteLinePatch(persisted as never, input as never);
+
+      // Resolve moved references before validating the final persisted shape so
+      // adding a site to an org-wide line validates against its fresh stamp.
+      if (input.deviceGroupId !== undefined && input.deviceGroupId !== existing.deviceGroupId) {
+        const group = await assertQuoteGroupInOrg(tx, input.deviceGroupId, q.orgId);
+        set.deviceGroupId = group.id;
+        set.deviceGroupName = group.name;
+        merged.deviceGroupId = group.id;
+        merged.deviceGroupName = group.name;
+      }
+      if (Object.prototype.hasOwnProperty.call(input, 'siteId') && input.siteId !== existing.siteId) {
+        const site = input.siteId ? await assertQuoteSiteInOrg(tx, input.siteId, q.orgId) : null;
+        set.siteId = site?.id ?? null;
+        set.siteName = site?.name ?? null;
+        merged.siteId = site?.id ?? null;
+        merged.siteName = site?.name ?? null;
+      }
+
+      const issues = quoteLineDeviceSetIssues(merged, { mode: 'persisted' });
+      if (issues.length > 0) {
+        throw new QuoteServiceError('Invalid line patch', 400, 'INVALID_LINE_PATCH', { issues });
+      }
+
+      for (const key of ['deviceRoles', 'includedQuantity', 'overageMode', 'overageUnitPrice'] as const) {
+        if (!Object.prototype.hasOwnProperty.call(input, key)) continue;
+        const value = input[key];
+        set[key] = key === 'includedQuantity' || key === 'overageUnitPrice'
+          ? (value == null ? null : Number(value).toFixed(2))
+          : (value ?? null);
+      }
+      if (set.overageUnitPrice) assertRepresentable(set.overageUnitPrice as string, q.currencyCode);
+
+      // A descriptor change is the one mutation that explicitly re-counts this
+      // line; unrelated edits retain the persisted estimate.
+      const descriptorTouched = descriptorKeys
+        .some((key) => Object.prototype.hasOwnProperty.call(input, key));
+      if (descriptorTouched) {
+        const valueFor = <T>(key: string, fallback: T): T =>
+          (Object.prototype.hasOwnProperty.call(set, key) ? set[key] : fallback) as T;
+        const [count] = await countQuoteDeviceSetLines(q.orgId, [{
+          id: lineId,
+          description: (set.name as string | null) ?? existing.name ?? existing.description ?? '',
+          contractLineType: existing.contractLineType as QuoteDeviceSetType,
+          deviceRoles: valueFor<string[] | null>('deviceRoles', existing.deviceRoles),
+          deviceGroupId: valueFor<string | null>('deviceGroupId', existing.deviceGroupId),
+          deviceGroupName: valueFor<string | null>('deviceGroupName', existing.deviceGroupName),
+          siteId: valueFor<string | null>('siteId', existing.siteId),
+          siteName: valueFor<string | null>('siteName', existing.siteName),
+          includedQuantity: valueFor<string | null>('includedQuantity', existing.includedQuantity),
+          overageMode: valueFor<'bill' | 'flag' | null>('overageMode', existing.overageMode as 'bill' | 'flag' | null),
+          overageUnitPrice: valueFor<string | null>('overageUnitPrice', existing.overageUnitPrice),
+        }]);
+        if (count!.error) {
+          throw new QuoteServiceError(
+            'This device set could not be counted right now', 400, 'DEVICE_SET_UNCOUNTABLE', { reason: count!.error },
+          );
+        }
+        set.quantity = count!.billed.toFixed(2);
+        set.lineTotal = computeLineTotal(
+          set.quantity as string, (set.unitPrice as string) ?? existing.unitPrice, q.currencyCode,
+        );
+      }
+    }
+    if (input.imageId !== undefined) {
+      // Ownership check: the image must be a quote_images row on THIS quote, or a
+      // caller could point a line at another tenant's image and exfiltrate its
+      // bytes through the customer document/PDF.
+      if (input.imageId !== null) {
+        const [img] = await tx.select({ id: quoteImages.id }).from(quoteImages)
+          .where(and(eq(quoteImages.id, input.imageId), eq(quoteImages.quoteId, quoteId))).limit(1);
+        if (!img) throw new QuoteServiceError('Image not found on this quote', 404, 'IMAGE_NOT_FOUND');
+      }
+      set.imageId = input.imageId;
+    }
+    await tx.update(quoteLines).set(set).where(eq(quoteLines.id, lineId));
+    await recomputeAndPersist(quoteId, tx);
+    const [updated] = await tx.select().from(quoteLines).where(eq(quoteLines.id, lineId)).limit(1);
+    return updated!;
+  });
+}
+
+/** #3205 W05, decision 6: the explicit, auditable refresh. Drafts only — a
+ *  sent quote's lines are immutable. A quantity never moves as a side effect of
+ *  an unrelated edit. */
+export async function refreshQuoteDeviceCounts(
+  quoteId: string, actor: QuoteActor,
+): Promise<QuoteDeviceSetCount[]> {
+  return db.transaction(async (tx) => {
+    let q;
+    try {
+      q = await lockDraftQuote(tx, quoteId, actor);
+    } catch (err) {
+      // This endpoint exposes INVALID_STATE for status conflicts, matching the
+      // endpoint contract while retaining lockDraftQuote's standard guard.
+      if (err instanceof QuoteServiceError && err.code === 'NOT_A_DRAFT') {
+        throw new QuoteServiceError('Quote is not a draft', 409, 'INVALID_STATE');
+      }
+      throw err;
+    }
+    const rows = await tx.select().from(quoteLines)
+      .where(and(eq(quoteLines.quoteId, quoteId), isNotNull(quoteLines.contractLineType)));
+    if (rows.length === 0) return [];
+    const counts = await countQuoteDeviceSetLines(q.orgId, rows.map(toQuoteDeviceSetLine));
+    await persistQuoteDeviceSetQuantities(tx, quoteId, q.currencyCode, rows, counts);
+    await recomputeAndPersist(quoteId, tx);
+    return counts;
+  });
+}
+
+/** Advisory live counts for the editor's staleness chip and the send-time drift
+ *  report. READ-ONLY and available in any status — it changes nothing, so a
+ *  sent quote can be inspected without being repriced. */
+export async function quoteDeviceSetEstimate(
+  quoteId: string, actor: QuoteActor,
+): Promise<QuoteDeviceSetCount[]> {
+  const [q] = await db.select().from(quotes).where(eq(quotes.id, quoteId)).limit(1);
+  if (!q) throw new QuoteServiceError('Quote not found', 404, 'QUOTE_NOT_FOUND');
+  assertQuoteAccess(actor, q);
+  const rows = await db.select().from(quoteLines)
+    .where(and(eq(quoteLines.quoteId, quoteId), isNotNull(quoteLines.contractLineType)));
+  return countQuoteDeviceSetLines(q.orgId, rows.map(toQuoteDeviceSetLine));
 }
 
 export async function removeLine(quoteId: string, lineId: string, actor: QuoteActor) {
-  await loadDraft(quoteId, actor);
-  await db.delete(quoteLines).where(and(eq(quoteLines.id, lineId), eq(quoteLines.quoteId, quoteId)));
-  await recomputeAndPersist(quoteId);
+  await db.transaction(async (tx) => {
+    await lockDraftQuote(tx, quoteId, actor);
+    await tx.delete(quoteLines).where(and(eq(quoteLines.id, lineId), eq(quoteLines.quoteId, quoteId)));
+    await recomputeAndPersist(quoteId, tx);
+  });
 }
 
 // ---------------------------------------------------------------------------

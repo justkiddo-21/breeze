@@ -30,6 +30,7 @@ import {
   canManagePartnerWidePolicies,
   policyAccessCondition,
   PARTNER_WIDE_WRITE_DENIED_MESSAGE,
+  PolicyHasChildrenError,
 } from './configurationPolicy';
 import {
   getConfigPolicyComplianceRuleInfo,
@@ -72,10 +73,62 @@ const VALIDATED_INLINE_SETTINGS: Record<string, { schema: { safeParse: (raw: unk
   monitoring: { schema: monitoringInlineSettingsSchema, normalize: false },
 };
 
+/**
+ * Refuses an assistant-authored automation action that asks to run a script
+ * ELEVATED (#4888).
+ *
+ * `automation` inline settings are not schema-validated at this layer (they
+ * are not in VALIDATED_INLINE_SETTINGS), so `actions` reaches
+ * `normalizeAutomationActions` as an opaque record — and that function
+ * tolerates `runAs: 'elevated'` on purpose, because it also runs over
+ * already-stored rows every time an automation executes and must not take a
+ * live automation offline.
+ *
+ * The result, without this guard, is a privilege hole with this PR's name on
+ * it: `manage_policy_feature_link` is TIER 2 (auto-executes, audit only, no
+ * human approval), so an assistant could author an automation action that runs
+ * a script with full administrator/root privileges — while the very same
+ * assistant calling `run_script` directly is held to `executeScriptSchema`,
+ * which excludes 'elevated', AND to a Tier-3 human approval. An assistant must
+ * not be able to reach through a config policy for a capability it is refused
+ * head-on.
+ *
+ * Scope, stated plainly: this closes the ASSISTANT path only. A raw
+ * `POST /automations` call still reaches the same tolerant
+ * `normalizeAutomationActions` (`routes/automations.ts` types `actions` as
+ * `z.unknown()`), because closing that safely needs to distinguish a NEWLY
+ * SUBMITTED 'elevated' from one already stored on the row being edited — a
+ * design decision, not a guard. Tracked as follow-up work on #4888; it is a
+ * pre-existing gap, not one this change opens.
+ */
+function rejectElevatedAutomationActions(raw: unknown): string | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const items = (raw as { items?: unknown }).items;
+  if (!Array.isArray(items)) return null;
+
+  for (const item of items) {
+    const actions = (item as { actions?: unknown } | null)?.actions;
+    if (!Array.isArray(actions)) continue;
+    for (const action of actions) {
+      const candidate = action as { type?: unknown; runAs?: unknown } | null;
+      if (candidate?.type !== 'run_script' || candidate.runAs === undefined || candidate.runAs === null) continue;
+      if (candidate.runAs !== 'system' && candidate.runAs !== 'user') {
+        return `A run_script automation action may set runAs to "system" or "user" only (got "${String(candidate.runAs)}"). Elevation is a property of the saved script, not something an automation action may request.`;
+      }
+    }
+  }
+  return null;
+}
+
 function validateInlineSettingsForFeature(
   featureType: string | undefined,
   raw: unknown
 ): { value: unknown } | { error: string } {
+  if (featureType === 'automation') {
+    const elevated = rejectElevatedAutomationActions(raw);
+    if (elevated) return { error: elevated };
+  }
+
   const entry = featureType ? VALIDATED_INLINE_SETTINGS[featureType] : undefined;
   if (!entry || raw === undefined || raw === null) return { value: raw };
 
@@ -107,6 +160,15 @@ function safeHandler(
     }
   };
 }
+
+/**
+ * RMM-QA-176 D9.3. Exported so the tests assert the SAME string the handler
+ * returns, rather than a copy that can drift.
+ */
+export const MAINTENANCE_LINK_MACHINE_PRINCIPAL_DENIED =
+  'Authoring a maintenance feature link suppresses monitoring and requires an interactive user session. API-key and OAuth-grant callers cannot perform this action.';
+export const MAINTENANCE_LINK_FEATURE_TYPE_REQUIRED =
+  'This feature link is a maintenance link. Re-issue the call with featureType: "maintenance" so the change routes through approval.';
 
 export function registerConfigPolicyTools(aiTools: Map<string, AiTool>): void {
   function registerTool(tool: AiTool): void {
@@ -560,7 +622,31 @@ export function registerConfigPolicyTools(aiTools: Map<string, AiTool>): void {
 
       if (action === 'delete') {
         if (!input.policyId) return JSON.stringify({ error: 'policyId is required for delete' });
-        const deleted = await deleteConfigPolicy(input.policyId as string, auth);
+        let deleted;
+        try {
+          deleted = await deleteConfigPolicy(input.policyId as string, auth);
+        } catch (err) {
+          // Without this branch safeHandler would flatten an actionable refusal
+          // into "Operation failed. Check server logs for details.", leaving the
+          // model with no way to know WHY or what to do next (#5080).
+          if (err instanceof PolicyHasChildrenError) {
+            // The children list is EMPTY for the lost-race variant (a child was
+            // created between the pre-check and the DELETE, caught by the FK).
+            // Rendering the generic message there would read "0 policy/policies
+            // inherit from it" while still refusing — self-contradicting, and it
+            // hides the one fact that matters: a retry may now behave differently.
+            if (err.children.length === 0) {
+              return JSON.stringify({
+                error: 'Cannot delete this configuration policy: another policy started inheriting from it just now. Re-check its child policies and retry.',
+              });
+            }
+            const names = err.children.map((c) => `"${c.name}" (${c.id})`).join(', ');
+            return JSON.stringify({
+              error: `Cannot delete this configuration policy: ${err.children.length} policy/policies inherit from it — ${names}. Delete or re-create those first.`,
+            });
+          }
+          throw err;
+        }
         if (!deleted) return JSON.stringify({ error: 'Configuration policy not found or access denied' });
         return JSON.stringify({ success: true, message: `Policy "${deleted.name}" deleted` });
       }
@@ -707,7 +793,7 @@ Inline settings shapes by feature type:
 - patch: { sources: ["os","third_party"], autoApprove: true, autoApproveSeverities: ["critical","important"], scheduleFrequency: "daily"|"weekly"|"monthly", scheduleTime: "02:00", scheduleDayOfWeek?: "tue", scheduleDayOfMonth?: 1, rebootPolicy: "never"|"if_required"|"always"|"maintenance_window" }
 - alert_rule: server-evaluated rules — CPU/RAM/disk thresholds, offline detection, and event log alerts. { items: [{ name, severity: "critical"|"high"|"medium"|"low"|"info" (default "medium"), conditions: 1-10 of [ { type: "metric" ("threshold" is accepted as an alias and canonicalized to "metric"), metric: "cpu"|"ram"|"disk"|"processCount" (these four are canonical; the aliases "cpuPercent"->cpu, "ramPercent"/"memory"->ram, "diskPercent"->disk, "processes"->processCount are accepted but map onto them — prefer the canonical names), operator: "gt"|"gte"|"lt"|"lte"|"eq"|"neq", value: number (a PERCENTAGE 0-100 for cpu/ram/disk; a plain count for processCount), durationMinutes?: number (1-10080; sustained window the samples are averaged over, default 1 minute) } | { type: "offline", durationMinutes?: number } | { type: "event_log", category: "security"|"hardware"|"application"|"system", level: "warning"|"error"|"critical" (matches this level and above), sourcePattern?: string (case-insensitive substring match, NOT a regex), messagePattern?: string, countThreshold?: number (1-10000, default 1), windowMinutes?: number (1-1440, default 15) } ], cooldownMinutes?: number (default 5), autoResolve?: boolean (default false), autoResolveConditions?: same condition shapes or null, titleTemplate?: string, messageTemplate?: string, sortOrder?: number }] } — 'custom' conditions and the extended types (bandwidth_high, disk_io_high, network_errors, patch_compliance, cert_expiry) are rejected on write. When the same threshold is configured in policies at different levels (e.g. org and site), the CLOSEST level to the device wins.
 - monitoring: agent-side service/process watches with auto-restart, delivered via heartbeat — not evaluated by the alert engine; watch failures are recorded and shown in the UI but do not currently raise alerts (alertOnStop/alertSeverity are stored but unused at runtime). { checkIntervalSeconds: 60, watches: [{ watchType: "service"|"process", name: "wuauserv", displayName?: "Windows Update", enabled: true, alertOnStop: true, alertAfterConsecutiveFailures: 2, alertSeverity: "critical"|"high"|"medium"|"low"|"info", cpuThresholdPercent?: 90, memoryThresholdMb?: 500, thresholdDurationSeconds: 300, autoRestart: false, maxRestartAttempts: 3, restartCooldownSeconds: 300 }] } — inline settings carry ONLY checkIntervalSeconds/watches now; metric alert rules and event log alerts moved to the alert_rule feature. Sending a non-empty 'alertRules' or 'eventLogAlerts' array is rejected with an error directing you to the alert_rule feature type instead.
-- maintenance: { recurrence: "once"|"daily"|"weekly"|"monthly", windowStart?: "ISO-8601 (for once)", durationHours: 1-72, timezone: "America/New_York", suppressAlerts: true, suppressPatching: true, suppressAutomations: false, suppressScripts: false, notifyBeforeMinutes?: 15, notifyOnStart: true, notifyOnEnd: true }
+- maintenance: { recurrence: "once"|"daily"|"weekly"|"monthly", windowStart?: "naive ISO-8601 local datetime for once (e.g. 2026-03-15T02:00) | HH:MM local time of day for daily/weekly/monthly (omit or null = 00:00). Never pass a Z-suffixed or offset-bearing instant for a recurring cadence — it is rejected and the window falls back to midnight.", durationHours: 1-72, timezone: "America/New_York", suppressAlerts: true, suppressPatching: true, suppressAutomations: false, suppressScripts: false, notifyBeforeMinutes?: 15, notifyOnStart: true, notifyOnEnd: true }
 - automation: { items: [{ name, enabled: true, triggerType: "schedule"|"event"|"manual", cronExpression?: "0 2 * * *", timezone?: "America/New_York", eventType?: "device.offline"|"alert.triggered"|"compliance.failed"|"patch.available", actions: [{ type: "run_script"|"send_notification"|"create_alert"|"execute_command", scriptId?|channelId?|severity?|message?|command? }], onFailure: "stop"|"continue"|"notify" }] }
 - event_log: { retentionDays: 30, maxEventsPerCycle: 100, collectCategories: ["security","hardware","application","system"], minimumLevel: "info"|"warning"|"error"|"critical", collectionIntervalMinutes: 15, rateLimitPerHour: 12000 }
 - compliance: { items: [{ name, enforcementLevel: "monitor"|"warn"|"enforce", checkIntervalMinutes: 60, rules: [{ type: "required_software"|"prohibited_software"|"disk_space_minimum"|"os_version"|"registry_check"|"config_file_check", name?|minGb?|osType?|path?|valueName?|expectedValue?|minVersion? }] }] }
@@ -718,6 +804,7 @@ Inline settings shapes by feature type:
 - helper: { enabled: true, showTrayIcon: true, showOpenPortal: true, showDeviceInfo: true, showRequestSupport: true, portalUrl?: "" } — showTrayIcon:false hides the system-tray icon while the helper keeps serving chat, remote-access consent and PAM dialogs.
 - pam: inlineSettings {uacInterceptionEnabled: boolean} — Windows UAC elevation prompt capture (default false / opt-in: capture is OFF when no policy assigns this feature). PAM rules/approvals are managed separately in the /pam console, not via config policies.
 - vulnerability: inlineSettings {enabled: boolean} — per-device CVE correlation / vulnerability scanning (default false / opt-in: devices with no policy are NOT scanned). Findings appear in the /vulnerabilities console; correlation runs daily.
+- device_lifecycle: inlineSettings {purgeRemovedAfterDays: number|null} — permanently delete removed devices N days after removal (1..3650); null/absent = keep forever. Purge is IRREVERSIBLE: it destroys the device record and all of its history. A daily job applies it; devices whose agent uninstall is still queued are skipped until it completes. Closest level wins, so an org-level link with null opts that org out of a partner-wide window.
 - remote_access: { webrtcDesktop: true, vncRelay: false, remoteTools: true, clipboardHostToViewer: true, clipboardViewerToHost: true, enableProxy: false, defaultAllowedPorts: [80,443], autoEnableProxy: false, maxConcurrentTunnels: 5, idleTimeoutMinutes: 5, maxSessionDurationHours: 8, sessionPromptMode?: "off"|"notify"|"consent", consentUnavailableBehavior?: "proceed"|"block", notifyOnSessionEnd?: true, showActiveIndicator?: true, technicianIdentityLevel?: "name_email"|"name"|"generic" } — all fields optional; updates MERGE over the currently stored settings, so send only the fields to change. Unknown keys are stripped, never applied — use exactly these key names.
 - onedrive_helper: { silentAccountConfig?, filesOnDemand?, kfmSilentOptIn?, kfmFolders? (Desktop/Documents/Pictures), kfmBlockOptOut?, tenantAssociationId?, restartOnChange?, libraries?: [{ libraryId, displayName, targetingMode (everyone|graph_group|local_ad_group), groupId?, groupName?, siteUrl? }] }
 
@@ -739,6 +826,7 @@ For link-only types, set featurePolicyId instead of inlineSettings:
               'maintenance', 'compliance', 'automation', 'event_log',
               'software_policy', 'sensitive_data', 'peripheral_control',
               'warranty', 'helper', 'remote_access', 'pam', 'onedrive_helper', 'vulnerability',
+              'device_lifecycle',
             ],
             description: 'Feature type (required for add)',
           },
@@ -767,6 +855,50 @@ For link-only types, set featurePolicyId instead of inlineSettings:
       // handler is the enforcement point for the AI path.)
       if (policy.orgId === null && !canManagePartnerWidePolicies(auth)) {
         return JSON.stringify({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE });
+      }
+
+      // RMM-QA-176 D9.3. Belt-and-braces to the input-aware tier escalation in
+      // aiGuardrails, and the ANTI-BYPASS for `update`: featureType is not a
+      // required input there, so a call that omits it presents nothing the
+      // guardrail hook can recognise as maintenance and would auto-execute at
+      // tier 2. Resolve the EXISTING link's type unconditionally (one indexed
+      // lookup, reused by the update branch below) and make the omission an
+      // actionable refusal, not a silent write.
+      let existingFeatureType: string | undefined;
+      if (action === 'update') {
+        const featureLinkIdForLookup = input.featureLinkId as string | undefined;
+        if (!featureLinkIdForLookup) return JSON.stringify({ error: 'featureLinkId is required for update' });
+        const [existingLink] = await db
+          .select({ featureType: configPolicyFeatureLinks.featureType })
+          .from(configPolicyFeatureLinks)
+          .where(and(
+            eq(configPolicyFeatureLinks.id, featureLinkIdForLookup),
+            eq(configPolicyFeatureLinks.configPolicyId, configPolicyId),
+          ))
+          .limit(1);
+        existingFeatureType = existingLink?.featureType as string | undefined;
+      }
+
+      const touchesMaintenance =
+        (action === 'add' && input.featureType === 'maintenance') ||
+        (action === 'update' && existingFeatureType === 'maintenance');
+
+      if (touchesMaintenance) {
+        // `?.` deliberately: callers build this context in several shapes and a
+        // hard read would turn any principal-less one into a safeHandler-wrapped
+        // generic tool error rather than reaching the real handler.
+        const principalKind = auth.principal?.kind;
+        if (principalKind === 'api_key' || principalKind === 'oauth_grant') {
+          // NOT an MFA check. Machine contexts carry token:{} (mcpServer.ts:2246)
+          // and hasSatisfiedMfa passes ANY context when ENABLE_2FA is off
+          // (middleware/auth.ts:884-887), so an MFA-based denial would admit
+          // exactly the callers this refuses. `ai_agent` is deliberately NOT
+          // here: an approved agent run must proceed (approval is upstream).
+          return JSON.stringify({ error: MAINTENANCE_LINK_MACHINE_PRINCIPAL_DENIED });
+        }
+        if (action === 'update' && input.featureType !== 'maintenance') {
+          return JSON.stringify({ error: MAINTENANCE_LINK_FEATURE_TYPE_REQUIRED });
+        }
       }
 
       if (action === 'add') {
@@ -812,15 +944,13 @@ For link-only types, set featurePolicyId instead of inlineSettings:
         if (input.featurePolicyId !== undefined) updates.featurePolicyId = input.featurePolicyId as string | null;
         if (input.inlineSettings !== undefined) {
           let inlineSettings: unknown = input.inlineSettings;
-          // update doesn't take featureType, so look up the existing link's
-          // type to know which validate-via-schema rule applies (same reasoning
-          // as the 'add' branch above).
-          const [existingLink] = await db
-            .select({ featureType: configPolicyFeatureLinks.featureType })
-            .from(configPolicyFeatureLinks)
-            .where(and(eq(configPolicyFeatureLinks.id, featureLinkId), eq(configPolicyFeatureLinks.configPolicyId, configPolicyId)))
-            .limit(1);
-          const validated = validateInlineSettingsForFeature(existingLink?.featureType, inlineSettings);
+          // update doesn't take featureType, so the existing link's type says
+          // which validate-via-schema rule applies (same reasoning as the 'add'
+          // branch above). Resolved once, above the maintenance gate — the
+          // lookup has to happen for EVERY update, not only inlineSettings
+          // ones, or a featurePolicyId-only edit of a maintenance link would
+          // slip past that gate entirely.
+          const validated = validateInlineSettingsForFeature(existingFeatureType, inlineSettings);
           if ('error' in validated) return JSON.stringify({ error: validated.error });
           inlineSettings = validated.value;
           updates.inlineSettings = inlineSettings;

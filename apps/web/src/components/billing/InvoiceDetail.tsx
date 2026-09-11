@@ -3,11 +3,12 @@ import { useTranslation } from 'react-i18next';
 import '../../lib/i18n';
 import { fetchWithAuth } from '../../stores/auth';
 import { navigateTo } from '@/lib/navigation';
-import { runAction, handleActionError } from '../../lib/runAction';
+import { runAction, handleActionError, ActionError } from '../../lib/runAction';
 import { usePermissions } from '../../lib/permissions';
 import { showToast } from '../shared/Toast';
 import { Dialog } from '../shared/Dialog';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
+import ChangeCurrencyDialog, { type CurrencyChangeMode } from './ChangeCurrencyDialog';
 import {
   type InvoiceDetail as InvoiceDetailData,
   type InvoiceLine,
@@ -26,14 +27,18 @@ import {
 } from './invoiceTypes';
 import { StatusPill } from './shared/StatusPill';
 import InvoiceActions from './InvoiceActions';
+import AccountingSyncCard from './AccountingSyncCard';
 import { MarginPanel, MarginToggle, useShowMargin } from './billingUi';
 import { computeChargeNow } from '@breeze/shared';
+import InvoiceLineDevices from './InvoiceLineDevices';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
 interface Props {
   detail: InvoiceDetailData;
-  onChanged: () => void;
+  /** Refetch the invoice. May return a promise — AccountingSyncCard's sync
+   *  watch awaits it so its polls cannot overlap. */
+  onChanged: () => void | Promise<void>;
   /** The workspace header owns the primary actions (Issue / Issue & Send /
    *  Download PDF / Delete draft) — suppress the rail copy so the two don't
    *  render at once (mirrors QuoteDetail.actionsInHeader). */
@@ -49,6 +54,9 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
     ? t('invoice.status.issued')
     : t(/* i18n-dynamic */ `invoice.status.${invoice.status}`);
   const stripeConnected = detail.stripeConnected === true;
+  // Warn-don't-block (#3777): only the API's cached account currency decides
+  // this — never recomputed client-side, never gates the pay-link action.
+  const currencyWarning = stripeConnected ? detail.currencyWarning ?? null : null;
 
   // The billing-wide persisted "internal costs on screen?" preference — the SAME
   // key the quote editor/detail toggles write, so "hide cost & margin" holds
@@ -74,16 +82,40 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
   // Reverse-a-payment confirm: reversing is a financial mutation, so it goes
   // through a confirm step that names the specific payment.
   const [reversePayment, setReversePayment] = useState<InvoicePayment | null>(null);
+  // Reset-link confirm dialog (revokes every issued public invoice link)
+  const [resetLinkOpen, setResetLinkOpen] = useState(false);
   // Void dialog
   const [voidOpen, setVoidOpen] = useState(false);
   const [voidReason, setVoidReason] = useState('');
   const [voidReissue, setVoidReissue] = useState(false);
 
+  // Draft-only currency restamp (#4416, ports the ContractDetail #3778
+  // pattern). The server (changeInvoiceCurrency, invoiceService.ts) is the
+  // authority: it re-checks invoices:write, the draft status and the row
+  // lock, so this dialog is a convenience, never a gate.
+  const [currencyOpen, setCurrencyOpen] = useState(false);
+  const [currencyBusy, setCurrencyBusy] = useState(false);
+  const [targetCurrency, setTargetCurrency] = useState(currency);
+  const [currencyMode, setCurrencyMode] = useState<CurrencyChangeMode | null>(null);
+  const [currencyConfirmed, setCurrencyConfirmed] = useState(false);
+  const [currencyError, setCurrencyError] = useState<string | null>(null);
+
   // Inline due-date editor (issued invoices only). Opens with the current due date;
   // Save PATCHes /invoices/:id/due-date.
   const [dueDateEditing, setDueDateEditing] = useState(false);
   const [dueDateDraft, setDueDateDraft] = useState(invoice.dueDate ?? '');
-  useEffect(() => { setDueDateDraft(invoice.dueDate ?? ''); }, [invoice.dueDate]);
+  // Re-seed from the prop DURING RENDER, never from a passive effect (#4807;
+  // same defect and remedy as InvoiceEditor's notes/terms drafts — #2925,
+  // #3219, #3277, #3980, #4033 — and AiBudgetThresholdsInput, #4659/#4805). A
+  // passive effect flushes AFTER commit, so a keystroke landing between the
+  // prop's commit and the effect's later run gets silently overwritten by the
+  // stale date the effect captured.
+  const dueDateSeed = invoice.dueDate ?? '';
+  const [dueDateSeededFrom, setDueDateSeededFrom] = useState(dueDateSeed);
+  if (dueDateSeededFrom !== dueDateSeed) {
+    setDueDateSeededFrom(dueDateSeed);
+    setDueDateDraft(dueDateSeed);
+  }
 
   const loadPayments = useCallback(async () => {
     const res = await fetchWithAuth(`/invoices/${invoice.id}/payments`);
@@ -144,20 +176,17 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
     depositDue: invoice.depositDue ?? null,
     amountPaid: invoice.amountPaid,
     balance: invoice.balance,
-  });
+  }, invoice.currencyCode);
 
   // The due date is editable once the invoice is live (issued/partially paid/overdue);
   // the /due-date route is gated on invoices:write.
   const canEditDueDate =
     can('invoices', 'write') && ['sent', 'partially_paid', 'overdue'].includes(invoice.status);
 
-  // Re-sending an issued, part-paid invoice reads as "request payment" rather than
-  // "send" — same POST /send call. Gate on a live, still-owing invoice + invoices:send.
-  const partiallyPaid = Number(invoice.amountPaid) > 0 && Number(invoice.balance) > 0;
-  const canRequestPayment =
-    can('invoices', 'send') &&
-    invoice.status !== 'draft' && invoice.status !== 'void' && invoice.status !== 'paid' &&
-    Number(invoice.balance) > 0;
+  // The email action on a live invoice (Send invoice / Request payment /
+  // Re-send) moved into InvoiceActions when invoices gained the quote composer:
+  // it belongs beside Issue & Send, and only there is it reachable from the
+  // workspace header as well as this rail.
 
   const saveDueDate = useCallback(async () => {
     if (busy || !dueDateDraft) return;
@@ -179,30 +208,6 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
       setBusy(false);
     }
   }, [busy, dueDateDraft, invoice.id, refresh, t]);
-
-  const requestPayment = useCallback(async () => {
-    if (busy) return;
-    setBusy(true);
-    try {
-      // /send is honest about whether an email actually went out — only claim it
-      // was sent when the API confirms an email was dispatched.
-      const result = await runAction<{ data: { emailed: boolean } }>({
-        request: () => fetchWithAuth(`/invoices/${invoice.id}/send`, { method: 'POST' }),
-        errorFallback: t('invoiceDetail.requestPayment.sendError'),
-        onUnauthorized: UNAUTHORIZED,
-      });
-      if (result?.data?.emailed) {
-        showToast({ type: 'success', message: partiallyPaid ? t('invoiceDetail.requestPayment.paymentRequestSent') : t('invoiceDetail.requestPayment.invoiceSent') });
-      } else {
-        showToast({ type: 'warning', message: t('invoiceDetail.requestPayment.noEmailWarning') });
-      }
-      refresh();
-    } catch (err) {
-      handleActionError(err, t('invoiceDetail.requestPayment.sendError'));
-    } finally {
-      setBusy(false);
-    }
-  }, [busy, invoice.id, partiallyPaid, refresh, t]);
 
   const recordPayment = useCallback(async () => {
     if (busy || !payAmount) return;
@@ -231,37 +236,6 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
     }
   }, [busy, payAmount, payMethod, payRef, payDate, invoice.id, refresh, t]);
 
-  const sendPayLink = useCallback(async () => {
-    if (busy) return;
-    setBusy(true);
-    try {
-      const result = await runAction<{ data: { url: string } }>({
-        request: () => fetchWithAuth(`/invoices/${invoice.id}/pay-link`, { method: 'POST' }),
-        errorFallback: t('invoiceDetail.payments.linkError'),
-        friendly: (code) => (code === 'STRIPE_NOT_CONNECTED' ? t('invoiceDetail.payments.connectStripe') : undefined),
-        onUnauthorized: UNAUTHORIZED,
-      });
-      const url = result?.data?.url;
-      if (url) {
-        try {
-          await navigator.clipboard.writeText(url);
-          showToast({ type: 'success', message: t('invoiceDetail.payments.linkCopied') });
-        } catch {
-          // Clipboard blocked (insecure context / permissions) — surface the URL.
-          window.prompt(t('invoiceDetail.payments.shareLinkPrompt'), url);
-        }
-      } else {
-        // 200 without a URL shouldn't happen (the API throws STRIPE_NO_URL), but
-        // never leave a money action with no feedback.
-        showToast({ type: 'error', message: t('invoiceDetail.payments.noLinkReturned') });
-      }
-    } catch (err) {
-      handleActionError(err, t('invoiceDetail.payments.linkError'));
-    } finally {
-      setBusy(false);
-    }
-  }, [busy, invoice.id, t]);
-
   const voidPayment = useCallback(async (paymentId: string) => {
     if (busy) return;
     setBusy(true);
@@ -280,6 +254,26 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
       setBusy(false);
     }
   }, [busy, invoice.id, refresh, t]);
+
+  // Revoke every issued public view-and-pay link; the next send/copy dispenses
+  // a fresh url. Rare action — for a link forwarded to the wrong hands.
+  const submitResetLink = useCallback(async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await runAction({
+        request: () => fetchWithAuth(`/invoices/${invoice.id}/reset-link`, { method: 'POST' }),
+        errorFallback: t('invoiceDetail.resetLink.error'),
+        successMessage: t('invoiceDetail.resetLink.success'),
+        onUnauthorized: UNAUTHORIZED,
+      });
+      setResetLinkOpen(false);
+    } catch (err) {
+      handleActionError(err, t('invoiceDetail.resetLink.error'));
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, invoice.id, t]);
 
   const submitVoid = useCallback(async () => {
     if (busy || !voidReason.trim()) return;
@@ -307,6 +301,51 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
       setBusy(false);
     }
   }, [busy, voidReason, voidReissue, invoice.id, refresh, t]);
+
+  const openCurrencyDialog = useCallback(() => {
+    setTargetCurrency(currency);
+    setCurrencyMode(null);
+    setCurrencyConfirmed(false);
+    setCurrencyError(null);
+    setCurrencyOpen(true);
+  }, [currency]);
+
+  const submitCurrency = useCallback(async () => {
+    if (currencyBusy || !currencyMode || !currencyConfirmed || targetCurrency === currency) return;
+    setCurrencyBusy(true);
+    // A retry starts from a clean slate — a stale error would read as a fresh
+    // rejection of the SAME attempt.
+    setCurrencyError(null);
+    try {
+      await runAction({
+        request: () => fetchWithAuth(`/invoices/${invoice.id}/currency`, {
+          method: 'POST',
+          body: JSON.stringify({
+            currencyCode: targetCurrency,
+            ...(currencyMode === 'clear' ? { clearLines: true } : { reprice: true }),
+          }),
+        }),
+        errorFallback: t('invoiceDetail.currency.errors.change'),
+        successMessage: t('invoiceDetail.currency.toast.changed', { currency: targetCurrency }),
+        onUnauthorized: UNAUTHORIZED,
+      });
+      setCurrencyOpen(false);
+      refresh();
+    } catch (err) {
+      // A 409 CURRENCY_LOCKED names why (line count) in its message — keep the
+      // dialog open and show it inline rather than losing it to a toast alone.
+      if (err instanceof ActionError && err.status === 409) {
+        setCurrencyError(err.message);
+      } else {
+        handleActionError(err, t('invoiceDetail.currency.errors.change'));
+      }
+    } finally {
+      setCurrencyBusy(false);
+    }
+  }, [currencyBusy, currencyMode, currencyConfirmed, targetCurrency, currency, invoice.id, refresh, t]);
+
+  const canChangeCurrency = can('invoices', 'write') && invoice.status === 'draft';
+  const currencySubmittable = !!currencyMode && currencyConfirmed && targetCurrency !== currency;
 
   return (
     <div className="space-y-6" data-testid="invoice-detail">
@@ -338,6 +377,12 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
             </div>
           ) : (
           <div className="rounded-lg border bg-card shadow-xs">
+            {/* #3205 W07: invoice-level provenance, rendered once. */}
+            {invoice.evidenceVersion === null && (
+              <p className="mb-2 px-3 pt-2 text-xs text-muted-foreground" data-testid="invoice-devices-not-recorded">
+                {t('invoiceDetail.devices.notRecorded')}
+              </p>
+            )}
             {/* Labeled, keyboard-reachable scroll region: the internal view runs
                 to 7 columns, well past a phone viewport — scroll inside the card
                 instead of bleeding past its rounded edge (QuoteDetail pattern). */}
@@ -378,6 +423,7 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
                       </span>
                       {internalView && !l.customerVisible ? t('invoiceDetail.lines.hiddenMarker') : ''}
                       {lineBlurb(l) && <div className="text-xs text-muted-foreground">{lineBlurb(l)}</div>}
+                      <InvoiceLineDevices invoiceId={invoice.id} line={l} />
                     </td>
                     <td className="px-3 py-2 text-right">{l.quantity}</td>
                     <td className="px-3 py-2 text-right">{formatMoney(l.unitPrice, currency)}</td>
@@ -511,6 +557,19 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
             </div>
           )}
 
+          {/* QuickBooks push status (Phase C). Renders only when the API
+              returned a mapping row — no connection, or an org-scoped read that
+              RLS-hides the partner-axis row, both come back null and the card
+              stays off the rail rather than implying "not synced". */}
+          <AccountingSyncCard
+            invoiceId={invoice.id}
+            sync={detail.accountingSync}
+            invoiceStatus={invoice.status}
+            invoiceTouchedAt={invoice.updatedAt}
+            canPush={can('invoices', 'write')}
+            onChanged={onChanged}
+          />
+
           {/* Terms & Conditions */}
           {invoice.termsAndConditions && (
             <div className="rounded-lg border bg-card p-4" data-testid="invoice-detail-terms">
@@ -519,21 +578,20 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
             </div>
           )}
 
-          {/* Primary actions (Issue / PDF / Delete) + void. The rail copy of
-              InvoiceActions is suppressed when the workspace header owns the
-              actions; Void stays here — its written-reason dialog belongs with
-              the issued-lifecycle rail, not the header. */}
+          {/* Primary actions (Issue / Send / Copy payment link / PDF / Delete)
+              + void. The rail copy of InvoiceActions is suppressed when the
+              workspace header owns the actions; Void stays here — its
+              written-reason dialog belongs with the issued-lifecycle rail, not
+              the header. */}
           <div className="space-y-2">
             {!actionsInHeader && <InvoiceActions detail={detail} onChanged={onChanged} variant="rail" />}
-            {/* Re-send the issued invoice. Reads as "Request payment" once the
-                customer has partially paid (same POST /send call). */}
-            {canRequestPayment && (
+            {invoice.status !== 'draft' && invoice.status !== 'void' && can('invoices', 'send') && (
               <button
-                type="button" onClick={() => void requestPayment()} disabled={busy}
-                data-testid="invoice-request-payment"
-                className="inline-flex w-full items-center justify-center rounded-md border px-4 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50"
+                type="button" onClick={() => setResetLinkOpen(true)}
+                data-testid="invoice-reset-link-open"
+                className="inline-flex w-full items-center justify-center rounded-md border px-4 py-2 text-sm font-medium hover:bg-muted"
               >
-                {partiallyPaid ? t('invoiceDetail.requestPayment.requestPayment') : t('invoiceDetail.requestPayment.sendInvoice')}
+                {t('invoiceDetail.resetLink.button')}
               </button>
             )}
             {canVoid && can('invoices', 'send') && (
@@ -543,6 +601,20 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
                 className="inline-flex w-full items-center justify-center rounded-md border border-destructive/40 px-4 py-2 text-sm font-medium text-destructive hover:bg-destructive/10"
               >
                 {t('invoiceDetail.void.button')}
+              </button>
+            )}
+            {/* Change stamped currency (DRAFT only, #4416). The server
+                re-checks permission, the draft status and eligibility under
+                the row lock. */}
+            {canChangeCurrency && (
+              <button
+                type="button"
+                onClick={openCurrencyDialog}
+                disabled={currencyBusy}
+                data-testid="invoice-currency-open"
+                className="inline-flex w-full items-center justify-center rounded-md border px-4 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50"
+              >
+                {t('invoiceDetail.currency.actions.change')}
               </button>
             )}
           </div>
@@ -572,10 +644,40 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
                           {t('invoiceDetail.payments.online')}
                         </span>
                       )}
+                      {p.source === 'quickbooks' && (
+                        <span
+                          className="rounded border border-border bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
+                          data-testid={`invoice-payment-quickbooks-${p.id}`}
+                        >
+                          {t('invoiceDetail.payments.quickbooks')}
+                        </span>
+                      )}
+                      {p.accountingSync && (
+                        <span
+                          className={`rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${
+                            p.accountingSync.status === 'error'
+                              ? 'border-destructive/40 bg-destructive/10 text-destructive'
+                              : 'border-border bg-muted text-muted-foreground'
+                          }`}
+                          data-testid={`invoice-payment-qbosync-${p.id}`}
+                          title={p.accountingSync.lastError ?? undefined}
+                        >
+                          {p.accountingSync.status === 'error'
+                            ? t('invoiceDetail.payments.quickbooksSyncFailed')
+                            : p.accountingSync.status === 'pending'
+                              ? t('invoiceDetail.payments.syncingToQuickbooks')
+                              : t('invoiceDetail.payments.inQuickbooks')}
+                        </span>
+                      )}
                     </span>
-                    {/* Stripe payments are refunded through Stripe, never hand-voided. */}
+                    {/* Stripe payments are refunded through Stripe, never hand-voided.
+                        QuickBooks-pulled payments are the same story with a different
+                        system of record: reversing one here would not touch the books,
+                        and the next reconcile would pull it straight back in. */}
                     {p.source === 'stripe' ? (
                       <span className="whitespace-nowrap text-[11px] text-muted-foreground">{t('invoiceDetail.payments.viaStripe')}</span>
+                    ) : p.source === 'quickbooks' ? (
+                      <span className="whitespace-nowrap text-[11px] text-muted-foreground">{t('invoiceDetail.payments.viaQuickbooks')}</span>
                     ) : can('invoices', 'send') ? (
                       <button
                         type="button" onClick={() => setReversePayment(p)} disabled={busy || invoice.status === 'void'}
@@ -597,15 +699,23 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
               </p>
             )}
 
-            {canRecordPayment && stripeConnected && can('invoices', 'send') && (
-              <button
-                type="button" onClick={() => void sendPayLink()} disabled={busy}
-                data-testid="invoice-pay-link"
-                className="mt-3 inline-flex w-full items-center justify-center rounded-md border px-4 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50"
+            {currencyWarning && (
+              <p
+                className="mt-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300"
+                role="status"
+                data-testid="invoice-stripe-currency-warning"
               >
-                {t('invoiceDetail.payments.sendLink')}
-              </button>
+                {currencyWarning.code === 'STRIPE_ACCOUNT_CURRENCY_UNKNOWN'
+                  ? t('invoiceDetail.payments.currencyUnknown', {
+                      documentCurrency: currencyWarning.documentCurrency,
+                    })
+                  : t('invoiceDetail.payments.currencyMismatch', {
+                      documentCurrency: currencyWarning.documentCurrency,
+                      accountCurrency: currencyWarning.accountCurrency,
+                    })}
+              </p>
             )}
+
             {canRecordPayment && !stripeConnected && (
               <p className="mt-3 text-xs text-muted-foreground" data-testid="invoice-stripe-nudge">
                 {t('invoiceDetail.payments.stripeNudge')}{' '}
@@ -697,6 +807,26 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
         confirmTestId="invoice-payment-confirm"
       />
 
+      {/* Reset-link confirm dialog */}
+      <Dialog open={resetLinkOpen} onClose={() => setResetLinkOpen(false)} title={t('invoiceDetail.resetLink.title')} labelledBy="invoice-reset-link-title" maxWidth="md" className="p-6">
+        <div className="space-y-4" data-testid="invoice-reset-link-dialog">
+          <div>
+            <h2 id="invoice-reset-link-title" className="text-lg font-semibold">{t('invoiceDetail.resetLink.title')}</h2>
+            <p className="mt-1 text-sm text-muted-foreground">{t('invoiceDetail.resetLink.description')}</p>
+          </div>
+          <div className="flex justify-end gap-2">
+            <button type="button" onClick={() => setResetLinkOpen(false)} className="rounded-md border px-4 py-2 text-sm font-medium hover:bg-muted">{t('common:actions.cancel')}</button>
+            <button
+              type="button" onClick={() => void submitResetLink()} disabled={busy}
+              data-testid="invoice-reset-link-submit"
+              className="inline-flex items-center justify-center rounded-md border border-destructive/40 px-4 py-2 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50"
+            >
+              {t('invoiceDetail.resetLink.confirm')}
+            </button>
+          </div>
+        </div>
+      </Dialog>
+
       {/* Void dialog */}
       <Dialog open={voidOpen} onClose={() => setVoidOpen(false)} title={t('invoiceDetail.void.title')} labelledBy="invoice-void-title" maxWidth="md" className="p-6">
         <div className="space-y-4" data-testid="invoice-void-dialog">
@@ -732,6 +862,36 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
           </div>
         </div>
       </Dialog>
+
+      <ChangeCurrencyDialog
+        open={currencyOpen}
+        onClose={() => setCurrencyOpen(false)}
+        busy={currencyBusy}
+        currentCurrency={currency}
+        targetCurrency={targetCurrency}
+        onTargetCurrencyChange={setTargetCurrency}
+        mode={currencyMode}
+        onModeChange={setCurrencyMode}
+        confirmed={currencyConfirmed}
+        onConfirmedChange={setCurrencyConfirmed}
+        error={currencyError}
+        onSubmit={() => void submitCurrency()}
+        submittable={currencySubmittable}
+        testIdPrefix="invoice-currency"
+        copy={{
+          title: t('invoiceDetail.currency.dialog.title'),
+          description: t('invoiceDetail.currency.dialog.description', { currency }),
+          currencyLabel: t('invoiceDetail.currency.dialog.currencyLabel'),
+          modeLegend: t('invoiceDetail.currency.dialog.modeLegend'),
+          modeClearLabel: t('invoiceDetail.currency.dialog.modeClear'),
+          modeClearHint: t('invoiceDetail.currency.dialog.modeClearHint'),
+          modeRepriceLabel: t('invoiceDetail.currency.dialog.modeReprice'),
+          modeRepriceHint: t('invoiceDetail.currency.dialog.modeRepriceHint'),
+          confirmLabel: t('invoiceDetail.currency.dialog.confirm'),
+          submitLabel: t('invoiceDetail.currency.dialog.submit'),
+          cancelLabel: t('common:actions.cancel'),
+        }}
+      />
     </div>
   );
 }

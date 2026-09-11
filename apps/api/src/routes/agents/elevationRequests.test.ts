@@ -8,6 +8,7 @@ vi.mock('../../db', () => ({
   db: {
     select: vi.fn(),
     insert: vi.fn(),
+    transaction: vi.fn(),
   },
 }));
 
@@ -104,6 +105,9 @@ vi.mock('../../services/auditEvents', () => ({
   writeAuditEvent: vi.fn(),
 }));
 
+const lifecycleMocks = vi.hoisted(() => ({ createPamDecisionIntent: vi.fn() }));
+vi.mock('../../services/pamActuationLifecycle', () => lifecycleMocks);
+
 vi.mock('../../services/clientIp', () => ({
   getTrustedClientIpOrUndefined: () => '203.0.113.7',
 }));
@@ -128,6 +132,7 @@ function buildApp(opts: { skipAuth?: boolean } = {}): Hono {
       c.set('agent', {
         deviceId: 'device-1',
         orgId: 'org-1',
+        partnerId: 'partner-1',
         agentId: 'agent-123',
         siteId: 'site-1',
         role: 'agent',
@@ -240,6 +245,14 @@ describe('agent elevation-requests ingestion route', () => {
     bridgeMocks.resolveElevationApprovers.mockResolvedValue([]);
     bridgeMocks.getUserPushTokens.mockResolvedValue([]);
     bridgeMocks.dispatchApprovalPushToTokens.mockResolvedValue({ tokensFound: 0, dispatched: 0, errors: 0 });
+    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn({ insert: db.insert }));
+    lifecycleMocks.createPamDecisionIntent.mockImplementation(async (_tx, input) => ({
+      actuationId: 'actuation-1',
+      elevationRequestId: input.request.id,
+      requestRevision: input.requestRevision,
+      generation: 1,
+      desiredState: input.decision === 'denied' ? 'cleanup' : 'active',
+    }));
   });
 
   it('inserts an elevation request and returns id + status', async () => {

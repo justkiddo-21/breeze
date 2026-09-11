@@ -18,7 +18,9 @@ import type { ToolExecutionContext } from './toolExecutionContext';
 import type { AiToolTier, ActionPlanStep } from '@breeze/shared/types/ai';
 import { compactToolResultForChat } from './aiToolOutput';
 import { sanitizeThrownToolError } from './aiToolErrors';
+import { buildToolHandoffResult, type ToolHandoffStatus } from './aiToolHandoff';
 import type { ActiveSession } from './streamingSessionManager';
+import type { SdkTool } from './aiAgents/outcomeTools';
 import { waitForPlanApproval } from './aiAgent';
 import {
   aiActionPlans,
@@ -26,8 +28,11 @@ import {
   peripheralPolicyActionEnum,
 } from '../db/schema';
 import { CONFIG_FEATURE_TYPES } from './configFeatureTypes';
-import { INVOICE_STATUSES } from '@breeze/shared';
+import { CONTACT_ROLES } from './contacts/types';
+import { ACTOR_TYPES, AI_AGENT_KINDS, INVOICE_STATUSES } from '@breeze/shared';
 import { getToolTimeout, withToolTimeout } from './toolTimeouts';
+import { aiRunContextInputShape } from './scriptRunRequest';
+import { captureMessage } from './sentry';
 import {
   m365LookupUserHandler, m365RecentSigninsHandler, m365ListGroupMembershipsHandler,
   m365DisableUserHandler, m365ResetPasswordHandler,
@@ -85,9 +90,41 @@ const SECRET_ACTION_REFUSED_TEXT =
 export type PreToolUseCallback = (
   toolName: string,
   input: Record<string, unknown>,
+  /**
+   * The `mcp__<server>__<tool>` name this call was EXPOSED to the model as,
+   * when it differs from the `executeTool` handler `toolName` above. Used for
+   * one thing only: the session-allowlist check, which compares against the
+   * names the caller put in `allowedTools` — i.e. exposed names, not handler
+   * names. Everything downstream (tier, RBAC, rate limit, approval, audit)
+   * stays on `toolName`, because that is where the capability actually lives.
+   *
+   * Pass the FULLY-QUALIFIED, non-empty `mcp__<server>__<tool>` string, not a
+   * bare name. Omit it whenever the two identities coincide — as of writing
+   * that is every tool this file's `breeze` server registers, and every
+   * script-builder tool except `execute_script_on_device` -> `run_script`.
+   * Only script builder's registrations are pinned against drift (see
+   * `scriptBuilderTools.guard.test.ts`); a NEW tool registered here under a
+   * name that differs from its handler must wire this argument, or the
+   * session allowlist will refuse it the way it refused every Script Builder
+   * test run with "Tool 'run_script' is not allowed for this session" (#4883).
+   */
+  mcpToolName?: string,
 ) => Promise<
   | { allowed: true; intentId?: string; context?: ToolExecutionContext }
-  | { allowed: false; error: string }
+  /**
+   * Not run by THIS session. Two different things wear this shape:
+   *
+   *  - a real denial/failure (`handoff` absent) — published as `isError: true`
+   *    with `{ error }`, as it always was; and
+   *  - an approval HANDOFF (`handoff` set) — the human approved and the action
+   *    is executing under the durable release worker, so this session declines
+   *    to run it. Published as `isError: false` with `{ status, message }`.
+   *
+   * `error` carries the model-facing text in both cases; when `handoff` is set
+   * it is a status message, not a failure, and it never reaches an `error`
+   * field on the wire. See services/aiToolHandoff.ts (#5107).
+   */
+  | { allowed: false; error: string; handoff?: ToolHandoffStatus }
 >;
 
 /**
@@ -105,6 +142,14 @@ export type PostToolUseCallback = (
    *  the blob destined for action_intents.result, which must never appear in
    *  `output`. */
   sealed?: { intentId: string; sealedResult: Record<string, unknown> },
+  /**
+   * Set ONLY when the pre-tool-use gate itself reported an approval handoff
+   * (#5107) — never inferred from `output`. The same value also appears as
+   * `output.status`, but a tool controls its own output: without this trusted
+   * channel, any tool could stamp its own audit row and repaint its own
+   * failure as an approved, in-flight action.
+   */
+  handoff?: ToolHandoffStatus,
 ) => Promise<void>;
 
 // ============================================
@@ -129,6 +174,8 @@ export const TOOL_TIERS = {
   sync_huntress_data: 2,
   execute_command: 3,
   run_script: 3,
+  // #3525 — the de-escalation that undoes run_script; same tier, same gate.
+  cancel_script_execution: 3,
   // Script library (read-only) — used by the script-builder assistant to
   // reference existing scripts. Absent here, createSessionPreToolUse rejects
   // them as "Unknown tool" before execution (the script-builder could not
@@ -148,7 +195,7 @@ export const TOOL_TIERS = {
   // Fleet hygiene (Task 8) — read-only fleet-wide aggregation.
   get_fleet_findings: 1,
   analyze_fleet_metrics: 1,
-  get_fleet_status: 1,
+  get_invite_funnel: 1,
   delete_tenant: 3,
   get_backup_health: 1,
   run_backup_verification: 2,
@@ -218,6 +265,9 @@ export const TOOL_TIERS = {
   // Org lifecycle tools (issue #2366) — new-customer intake (org → site → quote)
   list_organizations: 1,
   manage_organizations: 2,      // create_org/update_org/create_site escalate to 3 in guardrails
+  // AI agent governance (P2-5, #4192). Base tier 3 — there is no lower-tier
+  // action on this tool, and its single action is four_eyes in guardrails.
+  manage_ai_agents: 3,
   // Billing / quoting / catalog / contracts (#3156). Same #2605 failure mode as
   // the vulnerability tools: registered in the aiTools execution registry (all
   // Tier 2 there) and reachable by external MCP clients, but never listed here
@@ -290,13 +340,43 @@ export const BREEZE_MCP_TOOL_NAMES = Object.keys(TOOL_TIERS).map(
 // Helper: Create tool handler that delegates to executeTool
 // ============================================
 
-const POST_TOOL_USE_TIMEOUT_MS = 10_000; // 10s for postToolUse DB writes
+// Exported so callers that schedule I/O INSIDE a postToolUse hook (e.g. the
+// headless agent run loop's act-mode verification read, actVerify.ts) can
+// size their own budget with headroom under this cap instead of picking an
+// unrelated number — see the wave-4b review fix.
+export const POST_TOOL_USE_TIMEOUT_MS = 10_000; // 10s for postToolUse DB writes
 
 /**
  * Fire postToolUse with a timeout — if DB writes hang, don't block the conversation.
  * The postToolUse callback already emits SSE events synchronously before DB writes,
  * so even on timeout the UI receives the tool_result event.
  */
+/**
+ * Turns a `allowed: false` pre-tool-use decision into the SDK result shape,
+ * and says whether it is a failure.
+ *
+ * The ONE place that decides `isError` for a blocked call. Three call sites
+ * (registry handler, session-aware handler, extra-tool wrapper) previously
+ * hard-coded `true` at each, which is how the approval handoff (#5107) reached
+ * the phone as `MANAGE_SERVICES · FAILED` right after the user approved it: an
+ * approved action executing under the durable worker is not an error. The
+ * handoff payload carries `status` (machine-readable, what the clients switch
+ * on) and never an `error` field, so nothing downstream can mistake it for a
+ * failure by shape either.
+ */
+function preToolUseDenialResult(
+  toolName: string,
+  check: { error: string; handoff?: ToolHandoffStatus },
+): { text: string; isError: boolean } {
+  const payload = check.handoff
+    ? buildToolHandoffResult(check.handoff, check.error)
+    : { error: check.error };
+  return {
+    text: compactToolResultForChat(toolName, JSON.stringify(payload)),
+    isError: !check.handoff,
+  };
+}
+
 async function safePostToolUse(
   onPostToolUse: PostToolUseCallback | undefined,
   toolName: string,
@@ -305,11 +385,12 @@ async function safePostToolUse(
   isError: boolean,
   durationMs: number,
   sealed?: { intentId: string; sealedResult: Record<string, unknown> },
+  handoff?: ToolHandoffStatus,
 ): Promise<void> {
   if (!onPostToolUse) return;
   try {
     await withToolTimeout(
-      onPostToolUse(toolName, args, output, isError, durationMs, sealed),
+      onPostToolUse(toolName, args, output, isError, durationMs, sealed, handoff),
       POST_TOOL_USE_TIMEOUT_MS,
       `postToolUse:${toolName}`,
     );
@@ -382,8 +463,8 @@ function makeHandler(
     // Pre-execution check (guardrails, RBAC, rate limits, approval)
     if (onPreToolUse) {
       let check:
-        | { allowed: true; context?: ToolExecutionContext }
-        | { allowed: false; error: string };
+        | { allowed: true; intentId?: string; context?: ToolExecutionContext }
+        | { allowed: false; error: string; handoff?: ToolHandoffStatus };
       try {
         check = await onPreToolUse(toolName, args);
       } catch (err) {
@@ -393,13 +474,26 @@ function makeHandler(
         const reason = sanitizeThrownToolError(`${toolName}:preToolUse`, err);
         check = { allowed: false, error: `Guardrails check failed: ${reason}` };
       }
-      if (check.allowed) verifiedContext = check.context;
+      // P2-5 (#4192): `intentId` is set by createSessionPreToolUse ONLY after
+      // it won the approved -> executing CAS on a durable intent, i.e. this
+      // invocation IS that intent's inline release — the same fact the durable
+      // worker carries as `intent.id`. Carried on the context (not on args,
+      // not on auth — see toolExecutionContext.ts) so a handler that may only
+      // run as an approved release can name the approval it is executing.
+      // Left entirely absent for an ordinary chat call, which keeps the
+      // three-argument executeTool call below unchanged for every tool that
+      // neither verified anything nor went through an intent.
+      if (check.allowed) {
+        verifiedContext = check.intentId
+          ? { ...check.context, actionIntentId: check.intentId }
+          : check.context;
+      }
       if (!check.allowed) {
-        const safeError = compactToolResultForChat(toolName, JSON.stringify({ error: check.error }));
-        await safePostToolUse(onPostToolUse, toolName, args, safeError, true, 0);
+        const denial = preToolUseDenialResult(toolName, check);
+        await safePostToolUse(onPostToolUse, toolName, args, denial.text, denial.isError, 0, undefined, check.handoff);
         return {
-          content: [{ type: 'text' as const, text: safeError }],
-          isError: true,
+          content: [{ type: 'text' as const, text: denial.text }],
+          isError: denial.isError,
         };
       }
     }
@@ -569,7 +663,9 @@ function makeSessionAwareHandler(
     // Pre-execution check (guardrails, RBAC, rate limits, approval). IDENTICAL to makeHandler.
     let intentId: string | undefined;
     if (onPreToolUse) {
-      let check: { allowed: true; intentId?: string } | { allowed: false; error: string };
+      let check:
+        | { allowed: true; intentId?: string }
+        | { allowed: false; error: string; handoff?: ToolHandoffStatus };
       try {
         check = await onPreToolUse(toolName, args);
       } catch (err) {
@@ -580,11 +676,11 @@ function makeSessionAwareHandler(
         check = { allowed: false, error: `Guardrails check failed: ${reason}` };
       }
       if (!check.allowed) {
-        const safeError = compactToolResultForChat(toolName, JSON.stringify({ error: check.error }));
-        await safePostToolUse(onPostToolUse, toolName, args, safeError, true, 0);
+        const denial = preToolUseDenialResult(toolName, check);
+        await safePostToolUse(onPostToolUse, toolName, args, denial.text, denial.isError, 0, undefined, check.handoff);
         return {
-          content: [{ type: 'text' as const, text: safeError }],
-          isError: true,
+          content: [{ type: 'text' as const, text: denial.text }],
+          isError: denial.isError,
         };
       }
       intentId = check.intentId;
@@ -949,16 +1045,175 @@ export function googleToolDefinitions(
 }
 
 /**
+ * `extraTools` (e.g. the headless-run outcome tools built by
+ * `buildOutcomeSdkTools` — `outcomeTools.ts`) arrive as bare
+ * `SdkMcpToolDefinition`s with no hook wiring of their own — `outcomeTools.ts`
+ * stays hook-free by design (it never touches the DB or the run's outcome
+ * object). Without this wrapper the SDK would invoke an extra tool's
+ * `handler` directly, so `onPreToolUse`/`onPostToolUse` — the run loop's
+ * ONLY channel for denying a call or capturing `outcome.alertVerdict` —
+ * would never fire for it (found in review: the verdict was silently never
+ * captured outside the unit tests, since nothing called the hooks in a real
+ * run). This gives an extra tool the SAME contract `makeHandler` gives every
+ * registry tool, including the two protections that were originally missing
+ * here (review round 2, Minor 1):
+ *   - The ENTIRE handler (preToolUse, the original handler, postToolUse)
+ *     runs inside `runOutsideDbContext`, exactly where `makeHandler` places
+ *     it — escaping any stale/committed AsyncLocalStorage DB context
+ *     inherited from the SDK's MCP callback chain (see `makeHandler`'s
+ *     docstring for the hang this prevents) so pre/post hooks that touch the
+ *     DB never inherit a dead connection.
+ *   - The original handler runs under `withToolTimeout(…, getToolTimeout(name),
+ *     name)` — the SAME timeout table `makeHandler` uses for registry tools
+ *     (`toolTimeouts.ts`: 60s default, per-name overrides), computed once per
+ *     wrap just like `makeHandler` computes it once per tool.
+ * Otherwise the flow is unchanged: the preToolUse gate runs first (a denial
+ * short-circuits with the SDK's own error-result shape, never reaching the
+ * handler), then postToolUse fires with the result's first text block (or the
+ * whole serialized result, if there is none) as `output` and `isError`
+ * reflecting whether the call actually failed — a timeout included, since
+ * `withToolTimeout`'s rejection lands in the same thrown-error catch block as
+ * any other failure (`sanitizeThrownToolError` → `isError` result →
+ * postToolUse).
+ */
+export function wrapExtraToolWithHooks(
+  extraTool: SdkTool,
+  onPreToolUse?: PreToolUseCallback,
+  onPostToolUse?: PostToolUseCallback,
+): SdkTool {
+  const { name, handler } = extraTool;
+  const toolTimeout = getToolTimeout(name);
+  return {
+    ...extraTool,
+    handler: async (args: Record<string, unknown>, extra: unknown): Promise<SdkToolResult> => {
+      // See makeHandler: escape any inherited AsyncLocalStorage DB context so
+      // preToolUse/handler/postToolUse all start with a clean context rather
+      // than a stale/committed one from the SDK's MCP callback chain.
+      return runOutsideDbContext(async (): Promise<SdkToolResult> => {
+      const startTime = Date.now();
+      if (onPreToolUse) {
+        let check:
+          | { allowed: true; context?: ToolExecutionContext }
+          | { allowed: false; error: string; handoff?: ToolHandoffStatus };
+        try {
+          check = await onPreToolUse(name, args);
+        } catch (err) {
+          const reason = sanitizeThrownToolError(`${name}:preToolUse`, err);
+          check = { allowed: false, error: `Guardrails check failed: ${reason}` };
+        }
+        if (!check.allowed) {
+          const denial = preToolUseDenialResult(name, check);
+          await safePostToolUse(onPostToolUse, name, args, denial.text, denial.isError, 0, undefined, check.handoff);
+          return { content: [{ type: 'text' as const, text: denial.text }], isError: denial.isError };
+        }
+      }
+      try {
+        const result = await withToolTimeout(handler(args, extra), toolTimeout, name);
+        const durationMs = Date.now() - startTime;
+        await safePostToolUse(onPostToolUse, name, args, extraToolResultText(result), result.isError === true, durationMs);
+        return result;
+      } catch (err) {
+        const durationMs = Date.now() - startTime;
+        const message = sanitizeThrownToolError(name, err, { durationMs });
+        const safeError = compactToolResultForChat(name, JSON.stringify({ error: message }));
+        await safePostToolUse(onPostToolUse, name, args, safeError, true, durationMs);
+        return { content: [{ type: 'text' as const, text: safeError }], isError: true };
+      }
+      }); // end runOutsideDbContext
+    },
+  };
+}
+
+/** Best-effort text extraction from a `CallToolResult` for `onPostToolUse`'s
+ *  `output` string — the first text content block, or the whole serialized
+ *  result when there isn't one (e.g. an image-only result). */
+function extraToolResultText(result: SdkToolResult): string {
+  const blocks = (result as { content?: unknown[] }).content;
+  if (Array.isArray(blocks)) {
+    const first = blocks.find(
+      (block): block is { type: 'text'; text: string } =>
+        typeof block === 'object' && block !== null
+        && (block as { type?: unknown }).type === 'text'
+        && typeof (block as { text?: unknown }).text === 'string',
+    );
+    if (first) return first.text;
+  }
+  return JSON.stringify(result);
+}
+
+/** Levenshtein edit distance — cheapest way to surface a likely-intended
+ *  tool name for a typo without pulling in a fuzzy-match dependency. */
+function levenshteinDistance(a: string, b: string): number {
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  const dp: number[][] = Array.from({ length: rows }, () => new Array<number>(cols).fill(0));
+  for (let i = 0; i < rows; i++) dp[i]![0] = i;
+  for (let j = 0; j < cols; j++) dp[0]![j] = j;
+  for (let i = 1; i < rows; i++) {
+    for (let j = 1; j < cols; j++) {
+      dp[i]![j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1]![j - 1]!
+        : 1 + Math.min(dp[i - 1]![j]!, dp[i]![j - 1]!, dp[i - 1]![j - 1]!);
+    }
+  }
+  return dp[rows - 1]![cols - 1]!;
+}
+
+/** The `limit` registered tool names nearest (by edit distance) to `name` —
+ *  used to make an unmatched `onlyTools` entry's likely typo self-evident. */
+function nearestToolNames(name: string, candidates: readonly string[], limit = 3): string[] {
+  return [...candidates]
+    .map((candidate) => ({ candidate, distance: levenshteinDistance(name, candidate) }))
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, limit)
+    .map(({ candidate }) => candidate);
+}
+
+/**
  * Creates an SDK MCP server instance with all Breeze tools.
  * Auth context is fetched lazily via the getAuth thunk so all tool handlers
  * see the latest org-scoped access even when the session is reused.
  * Optional postToolUse callback fires after every tool execution for persistence/audit.
+ *
+ * `options.onlyTools` (F2 fix, P2-1 second live check): the SDK's
+ * `allowedTools` (set by the caller on `query()`) only gates PERMISSION to
+ * call a tool — it does not stop that tool's full JSON schema from being
+ * sent to the model every turn. Registering the whole ~200-tool registry
+ * unconditionally, as this function used to do, meant every turn of every
+ * run (verdict runs included, despite being restricted to 4-5 tools by
+ * `allowedTools`) paid the token cost of every tool definition — a single
+ * verdict turn cost 9¢ (run `59fb933c-…`, `turn_count=1`). When
+ * `onlyTools` is set, the registry `tools` array is filtered down to just
+ * those bare names BEFORE `createSdkMcpServer` is called, so the SERVER
+ * itself only advertises the pinned subset. `extraTools` are always
+ * included regardless of `onlyTools` — they're never part of the registry
+ * `tools` array (outcome tools in particular are deliberately absent from
+ * `TOOL_TIERS`, see `outcomeTools.ts`), so there's nothing in `onlyTools` for
+ * them to be filtered against. The name-collision guard below is unchanged:
+ * it still runs against the full, unfiltered registry.
+ *
+ * `onlyTools` is populated only internally, from hardcoded profile
+ * allowlists (see `aiAgents/runLoop.ts`'s `onlyTools` computation) — never
+ * from request input — so a name in it that matches no registered tool is
+ * always a programming error: a typo in the allowlist, or a tool renamed in
+ * the registry without updating it. (#4447) Since every caller is internal,
+ * that condition throws outside production (test/dev), so the bug is caught
+ * before it ships; in production it degrades to the matched subset rather
+ * than failing a live run, but logs via `console.error` and Sentry-captures
+ * (event code `ai_agent_onlytools_unknown_name`) so it does not vanish the
+ * way the old silent `.filter()` did. The Sentry capture is best-effort, not
+ * guaranteed delivery: on a self-hosted install with no `SENTRY_DSN`,
+ * `captureMessage` is a documented no-op (see `sentry.ts`) and the
+ * `console.error` line is the only surviving signal — an operator has to be
+ * watching API logs, not a Sentry inbox, to catch it there.
  */
 export function createBreezeMcpServer(
   getAuth: () => AuthContext,
   onPreToolUse?: PreToolUseCallback,
   onPostToolUse?: PostToolUseCallback,
   getActiveSession?: () => ActiveSession,
+  extraTools: SdkTool[] = [],
+  options?: { onlyTools?: ReadonlySet<string> },
 ) {
   const uuid = z.string().guid();
   const backupEntityId = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/);
@@ -1170,8 +1425,23 @@ export function createBreezeMcpServer(
         scriptId: uuid,
         deviceIds: z.array(uuid).min(1).max(10),
         parameters: z.record(z.string(), z.unknown()).optional(),
+        // #4888 — mirrors toolInputSchemas.run_script; see scriptRunRequest.ts
+        // for why the shape is shared rather than repeated.
+        ...aiRunContextInputShape,
       },
       makeHandler('run_script', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'cancel_script_execution',
+      'Stop a running script execution on a device. The execution moves to "cancelling" and only reports "cancelled" once the device proves the process stopped — re-read it with get_script_execution rather than assuming the stop succeeded.',
+      {
+        executionId: uuid,
+        // Mirrors toolInputSchemas.cancel_script_execution; the 30s ceiling is
+        // MAX_GRACE_SECONDS in services/scriptCancellation.
+        graceSeconds: z.number().int().min(0).max(30).optional(),
+      },
+      makeHandler('cancel_script_execution', getAuth, onPreToolUse, onPostToolUse)
     ),
 
     tool(
@@ -1305,10 +1575,10 @@ export function createBreezeMcpServer(
     ),
 
     tool(
-      'get_fleet_status',
-      'Return the deployment-invite funnel for this tenant (total invited, clicked, enrolled, online) with recent enrollments. Poll during MCP bootstrap to track devices coming online.',
+      'get_invite_funnel',
+      'Deployment-invite funnel only (invites sent/clicked/enrolled). NOT a fleet overview: for device counts or online/offline status use query_devices or get_fleet_health. Returns total invited, clicked, enrolled and online for this tenant plus recent enrollments; a tenant enrolled without invites reports zeros here. Poll during MCP bootstrap to track devices coming online.',
       {},
-      makeHandler('get_fleet_status', getAuth, onPreToolUse, onPostToolUse)
+      makeHandler('get_invite_funnel', getAuth, onPreToolUse, onPostToolUse)
     ),
 
     tool(
@@ -1406,7 +1676,7 @@ export function createBreezeMcpServer(
         action: z.string().max(100).optional(),
         resourceType: z.string().max(100).optional(),
         resourceId: uuid.optional(),
-        actorType: z.enum(['user', 'api_key', 'agent', 'system']).optional(),
+        actorType: z.enum(ACTOR_TYPES).optional(),
         hoursBack: z.number().int().min(1).max(168).optional(),
         limit: z.number().int().min(1).max(100).optional(),
       },
@@ -2121,7 +2391,7 @@ export function createBreezeMcpServer(
 
     tool(
       'manage_organizations',
-      'Create and manage organizations and sites (new-customer intake). Actions: create_org (name required; creates the org under the caller\'s partner with a default "Main Office" site — partner scope only), update_org (name/status patch), create_site (orgId + name + optional address), add_contact (not yet supported — returns guidance). create_org, update_org, and create_site require approval.',
+      'Create and manage organizations, sites, and contacts (new-customer intake). Actions: create_org (name required; creates the org under the caller\'s partner with a default "Main Office" site — partner scope only), update_org (name/status patch), create_site (orgId + name + optional address), add_contact (orgId required; at least one of name/email/phone/mobile required — mirrors contacts_identifiable_chk; optional title/roles/siteId/isPrimary — creates a first-class contact on the organization or one of its sites). create_org, update_org, create_site, and add_contact require approval.',
       {
         action: z.enum(['create_org', 'update_org', 'create_site', 'add_contact']),
         orgId: uuid.optional(),
@@ -2129,8 +2399,30 @@ export function createBreezeMcpServer(
         status: z.enum(['active', 'suspended', 'trial', 'churned']).optional(),
         address: z.record(z.string(), z.unknown()).optional(),
         email: z.string().email().max(255).optional(),
+        siteId: uuid.optional(),
+        phone: z.string().max(64).optional(),
+        mobile: z.string().max(64).optional(),
+        title: z.string().max(255).optional(),
+        roles: z.array(z.enum(CONTACT_ROLES)).optional(),
+        isPrimary: z.boolean().optional(),
       },
       makeHandler('manage_organizations', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'manage_ai_agents',
+      'Govern the autonomous AI agents for the current organization. Action: authorize_supervised_key — grant the organization\'s agent of the given kind a pre-authorized action key (opKey, e.g. "manage_services:restart") so future agent runs may execute it without raising an approval. The key must already sit inside the partner baseline ceiling and the agent must have earned it on recent evidence. Requires a SECOND approver (four-eyes). orgId must be the CURRENT organization — it is not a target selector, and naming any other organization is rejected both when the approval is raised and again before it executes.',
+      {
+        action: z.enum(['authorize_supervised_key']),
+        kind: z.enum(AI_AGENT_KINDS),
+        opKey: z.string().min(3).max(120),
+        // Required, and re-checked against the intent's own org at creation and
+        // again at execution. It is here so the approval can PIN this org's
+        // authorized-key list (services/actionIntents/effectDigest.ts), not so
+        // a caller can choose a target.
+        orgId: uuid,
+      },
+      makeHandler('manage_ai_agents', getAuth, onPreToolUse, onPostToolUse)
     ),
 
     // Billing, quoting, catalog and contract tools (#3156). Identical failure
@@ -2208,7 +2500,7 @@ export function createBreezeMcpServer(
       'List quotes/proposals for the orgs the caller can access, newest first. Optionally filter by org or status. Read-only.',
       {
         orgId: uuid.optional(),
-        status: z.enum(['draft', 'sent', 'viewed', 'accepted', 'declined', 'expired', 'converted']).optional(),
+        status: z.enum(['draft', 'sent', 'viewed', 'accepted', 'declined', 'expired', 'converted', 'superseded']).optional(),
         limit: z.number().int().min(1).max(100).optional(),
       },
       makeHandler('list_quotes', getAuth, onPreToolUse, onPostToolUse)
@@ -2261,6 +2553,7 @@ export function createBreezeMcpServer(
           'delete_draft',
           'add_line',
           'remove_line',
+          'update_line',
           'activate',
           'pause',
           'resume',
@@ -2526,9 +2819,61 @@ export function createBreezeMcpServer(
     ...googleToolDefinitions(getAuth, getActiveSession, onPreToolUse, onPostToolUse),
   ];
 
+  // extraTools (e.g. headless-run outcome tools like submit_alert_verdict) are
+  // never in the TOOL_TIERS registry — that's what keeps them off the chat/MCP
+  // surface (see outcomeTools.ts). A name collision here would mean an outcome
+  // tool shadowing a real registered tool, which must never happen silently.
+  // Checked against the ORIGINAL (unwrapped) names/array — wrapping never
+  // changes `.name`.
+  for (const extra of extraTools) {
+    if (Object.prototype.hasOwnProperty.call(TOOL_TIERS, extra.name)) {
+      throw new Error(`[createBreezeMcpServer] extra tool collides with registry: ${extra.name}`);
+    }
+  }
+  // Every extra tool is wrapped so onPreToolUse/onPostToolUse fire for it —
+  // see wrapExtraToolWithHooks's own docstring for why this is required, not
+  // optional plumbing.
+  const wrappedExtraTools = extraTools.map((extra) => wrapExtraToolWithHooks(extra, onPreToolUse, onPostToolUse));
+
+  // F2 fix: filter the registry down to the pinned subset BEFORE
+  // createSdkMcpServer, so those ~200 definitions never ride along on a
+  // verdict run's turns. See this function's docstring for the full
+  // rationale. Applied AFTER the collision guard above, which must still
+  // see the full, unfiltered registry.
+  const registeredTools = options?.onlyTools
+    ? tools.filter((t) => options.onlyTools!.has(t.name))
+    : tools;
+
+  // #4447: a name in onlyTools that matches no registered tool used to be
+  // dropped here with no signal at all. See this function's docstring for
+  // why every caller being internal means this is always a bug, not a
+  // runtime condition, and for the throw/log-and-capture split below.
+  if (options?.onlyTools) {
+    const matchedNames = new Set(registeredTools.map((t) => t.name));
+    const unknownNames = [...options.onlyTools].filter((name) => !matchedNames.has(name));
+    if (unknownNames.length > 0) {
+      const allNames = tools.map((t) => t.name);
+      const detail = unknownNames
+        .map((name) => {
+          const nearest = nearestToolNames(name, allNames);
+          return `"${name}" (nearest: ${nearest.length > 0 ? nearest.join(', ') : 'no close match'})`;
+        })
+        .join('; ');
+      const message = `[createBreezeMcpServer] onlyTools referenced unknown tool name(s): ${detail}`;
+      if (process.env.NODE_ENV !== 'production') {
+        throw new Error(message);
+      }
+      console.error(message);
+      captureMessage('onlyTools referenced unknown tool name(s)', {
+        eventCode: 'ai_agent_onlytools_unknown_name',
+        level: 'error',
+      });
+    }
+  }
+
   return createSdkMcpServer({
     name: 'breeze',
     version: '1.0.0',
-    tools,
+    tools: [...registeredTools, ...wrappedExtraTools],
   });
 }

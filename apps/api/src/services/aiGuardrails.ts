@@ -11,16 +11,21 @@
  */
 
 import type { AiApprovalScope } from '@breeze/shared/types/ai';
+import type { AiAgentMode, AiAgentProtectedResources } from '@breeze/shared';
 import { getToolTier } from './aiTools';
 import { getUserPermissions, hasPermission } from './permissions';
 import { rateLimiter } from './rate-limit';
 import { getRedis } from './redis';
+import { isSecretBearingTool } from './actionIntents/secretBearingTools';
 import type { AuthContext } from '../middleware/auth';
+import { envFlag } from '../config/env';
+import { resolveActOperation } from './aiAgents/actManifest';
+import { getCachedAiKillStateSnapshot } from './aiKillState';
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
 // Tools that are always blocked (Tier 4)
-const BLOCKED_TOOLS = new Set<string>([
+export const BLOCKED_TOOLS: ReadonlySet<string> = new Set<string>([
   // No tools are explicitly blocked at the tool level —
   // cross-org access is enforced by orgCondition in each handler
 ]);
@@ -59,7 +64,13 @@ export const TIER2_ACTIONS: Record<string, string[]> = {
     // create/comment above. move_org stays Tier 3 (tenant-shape mutation).
     'log_time_entry',
     'start_timer',
-    'stop_timer'
+    'stop_timer',
+    // P2-4 (#4191) ticket triage: same family as update_fields — low-risk,
+    // ticket-scoped mutations an autonomous triage run makes. link_device
+    // only sets a currently-null device_id (never overwrites); draft only
+    // writes an internal ticket_drafts row, never a customer-visible comment.
+    'link_device',
+    'draft'
   ],
   manage_services: ['list'],
   // SR5-01 partial relaxation (2026-07-20): directory LISTING is recon-only —
@@ -241,14 +252,32 @@ export const TIER3_ACTIONS: Record<string, string[]> = {
   // Ticketing — move_org is a tenant-shape mutation and requires approval.
   // log_time_entry/start_timer/stop_timer downgraded to Tier 2 (2026-07-20).
   manage_tickets: ['move_org'],
+  // Money-authoring drafts vs money-moving actions (#2551): this boundary
+  // tracks reversibility/external-commitment, not dollar amount. Drafting —
+  // create_draft, add_manual_line, add_catalog_line, update, etc. — only
+  // mutates an internal record nobody outside Breeze has seen yet; it's
+  // Tier 2 (auto-execute + audit) no matter how large the draft's total is.
+  // The step that actually commits externally — issuing/voiding an invoice,
+  // recording/voiding a payment, sending a quote to the customer, or
+  // transitioning a contract's lifecycle — is what exposes the change beyond
+  // Breeze, so THAT step is Tier 3 regardless of amount. A five-figure quote
+  // draft and a $10 one get the same tier; only `send` escalates.
+  //
+  // This is deliberate, not an oversight that `manage_organizations:
+  // create_org` is Tier 3 while `manage_quotes: create_draft` is Tier 2 —
+  // create_org is gated on tenant-structure mutation, an unrelated axis, not
+  // financial size. A partner-configurable dollar-amount escalation
+  // threshold for drafting was proposed and explicitly deferred (not
+  // rejected) — see #2551 for the full analysis and the decision record.
   manage_invoices: ['issue', 'void', 'record_payment', 'void_payment'],
   manage_contracts: ['activate', 'pause', 'resume', 'cancel'],
   manage_quotes: ['send'],
   // Org lifecycle (issue #2366) — tenant-shape mutations require approval.
-  // add_contact stays at the tool's base tier (it returns guidance only).
+  // add_contact (#3258) writes customer PII (a first-class contact record),
+  // so it escalates too, even though it reshapes no tenant boundary.
   // update_org's approval SCOPE (not its tier) is input-aware — see
   // resolveApprovalScope's override hook below.
-  manage_organizations: ['create_org', 'update_org', 'create_site'],
+  manage_organizations: ['create_org', 'update_org', 'create_site', 'add_contact'],
   // s1_threat_action is registered at base Tier 3 (see TIER3_FOUR_EYES_TOOLS /
   // TIER3_SUPERVISED_TOOLS below for its whole-tool catch-all), but its
   // `action` enum (kill/quarantine/rollback) is a real dispatch discriminator
@@ -310,6 +339,11 @@ export const TIER3_FOUR_EYES_ACTIONS: Record<string, string[]> = {
   // See TIER3_INPUT_AWARE_ACTIONS.
   manage_organizations: ['create_org'],
   manage_tickets: ['move_org'],
+  // Grants an AUTHORITY, not a device action: it converts "this agent must ask
+  // a human for <opKey>" into "this agent may run <opKey> unattended for this
+  // org from now on". Proposing that and authorising it are separate
+  // responsibilities. See services/aiToolsAiAgentGovernance.ts.
+  manage_ai_agents: ['authorize_supervised_key'],
   // Destroys or rewinds state.
   manage_hyperv_checkpoints: ['delete', 'apply'],
   manage_patches: ['rollback'],
@@ -329,6 +363,10 @@ export const TIER3_FOUR_EYES_TOOLS = new Set<string>([
   'computer_control', 'create_remote_session',
   // Tenant destruction.
   'delete_tenant',
+  // AI agent authority grants (P2-5, #4192). Whole-tool member on top of the
+  // TIER3_FOUR_EYES_ACTIONS entry above, so a future action of this tool
+  // defaults to four_eyes instead of falling through to `supervised`.
+  'manage_ai_agents',
   // Identity / account control — M365 (helpdesk tools; dispatch outside the
   // headless registry via makeSessionAwareHandler, but still carry a real
   // tier via m365ToolTiers).
@@ -359,6 +397,25 @@ export const TIER3_FOUR_EYES_TOOLS = new Set<string>([
   // request_elevation above). Not named in spec §3.2; classified four_eyes
   // out of caution — flagged in the task report "concerns".
   'request_elevation',
+]);
+
+/**
+ * Tools the `ai_agent` principal may NEVER call, whatever its allowlist says.
+ *
+ * A third unconditional denial class alongside BLOCKED_TOOLS (tier 4) and
+ * `isSecretBearingTool` — and, like those, enforced in `checkAgentGuardrails`
+ * ABOVE the allowlist and the multiplexed-action resolution, so the deny
+ * cannot depend on a parseable `action` or on the snapshot omitting the name.
+ *
+ * `manage_ai_agents` (P2-5, #4192) grants an agent a pre-authorized action
+ * key: an agent able to call it could grant ITSELF new unattended authority,
+ * which is the one escalation no approval scope can contain (the grant
+ * outlives the run). Membership here is a registry, not a hard-coded string,
+ * so aiGuardrails.agentPrincipal.contract.test.ts can treat the class as
+ * unconditionally denied instead of duplicating the literal.
+ */
+export const AGENT_HUMAN_ONLY_TOOLS = new Set<string>([
+  'manage_ai_agents',
 ]);
 
 export const TIER3_SUPERVISED_ACTIONS: Record<string, string[]> = {
@@ -399,13 +456,22 @@ export const TIER3_SUPERVISED_ACTIONS: Record<string, string[]> = {
   manage_contracts: ['pause', 'resume'],
   // create_site adds a location within an existing org, not a new tenant —
   // spec §3.2's tenant-shape bullet names only create_org/update_org.
-  manage_organizations: ['create_site'],
+  // add_contact (#3258) writes customer PII but is neither externally-binding
+  // nor identity/destroy-class, so it stays supervised alongside create_site
+  // rather than four_eyes — see spec §5.
+  manage_organizations: ['create_site', 'add_contact'],
   s1_threat_action: ['kill', 'quarantine'],
 };
 
 export const TIER3_SUPERVISED_TOOLS = new Set<string>([
   // The customer's "regular work on a PC" (spec §3.2's explicit supervised list).
   'execute_command', 'run_script',
+  // #3525: stopping a script is a de-escalation — it never starts work, carries
+  // no operator-chosen content, target, credential or binary, and the worst
+  // outcome of an unwanted one is a job that has to be re-run. Supervised, at
+  // the same gate as the run_script it undoes; four_eyes would leave a runaway
+  // script on a customer endpoint while a second approver is found.
+  'cancel_script_execution',
   // s1_isolate_device is deliberately ABSENT here: its boolean `isolate`
   // discriminator cannot be action-classified (spec §3.1), so its scope is
   // resolved by resolveApprovalScope's override hook instead of this static
@@ -440,7 +506,41 @@ export const TIER3_SUPERVISED_TOOLS = new Set<string>([
  */
 export const TIER3_INPUT_AWARE_ACTIONS: ReadonlySet<string> = new Set<string>([
   'manage_organizations:update_org',
+  // RMM-QA-176 D9: a 'maintenance' feature link is the canonical
+  // monitoring-suppression source, so authoring one is a different class of
+  // act from authoring any other link — but only the INPUT says which it is,
+  // so it cannot be classified by (tool, action) in the static tables.
+  'manage_policy_feature_link:add',
+  'manage_policy_feature_link:update',
 ]);
+
+/**
+ * True when a (tool, action, input) triple escalates to Tier 3 on argument
+ * CONTENT. Exported so checkGuardrails, resolveApprovalScope and the tests all
+ * ask the SAME question — a second copy of this predicate is how a tier and
+ * its scope drift apart.
+ *
+ * Strict `=== 'maintenance'`: a non-string featureType stays at the base tier,
+ * which is safe here because the handler writes exactly the featureType it was
+ * given, so a value that is not the literal 'maintenance' cannot create a
+ * maintenance link either. The handler's own principal check (D9.3) is the
+ * belt to this brace for `update`, where featureType is not a required input.
+ *
+ * The action guard is not decoration: without it a read (`list`) carrying a
+ * stray featureType argument would be escalated into an approval that the MCP
+ * transport then denies outright.
+ */
+export function isInputAwareTier3(
+  toolName: string,
+  action: string | undefined,
+  input: Record<string, unknown>,
+): boolean {
+  return (
+    toolName === 'manage_policy_feature_link' &&
+    (action === 'add' || action === 'update') &&
+    input.featureType === 'maintenance'
+  );
+}
 
 /**
  * Whole-tool counterpart of TIER3_INPUT_AWARE_ACTIONS — base-tier-3 tools
@@ -466,6 +566,16 @@ export function resolveApprovalScope(
     // tenant access — externally binding, same class as the other
     // TIER3_FOUR_EYES_ACTIONS members — vs a plain name edit, which is inert.
     return 'status' in input ? 'four_eyes' : 'supervised';
+  }
+  if (isInputAwareTier3(toolName, action, input)) {
+    // MANDATORY, not stylistic: manage_policy_feature_link is in NEITHER
+    // whole-tool scope set and add/update are in neither *_ACTIONS scope
+    // table, so without this override an escalated add/update would fall all
+    // the way to the per-TOOL `four_eyes` fail-safe at the bottom of this
+    // function. `supervised` matches the #3552/835f7eb3d policy-prerequisite
+    // escalations and manage_configuration_policy's own create/update/delete —
+    // authoring policy configuration, not an externally binding act.
+    return 'supervised';
   }
   if (toolName === 's1_isolate_device') {
     // isolate:false is containment RELEASE (reverses a prior mitigation —
@@ -502,12 +612,21 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   s1_threat_action: { resource: 'devices', action: 'execute' },
   execute_command: { resource: 'devices', action: 'execute' },
   run_script: { resource: 'scripts', action: 'execute' },
+  // Same permission the HTTP cancel route requires (PERMISSIONS.SCRIPTS_EXECUTE):
+  // whoever may start a script may stop it, and nobody else.
+  cancel_script_execution: { resource: 'scripts', action: 'execute' },
   manage_alerts: {
     list: { resource: 'alerts', action: 'read' },
     get: { resource: 'alerts', action: 'read' },
     acknowledge: { resource: 'alerts', action: 'acknowledge' },
     resolve: { resource: 'alerts', action: 'write' },
     suppress: { resource: 'alerts', action: 'write' },
+  },
+  // Per-ACTION shape (like manage_tickets below) so a future action of this
+  // tool cannot inherit the grant permission by accident. `ai_agents:write`
+  // already exists in the canonical registry, seed, migration and catalog.
+  manage_ai_agents: {
+    authorize_supervised_key: { resource: 'ai_agents', action: 'write' },
   },
   manage_tickets: {
     list: { resource: 'tickets', action: 'read' },
@@ -526,6 +645,16 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
     log_time_entry: { resource: 'time_entries', action: 'write' },
     start_timer: { resource: 'time_entries', action: 'write' },
     stop_timer: { resource: 'time_entries', action: 'write' },
+    // P2-4 (#4191): deliberately 'update', not 'write' — no seeded role
+    // grants `tickets:update` (seed.ts only ever grants tickets:read/write/
+    // manage), so this fails CLOSED for `checkToolPermission`'s interactive
+    // path. link_device/draft are agent-only ticket-triage executors, never
+    // reachable from a live chat/MCP session; the only path that can execute
+    // them is the ai_agent-principal release path, which never consults RBAC
+    // at all (`checkAgentGuardrails`'s doc comment). A future human-facing
+    // caller of these two actions needs a real permission grant added first.
+    link_device: { resource: 'tickets', action: 'update' },
+    draft: { resource: 'tickets', action: 'update' },
   },
   list_invoices: { resource: 'invoices', action: 'read' },
   get_invoice: { resource: 'invoices', action: 'read' },
@@ -566,6 +695,7 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
     delete_draft: { resource: 'contracts', action: 'write' },
     add_line: { resource: 'contracts', action: 'write' },
     remove_line: { resource: 'contracts', action: 'write' },
+    update_line: { resource: 'contracts', action: 'write' },
     activate: { resource: 'contracts', action: 'manage' },
     pause: { resource: 'contracts', action: 'manage' },
     resume: { resource: 'contracts', action: 'manage' },
@@ -770,7 +900,7 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   // Security + reliability read tools
   get_security_posture: { resource: 'devices', action: 'read' },
   get_fleet_health: { resource: 'devices', action: 'read' },
-  get_fleet_status: { resource: 'devices', action: 'read' },
+  get_invite_funnel: { resource: 'devices', action: 'read' },
   // Fleet hygiene findings (Task 8) — read-only, mirrors the
   // GET /fleet/findings route's requireFindingsRead (DEVICES_READ) gate.
   get_fleet_findings: { resource: 'devices', action: 'read' },
@@ -1054,6 +1184,10 @@ const TOOL_EXTRA_PERMISSIONS: Record<string, { resource: string; action: string 
 const TOOL_RATE_LIMITS: Record<string, { limit: number; windowSeconds: number }> = {
   execute_command: { limit: 10, windowSeconds: 300 },
   run_script: { limit: 5, windowSeconds: 300 },
+  // Deliberately looser than run_script: a stop is the safe direction, and a
+  // rate limit that blocks a tech's assistant from halting a runaway script is
+  // worse than the burst it prevents.
+  cancel_script_execution: { limit: 20, windowSeconds: 300 },
   security_scan: { limit: 3, windowSeconds: 600 },
   network_discovery: { limit: 2, windowSeconds: 600 },
   file_operations: { limit: 20, windowSeconds: 300 },
@@ -1124,6 +1258,8 @@ const TOOL_RATE_LIMITS: Record<string, { limit: number; windowSeconds: number }>
   get_service_monitoring_status: { limit: 30, windowSeconds: 300 },
   // Integration & webhook tools
   test_webhook: { limit: 5, windowSeconds: 300 },
+  // AI agent governance — a grant is a rare, deliberate act.
+  manage_ai_agents: { limit: 5, windowSeconds: 3600 },
   // Agent version & remote session tools
   trigger_agent_upgrade: { limit: 5, windowSeconds: 600 },
   trigger_agent_restart: { limit: 5, windowSeconds: 600 },
@@ -1188,6 +1324,60 @@ export type GuardrailCheck =
     });
 
 /**
+ * The read-only formula `checkAgentGuardrails` applies to a resolved
+ * `GuardrailCheck`: tier 1 is always read-only; tier 2 is read-only only on
+ * the #3130 allowlists (an explicit `readOnly: true` from an action-level
+ * table, or the tool being in `TIER2_READONLY_TOOLS`). Extracted so
+ * `agentToolCatalog.ts`'s catalog-operation resolution (which never calls
+ * `checkAgentGuardrails` — it has no run policy to check against) computes
+ * the exact same answer `checkAgentGuardrails` would, instead of a
+ * hand-rolled copy that could drift from it.
+ */
+export function isReadOnlyResolution(
+  toolName: string,
+  check: Pick<GuardrailCheck, 'tier' | 'readOnly'>,
+): boolean {
+  return check.tier === 1
+    || (check.tier === 2 && (check.readOnly === true || TIER2_READONLY_TOOLS.has(toolName)));
+}
+
+/**
+ * `'act'` (wave 4 Part B): a manifest-matched, rule-equivalent mutation under
+ * a live `mode: 'act'` policy. Distinct from `'allow'` — `'act'` additionally
+ * signals the run-loop pre-hook to revalidate (live policy + guardrail
+ * re-run + device/asset pinning) and reserve a `maxActionsPerRun` slot before
+ * dispatch (actRevalidation.ts, Task 3); `'allow'` never does either.
+ */
+export type GuardrailDisposition = 'allow' | 'propose' | 'deny' | 'act';
+
+/**
+ * checkAgentGuardrails' verdict. `allowed` stays false for 'propose' on
+ * purpose: a consumer that only reads `allowed` (every pre-3b consumer)
+ * fails CLOSED rather than executing a proposal.
+ */
+export type AgentGuardrailCheck = GuardrailCheck & { disposition: GuardrailDisposition };
+
+/**
+ * The sub-operation discriminator for a tool call, resolved EXACTLY the way
+ * `checkGuardrails` and `checkAgentGuardrails` each used to do inline (two
+ * byte-identical copies, now one). `TOOL_ACTION_INPUT_KEYS` overrides the
+ * default `action` key for a multiplexer keyed on something else
+ * (`execute_command`'s `commandType`, #3088). A non-string value at that key
+ * resolves to `undefined`, not a coerced string — callers fall back to
+ * whatever "no action" means for them (checkGuardrails: the tool's base
+ * tier; checkAgentGuardrails: a hard deny on a multiplexed tool;
+ * policyDecide.ts: no `tool:action` key, so a bare-tool registry lookup).
+ *
+ * Exported so `policyDecide.ts`'s canonical-key derivation reuses this
+ * instead of a third inline copy (wave 5 Part B, #3827).
+ */
+export function resolveActionForTool(toolName: string, input: Record<string, unknown>): string | undefined {
+  const actionKey = TOOL_ACTION_INPUT_KEYS[toolName] ?? 'action';
+  const actionValue = input[actionKey];
+  return typeof actionValue === 'string' ? actionValue : undefined;
+}
+
+/**
  * Check guardrails for a tool invocation.
  * Returns the effective tier and whether approval is needed.
  */
@@ -1215,13 +1405,9 @@ export function checkGuardrails(
     };
   }
 
-  // Check for action-based tier escalation. The discriminator is `action` for
-  // most tools; a TOOL_ACTION_INPUT_KEYS entry overrides the key (#3088 —
-  // execute_command multiplexes on `commandType`). Non-string values resolve
-  // to undefined, which falls through to the base tier (fail-closed).
-  const actionKey = TOOL_ACTION_INPUT_KEYS[toolName] ?? 'action';
-  const actionValue = input[actionKey];
-  const action = typeof actionValue === 'string' ? actionValue : undefined;
+  // Check for action-based tier escalation. Non-string values resolve to
+  // undefined, which falls through to the base tier (fail-closed).
+  const action = resolveActionForTool(toolName, input);
 
   // Tier 1 downgrade: read-only actions on otherwise-high-tier tools
   if (action && TIER1_ACTIONS[toolName]?.includes(action)) {
@@ -1229,6 +1415,20 @@ export function checkGuardrails(
       tier: 1,
       allowed: true,
       requiresApproval: false,
+      description: buildApprovalDescription(toolName, action, input)
+    };
+  }
+
+  // Input-aware Tier-3 escalation (RMM-QA-176 D9). After the Tier-1 downgrade
+  // so a read action can never be escalated by a stray argument; before
+  // TIER3_ACTIONS and TIER2_ACTIONS, and necessarily before the base-tier
+  // resolution below, so the base tier 2 cannot claim it first.
+  if (isInputAwareTier3(toolName, action, input)) {
+    return {
+      tier: 3,
+      allowed: true,
+      requiresApproval: true,
+      approvalScope: resolveApprovalScope(toolName, action, input),
       description: buildApprovalDescription(toolName, action, input)
     };
   }
@@ -1286,6 +1486,397 @@ export function checkGuardrails(
   };
 }
 
+export interface AgentGuardrailPolicy {
+  /**
+   * Both carried, both enforced here. The resolver computes them, but returning
+   * a snapshot makes enforcement advisory — the gate must be able to deny a
+   * disabled or propose-only agent on its own.
+   */
+  enabled: boolean;
+  mode: AiAgentMode;
+  toolAllowlist: string[];
+  protectedResources: AiAgentProtectedResources;
+  /** Resolved from the run device, not from caller-controlled tool input. */
+  deviceSiteId?: string | null;
+  /**
+   * The run's device id, resolved from the run row (never from tool input).
+   * null = device-less run. A device-less run skips the site gate entirely
+   * (buildAgentAuthContext only pins allowedSiteIds when a device exists), so
+   * mutating tools are denied outright for it — there is no site scope to
+   * bound the blast radius.
+   */
+  deviceId: string | null;
+  /**
+   * P2-4 (#4191): the intent's resolved TICKET target, populated by the
+   * release path (`agentReleaseAuthority.ts`'s ticket mirror of its own
+   * device-target resolution, `resolveIntentTargetTicket` in
+   * `intentTargetScope.ts`) — never from tool input. Ticket-triage runs are
+   * device-less by construction (one run walks the ticket queue, not a
+   * device fleet), so without this a mutating `manage_tickets` call would
+   * always trip the device-less-mutation deny below. Deliberately NOT a
+   * general "any tool with a ticket" escape hatch: only `manage_tickets`
+   * itself consults it (see the deny below) — no run-profile literal
+   * anywhere in this file, keyed off tool name + scope alone.
+   */
+  scope?: { ticketId: string };
+}
+
+const SERVICE_INPUT_KEYS = ['serviceName', 'service', 'name'];
+const PATH_INPUT_KEYS = [
+  'path', 'filePath', 'source', 'destination', 'directory',
+  // Swept from the real tool schemas — each of these carries a filesystem path
+  // and every one of them was unprotected.
+  'newPath', 'targetPath', 'selectedPaths', 'paths', 'filePaths',
+  'itemPath', 'quarantineDir', 'scriptPath', 'dest',
+];
+const REGISTRY_INPUT_KEYS = ['key', 'registryKey', 'keyPath'];
+const DEVICE_TAG_INPUT_KEYS = ['deviceTag', 'tag', 'tagName'];
+const DEVICE_TAG_ARRAY_INPUT_KEYS = ['deviceTags', 'tags'];
+const SITE_INPUT_KEYS = ['siteId', 'site_id', 'targetSiteId'];
+const SITE_ARRAY_INPUT_KEYS = ['siteIds', 'site_ids'];
+
+/** Tools whose real tier depends on an `action` argument. */
+function isActionMultiplexedTool(toolName: string): boolean {
+  return Boolean(
+    TIER3_ACTIONS[toolName] ?? TIER2_ACTIONS[toolName] ?? TIER1_ACTIONS[toolName],
+  );
+}
+
+function describeType(value: unknown): string {
+  if (value === undefined) return 'nothing';
+  if (value === null) return 'null';
+  return Array.isArray(value) ? 'an array' : `a ${typeof value}`;
+}
+
+/**
+ * Every string leaf of the input, at any depth, paired with the key it sat
+ * under. A top-level key lookup missed nested parameter objects entirely —
+ * `execute_command { commandType:'file_list', payload:{ path:'C:\\Windows\\...' } }`
+ * dispatches the same agent command as `file_operations` but hid its path from
+ * the protected-resource matcher, with no allowlist entry required.
+ */
+function collectStringLeaves(
+  value: unknown,
+  depth = 0,
+  out: Array<{ key: string; value: string }> = [],
+  key = '',
+): Array<{ key: string; value: string }> {
+  if (depth > 6 || out.length > 500) return out;
+  if (typeof value === 'string') {
+    out.push({ key, value });
+  } else if (Array.isArray(value)) {
+    for (const item of value) collectStringLeaves(item, depth + 1, out, key);
+  } else if (value && typeof value === 'object') {
+    for (const [childKey, child] of Object.entries(value as Record<string, unknown>)) {
+      collectStringLeaves(child, depth + 1, out, childKey);
+    }
+  }
+  return out;
+}
+
+function leafValuesFor(input: Record<string, unknown>, keys: string[]): string[] {
+  const wanted = new Set(keys.map((key) => key.toLowerCase()));
+  return collectStringLeaves(input)
+    .filter((leaf) => wanted.has(leaf.key.toLowerCase()))
+    .map((leaf) => leaf.value);
+}
+
+function inputStrings(input: Record<string, unknown>, keys: string[]): string[] {
+  return keys.map((key) => input[key]).filter((value): value is string => typeof value === 'string');
+}
+
+function inputStringArrays(input: Record<string, unknown>, keys: string[]): string[] {
+  return keys.flatMap((key) => {
+    const value = input[key];
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+  });
+}
+
+function isWindowsStylePath(value: string): boolean {
+  return /^[a-z]:[\\/]/i.test(value) || value.startsWith('\\\\') || value.includes('\\');
+}
+
+function normalizeHierarchy(value: string, separator: '\\' | '/', caseInsensitive: boolean): string {
+  const separatorPattern = separator === '\\' ? /[\\/]+/g : /\/+/g;
+  let normalized = value.trim().replace(separatorPattern, separator);
+  while (normalized.length > 1 && normalized.endsWith(separator)) {
+    normalized = normalized.slice(0, -1);
+  }
+  return caseInsensitive ? normalized.toLowerCase() : normalized;
+}
+
+function normalizePath(value: string, separator: '\\' | '/', caseInsensitive: boolean): string {
+  const normalized = normalizeHierarchy(value, separator, caseInsensitive);
+  const segments: string[] = [];
+
+  for (const segment of normalized.split(separator)) {
+    if (segment === '.') continue;
+    if (segment === '..' && segments.length > 0) {
+      const previous = segments[segments.length - 1];
+      if (previous !== undefined && previous !== '' && !previous.endsWith(':') && previous !== '..') {
+        segments.pop();
+        continue;
+      }
+    }
+    segments.push(segment);
+  }
+
+  return segments.join(separator) || separator;
+}
+
+function isSameOrDescendant(candidate: string, root: string, separator: '\\' | '/'): boolean {
+  return candidate === root || candidate.startsWith(root === separator ? root : `${root}${separator}`);
+}
+
+function pathIsProtected(candidate: string, protectedPath: string): boolean {
+  const windowsStyle = isWindowsStylePath(candidate) || isWindowsStylePath(protectedPath);
+  const separator = windowsStyle ? '\\' : '/';
+  return isSameOrDescendant(
+    normalizePath(candidate, separator, windowsStyle),
+    normalizePath(protectedPath, separator, windowsStyle),
+    separator,
+  );
+}
+
+function registryKeyIsProtected(candidate: string, protectedKey: string): boolean {
+  return isSameOrDescendant(
+    normalizeHierarchy(candidate, '\\', true),
+    normalizeHierarchy(protectedKey, '\\', true),
+    '\\',
+  );
+}
+
+function touchesProtected(
+  input: Record<string, unknown>,
+  protectedResources: AiAgentProtectedResources,
+): string | null {
+  for (const serviceName of leafValuesFor(input, SERVICE_INPUT_KEYS)) {
+    if (protectedResources.services.some(
+      (protectedService) => protectedService.toLowerCase() === serviceName.toLowerCase(),
+    )) {
+      return `service "${serviceName}" is protected`;
+    }
+  }
+
+  for (const path of leafValuesFor(input, PATH_INPUT_KEYS)) {
+    if (protectedResources.paths.some((protectedPath) => pathIsProtected(path, protectedPath))) {
+      return `path "${path}" is protected`;
+    }
+  }
+
+  for (const registryKey of leafValuesFor(input, REGISTRY_INPUT_KEYS)) {
+    if (protectedResources.registryKeys.some(
+      (protectedKey) => registryKeyIsProtected(registryKey, protectedKey),
+    )) {
+      return `registry key "${registryKey}" is protected`;
+    }
+  }
+
+  const deviceTags = [
+    ...leafValuesFor(input, DEVICE_TAG_INPUT_KEYS),
+    ...leafValuesFor(input, DEVICE_TAG_ARRAY_INPUT_KEYS),
+  ];
+  for (const deviceTag of deviceTags) {
+    // Case-insensitive, matching services/paths/registry. 'Production' vs
+    // 'production' passed before.
+    if (protectedResources.deviceTags.some(
+      (protectedTag) => protectedTag.toLowerCase() === deviceTag.toLowerCase(),
+    )) {
+      return `device tag "${deviceTag}" is protected`;
+    }
+  }
+
+  return null;
+}
+
+function isAgentGuardrailPolicy(
+  policy: AgentGuardrailPolicy | null | undefined,
+): policy is AgentGuardrailPolicy {
+  if (!policy || !Array.isArray(policy.toolAllowlist)) return false;
+  if (typeof policy.enabled !== 'boolean') return false;
+  if (policy.deviceId !== null && typeof policy.deviceId !== 'string') return false;
+  if (policy.mode !== 'off' && policy.mode !== 'shadow' && policy.mode !== 'act') return false;
+  if (!policy.toolAllowlist.every((toolName) => typeof toolName === 'string')) return false;
+
+  const resources = policy.protectedResources;
+  if (!resources || typeof resources !== 'object') return false;
+  return [resources.services, resources.paths, resources.registryKeys, resources.deviceTags]
+    .every((values) => Array.isArray(values) && values.every((value) => typeof value === 'string'));
+}
+
+function siteScopeDenial(
+  input: Record<string, unknown>,
+  deviceSiteId: string | null | undefined,
+): string | null {
+  const selectedSiteIds: string[] = [];
+
+  for (const key of SITE_INPUT_KEYS) {
+    if (!(key in input)) continue;
+    const value = input[key];
+    if (typeof value !== 'string') return `site selector "${key}" is invalid`;
+    selectedSiteIds.push(value);
+  }
+
+  for (const key of SITE_ARRAY_INPUT_KEYS) {
+    if (!(key in input)) continue;
+    const value = input[key];
+    if (!Array.isArray(value) || !value.every((siteId) => typeof siteId === 'string')) {
+      return `site selector "${key}" is invalid`;
+    }
+    selectedSiteIds.push(...value);
+  }
+
+  if (selectedSiteIds.length === 0) return null;
+  if (!deviceSiteId) return 'run device site is unavailable';
+  const outsideSite = selectedSiteIds.find((siteId) => siteId !== deviceSiteId);
+  return outsideSite ? `site "${outsideSite}" is outside the run device site` : null;
+}
+
+/**
+ * Structural guardrails for the ai_agent principal. This path intentionally
+ * never consults user RBAC: an agent has no user role to authorize against.
+ */
+export function checkAgentGuardrails(
+  toolName: string,
+  input: Record<string, unknown>,
+  policy: AgentGuardrailPolicy | null | undefined,
+): AgentGuardrailCheck {
+  const base = checkGuardrails(toolName, input);
+  const deny = (reason: string): AgentGuardrailCheck =>
+    ({ ...base, allowed: false, requiresApproval: false, disposition: 'deny', reason });
+
+  // envFlag reads process.env at CALL time and shares its normalization with
+  // config/env, so the two readers of this flag cannot disagree (a module-level
+  // const also made the kill switch unstubbable, and therefore untestable).
+  if (!envFlag('BREEZE_AI_AGENTS_ENABLED', false)) {
+    return deny('Autonomous AI agents are disabled');
+  }
+  // Wave 5A Task 2 (#3827): DB-backed kill switch, ADDITIONAL to the env
+  // flag above, not a replacement for it — the two need not agree, and
+  // either alone denies. `getCachedAiKillStateSnapshot` is a pure sync read
+  // of a module-level cache (see `aiKillState.ts`'s header for the ≤5s
+  // staleness bound and why its default is not-killed); this function stays
+  // synchronous, unable to await a fresh DB read on every dispatch, exactly
+  // like the env-flag check above it.
+  const killState = getCachedAiKillStateSnapshot();
+  if (killState.killed) {
+    return deny(`Autonomous AI agents are kill-switched (epoch ${killState.epoch})`);
+  }
+  if (!isAgentGuardrailPolicy(policy)) {
+    return deny('AI agent run policy snapshot is missing or invalid');
+  }
+  if (!base.allowed || base.tier === 4 || BLOCKED_TOOLS.has(toolName)) {
+    return deny(base.reason ?? `Tool "${toolName}" is not available to agents`);
+  }
+  if (isSecretBearingTool(toolName)) {
+    return deny(`Tool "${toolName}" is secret-bearing and never available to agents`);
+  }
+  if (AGENT_HUMAN_ONLY_TOOLS.has(toolName)) {
+    return deny(`Tool "${toolName}" is human-only and is never available to agents`);
+  }
+
+  const siteDenial = siteScopeDenial(input, policy.deviceSiteId);
+  if (siteDenial) return deny(`Denied: ${siteDenial}`);
+
+  // An operator switching the agent off, or holding it at propose-only, must be
+  // enforced HERE. The resolver computes enabled/mode but returning a snapshot
+  // makes that advisory — every caller would have to remember to re-check it.
+  if (policy.enabled === false) return deny('Agent is disabled');
+  if (policy.mode === 'off') return deny('Agent mode is off');
+
+  const actionKey = TOOL_ACTION_INPUT_KEYS[toolName] ?? 'action';
+  const action = resolveActionForTool(toolName, input);
+
+  // A non-string action (`action: ['write']`) makes checkGuardrails skip its
+  // TIER3_ACTIONS escalation and fall back to the tool's REGISTERED BASE TIER —
+  // which is 1 for most action-multiplexed tools. Falling back is a DOWNGRADE,
+  // not a floor: it collapsed 15 mutating tools to Tier 1 and skipped the
+  // allowlist entirely. An unresolvable action on a multiplexed tool denies.
+  if (action === undefined && isActionMultiplexedTool(toolName)) {
+    return deny(
+      `Tool "${toolName}" requires a string "${actionKey}"; got ${describeType(input[actionKey])}`,
+    );
+  }
+
+  const readOnly = isReadOnlyResolution(toolName, base);
+
+  // A device-less run has no site scope (buildAgentAuthContext pins
+  // allowedSiteIds only when a device exists), so a mutation from it would be
+  // org-wide. Deny rather than propose: a human approving it could not see
+  // what it is bounded to.
+  //
+  // P2-4 (#4191) exemption: a `manage_tickets` call carrying an explicit
+  // ticket binding (`policy.scope.ticketId`, populated only by the release
+  // path from the intent's own scope — see AgentGuardrailPolicy.scope's doc
+  // comment) satisfies the same "the mutation is bounded to something a
+  // human can see" requirement the device/site scope exists to prove, just
+  // on the ticket axis instead of the device axis. Every other tool, and
+  // every OTHER `manage_tickets` call with no ticket scope, still denies
+  // exactly as before — this is not a blanket device-less carve-out.
+  const ticketScoped = toolName === 'manage_tickets' && !!policy.scope?.ticketId;
+  if (!readOnly && policy.deviceId === null && !ticketScoped) {
+    return deny(`Tool "${toolName}" mutates and the run is not device-bound`);
+  }
+
+  const allowlisted = policy.toolAllowlist.includes(toolName)
+    || (action !== undefined && policy.toolAllowlist.includes(`${toolName}:${action}`));
+  if (!readOnly && !allowlisted) {
+    return deny(`Tool "${toolName}"${action ? `:${action}` : ''} is not in the agent's allowlist`);
+  }
+
+  const protectedHit = touchesProtected(input, policy.protectedResources);
+  if (protectedHit) return deny(`Denied: ${protectedHit}`);
+
+  // Act mode (wave 4 Part B): a manifest-matched, rule-equivalent mutation
+  // executes (through the normal tool path — the pre/post hooks in
+  // runLoop.ts do the actual revalidate/reserve/verify work); everything
+  // else that mutates records a proposal, exactly like shadow. This branch
+  // sits AFTER the allowlist and protected checks (same placement rule as
+  // shadow below), so both outcomes are only reachable for a call the agent
+  // could legitimately make in the first place — every structural deny above
+  // (kill switch, tier 4, secret-bearing, site scope, disabled/off, device-
+  // less mutation, allowlist, protected resources) is untouched and sits
+  // strictly upstream of this branch, never the reverse.
+  if (policy.mode === 'act' && !readOnly) {
+    const op = resolveActOperation(toolName, input);
+    if (op) {
+      return {
+        ...base,
+        allowed: true,
+        requiresApproval: false,
+        disposition: 'act',
+        reason: `Rule-equivalent operation "${op.key}" — act mode executes with verification`,
+      };
+    }
+    // Unmatched mutation under act: identical semantics to shadow — propose,
+    // never auto-approve-and-execute. There is no "act mode but not manifest
+    // -matched" execution path; the manifest IS the entire act-eligible surface.
+    return {
+      ...base,
+      allowed: false,
+      requiresApproval: false,
+      disposition: 'propose',
+      reason: `Tool "${toolName}" is not act-eligible; recorded as a proposal`,
+    };
+  }
+
+  // Shadow proposes; it never mutates — and this branch now sits AFTER the
+  // allowlist and protected checks so 'propose' is only reachable for a call
+  // the agent could legitimately make. allowed:false is load-bearing (see
+  // AgentGuardrailCheck).
+  if (policy.mode === 'shadow' && !readOnly) {
+    return {
+      ...base,
+      allowed: false,
+      requiresApproval: false,
+      disposition: 'propose',
+      reason: `Tool "${toolName}" mutates; shadow mode records a proposal instead of executing`,
+    };
+  }
+
+  return { ...base, disposition: 'allow' };
+}
+
 /**
  * Core role-resolution + permission-check primitive shared by checkToolPermission
  * (tools/call) and any other MCP dispatch path that needs to authorize a single
@@ -1316,6 +1907,11 @@ export async function checkPermissionRequirements(
   auth: AuthContext,
   requirements: Array<{ resource: string; action: string }>
 ): Promise<string | null> {
+  // Spec 2026-08-22 §3.2: an agent has no role; this helper's "no token ⇒
+  // allowed" fallback would fail OPEN for it. Deny before anything else.
+  if (auth.principal?.kind === 'ai_agent') {
+    return 'AI agent principals are never granted user permissions';
+  }
   if (requirements.length === 0) return null;
   if (!auth.token) {
     const described = requirements.map((r) => `${r.resource}.${r.action}`).join(', ');
@@ -1344,6 +1940,72 @@ export async function checkPermissionRequirements(
   return null;
 }
 
+type ToolPermissionRequirement = { resource: string; action: string };
+
+type ToolPermissionResolution =
+  | { ok: true; requirements: ToolPermissionRequirement[] }
+  | { ok: false; denial: string };
+
+function resolveToolPermissionRequirements(
+  toolName: string,
+  input: Record<string, unknown>,
+): ToolPermissionResolution {
+  const permDef = TOOL_PERMISSIONS[toolName];
+  if (!permDef) {
+    return { ok: false, denial: `No RBAC permission mapping for tool "${toolName}"` };
+  }
+
+  // Resolve the required permission (may be action-dependent)
+  let required: ToolPermissionRequirement;
+  const action = input.action as string | undefined;
+
+  if ('resource' in permDef && 'action' in permDef) {
+    required = permDef as ToolPermissionRequirement;
+  } else if (action && (permDef as Record<string, ToolPermissionRequirement>)[action]) {
+    required = (permDef as Record<string, ToolPermissionRequirement>)[action]!;
+  } else if (action) {
+    // Unknown action for a mapped tool — deny (fail-closed)
+    // Include redirect hints for tools that have been replaced by policy-based management
+    const redirectHints: Record<string, string> = {
+      manage_service_monitors: 'To add, update, or remove monitoring watches, use manage_policy_feature_link with the existing policy\'s featureLinkId and action "update". First call get_configuration_policy to find the monitoring featureLinkId and current inlineSettings.watches array, then update it with the new watch appended.',
+    };
+    const hint = redirectHints[toolName];
+    return {
+      ok: false,
+      denial: `Unknown action "${action}" for tool "${toolName}".${hint ? ` ${hint}` : ''}`,
+    };
+  } else {
+    // Action-multiplexed tool invoked without an `action` arg — deny (fail-closed).
+    // Each sub-operation has its own RBAC permission; without an action we can't
+    // resolve which one applies, so allowing here would let any caller bypass
+    // per-action checks. Zod schemas require `action` anyway; this is defense in depth.
+    return {
+      ok: false,
+      denial: `Missing required "action" argument for tool "${toolName}"`,
+    };
+  }
+
+  return {
+    ok: true,
+    requirements: [required, ...(TOOL_EXTRA_PERMISSIONS[toolName] ?? [])],
+  };
+}
+
+/**
+ * The RBAC requirements a HUMAN needs for this tool call. Used by wave-3b
+ * approver eligibility (a human approving an agent proposal must hold what
+ * they would need to do it themselves). Returns null when the tool has no
+ * mapping — callers must treat null as "nobody is eligible", mirroring
+ * checkToolPermission's deny.
+ */
+export function requiredPermissionsForTool(
+  toolName: string,
+  input: Record<string, unknown>,
+): Array<{ resource: string; action: string }> | null {
+  const resolution = resolveToolPermissionRequirements(toolName, input);
+  return resolution.ok ? resolution.requirements : null;
+}
+
 /**
  * Check RBAC permissions for a tool invocation.
  * Returns null if allowed, or an error message if denied.
@@ -1353,6 +2015,14 @@ export async function checkToolPermission(
   input: Record<string, unknown>,
   auth: AuthContext
 ): Promise<string | null> {
+  // An agent has no user role, so the token-less fallback below would grant it
+  // EVERY tool. This must stay the first statement: checkToolPermission
+  // short-circuits before it delegates to checkPermissionRequirements, so the
+  // deny there does not cover this path. (aiAgentSdk's tool loop, intent
+  // release revalidation, approvals and the MCP server all enter here.)
+  if (auth.principal?.kind === 'ai_agent') {
+    return 'AI agent principals are never granted user permissions';
+  }
   // Helper sessions use a synthetic auth with no roleId — tool access is
   // governed by the helper whitelist (helperToolFilter), not user RBAC.
   if (!auth.token) {
@@ -1361,40 +2031,13 @@ export async function checkToolPermission(
   }
   if (auth.token.roleId === null) return null;
 
-  const permDef = TOOL_PERMISSIONS[toolName];
-  if (!permDef) return `No RBAC permission mapping for tool "${toolName}"`;
-
-  // Resolve the required permission (may be action-dependent)
-  let required: { resource: string; action: string };
-  const action = input.action as string | undefined;
-
-  if ('resource' in permDef && 'action' in permDef) {
-    required = permDef as { resource: string; action: string };
-  } else if (action && (permDef as Record<string, { resource: string; action: string }>)[action]) {
-    required = (permDef as Record<string, { resource: string; action: string }>)[action]!;
-  } else if (action) {
-    // Unknown action for a mapped tool — deny (fail-closed)
-    // Include redirect hints for tools that have been replaced by policy-based management
-    const redirectHints: Record<string, string> = {
-      manage_service_monitors: 'To add, update, or remove monitoring watches, use manage_policy_feature_link with the existing policy\'s featureLinkId and action "update". First call get_configuration_policy to find the monitoring featureLinkId and current inlineSettings.watches array, then update it with the new watch appended.',
-    };
-    const hint = redirectHints[toolName];
-    return `Unknown action "${action}" for tool "${toolName}".${hint ? ` ${hint}` : ''}`;
-  } else {
-    // Action-multiplexed tool invoked without an `action` arg — deny (fail-closed).
-    // Each sub-operation has its own RBAC permission; without an action we can't
-    // resolve which one applies, so allowing here would let any caller bypass
-    // per-action checks. Zod schemas require `action` anyway; this is defense in depth.
-    return `Missing required "action" argument for tool "${toolName}"`;
-  }
+  const resolution = resolveToolPermissionRequirements(toolName, input);
+  if (!resolution.ok) return resolution.denial;
 
   // One getUserPermissions resolution covers the base requirement and every
   // extra permission; denials keep the same first-failure ordering as the
   // old per-requirement loop.
-  return checkPermissionRequirements(auth, [
-    required,
-    ...(TOOL_EXTRA_PERMISSIONS[toolName] ?? []),
-  ]);
+  return checkPermissionRequirements(auth, resolution.requirements);
 }
 
 /**
@@ -1419,6 +2062,81 @@ export async function checkToolRateLimit(
   return null;
 }
 
+/** A trimmed string, or a finite number coerced to a string — never '', null, undefined, NaN. */
+function nonEmptyText(value: unknown): string | null {
+  if (typeof value === 'string' && value.trim()) return value.trim();
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return null;
+}
+
+/**
+ * sweep 2026-09-08 row 19: `manage_services` exposes `serviceName` on ITS OWN
+ * input schema and normalizes it to `payload.name` before calling into
+ * commandQueue — but `execute_command`'s schema never documented a payload
+ * key for service commands, so a model calling it directly has been observed
+ * reusing the more visible `serviceName` name instead. A persisted approval's
+ * `action_arguments` looked like
+ * `{ commandType: 'restart_service', payload: { serviceName: 'Spooler' } }`,
+ * which the old `payload.name`-only read missed, falling back to the generic
+ * "Execute \"restart_service\" command" wording. Try `serviceName` first
+ * (the more likely source for a direct execute_command call) then `name`
+ * (manage_services' normalized shape) so either caller gets a named headline.
+ */
+function serviceNameFromPayload(payload: Record<string, unknown>): string | null {
+  return nonEmptyText(payload.serviceName) ?? nonEmptyText(payload.name);
+}
+
+/**
+ * #5173: `execute_command`'s headline used to be the raw call signature
+ * ('Execute "kill_process" command on device 74e15ef8...') for every
+ * commandType, mutating or not. These builders read `input.payload` (the
+ * tool's `payload: z.record(z.string(), z.unknown())` — deliberately
+ * unvalidated, so these are read-only extractions for display, never a
+ * validation gate) to produce a call-specific verb phrase for the
+ * commandTypes execute_command's schema actually accepts. A commandType not
+ * in this map, or one whose payload lacks the field its builder needs,
+ * returns null and buildApprovalDescription falls back to the pre-existing
+ * generic "Execute "<type>" command" wording below — so an unrecognised or
+ * sparse call never regresses to something worse than what shipped before.
+ */
+const EXECUTE_COMMAND_HEADLINE_BUILDERS: Record<string, (payload: Record<string, unknown>) => string | null> = {
+  kill_process: (payload) => {
+    const processName = nonEmptyText(payload.processName);
+    const pid = nonEmptyText(payload.pid);
+    if (processName && pid) return `Kill process "${processName}" (PID ${pid})`;
+    if (processName) return `Kill process "${processName}"`;
+    if (pid) return `Kill process PID ${pid}`;
+    return null;
+  },
+  start_service: (payload) => {
+    const name = serviceNameFromPayload(payload);
+    return name ? `Start service "${name}"` : null;
+  },
+  stop_service: (payload) => {
+    const name = serviceNameFromPayload(payload);
+    return name ? `Stop service "${name}"` : null;
+  },
+  restart_service: (payload) => {
+    const name = serviceNameFromPayload(payload);
+    return name ? `Restart service "${name}"` : null;
+  },
+  list_services: () => 'List services',
+  list_processes: () => 'List running processes',
+  file_read: (payload) => {
+    const path = nonEmptyText(payload.path);
+    return path ? `Read file "${path}"` : null;
+  },
+  file_list: (payload) => {
+    const path = nonEmptyText(payload.path);
+    return path ? `List files in "${path}"` : 'List files';
+  },
+  event_logs_list: () => 'List event logs',
+  event_logs_query: (payload) => {
+    const logName = nonEmptyText(payload.logName);
+    return logName ? `Query "${logName}" event log` : 'Query event log';
+  },
+};
+
 /**
  * Build a human-readable description of what the tool is about to do.
  */
@@ -1430,19 +2148,88 @@ function buildApprovalDescription(
   const parts: string[] = [];
 
   switch (toolName) {
-    case 'execute_command':
-      parts.push(`Execute "${input.commandType}" command`);
+    case 'execute_command': {
+      const commandType = nonEmptyText(input.commandType);
+      const payload = (input.payload && typeof input.payload === 'object'
+        ? input.payload as Record<string, unknown>
+        : {});
+      const specific = commandType ? EXECUTE_COMMAND_HEADLINE_BUILDERS[commandType]?.(payload) : null;
+      parts.push(specific ?? `Execute "${input.commandType}" command`);
       if (input.deviceId) parts.push(`on device ${(input.deviceId as string).slice(0, 8)}...`);
       break;
+    }
 
     case 'run_script':
       parts.push(`Run script ${(input.scriptId as string)?.slice(0, 8) ?? 'unknown'}...`);
       if (Array.isArray(input.deviceIds)) parts.push(`on ${input.deviceIds.length} device(s)`);
       break;
 
+    case 'cancel_script_execution':
+      parts.push(`Stop script execution ${(input.executionId as string)?.slice(0, 8) ?? 'unknown'}...`);
+      break;
+
     case 'manage_services':
       parts.push(`${action?.toUpperCase()} service "${input.serviceName}"`);
       if (input.deviceId) parts.push(`on device ${(input.deviceId as string).slice(0, 8)}...`);
+      break;
+
+    // P2-4 (#4191): ticket-triage actions get real copy; every other
+    // manage_tickets action (create/assign/update_status/link_alert/...)
+    // falls through to the SAME generic `${toolName}: ${action}` shape the
+    // top-level default produced before this case existed — no regression
+    // for actions this case doesn't special-case. Deliberately NEVER
+    // includes ticket subject/description/comment content — only ids,
+    // hostnames, and field NAMES (never field VALUES, which is what elides
+    // a categoryId's opaque uuid along with everything else).
+    case 'manage_tickets': {
+      const shortTicketId = typeof input.ticketId === 'string' ? `${input.ticketId.slice(0, 8)}...` : 'unknown';
+      if (action === 'update_fields') {
+        const fieldNames = input.fields && typeof input.fields === 'object'
+          ? Object.keys(input.fields as Record<string, unknown>)
+          : [];
+        parts.push(`Update ticket #${shortTicketId} fields (${fieldNames.join(', ') || 'none'})`);
+      } else if (action === 'link_device') {
+        const target = typeof input.hostname === 'string'
+          ? input.hostname
+          : (typeof input.serial === 'string' ? input.serial : 'unknown device');
+        parts.push(`Link device ${target} to ticket #${shortTicketId}`);
+      } else if (action === 'comment') {
+        parts.push(`Post private AI triage note on ticket #${shortTicketId}`);
+      } else if (action === 'draft') {
+        const kindLabel = input.kind === 'resolution_note' ? 'resolution note' : 'reply';
+        parts.push(`Store AI ${kindLabel} draft on ticket #${shortTicketId}`);
+      } else {
+        parts.push(`${toolName}${action ? `: ${action}` : ''}`);
+      }
+      break;
+    }
+
+    // P2-5 (#4192): the op key ONLY. Never the agent's own text, never a
+    // rationale — this string is rendered in the approval inbox and stored on
+    // the intent, and no model-authored content may reach either.
+    //
+    // The parenthetical is not decoration: `cloneValuesFromEffective`
+    // (`aiAgents/supervisedKeyGrant.ts`) materializes the partner's CURRENT
+    // policy as a per-org `ai_agents` row whenever the org has none — the
+    // COMMON case under partner-wide-first. After that the org follows the
+    // partner only where the merge is tighten-only, so a partner that later
+    // WIDENS (a new tool in the allowlist, a raised limit, a new recipient or
+    // trigger) no longer reaches this org. The grant audit row records
+    // `clonedFromEffective` after the fact; this is the only place the second
+    // approver can be told BEFORE they consent. Unconditional because the
+    // description is built at intent-CREATION time, when whether the org
+    // already has a row is a race against the release — stating the
+    // conditional truth is honest at both moments.
+    case 'manage_ai_agents':
+      if (action === 'authorize_supervised_key') {
+        parts.push(
+          `Authorize the AI agent to run "${String(input.opKey ?? 'unknown')}" without an approval ` +
+          'for this organization in future runs',
+          '(creates a per-organization agent policy override if this organization does not already have one)',
+        );
+      } else {
+        parts.push(`${toolName}${action ? `: ${action}` : ''}`);
+      }
       break;
 
     case 'security_scan':
@@ -1545,6 +2332,11 @@ function buildApprovalDescription(
       parts.push(`to ${input.level} ${(input.targetId as string)?.slice(0, 8)}...`);
       break;
 
+    case 'manage_policy_feature_link':
+      parts.push(`${action?.toUpperCase()} ${String(input.featureType ?? 'feature')} link`);
+      parts.push(`on config policy ${(input.configPolicyId as string)?.slice(0, 8) ?? 'unknown'}...`);
+      break;
+
     case 'remove_configuration_policy_assignment':
       parts.push(`Remove config policy assignment ${(input.assignmentId as string)?.slice(0, 8)}...`);
       break;
@@ -1586,7 +2378,44 @@ function buildApprovalDescription(
       if (action === 'create_org') parts.push(`Create organization "${input.name}" (with a default Main Office site)`);
       else if (action === 'update_org') parts.push(`Update organization ${(input.orgId as string)?.slice(0, 8)}...${input.status ? ` (status → ${input.status})` : ''}`);
       else if (action === 'create_site') parts.push(`Create site "${input.name}" in organization ${(input.orgId as string)?.slice(0, 8) ?? '(own org)'}...`);
-      else parts.push(`Organizations: ${action}`);
+      else if (action === 'add_contact') {
+        // Review finding (fix round 1): `input.name` had no `??` fallback, so
+        // a phone/mobile-only contact (legal since contacts_identifiable_chk
+        // only needs ONE of name/email/phone/mobile) rendered literally as
+        // `Add contact "undefined"` — the approver saw nothing identifying,
+        // the exact failure spec §5 created this branch to prevent. Falls
+        // back through the same priority order createContact accepts, and
+        // lists every OTHER present identifier alongside it so the approver
+        // sees everything supplied, not just whichever field won the fallback.
+        const acName = typeof input.name === 'string' ? input.name : undefined;
+        const acEmail = typeof input.email === 'string' ? input.email : undefined;
+        const acPhone = typeof input.phone === 'string' ? input.phone : undefined;
+        const acMobile = typeof input.mobile === 'string' ? input.mobile : undefined;
+        const acHeadline = acName ?? acEmail ?? acPhone ?? acMobile ?? 'no identifying info provided';
+        const acOthers = [
+          acEmail && acEmail !== acHeadline ? `email: ${acEmail}` : null,
+          acPhone && acPhone !== acHeadline ? `phone: ${acPhone}` : null,
+          acMobile && acMobile !== acHeadline ? `mobile: ${acMobile}` : null,
+        ].filter((part): part is string => part !== null);
+        parts.push(
+          `Add contact "${acHeadline}"${acOthers.length ? ` (${acOthers.join(', ')})` : ''} to organization ${(input.orgId as string)?.slice(0, 8) ?? '(own org)'}...`
+        );
+        // Review finding (fix round 2): `siteId` and `isPrimary` are the only
+        // two add_contact inputs whose effect reaches beyond inserting a row,
+        // and neither was shown. `isPrimary: true` DEMOTES whoever currently
+        // holds the scope's primary slot and REPLACES the legacy projection —
+        // organizations.billing_contact, or sites.contact when a site is
+        // pinned, which is a public partner-API DTO. Without these the
+        // approver cannot tell "file a new contact" (routine, hence
+        // supervised) apart from "overwrite this customer's billing contact".
+        const acSiteId = typeof input.siteId === 'string' ? input.siteId : undefined;
+        if (acSiteId) parts.push(`on site ${acSiteId.slice(0, 8)}...`);
+        if (input.isPrimary === true) {
+          parts.push(
+            `as PRIMARY contact (replaces the ${acSiteId ? "site's current contact" : 'current billing contact'})`
+          );
+        }
+      } else parts.push(`Organizations: ${action}`);
       break;
 
     case 'manage_monitors':

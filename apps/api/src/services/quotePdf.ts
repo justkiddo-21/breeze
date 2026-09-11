@@ -14,7 +14,9 @@
 // route in routes/quotes/quotes.ts supplies the real quote_images loader.
 
 import PDFDocument from 'pdfkit';
-import { toCents, fromCents, type CoverPage } from '@breeze/shared';
+import { DEVICE_ROLE_NOUNS, toCents, fromCents, formatMoney as sharedFormatMoney, type BillableDeviceRole, type CoverPage } from '@breeze/shared';
+import { formatMoneyForPdf } from './pdfMoney';
+import { fitFontSize } from './pdfFitText';
 import { sellerAddressLines, type SellerSnapshot, type BillToAddress } from './sellerSnapshot';
 import { captureException } from './sentry';
 import { renderRichTextIntoPdf } from './richTextPdf';
@@ -26,14 +28,13 @@ import { renderCalloutIntoPdf } from './calloutPdf';
 // Formatting helpers (kept in lock-step with invoicePdf.ts conventions)
 // ---------------------------------------------------------------------------
 
-// Exported so other renderers (contractTemplateRender.ts's auto-variable
-// resolver) format money identically instead of hand-rolling a second
-// Intl/toLocaleString call that could drift from this one.
-export function formatMoney(amount: string | number | null | undefined, currency: string): string {
-  const n = Number(amount ?? 0);
-  const symbol = currency === 'USD' ? '$' : '';
-  const formatted = n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  return symbol ? `${symbol}${formatted}` : `${formatted} ${currency}`;
+// Compatibility shim over the shared Intl-backed formatter (@breeze/shared
+// `formatMoney`, #3777): kept as an export because contractTemplateRender.ts
+// and routes/portal/quotes.test.ts import it from here. New code should import
+// `formatMoney` from '@breeze/shared' directly. Locale precedence for PDFs:
+// the document's stamped `document_locale` → branding.locale → 'en'.
+export function formatMoney(amount: string | number | null | undefined, currency: string, locale?: string): string {
+  return sharedFormatMoney(amount, currency, locale);
 }
 
 // Exported for the same reason as formatMoney above — kept in lock-step so a
@@ -51,6 +52,28 @@ function recurrenceSuffix(recurrence: string | null | undefined): string {
   if (recurrence === 'monthly') return '/mo';
   if (recurrence === 'annual') return '/yr';
   return '';
+}
+
+type DeviceSetLine = Pick<QuoteLine, 'contractLineType' | 'deviceRoles' | 'deviceGroupName' | 'siteName' | 'includedQuantity' | 'overageMode' | 'overageUnitPrice'>;
+
+function deviceSetCustomerText(line: DeviceSetLine, currency: string, locale: string): string[] {
+  if (!line.contractLineType || !['per_device', 'per_device_role', 'per_device_group', 'per_seat'].includes(line.contractLineType)) return [];
+  let set = 'devices';
+  if (line.contractLineType === 'per_device_role') {
+    set = (line.deviceRoles ?? []).map((r) => DEVICE_ROLE_NOUNS[r as BillableDeviceRole] ?? r).join(', ') || 'devices';
+  } else if (line.contractLineType === 'per_device_group') {
+    set = `devices in “${line.deviceGroupName ?? ''}”`;
+  } else if (line.contractLineType === 'per_seat') {
+    set = 'seats';
+  }
+  if (line.siteName) set = `${set} at ${line.siteName}`;
+  const result = [`Estimated quantity — billed at the actual number of ${set} each billing period.`];
+  if (line.includedQuantity != null && line.overageMode === 'bill' && line.overageUnitPrice != null) {
+    result.push(`Includes ${Number(line.includedQuantity)}; additional units billed at ${formatMoneyForPdf(line.overageUnitPrice, currency, locale)} each.`);
+  } else if (line.includedQuantity != null && line.overageMode === 'flag') {
+    result.push(`Includes ${Number(line.includedQuantity)}; additional units are reported for review, not billed automatically.`);
+  }
+  return result;
 }
 
 /** Per-line tax amount for the Tax column: taxable lines get lineTotal × rate
@@ -87,6 +110,10 @@ export interface QuotePdfBranding {
   primaryColor?: string | null;
   footer?: string | null;
   currencyCode?: string | null;
+  /** Render locale for money glyphs, used only when the quote carries no
+   *  `document_locale` snapshot (drafts/legacy). Resolved from the partner's
+   *  language by `resolvePartnerDocumentLocale`; defaults to 'en'. */
+  locale?: string | null;
   // Optional so existing callers/tests compile unchanged; default classic/a4
   // when absent (registerThemeFonts/pdfPageSize both treat undefined the same
   // as an explicit 'classic'/'a4').
@@ -100,6 +127,8 @@ interface QuoteHeader {
   title?: string | null;
   status?: string | null;
   currencyCode?: string | null;
+  /** Send-time locale snapshot (quotes.document_locale); null on drafts/legacy. */
+  documentLocale?: string | null;
   issueDate?: string | Date | null;
   expiryDate?: string | Date | null;
   billToName?: string | null;
@@ -127,7 +156,7 @@ interface QuoteHeader {
   // fall back to depositAmount, preserving the legacy rendering.
   depositDueTotal?: string | number | null;
   // Per-category subtotals (one-time / monthly / annual), derived in getQuote.
-  // Rendered as muted rows only when >1 category is present.
+  // Even a single zero-valued recurring category is meaningful to customers.
   categoryBreakdown?: { category: string; oneTimeTotal: string; monthlyTotal: string; annualTotal: string }[];
   sellerSnapshot?: unknown;
   termsAndConditions?: string | null;
@@ -159,6 +188,17 @@ interface QuoteLine {
   lineTotal?: string | number | null;
   recurrence?: string | null;
   taxable?: boolean | null;
+  customerVisible?: boolean | null;
+  itemType?: string | null;
+  contractLineType?: string | null;
+  deviceRoles?: string[] | null;
+  deviceGroupId?: string | null;
+  deviceGroupName?: string | null;
+  siteId?: string | null;
+  siteName?: string | null;
+  includedQuantity?: string | number | null;
+  overageMode?: 'bill' | 'flag' | null;
+  overageUnitPrice?: string | number | null;
 }
 
 /** Loads a catalog item's product image bytes (or null). Injected so renderQuotePdf
@@ -201,13 +241,20 @@ export interface QuotePdfColumns {
 }
 
 // When showTax is set the table carries a fifth column (qty | description | unit
-// | tax | total) with 12.5%-wide money cells; the four-column layout gives each
-// money cell 14%. TOTAL gets its own wider box (16.5% / 17.5%) because it is the
-// one cell that renders money PLUS a recurrence suffix ("$12,000.00/mo") — sized
-// to colNumW it character-wraps, and the wrapped second line overprints the next
+// | tax | total) with 15.5%-wide money cells; the four-column layout gives each
+// money cell 16%. TOTAL gets its own wider box (19%) because it is the one cell
+// that renders money PLUS a recurrence suffix ("$12,000.00/mo") — sized to
+// colNumW it character-wraps, and the wrapped second line overprints the next
 // row (row height is measured from the description column only). The summary
-// gets a 19% amount box for its 14pt emphasis figure; both it and TOTAL share
+// gets a 24% amount box for its 14pt emphasis figure; both it and TOTAL share
 // the table's right edge so the amounts stay visually aligned.
+//
+// Boxes are sized for prefix-code currencies (#3777): the shared Intl
+// formatter emits "CHF 888’888.88" (code + space + groupers) rather than a
+// one-glyph "$", and money cells draw with lineBreak: false, so an undersized
+// box overprints instead of wrapping. Measured at Helvetica 10 / Helvetica-Bold
+// 14 on A4 (the narrower page) in quotePdf.test.ts; the taxed description
+// column shrinks to 42% to pay for it.
 export function columnsFor(doc: PDFKit.PDFDocument, showTax = false): QuotePdfColumns {
   const left = doc.page.margins.left;
   const right = doc.page.width - doc.page.margins.right;
@@ -219,14 +266,14 @@ export function columnsFor(doc: PDFKit.PDFDocument, showTax = false): QuotePdfCo
       colQtyX: left,
       colQtyW: contentWidth * 0.07,
       colDescX,
-      colDescW: contentWidth * 0.485,
-      colUnitX: left + contentWidth * 0.57,
-      colTaxX: left + contentWidth * 0.70,
-      colAmtX: left + contentWidth * 0.835,
-      colNumW: contentWidth * 0.125,
-      colAmtW: contentWidth * 0.165,
-      colSummaryAmtX: left + contentWidth * 0.81,
-      colSummaryNumW: contentWidth * 0.19,
+      colDescW: contentWidth * 0.42,
+      colUnitX: left + contentWidth * 0.50,
+      colTaxX: left + contentWidth * 0.655,
+      colAmtX: left + contentWidth * 0.81,
+      colNumW: contentWidth * 0.155,
+      colAmtW: contentWidth * 0.19,
+      colSummaryAmtX: left + contentWidth * 0.76,
+      colSummaryNumW: contentWidth * 0.24,
     };
   }
   return {
@@ -235,13 +282,13 @@ export function columnsFor(doc: PDFKit.PDFDocument, showTax = false): QuotePdfCo
     colQtyW: contentWidth * 0.07,
     colDescX,
     colDescW: contentWidth * 0.57,
-    colUnitX: left + contentWidth * 0.66,
+    colUnitX: left + contentWidth * 0.65,
     colTaxX: left + contentWidth * 0.70, // unused when !showTax
-    colAmtX: left + contentWidth * 0.825,
-    colNumW: contentWidth * 0.14,
-    colAmtW: contentWidth * 0.175,
-    colSummaryAmtX: left + contentWidth * 0.81,
-    colSummaryNumW: contentWidth * 0.19,
+    colAmtX: left + contentWidth * 0.81,
+    colNumW: contentWidth * 0.16,
+    colAmtW: contentWidth * 0.19,
+    colSummaryAmtX: left + contentWidth * 0.76,
+    colSummaryNumW: contentWidth * 0.24,
   };
 }
 
@@ -304,9 +351,11 @@ async function renderLineTable(
   doc: PDFKit.PDFDocument,
   lines: QuoteLine[],
   currency: string,
+  locale: string,
   startY: number,
   loadCatalogImage: LoadCatalogImage,
   loadQuoteImage: (imageId: string) => Promise<{ data: Buffer } | null>,
+  fonts: PdfThemeFonts,
   taxRate = 0,
   showTax = false,
   showSubtotal = false,
@@ -351,7 +400,7 @@ async function renderLineTable(
     doc.save();
     doc.rect(c.left - 6, headerY - 5, c.contentWidth + 12, 22).fill('#f8fafc');
     doc.restore();
-    doc.fillColor('#6b7280').fontSize(8.5).font('Helvetica-Bold');
+    doc.fillColor('#6b7280').fontSize(8.5).font(fonts.heading.bold);
     doc.text('QTY', c.colQtyX, headerY, { width: c.colQtyW, align: 'left' });
     doc.text('DESCRIPTION', c.colDescX, headerY, { width: c.colDescW, align: 'left' });
     doc.text('UNIT', c.colUnitX, headerY, { width: c.colNumW, align: 'right' });
@@ -377,12 +426,16 @@ async function renderLineTable(
     // Title falls back to description for legacy lines that predate the name/description split.
     const title = (l.name ?? l.description ?? '').trim() || '—';
     const blurb = l.name ? (l.description ?? '').trim() : '';
-    doc.font('Helvetica-Bold').fontSize(10);
+    doc.font(fonts.body.bold).fontSize(10);
     const titleHeight = doc.heightOfString(title, { width: descW });
-    doc.font('Helvetica').fontSize(8.5);
+    doc.font(fonts.body.regular).fontSize(8.5);
     const blurbHeight = blurb ? doc.heightOfString(blurb, { width: descW, lineGap: 1 }) + 2 : 0;
+    const deviceSetText = deviceSetCustomerText(l, currency, locale);
+    const deviceSetHeight = deviceSetText.length
+      ? deviceSetText.reduce((h, text) => h + doc.heightOfString(text, { width: descW, lineGap: 1 }) + 2, 0)
+      : 0;
     const img = imageByLine.get(l.id);
-    return { title, blurb, titleHeight, img, rowHeight: Math.max(titleHeight + blurbHeight, img ? THUMB : 12) };
+    return { title, blurb, titleHeight, blurbHeight, deviceSetText, img, rowHeight: Math.max(titleHeight + blurbHeight + deviceSetHeight, img ? THUMB : 12) };
   };
 
   // Keep the section label, the column header and the FIRST row together as one
@@ -391,13 +444,13 @@ async function renderLineTable(
   // got drawn at the foot of the page, then the row-level break moved the row to
   // the next page and stranded them. Reserve the first row's real measured height
   // instead, capped to a page so a taller-than-a-page row can't force a blank one.
-  const labelHeight = label ? (doc.font('Helvetica-Bold').fontSize(11).heightOfString(label, { width: c.contentWidth }) + 6) : 0;
+  const labelHeight = label ? (doc.font(fonts.heading.bold).fontSize(11).heightOfString(label, { width: c.contentWidth }) + 6) : 0;
   const usable = doc.page.height - doc.page.margins.top - doc.page.margins.bottom;
   const firstLine = lines[0];
   const firstRowHeight = firstLine ? measureRow(firstLine).rowHeight + 6 : 0;
   y = ensureSpace(doc, y, Math.min(labelHeight + 24 + firstRowHeight, usable));
   if (label) {
-    doc.fillColor('#111827').fontSize(11).font('Helvetica-Bold').text(label, c.left, y, { width: c.contentWidth });
+    doc.fillColor('#111827').fontSize(11).font(fonts.heading.bold).text(label, c.left, y, { width: c.contentWidth });
     y = doc.y + 6;
   }
 
@@ -405,13 +458,13 @@ async function renderLineTable(
 
   const descX = c.colDescX;
   for (const l of lines) {
-    const { title, blurb, titleHeight, img, rowHeight } = measureRow(l);
+    const { title, blurb, titleHeight, blurbHeight, deviceSetText, img, rowHeight } = measureRow(l);
     // Keep the whole row together: if it won't fit in the remaining page, break to
     // a fresh page (re-drawing the column header) rather than letting a long
     // description overflow into the footer band. (Old reserve was a flat 30/52pt,
     // so tall rows spilled past the bottom margin.)
     y = ensureRowSpace(y, rowHeight + 6);
-    doc.fillColor('#1f2937').font('Helvetica').fontSize(10);
+    doc.fillColor('#1f2937').font(fonts.body.regular).fontSize(10);
     doc.text(String(Number(l.quantity)), c.colQtyX, y, { width: c.colQtyW, align: 'left' });
     if (img) {
       // A buffer that loaded but pdfkit can't decode: skip the thumbnail (never
@@ -424,22 +477,41 @@ async function renderLineTable(
         captureException(e instanceof Error ? e : new Error(String(e)));
       }
     }
-    doc.fillColor('#1f2937').font('Helvetica-Bold').fontSize(10).text(title, descX + gutter, y, { width: descW });
+    doc.fillColor('#1f2937').font(fonts.body.bold).fontSize(10).text(title, descX + gutter, y, { width: descW });
     if (blurb) {
-      doc.fillColor('#6b7280').fontSize(8.5).font('Helvetica').text(blurb, descX + gutter, y + titleHeight + 2, { width: descW, lineGap: 1 });
+      doc.fillColor('#6b7280').fontSize(8.5).font(fonts.body.regular).text(blurb, descX + gutter, y + titleHeight + 2, { width: descW, lineGap: 1 });
+      doc.fillColor('#1f2937').fontSize(10);
+    }
+    if (deviceSetText.length) {
+      let textY = y + titleHeight + blurbHeight + 2;
+      for (const text of deviceSetText) {
+        doc.fillColor('#6b7280').fontSize(8.5).font(fonts.body.regular).text(text, descX + gutter, textY, { width: descW, lineGap: 1 });
+        textY = doc.y + 2;
+      }
       doc.fillColor('#1f2937').fontSize(10);
     }
     // lineBreak: false on every money cell — row height is measured from the
     // description column only, so a wrapped amount would overprint the next
-    // row. An amount too wide for its box clips into the column gap instead.
-    doc.font('Helvetica').fontSize(10).text(formatMoney(l.unitPrice, currency), c.colUnitX, y, { width: c.colNumW, align: 'right', lineBreak: false });
+    // row. pdfkit TRUNCATES an over-wide single-line string (not a clip into
+    // the gutter — "CHF 9'999'999'99" is a different number), and the boxes are
+    // sized for ~1M while numeric(12,2) permits 9'999'999'999.99, so every
+    // money cell shrinks its font to fit its box (#3777 review F10).
+    const unitText = formatMoneyForPdf(l.unitPrice, currency, locale);
+    doc.font(fonts.body.regular);
+    fitFontSize(doc, unitText, c.colNumW, 10);
+    doc.text(unitText, c.colUnitX, y, { width: c.colNumW, align: 'right', lineBreak: false });
     if (showTax) {
       const t = lineTax(l.lineTotal ?? Number(l.quantity) * Number(l.unitPrice), !!l.taxable, taxRate);
-      doc.fillColor('#6b7280').text(t === null ? '—' : formatMoney(t, currency), c.colTaxX, y, { width: c.colNumW, align: 'right', lineBreak: false });
+      const taxText = t === null ? '—' : formatMoneyForPdf(t, currency, locale);
+      fitFontSize(doc, taxText, c.colNumW, 10);
+      doc.fillColor('#6b7280').text(taxText, c.colTaxX, y, { width: c.colNumW, align: 'right', lineBreak: false });
       doc.fillColor('#1f2937');
     }
     const suffix = recurrenceSuffix(l.recurrence);
-    doc.font('Helvetica').fontSize(10).text(`${formatMoney(l.lineTotal ?? Number(l.quantity) * Number(l.unitPrice), currency)}${suffix}`, c.colAmtX, y, { width: c.colAmtW, align: 'right', lineBreak: false });
+    const totalText = `${formatMoneyForPdf(l.lineTotal ?? Number(l.quantity) * Number(l.unitPrice), currency, locale)}${suffix}`;
+    fitFontSize(doc, totalText, c.colAmtW, 10);
+    doc.text(totalText, c.colAmtX, y, { width: c.colAmtW, align: 'right', lineBreak: false });
+    doc.fontSize(10);
     y += rowHeight + 6;
   }
 
@@ -455,12 +527,12 @@ async function renderLineTable(
       sums[key] += Number(l.lineTotal ?? Number(l.quantity) * Number(l.unitPrice));
     }
     const parts: string[] = [];
-    if (sums.one_time > 0) parts.push(formatMoney(sums.one_time, currency));
-    if (sums.monthly > 0) parts.push(`${formatMoney(sums.monthly, currency)}/mo`);
-    if (sums.annual > 0) parts.push(`${formatMoney(sums.annual, currency)}/yr`);
+    if (lines.some((l) => l.recurrence !== 'monthly' && l.recurrence !== 'annual')) parts.push(formatMoneyForPdf(sums.one_time, currency, locale));
+    if (lines.some((l) => l.recurrence === 'monthly')) parts.push(`${formatMoneyForPdf(sums.monthly, currency, locale)}/mo`);
+    if (lines.some((l) => l.recurrence === 'annual')) parts.push(`${formatMoneyForPdf(sums.annual, currency, locale)}/yr`);
     if (parts.length) {
       const subtotalText = parts.join('  +  ');
-      doc.font('Helvetica-Bold').fontSize(9.5);
+      doc.font(fonts.body.bold).fontSize(9.5);
       const subtotalWidth = c.right - c.colUnitX;
       const labelWidth = doc.widthOfString('Subtotal');
       const inlineAmountWidth = subtotalWidth - labelWidth - 10;
@@ -470,7 +542,7 @@ async function renderLineTable(
       y = ensureRowSpace(y, subtotalHeight);
       doc.moveTo(c.colUnitX, y).lineTo(c.right, y).lineWidth(0.5).strokeColor('#e5e7eb').stroke();
       y += 6;
-      doc.font('Helvetica-Bold').fontSize(9.5).fillColor('#374151').text('Subtotal', c.colUnitX, y, { width: c.contentWidth * 0.2, align: 'left' });
+      doc.font(fonts.body.bold).fontSize(9.5).fillColor('#374151').text('Subtotal', c.colUnitX, y, { width: c.contentWidth * 0.2, align: 'left' });
       if (stackAmount) {
         y += 14;
         doc.fillColor('#111827').text(subtotalText, c.colUnitX, y, { width: subtotalWidth, align: 'right' });
@@ -500,10 +572,13 @@ function renderRecurringSummary(
   doc: PDFKit.PDFDocument,
   quote: QuoteHeader,
   currency: string,
+  locale: string,
   primary: string,
   startY: number,
+  fonts: PdfThemeFonts,
   showTax = false,
   recurringLines: { monthly: boolean; annual: boolean } = { monthly: false, annual: false },
+  lines: QuoteLine[] = [],
 ): number {
   const c = columnsFor(doc, showTax);
   // Hoisted above ensureSpace so the page-break reservation can size itself to
@@ -511,27 +586,29 @@ function renderRecurringSummary(
   const breakdown = quote.categoryBreakdown ?? [];
   const depositDue = quote.depositDueTotal ?? quote.depositAmount;
   const hasDeposit = quote.depositType && quote.depositType !== 'none' && depositDue != null;
-  const showMonthly = Number(quote.monthlyRecurringTotal ?? 0) !== 0 || recurringLines.monthly;
-  const showAnnual = Number(quote.annualRecurringTotal ?? 0) !== 0 || recurringLines.annual;
+  const showMonthly = recurringLines.monthly;
+  const showAnnual = recurringLines.annual;
   const showTaxRow = quote.taxTotal != null && Number(quote.taxTotal) > 0;
-  const hasRecurring =
-    Number(quote.monthlyRecurringTotal ?? 0) > 0 || Number(quote.annualRecurringTotal ?? 0) > 0;
-  // 0.36, not 0.40: the label box ends at colSummaryAmtX (0.81), and the widest
-  // label — "Remaining balance (due per terms)" at bold 12pt, ~200pt — needs the
-  // extra room. Rows advance by the fixed constants below, so a wrapped label
-  // overprints the next row exactly like a wrapped amount would.
-  const sumX = c.left + c.contentWidth * 0.36;
+  const hasRecurring = recurringLines.monthly || recurringLines.annual;
+  // 0.33, not 0.40: the label box ends at colSummaryAmtX (0.76 — widened for
+  // prefix-code currencies, #3777), and the widest label — "Remaining balance
+  // (due per terms)" at bold 12pt, ~200pt — needs the extra room. Rows advance
+  // by the fixed constants below, so a wrapped label overprints the next row
+  // exactly like a wrapped amount would.
+  const sumX = c.left + c.contentWidth * 0.33;
   const labelX = sumX;
   const labelW = c.colSummaryAmtX - sumX - 8;
   const categoryAmountX = c.colSummaryAmtX - 60;
   const categoryAmountW = c.right - categoryAmountX;
-  doc.font('Helvetica').fontSize(9);
+  doc.font(fonts.body.regular).fontSize(9);
   const breakdownRows = breakdown.length > 1 ? breakdown.map((b) => {
     const label = b.category === 'other' ? 'Other' : b.category[0]!.toUpperCase() + b.category.slice(1);
     const parts: string[] = [];
-    if (Number(b.oneTimeTotal) > 0) parts.push(formatMoney(b.oneTimeTotal, currency));
-    if (Number(b.monthlyTotal) > 0) parts.push(`${formatMoney(b.monthlyTotal, currency)}/mo`);
-    if (Number(b.annualTotal) > 0) parts.push(`${formatMoney(b.annualTotal, currency)}/yr`);
+    const categoryLines = lines.filter((l) => (l.itemType ?? 'other') === b.category && l.customerVisible !== false);
+    const cadenceLines = categoryLines;
+    if (cadenceLines.some((l) => l.recurrence !== 'monthly' && l.recurrence !== 'annual')) parts.push(formatMoneyForPdf(b.oneTimeTotal, currency, locale));
+    if (cadenceLines.some((l) => l.recurrence === 'monthly')) parts.push(`${formatMoneyForPdf(b.monthlyTotal, currency, locale)}/mo`);
+    if (cadenceLines.some((l) => l.recurrence === 'annual')) parts.push(`${formatMoneyForPdf(b.annualTotal, currency, locale)}/yr`);
     const amount = parts.join(' + ');
     const stacked = doc.widthOfString(amount) > categoryAmountW;
     const amountHeight = stacked ? doc.heightOfString(amount, { width: c.right - sumX, align: 'right' }) : 0;
@@ -562,11 +639,11 @@ function renderRecurringSummary(
   doc.moveTo(sumX, y).lineTo(c.right, y).lineWidth(1).strokeColor('#e5e7eb').stroke();
   y += TOP_RULE_ADVANCE;
 
-  // Per-category subtotals (muted) — only worth showing when the quote spans more
-  // than one category. Drawn above the One-time/Monthly/Annual roll-up.
+  // Per-category subtotals (muted), including a lone zero-valued recurring
+  // category. Drawn above the One-time/Monthly/Annual roll-up.
   if (breakdownRows.length) {
     for (const row of breakdownRows) {
-      doc.font('Helvetica').fontSize(9).fillColor('#9ca3af');
+      doc.font(fonts.body.regular).fontSize(9).fillColor('#9ca3af');
       doc.text(row.label, labelX, y, { width: labelW, align: 'left' });
       if (row.stacked) {
         y += 12;
@@ -587,11 +664,15 @@ function renderRecurringSummary(
   ) => {
     const { bold = false, emphasis = false } = opts;
     const strong = bold || emphasis;
-    doc.font(strong ? 'Helvetica-Bold' : 'Helvetica').fontSize(emphasis ? 14 : strong ? 12 : 10).fillColor(strong ? '#111827' : '#6b7280');
+    const size = emphasis ? 14 : strong ? 12 : 10;
+    doc.font(strong ? fonts.body.bold : fonts.body.regular).fontSize(size).fillColor(strong ? '#111827' : '#6b7280');
     doc.text(label, labelX, y, { width: labelW, align: 'left' });
     // lineBreak: false — the y advances below are fixed constants shared with
     // the page-break reservation; a wrapped amount would silently break both.
-    doc.fillColor(emphasis ? primary : strong ? '#111827' : '#1f2937').text(`${formatMoney(amount, currency)}${suffix}`, c.colSummaryAmtX, y, { width: c.colSummaryNumW, align: 'right', lineBreak: false });
+    // Shrink-to-fit so a schema-maximum figure is never truncated by pdfkit.
+    const amountText = `${formatMoneyForPdf(amount, currency, locale)}${suffix}`;
+    fitFontSize(doc, amountText, c.colSummaryNumW, size);
+    doc.fillColor(emphasis ? primary : strong ? '#111827' : '#1f2937').text(amountText, c.colSummaryAmtX, y, { width: c.colSummaryNumW, align: 'right', lineBreak: false });
     y += emphasis ? EMPHASIS_ROW_ADVANCE : strong ? BOLD_ROW_ADVANCE : REGULAR_ROW_ADVANCE;
   };
 
@@ -667,14 +748,23 @@ async function renderCoverPage(
       captureException(e instanceof Error ? e : new Error(String(e)));
     }
     if (img?.data) {
+      // doc.save() must be paired with doc.restore() even when doc.image()
+      // throws (e.g. a WebP blob stored before upload-time rejection shipped,
+      // #3483) — otherwise the unmatched `q` graphics-state push corrupts the
+      // page's content stream for every draw call after this one. restore()
+      // now runs in `finally` so a failed draw still unwinds cleanly.
+      doc.save();
       try {
-        doc.save();
         doc.rect(0, 0, doc.page.width, doc.page.height).clip();
         doc.image(img.data, 0, 0, { cover: [doc.page.width, doc.page.height] });
-        doc.restore();
         hasBackground = true;
       } catch (e) {
+        // A decode-at-draw failure must not be the one silent gap — report it
+        // the same way the sibling doc.image() catches in this file do.
         console.error('[quotePdf] cover doc.image failed', cp.coverImageId, e instanceof Error ? e.message : e);
+        captureException(e instanceof Error ? e : new Error(String(e)));
+      } finally {
+        doc.restore();
       }
     }
   }
@@ -719,13 +809,13 @@ async function renderCoverPage(
 
   const preparedForName = cp.preparedForName ?? quote.billToName ?? null;
   if (preparedForName) {
-    doc.fillColor('#9ca3af').fontSize(9).font('Helvetica-Bold').text('PREPARED FOR', c.left, rowY);
-    doc.fillColor('#111827').fontSize(12).font('Helvetica-Bold').text(preparedForName, c.left, rowY + 14, { width: colW });
+    doc.fillColor('#9ca3af').fontSize(9).font(fonts.heading.bold).text('PREPARED FOR', c.left, rowY);
+    doc.fillColor('#111827').fontSize(12).font(fonts.heading.bold).text(preparedForName, c.left, rowY + 14, { width: colW });
     // Start the address at the name's real bottom edge (doc.y) — a name long
     // enough to wrap painted the address on top of its second line when this
     // assumed a fixed one-line name height.
     let addrY = Math.max(rowY + 30, doc.y + 4);
-    doc.fillColor('#4b5563').fontSize(9).font('Helvetica');
+    doc.fillColor('#4b5563').fontSize(9).font(fonts.body.regular);
     for (const line of addressLines(quote.billToAddress as BillToAddress | null)) {
       doc.text(line, c.left, addrY, { width: colW });
       addrY += 12;
@@ -736,10 +826,10 @@ async function renderCoverPage(
   // explicit `false` as "show" so a legacy/loosely-typed value degrades safely.
   if (cp.showPreparedBy !== false) {
     const seller = (quote.sellerSnapshot as SellerSnapshot | null) ?? null;
-    doc.fillColor('#9ca3af').fontSize(9).font('Helvetica-Bold').text('PREPARED BY', rightX, rowY);
-    doc.fillColor('#111827').fontSize(12).font('Helvetica-Bold').text(seller?.name ?? partnerName, rightX, rowY + 14, { width: colW });
+    doc.fillColor('#9ca3af').fontSize(9).font(fonts.heading.bold).text('PREPARED BY', rightX, rowY);
+    doc.fillColor('#111827').fontSize(12).font(fonts.heading.bold).text(seller?.name ?? partnerName, rightX, rowY + 14, { width: colW });
     let addrY = Math.max(rowY + 30, doc.y + 4); // same wrap-safe start as PREPARED FOR
-    doc.fillColor('#4b5563').fontSize(9).font('Helvetica');
+    doc.fillColor('#4b5563').fontSize(9).font(fonts.body.regular);
     for (const line of sellerAddressLines(seller)) {
       doc.text(line, rightX, addrY, { width: colW });
       addrY += 12;
@@ -770,6 +860,9 @@ export async function renderQuotePdf(
   contractRenderData: Map<string, ContractPdfBlockData> = new Map(),
 ): Promise<Buffer> {
   const currency = quote.currencyCode ?? branding.currencyCode ?? 'USD';
+  // Stamped send-time snapshot → partner-resolved branding locale → 'en'. Never
+  // changes the number, only the glyphs (#3777).
+  const locale = quote.documentLocale ?? branding.locale ?? 'en';
   const primary = hexToColor(branding.primaryColor, '#2563eb');
   const partnerName = branding.partnerName ?? 'Proposal';
   // Per-line Tax column only when this quote carries tax (mirrors the summary).
@@ -813,10 +906,10 @@ export async function renderQuotePdf(
   const rightX = c.left + c.contentWidth * 0.55;
   const rightW = c.contentWidth * 0.45;
 
-  doc.fillColor('#9ca3af').fontSize(9).font('Helvetica-Bold').text('FROM', c.left, y);
-  doc.fillColor('#111827').fontSize(12).font('Helvetica-Bold').text(seller?.name ?? partnerName, c.left, y + 12, { width: c.contentWidth * 0.5 });
+  doc.fillColor('#9ca3af').fontSize(9).font(fonts.heading.bold).text('FROM', c.left, y);
+  doc.fillColor('#111827').fontSize(12).font(fonts.heading.bold).text(seller?.name ?? partnerName, c.left, y + 12, { width: c.contentWidth * 0.5 });
   let fromY = doc.y + 2;
-  doc.fillColor('#4b5563').fontSize(10).font('Helvetica');
+  doc.fillColor('#4b5563').fontSize(10).font(fonts.body.regular);
   for (const aline of sellerAddressLines(seller)) {
     doc.text(aline, c.left, fromY, { width: c.contentWidth * 0.5 });
     fromY = doc.y + 1.5;
@@ -828,17 +921,17 @@ export async function renderQuotePdf(
 
   let billY = y;
   if (quote.billToName) {
-    doc.fillColor('#9ca3af').fontSize(9).font('Helvetica-Bold').text('PREPARED FOR', rightX, billY, { width: rightW });
-    doc.fillColor('#111827').fontSize(12).font('Helvetica-Bold').text(quote.billToName, rightX, billY + 12, { width: rightW });
+    doc.fillColor('#9ca3af').fontSize(9).font(fonts.heading.bold).text('PREPARED FOR', rightX, billY, { width: rightW });
+    doc.fillColor('#111827').fontSize(12).font(fonts.heading.bold).text(quote.billToName, rightX, billY + 12, { width: rightW });
     billY = doc.y + 2;
   }
-  doc.fillColor('#4b5563').fontSize(10).font('Helvetica');
+  doc.fillColor('#4b5563').fontSize(10).font(fonts.body.regular);
   for (const aline of addressLines(quote.billToAddress as BillToAddress | null)) {
     doc.text(aline, rightX, billY, { width: rightW });
     billY = doc.y + 1.5;
   }
   if (quote.billToTaxId) { doc.fillColor('#6b7280').fontSize(9).text(`Tax ID: ${quote.billToTaxId}`, rightX, billY, { width: rightW }); billY = doc.y + 1.5; }
-  doc.fillColor('#4b5563').fontSize(10).font('Helvetica');
+  doc.fillColor('#4b5563').fontSize(10).font(fonts.body.regular);
   if (quote.issueDate) { doc.text(`Issued: ${formatDate(quote.issueDate)}`, rightX, billY, { width: rightW }); billY = doc.y + 2; }
   if (quote.expiryDate) { doc.text(`Valid until: ${formatDate(quote.expiryDate)}`, rightX, billY, { width: rightW }); billY = doc.y + 2; }
 
@@ -847,7 +940,7 @@ export async function renderQuotePdf(
 
   // Intro notes, if any (above the blocks).
   if (quote.introNotes) {
-    doc.fillColor('#4b5563').fontSize(10).font('Helvetica').text(quote.introNotes, c.left, y, { width: c.contentWidth });
+    doc.fillColor('#4b5563').fontSize(10).font(fonts.body.regular).text(quote.introNotes, c.left, y, { width: c.contentWidth });
     y = doc.y + 14;
   }
 
@@ -914,13 +1007,16 @@ export async function renderQuotePdf(
           doc.image(img.data, c.left, y, { fit: [fitWidth, fitHeight] });
           y += drawnHeight + 6;
         } catch (e) {
-          // A corrupt/unsupported image must not abort the whole document.
+          // A corrupt/unsupported image (e.g. a WebP blob stored before
+          // upload-time rejection shipped, #3483) must not abort the whole
+          // document — but it must not be silent either, so report it.
           console.error('[quotePdf] doc.image failed', imageId, e instanceof Error ? e.message : e);
+          captureException(e instanceof Error ? e : new Error(String(e)));
           y += 6;
         }
         const caption = (b.content as { caption?: string }).caption;
         if (caption) {
-          doc.fillColor('#6b7280').fontSize(9).font('Helvetica').text(caption, c.left, y, { width: c.contentWidth });
+          doc.fillColor('#6b7280').fontSize(9).font(fonts.body.regular).text(caption, c.left, y, { width: c.contentWidth });
           y = doc.y;
         }
         doc.fillColor('#111827');
@@ -937,7 +1033,7 @@ export async function renderQuotePdf(
         // row's real height. Reserving a flat minimum here instead stranded the
         // label + header at the foot of a page whenever the first row was tall.
         const showSubtotal = (b.content as { showSubtotal?: boolean }).showSubtotal === true;
-        y = await renderLineTable(doc, blockLines, currency, y, loadCatalogImage, loadImage, taxRate, showTax, showSubtotal, label);
+        y = await renderLineTable(doc, blockLines, currency, locale, y, loadCatalogImage, loadImage, fonts, taxRate, showTax, showSubtotal, label);
       }
     } else if (b.blockType === 'contract') {
       // contractRenderData[b.id] is pre-fetched by the route (Task 14's
@@ -982,19 +1078,19 @@ export async function renderQuotePdf(
 
   // ---- Trailing default table for lines with no block ----------------------
   const orphanLines = lines.filter((l) => !l.blockId);
-  if (orphanLines.length) y = await renderLineTable(doc, orphanLines, currency, y, loadCatalogImage, loadImage, taxRate, showTax);
+  if (orphanLines.length) y = await renderLineTable(doc, orphanLines, currency, locale, y, loadCatalogImage, loadImage, fonts, taxRate, showTax);
 
   // ---- Recurring summary footer -------------------------------------------
-  y = renderRecurringSummary(doc, quote, currency, primary, y, showTax, {
+  y = renderRecurringSummary(doc, quote, currency, locale, primary, y, fonts, showTax, {
     monthly: lines.some((line) => line.recurrence === 'monthly'),
     annual: lines.some((line) => line.recurrence === 'annual'),
-  });
+  }, lines);
 
   // ---- Terms & Conditions --------------------------------------------------
   if (quote.termsAndConditions) {
     y = ensureSpace(doc, y + 14, 60);
-    doc.fillColor('#9ca3af').fontSize(9).font('Helvetica-Bold').text('TERMS & CONDITIONS', c.left, y); y = doc.y + 4;
-    doc.fillColor('#6b7280').fontSize(9).font('Helvetica').text(quote.termsAndConditions, c.left, y, { width: c.contentWidth });
+    doc.fillColor('#9ca3af').fontSize(9).font(fonts.heading.bold).text('TERMS & CONDITIONS', c.left, y); y = doc.y + 4;
+    doc.fillColor('#6b7280').fontSize(9).font(fonts.body.regular).text(quote.termsAndConditions, c.left, y, { width: c.contentWidth });
     y = doc.y;
   }
 
@@ -1003,7 +1099,7 @@ export async function renderQuotePdf(
   // footer band below, on EVERY page.
   if (quote.terms) {
     y = ensureSpace(doc, y + 14, 60);
-    doc.fillColor('#9ca3af').fontSize(9).font('Helvetica').text(quote.terms, c.left, y, { width: c.contentWidth });
+    doc.fillColor('#9ca3af').fontSize(9).font(fonts.body.regular).text(quote.terms, c.left, y, { width: c.contentWidth });
   }
 
   // ---- Per-page footer band: branding footer + quote number + page X of Y ---

@@ -16,6 +16,7 @@ import {
   updateContract,
   addContractLine,
   removeContractLine,
+  updateContractLine,
   contractTransition,
   getContractEstimate,
   type ContractBillingTiming,
@@ -23,31 +24,124 @@ import {
   type ContractLine,
   type ContractLineType,
   type ContractEstimate,
+  type ContractEstimateLine,
+  type OverageMode,
+  type UpdateContractLinePatch,
 } from '../../lib/api/contracts';
 import CatalogItemPicker from '../catalog/CatalogItemPicker';
 import CatalogDistributorDrawer from '../settings/CatalogDistributorDrawer';
 import Pax8CatalogDrawer from '../settings/Pax8CatalogDrawer';
 import ContractPax8Drawer from './ContractPax8Drawer';
-import { listCatalog, type CatalogItem } from '../../lib/api/catalog';
+import { listCatalog, resolveCatalogPrice, type CatalogItem, type ResolvedCatalogPrice } from '../../lib/api/catalog';
 import { ecExpressStatus, pax8Status } from '../../lib/api/distributors';
 import { formatMoney } from '../billing/invoiceTypes';
 import { usePermissions } from '../../lib/permissions';
+import { BILLABLE_DEVICE_ROLES, getDeviceRoleIcon, getDeviceRoleLabel, type DeviceRole } from '@/lib/deviceRoles';
+import { LINE_TYPE_LABELS, AUTO_QTY_TYPES, ALLOWANCE_TYPES, SITE_SCOPED_TYPES } from './lineTypes';
+import DeviceCoverageNotice from './DeviceCoverageNotice';
+import AllowanceCell, { OverageNotice } from './AllowanceCell';
 
 interface Organization { id: string; name: string }
 interface Site { id: string; name: string }
 
-const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
+interface EditLineDraft {
+  description: string;
+  unitPrice: string;
+  taxable: boolean;
+  manualQuantity: string;
+  siteId: string;
+  deviceRoles: Exclude<DeviceRole, 'unknown'>[];
+  deviceGroupId: string;
+  catalogItemId: string | null;
+  allowanceOn: boolean;
+  includedQuantity: string;
+  overageMode: OverageMode;
+  overageUnitPrice: string;
+}
 
-const LINE_TYPE_LABELS: Record<ContractLineType, string> = {
-  flat: 'contracts.shared.lineType.flat',
-  per_device: 'contracts.shared.lineType.perDevice',
-  per_seat: 'contracts.shared.lineType.perSeat',
-  manual: 'contracts.shared.lineType.manual',
+function integerQuantityForInput(value: string | null): string {
+  if (value === null) return '';
+  const quantity = Number(value);
+  return Number.isInteger(quantity) ? String(quantity) : value;
+}
+
+function draftFromLine(l: ContractLine): EditLineDraft {
+  return {
+    description: l.description,
+    unitPrice: l.unitPrice,
+    taxable: l.taxable,
+    manualQuantity: l.manualQuantity ?? '0',
+    siteId: l.siteId ?? '',
+    deviceRoles: (l.deviceRoles ?? []) as Exclude<DeviceRole, 'unknown'>[],
+    deviceGroupId: l.deviceGroupId ?? '',
+    catalogItemId: l.catalogItemId,
+    allowanceOn: l.includedQuantity != null,
+    includedQuantity: integerQuantityForInput(l.includedQuantity),
+    overageMode: l.overageMode ?? 'bill',
+    overageUnitPrice: l.overageUnitPrice ?? '',
+  };
+}
+
+const sameRoleSet = (a: readonly string[], b: readonly string[] | null): boolean => {
+  const other = b ?? [];
+  return a.length === other.length && [...a].sort().join(',') === [...other].sort().join(',');
 };
 
-// per_device / per_seat quantities are resolved by the generator at billing
-// time from live counts — the editor intentionally does not fetch them.
-const AUTO_QTY_TYPES = new Set<ContractLineType>(['per_device', 'per_seat']);
+const MONEY_RE = /^\d+(\.\d{1,2})?$/;
+const POSITIVE_INTEGER_RE = /^[1-9]\d*$/;
+
+function allowanceFieldsValid(includedQuantity: string, overageMode: OverageMode, overageUnitPrice: string): boolean {
+  return POSITIVE_INTEGER_RE.test(includedQuantity)
+    && (overageMode === 'flag' || MONEY_RE.test(overageUnitPrice));
+}
+
+function buildLinePatch(l: ContractLine, d: EditLineDraft): UpdateContractLinePatch {
+  const patch: UpdateContractLinePatch = {};
+  if (d.description.trim() !== l.description) patch.description = d.description.trim();
+
+  if (l.catalogItemId !== null && d.catalogItemId === null) {
+    patch.catalogItemId = null;
+    patch.unitPrice = d.unitPrice;
+    patch.taxable = d.taxable;
+  } else {
+    if (d.catalogItemId && d.catalogItemId !== l.catalogItemId) patch.catalogItemId = d.catalogItemId;
+    if (d.catalogItemId === null && d.unitPrice !== l.unitPrice) patch.unitPrice = d.unitPrice;
+    if (d.catalogItemId === null && d.taxable !== l.taxable) patch.taxable = d.taxable;
+  }
+
+  if (l.lineType === 'manual' && d.manualQuantity !== (l.manualQuantity ?? '0')) patch.manualQuantity = d.manualQuantity;
+  if (SITE_SCOPED_TYPES.has(l.lineType) && (d.siteId || null) !== l.siteId) patch.siteId = d.siteId || null;
+  if (l.lineType === 'per_device_role' && !sameRoleSet(d.deviceRoles, l.deviceRoles)) patch.deviceRoles = d.deviceRoles;
+  if (l.lineType === 'per_device_group' && d.deviceGroupId && d.deviceGroupId !== l.deviceGroupId) patch.deviceGroupId = d.deviceGroupId;
+  if (l.includedQuantity != null && !d.allowanceOn) {
+    // The persisted tuple is all-or-nothing. Clearing one key alone is an
+    // INVALID_LINE_PATCH, just like unlinking a catalog item needs its tuple.
+    patch.includedQuantity = null;
+    patch.overageMode = null;
+    patch.overageUnitPrice = null;
+  } else if (d.allowanceOn) {
+    if (d.includedQuantity !== integerQuantityForInput(l.includedQuantity)) patch.includedQuantity = d.includedQuantity;
+    if (d.overageMode !== l.overageMode) patch.overageMode = d.overageMode;
+    if (d.overageMode === 'flag') {
+      if (l.overageUnitPrice !== null) patch.overageUnitPrice = null;
+    } else if (d.overageUnitPrice !== l.overageUnitPrice) {
+      patch.overageUnitPrice = d.overageUnitPrice;
+    }
+  }
+  return patch;
+}
+
+function editDraftIncomplete(l: ContractLine, d: EditLineDraft): boolean {
+  if (!d.description.trim()) return true;
+  if (l.lineType === 'per_device_role' && d.deviceRoles.length === 0) return true;
+  if (l.lineType === 'per_device_group' && !d.deviceGroupId) return true;
+  if (l.lineType === 'manual' && !MONEY_RE.test(d.manualQuantity)) return true;
+  if (d.catalogItemId === null && !MONEY_RE.test(d.unitPrice)) return true;
+  if (d.allowanceOn && !allowanceFieldsValid(d.includedQuantity, d.overageMode, d.overageUnitPrice)) return true;
+  return false;
+}
+
+const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
 const INTERVAL_PRESETS = [
   { value: 1, label: 'contracts.shared.cadence.monthly' },
@@ -139,6 +233,8 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
   // ---- reference data ------------------------------------------------------
   const [orgs, setOrgs] = useState<Organization[]>([]);
   const [sites, setSites] = useState<Site[]>([]);
+  const [deviceGroupsList, setDeviceGroupsList] = useState<Array<{ id: string; name: string; type: 'static' | 'dynamic' }>>([]);
+  const [deviceGroupsLoadFailed, setDeviceGroupsLoadFailed] = useState(false);
   const [catalogItems, setCatalogItems] = useState<CatalogItem[]>([]);
 
   // ---- add-line form -------------------------------------------------------
@@ -148,7 +244,24 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
   const [lineQty, setLineQty] = useState('1');
   const [lineTaxable, setLineTaxable] = useState(false);
   const [lineSiteId, setLineSiteId] = useState('');
-  const [lineCatalogId, setLineCatalogId] = useState('');
+  const [lineRoles, setLineRoles] = useState<Exclude<DeviceRole, 'unknown'>[]>([]);
+  // #3205 W04: the add-form allowance. Cleared whenever lineType changes, so an
+  // allowance can never be smuggled onto a type the CHECK forbids it on.
+  const [lineAllowanceOn, setLineAllowanceOn] = useState(false);
+  const [lineIncludedQty, setLineIncludedQty] = useState('');
+  const [lineOverageMode, setLineOverageMode] = useState<OverageMode>('bill');
+  const [lineOveragePrice, setLineOveragePrice] = useState('');
+  const [lineGroupId, setLineGroupId] = useState('');
+  const [editingLineId, setEditingLineId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<EditLineDraft | null>(null);
+  const [editBase, setEditBase] = useState<ContractLine | null>(null);
+  const editFirstControlRef = useRef<HTMLInputElement>(null);
+  const editButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+  const returnFocusLineId = useRef<string | null>(null);
+  // Linked catalog item (optional). A catalog line is priced by the SERVER in
+  // the contract's currency (#3775 — price book, no conversion): the editor
+  // shows that price read-only and never sends unitPrice/taxable for it.
+  const [lineCatalogItem, setLineCatalogItem] = useState<CatalogItem | null>(null);
   // TD SYNNEX EC Express import, offered only when the integration is connected
   // (best-effort status check; stays hidden on any failure).
   const [ecActive, setEcActive] = useState(false);
@@ -161,6 +274,18 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
   const [pax8Active, setPax8Active] = useState(false);
 
   const lines: ContractLine[] = detail?.lines ?? [];
+
+  useEffect(() => {
+    if (editingLineId !== null) {
+      editFirstControlRef.current?.focus();
+      return;
+    }
+    const lineId = returnFocusLineId.current;
+    if (lineId !== null) {
+      editButtonRefs.current.get(lineId)?.focus();
+      returnFocusLineId.current = null;
+    }
+  }, [editingLineId]);
 
   // Line removal is irreversible, so it goes through a confirm step (mirrors the
   // quote/invoice editors) instead of deleting outright.
@@ -305,12 +430,33 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
   const onDistributorImported = useCallback((item: CatalogItem) => {
     setLineType('manual');
     setLineDesc(item.name);
-    setLinePrice(item.unitPrice);
-    setLineCatalogId(item.id);
-    setLineTaxable(item.taxable);
+    setLineCatalogItem(item);
     void loadCatalog();
   }, [loadCatalog]);
   useEffect(() => { void loadSites(orgId); }, [orgId, loadSites]);
+  useEffect(() => {
+    let alive = true;
+    const forOrg = orgId;
+    setDeviceGroupsList([]);
+    setDeviceGroupsLoadFailed(false);
+    if (forOrg) {
+      void (async () => {
+        try {
+          const res = await fetchWithAuth(`/device-groups?orgId=${forOrg}&limit=200`);
+          if (!res.ok) throw new Error(`Device groups request failed (${res.status})`);
+          const body = await res.json();
+          if (!alive) return;
+          const items = Array.isArray(body.data) ? body.data : [];
+          setDeviceGroupsList(items.map((g: { id: string; name: string; type: 'static' | 'dynamic' }) => ({ id: g.id, name: g.name, type: g.type })));
+        } catch {
+          if (!alive) return;
+          setDeviceGroupsList([]);
+          setDeviceGroupsLoadFailed(true);
+        }
+      })();
+    }
+    return () => { alive = false; };
+  }, [orgId]);
   useEffect(() => { if (!isCreate) void loadEstimate(); }, [isCreate, loadEstimate]);
 
   // Effective cadence in months: the custom text input when "Custom…" is chosen,
@@ -325,7 +471,7 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
   const orgName = orgs.find((o) => o.id === orgId)?.name ?? orgId;
 
   // ---- live "Estimated this period" ----------------------------------------
-  // flat/manual contribute qty×price; per_device/per_seat are resolved by the
+  // flat/manual contribute qty×price; per_device/per_device_role/per_seat are resolved by the
   // generator from live counts, so we surface them as "auto" without a number.
   const estimate = useMemo(() => {
     let known = 0;
@@ -338,18 +484,84 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
     return { known, hasAuto };
   }, [lines]);
 
-  // Resolved live quantity per line (per_device/per_seat) from the estimate.
+  // Resolved live estimate per line — the whole line now, because AllowanceCell
+  // needs counted/overage/overageMode as well as the base quantity (#3205 W04).
   const estByLine = useMemo(() => {
-    const m = new Map<string, number>();
-    for (const e of liveEstimate?.lines ?? []) m.set(e.lineId, e.quantity);
+    const m = new Map<string, ContractEstimateLine>();
+    for (const e of liveEstimate?.lines ?? []) m.set(e.lineId, e);
     return m;
   }, [liveEstimate]);
+
+  // The linked catalog item's price as the SERVER resolves it for this
+  // contract's org + currency (org override → price book → typed gap). The
+  // editor never infers this from `item.prices`: the list aggregate only carries
+  // the base book, so it can't see an org override (post-merge review #6). Add
+  // is enabled only on `resolved`; pending/failed/gap all block.
+  const contractCurrency = contract?.currencyCode;
+  const contractOrgId = contract?.orgId ?? null;
+  const [catalogResolution, setCatalogResolution] = useState<
+    | { status: 'idle' }
+    | { status: 'loading' }
+    | { status: 'resolved'; price: ResolvedCatalogPrice }
+    | { status: 'gap' }
+    // #3775 review #2: the price-book row EXISTS but is wrong for this currency
+    // (a legacy fractional amount in a zero-decimal currency). That is a gap the
+    // operator has to fix in the catalog, never a transient failure — it gets its
+    // own message carrying the server's actionable text, and no Retry.
+    | { status: 'notRepresentable'; message: string | null }
+    | { status: 'error' }
+  >({ status: 'idle' });
+  const resolveSeq = useRef(0);
+  const resolveCatalogLine = useCallback(async () => {
+    const seq = ++resolveSeq.current;
+    if (!lineCatalogItem || !contractCurrency) { setCatalogResolution({ status: 'idle' }); return; }
+    setCatalogResolution({ status: 'loading' });
+    try {
+      const res = await resolveCatalogPrice(lineCatalogItem.id, contractCurrency, contractOrgId);
+      if (seq !== resolveSeq.current) return; // a newer pick/clear superseded this lookup
+      if (res.status === 401) return UNAUTHORIZED();
+      if (res.ok) {
+        const body = (await res.json().catch(() => null)) as { data?: ResolvedCatalogPrice } | null;
+        if (seq !== resolveSeq.current) return;
+        setCatalogResolution(body?.data ? { status: 'resolved', price: body.data } : { status: 'error' });
+        return;
+      }
+      const body = (await res.json().catch(() => null)) as { code?: string; error?: string } | null;
+      if (seq !== resolveSeq.current) return;
+      if (res.status === 409 && body?.code === 'NO_PRICE_FOR_CURRENCY') { setCatalogResolution({ status: 'gap' }); return; }
+      if (res.status === 409 && body?.code === 'PRICE_NOT_REPRESENTABLE') {
+        setCatalogResolution({ status: 'notRepresentable', message: body.error?.trim() || null });
+        return;
+      }
+      setCatalogResolution({ status: 'error' });
+    } catch {
+      if (seq === resolveSeq.current) setCatalogResolution({ status: 'error' });
+    }
+  }, [lineCatalogItem, contractCurrency, contractOrgId]);
+  useEffect(() => { void resolveCatalogLine(); }, [resolveCatalogLine]);
+
+  const catalogPrice = catalogResolution.status === 'resolved' ? catalogResolution.price : null;
+  const catalogPriceGap = catalogResolution.status === 'gap';
+  // Anything short of a server-resolved price blocks Add (the server would
+  // refuse or — worse — a stale guess would mislead the preview).
+  const catalogPriceUnresolved = lineCatalogItem != null && catalogPrice == null;
+  // #3205: per_device_role requires at least one role picked before Add is allowed.
+  const roleLineMissingRoles = lineType === 'per_device_role' && lineRoles.length === 0;
+  // #3205 W04: an allowance needs a quantity, and a price when extras are billed.
+  const allowanceOn = lineAllowanceOn && ALLOWANCE_TYPES.has(lineType);
+  const allowanceIncomplete = allowanceOn
+    && !allowanceFieldsValid(lineIncludedQty, lineOverageMode, lineOveragePrice);
+  // #3205 W03: lines are editable on draft/active only (assertEditable). Remove
+  // was gated on permission ALONE and 409'd on click for cancelled/expired.
+  const linesEditable = canWrite && (contract?.status === 'draft' || contract?.status === 'active');
+  const groupLineMissingGroup = lineType === 'per_device_group' && !lineGroupId;
+  const effectiveLinePrice = lineCatalogItem ? (catalogPrice?.unitPrice ?? '0') : linePrice;
 
   const newLineEstimate = useMemo(() => {
     if (AUTO_QTY_TYPES.has(lineType)) return null;
     const qty = lineType === 'manual' ? Number(lineQty || '0') : 1;
-    return qty * Number(linePrice || '0');
-  }, [lineType, lineQty, linePrice]);
+    return qty * Number(effectiveLinePrice || '0');
+  }, [lineType, lineQty, effectiveLinePrice]);
 
   const refresh = useCallback(() => { onChanged?.(); void loadEstimate(); }, [onChanged, loadEstimate]);
 
@@ -517,7 +729,7 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
   }, [canWrite, isCreate, terms, contract, savePatch]);
 
   const addLine = useCallback(async () => {
-    if (busy || !contract || !lineDesc.trim()) return;
+    if (busy || !contract || !linesEditable || !lineDesc.trim() || catalogPriceUnresolved || roleLineMissingRoles || groupLineMissingGroup || allowanceIncomplete) return;
     setBusy(true);
     try {
       await runAction({
@@ -526,26 +738,38 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
           description: lineDesc.trim(),
           // unitPrice/manualQuantity are money strings (see contractLineInputSchema);
           // omit absent optionals (undefined) rather than sending null, which the
-          // string-typed schema rejects.
-          unitPrice: linePrice,
+          // string-typed schema rejects. A catalog line omits unitPrice AND
+          // taxable: the server resolves both from the price book / item (#3775).
+          unitPrice: lineCatalogItem ? undefined : linePrice,
           manualQuantity: lineType === 'manual' ? lineQty : undefined,
-          siteId: lineType === 'per_device' && lineSiteId ? lineSiteId : undefined,
-          catalogItemId: lineCatalogId || undefined,
-          taxable: lineTaxable,
+          siteId: SITE_SCOPED_TYPES.has(lineType) && lineSiteId ? lineSiteId : undefined,
+          deviceRoles: lineType === 'per_device_role' ? lineRoles : undefined,
+          deviceGroupId: lineType === 'per_device_group' ? lineGroupId : undefined,
+          catalogItemId: lineCatalogItem?.id,
+          taxable: lineCatalogItem ? undefined : lineTaxable,
+          includedQuantity: allowanceOn ? lineIncludedQty : undefined,
+          overageMode: allowanceOn ? lineOverageMode : undefined,
+          overageUnitPrice: allowanceOn && lineOverageMode === 'bill' ? lineOveragePrice : undefined,
         }),
         errorFallback: t('contracts.contractEditor.errors.addLine'),
+        friendly: (code) => (code === 'NO_PRICE_FOR_CURRENCY'
+          ? t('contracts.contractEditor.errors.noPriceForCurrency', { currency: contract.currencyCode })
+          : undefined),
         successMessage: t('contracts.contractEditor.toast.lineAdded'),
         onUnauthorized: UNAUTHORIZED,
       });
       setLineDesc(''); setLinePrice('0.00'); setLineQty('1');
-      setLineTaxable(false); setLineSiteId(''); setLineCatalogId('');
+      setLineRoles([]);
+      setLineAllowanceOn(false); setLineIncludedQty(''); setLineOveragePrice(''); setLineOverageMode('bill');
+      setLineGroupId('');
+      setLineTaxable(false); setLineSiteId(''); setLineCatalogItem(null);
       refresh();
     } catch (err) {
       handleActionError(err, t('contracts.contractEditor.errors.addLine'));
     } finally {
       setBusy(false);
     }
-  }, [busy, contract, lineType, lineDesc, linePrice, lineQty, lineSiteId, lineCatalogId, lineTaxable, refresh, t]);
+  }, [busy, contract, linesEditable, lineType, lineDesc, linePrice, lineQty, lineSiteId, lineRoles, lineGroupId, lineCatalogItem, lineTaxable, lineAllowanceOn, lineIncludedQty, lineOverageMode, lineOveragePrice, allowanceOn, allowanceIncomplete, catalogPriceUnresolved, roleLineMissingRoles, groupLineMissingGroup, refresh, t]);
 
   const removeLine = useCallback((lineId: string) =>
     runScoped(`remove-${lineId}`, async () => {
@@ -558,6 +782,32 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
       });
       refresh();
     }, t('contracts.contractEditor.errors.removeLine')),
+  [runScoped, contract, refresh, t]);
+
+  const saveLine = useCallback((l: ContractLine, patch: UpdateContractLinePatch) =>
+    runScoped(`edit-${l.id}`, async () => {
+      if (!contract) return;
+      await runAction({
+        request: () => updateContractLine(contract.id, l.id, patch),
+        errorFallback: t('contracts.contractEditor.errors.updateLine'),
+        friendly: (code) => ({
+          NO_PRICE_FOR_CURRENCY: t('contracts.contractEditor.errors.noPriceForCurrency', { currency: contract.currencyCode }),
+          PRICE_NOT_REPRESENTABLE: t('contracts.contractEditor.errors.priceNotRepresentable', { currency: contract.currencyCode }),
+          CATALOG_ITEM_NOT_FOUND: t('contracts.contractEditor.errors.catalogItemNotFound'),
+          INVALID_STATE: t('contracts.contractEditor.errors.contractNotEditable'),
+          LINE_NOT_FOUND: t('contracts.contractEditor.errors.lineNotFound'),
+          SITE_NOT_IN_ORG: t('contracts.contractEditor.errors.siteNotInOrg'),
+          GROUP_NOT_IN_ORG: t('contracts.contractEditor.errors.groupNotInOrg'),
+          INVALID_LINE_PATCH: t('contracts.contractEditor.errors.invalidLinePatch'),
+        } as Record<string, string>)[code],
+        successMessage: t('contracts.contractEditor.toast.lineUpdated'),
+        onUnauthorized: UNAUTHORIZED,
+      });
+      setEditingLineId(null);
+      setEditDraft(null);
+      setEditBase(null);
+      refresh();
+    }, t('contracts.contractEditor.errors.updateLine')),
   [runScoped, contract, refresh, t]);
 
   const activate = useCallback(async () => {
@@ -577,11 +827,6 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
       setBusy(false);
     }
   }, [busy, contract, refresh, t]);
-
-  const siteName = useCallback(
-    (id: string | null) => (id ? sites.find((s) => s.id === id)?.name ?? id.slice(0, 8) : null),
-    [sites],
-  );
 
   // Shared field chrome. `transition-colors` pairs with fieldRing's border-color
   // cue (border-color is not in the shadow property set, so `transition-shadow`
@@ -629,7 +874,12 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
                       data-testid="contract-form-org-readonly"
                       className="inline-flex h-10 items-center rounded-md border bg-muted/40 px-3 text-sm text-foreground"
                     >
-                      {orgName}
+                      {/* orgId can originate in the URL hash (ContractWorkspace's
+                          presetOrgId), so it is DOM text flowing into an href —
+                          encode the path segment. CodeQL js/xss-through-dom. */}
+                      <a href={`/organizations/${encodeURIComponent(orgId)}`} data-testid="org-record-link" className="hover:underline">
+                        {orgName}
+                      </a>
                     </span>
                   </div>
                 )}
@@ -852,37 +1102,331 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
                         </td>
                       </tr>
                     ) : (
-                      lines.map((l, idx) => (
-                        <tr key={l.id} className="border-t" data-testid={`line-row-${idx}`}>
-                          <td className="px-3 py-2">
-                            {t(/* i18n-dynamic */ LINE_TYPE_LABELS[l.lineType])}
-                            {l.lineType === 'per_device' && l.siteId
-                              ? <span className="block text-xs text-muted-foreground">{siteName(l.siteId)}</span>
-                              : null}
-                          </td>
-                          <td className="px-3 py-2">{l.description}</td>
-                          <td className="px-3 py-2 text-right">{formatMoney(l.unitPrice, contract?.currencyCode)}</td>
-                          <td className="px-3 py-2 text-right tabular-nums">
-                            {AUTO_QTY_TYPES.has(l.lineType)
-                              ? (estByLine.has(l.id)
-                                  ? estByLine.get(l.id)
-                                  : <span className="text-muted-foreground">{t('contracts.shared.values.auto')}</span>)
-                              : (l.lineType === 'manual' ? (l.manualQuantity ?? '0') : '1')}
-                          </td>
-                          <td className="px-3 py-2 text-center">{l.taxable ? '✓' : '—'}</td>
-                          <td className="px-3 py-2 text-right">
-                            {canWrite && (
-                              <button
-                                type="button" onClick={() => setPendingRemove(l)} disabled={isPending(`remove-${l.id}`)}
-                                data-testid={`line-remove-${idx}`}
-                                className="rounded-md border border-destructive/40 px-2 py-1 text-xs font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50"
-                              >
-                                {t('common:actions.remove')}
-                              </button>
+                      lines.map((l, idx) => {
+                        const editing = editingLineId === l.id;
+                        const d = editing ? editDraft : null;
+                        const base = editing ? editBase : null;
+                        const patch = editing && d && base ? buildLinePatch(base, d) : null;
+                        const saveDisabled = !d || !patch || Object.keys(patch).length === 0
+                          || !base || editDraftIncomplete(base, d) || isPending(`edit-${l.id}`);
+                        return (
+                          <tr key={l.id} className="border-t" data-testid={`line-row-${idx}`}>
+                            {editing && d ? (
+                              <td className="px-3 py-3" colSpan={6}>
+                                <div className="flex flex-col gap-3" data-testid={`line-edit-form-${idx}`}>
+                                  <span className="text-xs text-muted-foreground" data-testid={`line-edit-type-locked-${idx}`}>
+                                    {t(/* i18n-dynamic */ LINE_TYPE_LABELS[l.lineType])} — <span data-testid="line-edit-type-locked">{t('contracts.contractEditor.editLine.typeLocked')}</span>
+                                  </span>
+                                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                                    <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                                      {t('common:labels.description')}
+                                      <input
+                                        ref={editFirstControlRef}
+                                        value={d.description}
+                                        onChange={(e) => setEditDraft({ ...d, description: e.target.value })}
+                                        data-testid={`line-edit-desc-${idx}`}
+                                        className="h-9 rounded-md border bg-background px-3 text-sm text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
+                                      />
+                                    </label>
+                                    <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                                      {t('contracts.contractEditor.lines.unitPrice')}
+                                      <input
+                                        value={d.unitPrice} disabled={d.catalogItemId !== null}
+                                        onChange={(e) => setEditDraft({ ...d, unitPrice: e.target.value })}
+                                        data-testid={`line-edit-price-${idx}`}
+                                        className="h-9 rounded-md border bg-background px-3 text-sm text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring disabled:opacity-50"
+                                      />
+                                      {d.catalogItemId !== null && (
+                                        <span data-testid={`line-edit-price-source-${idx}`}>{t('contracts.contractEditor.editLine.priceFromCatalog')}</span>
+                                      )}
+                                      {d.catalogItemId === null && l.catalogItemId !== null && (
+                                        <span className="text-amber-600 dark:text-amber-500">{t('contracts.contractEditor.editLine.unlinkNeedsPrice')}</span>
+                                      )}
+                                    </label>
+                                    {l.lineType === 'manual' && (
+                                      <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                                        {t('contracts.contractEditor.addLine.quantity')}
+                                        <input
+                                          value={d.manualQuantity}
+                                          onChange={(e) => setEditDraft({ ...d, manualQuantity: e.target.value })}
+                                          data-testid={`line-edit-qty-${idx}`}
+                                          className="h-9 rounded-md border bg-background px-3 text-sm text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
+                                        />
+                                      </label>
+                                    )}
+                                    {SITE_SCOPED_TYPES.has(l.lineType) && (
+                                      <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                                        {t('contracts.contractEditor.addLine.siteOptional')}
+                                        <select
+                                          value={d.siteId} onChange={(e) => setEditDraft({ ...d, siteId: e.target.value })}
+                                          data-testid={`line-edit-site-${idx}`}
+                                          className="h-9 rounded-md border bg-background px-3 text-sm text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
+                                        >
+                                          <option value="">{t('contracts.contractEditor.addLine.allSites')}</option>
+                                          {sites.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                                        </select>
+                                      </label>
+                                    )}
+                                    {ALLOWANCE_TYPES.has(l.lineType) && (
+                                      <fieldset className="flex flex-col gap-2 text-xs text-muted-foreground sm:col-span-2">
+                                        <label className="flex items-center gap-2 text-sm text-foreground">
+                                          <input
+                                            type="checkbox" checked={d.allowanceOn}
+                                            onChange={(e) => setEditDraft({
+                                              ...d,
+                                              allowanceOn: e.target.checked,
+                                              includedQuantity: e.target.checked ? d.includedQuantity : '',
+                                              overageMode: e.target.checked ? d.overageMode : 'bill',
+                                              overageUnitPrice: e.target.checked ? d.overageUnitPrice : '',
+                                            })}
+                                            data-testid={`line-edit-allowance-toggle-${idx}`}
+                                          />
+                                          {t('contracts.contractEditor.addLine.allowanceToggle')}
+                                        </label>
+                                        {d.allowanceOn && (
+                                          <>
+                                            <span>{t('contracts.contractEditor.addLine.allowanceHint')}</span>
+                                            <label className="flex flex-col gap-1">
+                                              {t('contracts.contractEditor.addLine.includedQuantity')}
+                                              <input
+                                                type="number" min="1" step="1" value={d.includedQuantity}
+                                                onChange={(e) => setEditDraft({ ...d, includedQuantity: e.target.value })}
+                                                data-testid={`line-edit-included-qty-${idx}`}
+                                                className="h-9 rounded-md border bg-background px-3 text-sm text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
+                                              />
+                                            </label>
+                                            <fieldset
+                                              className="flex flex-col gap-1"
+                                              data-testid={`line-edit-overage-mode-group-${idx}`}
+                                            >
+                                              <legend>{t('contracts.contractEditor.addLine.overageMode')}</legend>
+                                              <div className="flex flex-wrap gap-3 text-sm text-foreground">
+                                              <label className="inline-flex items-center gap-1.5">
+                                                <input
+                                                  type="radio" name={`edit-overage-mode-${l.id}`} checked={d.overageMode === 'bill'}
+                                                  onChange={() => setEditDraft({ ...d, overageMode: 'bill' })}
+                                                  data-testid={`line-edit-overage-bill-${idx}`}
+                                                />
+                                                {t('contracts.contractEditor.addLine.overageBill')}
+                                              </label>
+                                              <label className="inline-flex items-center gap-1.5">
+                                                <input
+                                                  type="radio" name={`edit-overage-mode-${l.id}`} checked={d.overageMode === 'flag'}
+                                                  onChange={() => setEditDraft({ ...d, overageMode: 'flag' })}
+                                                  data-testid={`line-edit-overage-flag-${idx}`}
+                                                />
+                                                {t('contracts.contractEditor.addLine.overageFlag')}
+                                              </label>
+                                              </div>
+                                            </fieldset>
+                                            {d.overageMode === 'bill' && (
+                                              <label className="flex flex-col gap-1">
+                                                {t('contracts.contractEditor.addLine.overageUnitPrice')}
+                                                <input
+                                                  type="number" min="0" step="0.01" value={d.overageUnitPrice}
+                                                  onChange={(e) => setEditDraft({ ...d, overageUnitPrice: e.target.value })}
+                                                  data-testid={`line-edit-overage-price-${idx}`}
+                                                  className="h-9 rounded-md border bg-background px-3 text-sm text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
+                                                />
+                                                {d.overageUnitPrice !== '' && !MONEY_RE.test(d.overageUnitPrice) && (
+                                                  <span className="text-xs text-destructive" data-testid={`line-edit-overage-price-not-representable-${idx}`}>
+                                                    {t('contracts.contractEditor.addLine.priceNotRepresentable', { currency: contractCurrency })}
+                                                  </span>
+                                                )}
+                                              </label>
+                                            )}
+                                            {!allowanceFieldsValid(d.includedQuantity, d.overageMode, d.overageUnitPrice) && (
+                                              <span className="text-amber-600 dark:text-amber-500">
+                                                {t('contracts.contractEditor.addLine.allowanceRequired')}
+                                              </span>
+                                            )}
+                                          </>
+                                        )}
+                                      </fieldset>
+                                    )}
+                                    {l.lineType === 'per_device_group' && (
+                                      <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                                        {t('contracts.contractEditor.addLine.deviceGroup')}
+                                        <select
+                                          value={d.deviceGroupId} onChange={(e) => setEditDraft({ ...d, deviceGroupId: e.target.value })}
+                                          data-testid={`line-edit-group-${idx}`}
+                                          className="h-9 rounded-md border bg-background px-3 text-sm text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
+                                        >
+                                          <option value="">{t('contracts.contractEditor.addLine.selectGroup')}</option>
+                                          {deviceGroupsList.map((g) => <option key={g.id} value={g.id} data-testid={`line-edit-group-option-${g.id}`}>{g.name}</option>)}
+                                        </select>
+                                        {!d.deviceGroupId && <span className="text-amber-600 dark:text-amber-500">{t('contracts.contractEditor.addLine.deviceGroupRequired')}</span>}
+                                      </label>
+                                    )}
+                                    {catalogItems.length > 0 && (
+                                      <div className="flex flex-col gap-1 text-xs text-muted-foreground">
+                                        {t('contracts.contractEditor.addLine.linkCatalogItemOptional')}
+                                        <CatalogItemPicker
+                                          items={catalogItems}
+                                          currencyCode={contractCurrency ?? ''}
+                                          includeBundles={false}
+                                          onSelect={(item) => setEditDraft({ ...d, catalogItemId: item.id })}
+                                          testId={`line-edit-catalog-picker-${idx}`}
+                                          placeholder={t('contracts.contractEditor.addLine.searchCatalog')}
+                                        />
+                                      </div>
+                                    )}
+                                    <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                                      <input
+                                        type="checkbox" checked={d.taxable} disabled={d.catalogItemId !== null}
+                                        onChange={(e) => setEditDraft({ ...d, taxable: e.target.checked })}
+                                        data-testid={`line-edit-taxable-${idx}`}
+                                      />
+                                      {t('contracts.contractEditor.lines.tax')}
+                                    </label>
+                                  </div>
+                                  {l.lineType === 'per_device_role' && (
+                                    <fieldset className="flex flex-col gap-1 text-xs text-muted-foreground" data-testid={`line-edit-roles-${idx}`}>
+                                      <legend className="mb-1">{t('contracts.contractEditor.addLine.deviceRoles')}</legend>
+                                      <div className="flex flex-wrap gap-2">
+                                        {BILLABLE_DEVICE_ROLES.map((role) => {
+                                          const checked = d.deviceRoles.includes(role);
+                                          return (
+                                            <label key={role} className={`inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-md border px-2.5 text-sm ${checked ? 'border-primary bg-primary/10 text-foreground' : 'bg-background text-muted-foreground hover:text-foreground'}`}>
+                                              <input
+                                                type="checkbox" className="sr-only" checked={checked}
+                                                onChange={() => setEditDraft({
+                                                  ...d,
+                                                  deviceRoles: checked ? d.deviceRoles.filter((r) => r !== role) : [...d.deviceRoles, role],
+                                                })}
+                                                data-testid={`line-edit-role-${role}-${idx}`}
+                                              />
+                                              {getDeviceRoleLabel(role)}
+                                            </label>
+                                          );
+                                        })}
+                                      </div>
+                                      {d.deviceRoles.length === 0 && (
+                                        <span className="text-amber-600 dark:text-amber-500">{t('contracts.contractEditor.addLine.deviceRolesRequired')}</span>
+                                      )}
+                                    </fieldset>
+                                  )}
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <button
+                                      type="button" disabled={saveDisabled}
+                                      onClick={() => { if (patch) void saveLine(l, patch); }}
+                                      data-testid={`line-edit-save-${idx}`}
+                                      className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground disabled:opacity-50"
+                                    >
+                                      {t('contracts.contractEditor.editLine.save')}
+                                    </button>
+                                    <button
+                                      type="button" onClick={() => {
+                                        returnFocusLineId.current = l.id;
+                                        setEditingLineId(null);
+                                        setEditDraft(null);
+                                        setEditBase(null);
+                                      }}
+                                      data-testid={`line-edit-cancel-${idx}`}
+                                      className="inline-flex h-8 items-center rounded-md border px-3 text-xs font-medium hover:bg-muted"
+                                    >
+                                      {t('contracts.contractEditor.editLine.cancel')}
+                                    </button>
+                                    {l.catalogItemId !== null && d.catalogItemId !== null && (
+                                      <>
+                                        <button
+                                          type="button" disabled={isPending(`edit-${l.id}`)}
+                                          onClick={() => void saveLine(l, { ...(patch ?? {}), refreshCatalogPrice: true })}
+                                          data-testid={`line-edit-refresh-${idx}`}
+                                          className="inline-flex h-8 items-center rounded-md border px-3 text-xs font-medium hover:bg-muted disabled:opacity-50"
+                                        >
+                                          {t('contracts.contractEditor.editLine.refreshPrice')}
+                                        </button>
+                                        <button
+                                          type="button" onClick={() => setEditDraft({ ...d, catalogItemId: null })}
+                                          data-testid={`line-edit-unlink-${idx}`}
+                                          className="inline-flex h-8 items-center rounded-md border px-3 text-xs font-medium hover:bg-muted"
+                                        >
+                                          {t('contracts.contractEditor.addLine.clearCatalogLink')}
+                                        </button>
+                                      </>
+                                    )}
+                                    {l.catalogItemId !== null && d.catalogItemId === null && (
+                                      <button
+                                        type="button"
+                                        onClick={() => setEditDraft({ ...d, catalogItemId: l.catalogItemId })}
+                                        data-testid={`line-edit-restore-catalog-${idx}`}
+                                        className="inline-flex h-8 items-center rounded-md border px-3 text-xs font-medium hover:bg-muted"
+                                      >
+                                        {t('contracts.contractEditor.editLine.restoreCatalogLink')}
+                                      </button>
+                                    )}
+                                    {patch && Object.keys(patch).length === 0 && (
+                                      <span className="text-xs text-muted-foreground">{t('contracts.contractEditor.editLine.noChanges')}</span>
+                                    )}
+                                  </div>
+                                </div>
+                              </td>
+                            ) : (
+                              <>
+                                <td className="px-3 py-2">
+                                  {t(/* i18n-dynamic */ LINE_TYPE_LABELS[l.lineType])}
+                                  {l.site
+                                    ? <span className="block text-xs text-muted-foreground" data-testid={`line-site-${idx}`}>{t('contracts.shared.lineScope.site', { name: l.site.name })}</span>
+                                    : null}
+                                  {l.lineType === 'per_device_role' && l.deviceRoles
+                                    ? <span className="block text-xs text-muted-foreground" data-testid={`line-roles-${idx}`}>{l.deviceRoles.map(getDeviceRoleLabel).join(', ')}</span>
+                                    : null}
+                                  {l.lineType === 'per_device_group'
+                                    ? <span className="block text-xs text-muted-foreground" data-testid={`line-group-${idx}`}>
+                                        {l.deviceGroup
+                                          ? `${l.deviceGroup.name}${l.deviceGroup.type === 'dynamic' ? ` · ${t('contracts.shared.dynamicGroup')}` : ''}`
+                                          : t('contracts.shared.deletedGroup', { name: l.deviceGroupName ?? '' })}
+                                      </span>
+                                    : null}
+                                </td>
+                                <td className="px-3 py-2">{l.description}</td>
+                                <td className="px-3 py-2 text-right">{formatMoney(l.unitPrice, contract?.currencyCode)}</td>
+                                <td className="px-3 py-2 text-right tabular-nums" data-testid={`line-qty-${idx}`}>
+                                  <AllowanceCell line={l} estimate={estByLine.get(l.id)} />
+                                </td>
+                                <td className="px-3 py-2 text-center">{l.taxable ? '✓' : '—'}</td>
+                                <td className="px-3 py-2 text-right">
+                                  {linesEditable && (
+                                    <div className="flex justify-end gap-2">
+                                      <button
+                                        type="button"
+                                        ref={(node) => {
+                                          if (node) editButtonRefs.current.set(l.id, node);
+                                          else editButtonRefs.current.delete(l.id);
+                                        }}
+                                        onClick={() => {
+                                          const snapshot: ContractLine = {
+                                            ...l,
+                                            deviceRoles: l.deviceRoles ? [...l.deviceRoles] : null,
+                                            site: l.site ? { ...l.site } : null,
+                                            deviceGroup: l.deviceGroup ? { ...l.deviceGroup } : null,
+                                          };
+                                          setEditBase(snapshot);
+                                          setEditDraft(draftFromLine(snapshot));
+                                          setEditingLineId(l.id);
+                                        }}
+                                        disabled={editingLineId !== null || isPending(`edit-${l.id}`)}
+                                        data-testid={`line-edit-${idx}`}
+                                        className="rounded-md border px-2 py-1 text-xs font-medium hover:bg-muted disabled:opacity-50"
+                                      >
+                                        {t('contracts.contractEditor.lines.edit')}
+                                      </button>
+                                      <button
+                                        type="button" onClick={() => setPendingRemove(l)} disabled={isPending(`remove-${l.id}`) || editingLineId !== null}
+                                        data-testid={`line-remove-${idx}`}
+                                        className="rounded-md border border-destructive/40 px-2 py-1 text-xs font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50"
+                                      >
+                                        {t('common:actions.remove')}
+                                      </button>
+                                    </div>
+                                  )}
+                                </td>
+                              </>
                             )}
-                          </td>
-                        </tr>
-                      ))
+                          </tr>
+                        );
+                      })
                     )}
                   </tbody>
                 </table>
@@ -932,7 +1476,11 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
                     {t('contracts.contractEditor.addLine.lineType')}
                     <select
                       value={lineType}
-                      onChange={(e) => { setLineType(e.target.value as ContractLineType); setLineSiteId(''); }}
+                      onChange={(e) => {
+                        setLineType(e.target.value as ContractLineType);
+                        setLineSiteId(''); setLineRoles([]); setLineGroupId('');
+                        setLineAllowanceOn(false); setLineIncludedQty(''); setLineOveragePrice(''); setLineOverageMode('bill');
+                      }}
                       data-testid="contract-line-type"
                       className="h-9 rounded-md border bg-background px-3 text-sm text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
                     >
@@ -951,13 +1499,47 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
                     />
                   </label>
                   <label className="flex flex-col gap-1 text-xs text-muted-foreground">
-                    {t('contracts.contractEditor.addLine.unitPrice')}
+                    {lineCatalogItem
+                      ? t('contracts.contractEditor.addLine.priceFromCatalog', { currency: contractCurrency })
+                      : t('contracts.contractEditor.addLine.unitPrice')}
+                    {/* A catalog line's price comes from the price book in the contract
+                        currency — read-only here; clear the link for a custom price. */}
                     <input
-                      type="number" min="0" step="0.01" value={linePrice}
-                      onChange={(e) => setLinePrice(e.target.value)}
+                      type="number" min="0" step="0.01"
+                      value={lineCatalogItem ? (catalogPrice?.unitPrice ?? '') : linePrice}
+                      readOnly={lineCatalogItem != null}
+                      aria-readonly={lineCatalogItem != null}
+                      onChange={(e) => { if (!lineCatalogItem) setLinePrice(e.target.value); }}
                       data-testid="contract-line-price"
-                      className="h-9 rounded-md border bg-background px-3 text-sm text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
+                      className="h-9 rounded-md border bg-background px-3 text-sm text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring read-only:bg-muted/40 read-only:text-muted-foreground"
                     />
+                    {catalogPriceGap && (
+                      <span className="text-xs text-destructive" data-testid="contract-line-price-missing">
+                        {t('contracts.contractEditor.addLine.noPriceInCurrency', { currency: contractCurrency })}
+                      </span>
+                    )}
+                    {catalogResolution.status === 'notRepresentable' && (
+                      <span className="text-xs text-destructive" data-testid="contract-line-price-not-representable">
+                        {catalogResolution.message
+                          ?? t('contracts.contractEditor.addLine.priceNotRepresentable', { currency: contractCurrency })}
+                      </span>
+                    )}
+                    {catalogResolution.status === 'loading' && (
+                      <span className="text-xs text-muted-foreground" data-testid="contract-line-price-resolving">
+                        {t('contracts.contractEditor.addLine.resolvingPrice', { currency: contractCurrency })}
+                      </span>
+                    )}
+                    {catalogResolution.status === 'error' && (
+                      <span className="text-xs text-destructive" data-testid="contract-line-price-unavailable">
+                        {t('contracts.contractEditor.addLine.priceLookupFailed', { currency: contractCurrency })}{' '}
+                        <button type="button" onClick={() => void resolveCatalogLine()} data-testid="contract-line-price-retry" className="underline hover:text-foreground">{t('common:actions.retry')}</button>
+                      </span>
+                    )}
+                    {catalogPrice?.source === 'org_override' && (
+                      <span className="text-xs text-muted-foreground" data-testid="contract-line-price-source">
+                        {t('contracts.contractEditor.addLine.priceSourceOrgOverride', { org: orgName })}
+                      </span>
+                    )}
                   </label>
                   {lineType === 'manual' && (
                     <label className="flex flex-col gap-1 text-xs text-muted-foreground">
@@ -970,7 +1552,55 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
                       />
                     </label>
                   )}
-                  {lineType === 'per_device' && (
+                  {lineType === 'per_device_role' && (
+                    <fieldset className="flex flex-col gap-1 text-xs text-muted-foreground sm:col-span-2" data-testid="contract-line-roles">
+                      <legend className="mb-1">{t('contracts.contractEditor.addLine.deviceRoles')}</legend>
+                      <div className="flex flex-wrap gap-2">
+                        {BILLABLE_DEVICE_ROLES.map((role) => {
+                          const Icon = getDeviceRoleIcon(role);
+                          const checked = lineRoles.includes(role);
+                          return (
+                            <label
+                              key={role}
+                              className={`inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-md border px-2.5 text-sm ${checked ? 'border-primary bg-primary/10 text-foreground' : 'bg-background text-muted-foreground hover:text-foreground'}`}
+                            >
+                              <input
+                                type="checkbox" className="sr-only" checked={checked}
+                                onChange={() => setLineRoles((prev) => (checked ? prev.filter((r) => r !== role) : [...prev, role]))}
+                                data-testid={`contract-line-role-${role}`}
+                              />
+                              <Icon className="h-3.5 w-3.5" />
+                              {getDeviceRoleLabel(role)}
+                            </label>
+                          );
+                        })}
+                      </div>
+                      {lineRoles.length === 0 && (
+                        <span className="text-amber-600 dark:text-amber-500">{t('contracts.contractEditor.addLine.deviceRolesRequired')}</span>
+                      )}
+                    </fieldset>
+                  )}
+                  {lineType === 'per_device_group' && (
+                    <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                      {t('contracts.contractEditor.addLine.deviceGroup')}
+                      <select
+                        value={lineGroupId} onChange={(e) => setLineGroupId(e.target.value)}
+                        data-testid="contract-line-group"
+                        className="h-9 rounded-md border bg-background px-3 text-sm text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
+                      >
+                        <option value="">{t('contracts.contractEditor.addLine.selectGroup')}</option>
+                        {deviceGroupsList.map((g) => (
+                          <option key={g.id} value={g.id}>
+                            {g.name}{g.type === 'dynamic' ? ` (${t('contracts.shared.dynamicGroup')})` : ''}
+                          </option>
+                        ))}
+                      </select>
+                      {deviceGroupsLoadFailed
+                        ? <span className="text-destructive" data-testid="contract-line-groups-load-failed">{t('contracts.contractEditor.addLine.deviceGroupsLoadFailed')}</span>
+                        : !lineGroupId && <span className="text-amber-600 dark:text-amber-500">{t('contracts.contractEditor.addLine.deviceGroupRequired')}</span>}
+                    </label>
+                  )}
+                  {SITE_SCOPED_TYPES.has(lineType) && (
                     <label className="flex flex-col gap-1 text-xs text-muted-foreground">
                       {t('contracts.contractEditor.addLine.siteOptional')}
                       <select
@@ -983,22 +1613,92 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
                       </select>
                     </label>
                   )}
+                  {ALLOWANCE_TYPES.has(lineType) && (
+                    <fieldset className="flex flex-col gap-2 text-xs text-muted-foreground sm:col-span-2">
+                      <label className="flex items-center gap-2 text-sm text-foreground">
+                        <input
+                          type="checkbox" checked={lineAllowanceOn}
+                          onChange={(e) => setLineAllowanceOn(e.target.checked)}
+                          data-testid="contract-line-allowance-toggle"
+                        />
+                        {t('contracts.contractEditor.addLine.allowanceToggle')}
+                      </label>
+                      {lineAllowanceOn && (
+                        <>
+                          <span>{t('contracts.contractEditor.addLine.allowanceHint')}</span>
+                          <label className="flex flex-col gap-1">
+                            {t('contracts.contractEditor.addLine.includedQuantity')}
+                            <input
+                              type="number" min="1" step="1" value={lineIncludedQty}
+                              onChange={(e) => setLineIncludedQty(e.target.value)}
+                              data-testid="contract-line-included-qty"
+                              className="h-9 rounded-md border bg-background px-3 text-sm text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
+                            />
+                          </label>
+                          <fieldset className="flex flex-col gap-1" data-testid="contract-line-overage-mode-group">
+                            <legend>{t('contracts.contractEditor.addLine.overageMode')}</legend>
+                            <div className="flex flex-wrap gap-3 text-sm text-foreground">
+                            <label className="inline-flex items-center gap-1.5">
+                              <input
+                                type="radio" name="overage-mode" checked={lineOverageMode === 'bill'}
+                                onChange={() => setLineOverageMode('bill')}
+                                data-testid="contract-line-overage-bill"
+                              />
+                              {t('contracts.contractEditor.addLine.overageBill')}
+                            </label>
+                            <label className="inline-flex items-center gap-1.5">
+                              <input
+                                type="radio" name="overage-mode" checked={lineOverageMode === 'flag'}
+                                onChange={() => setLineOverageMode('flag')}
+                                data-testid="contract-line-overage-flag"
+                              />
+                              {t('contracts.contractEditor.addLine.overageFlag')}
+                            </label>
+                            </div>
+                          </fieldset>
+                          {lineOverageMode === 'bill' && (
+                            <label className="flex flex-col gap-1">
+                              {t('contracts.contractEditor.addLine.overageUnitPrice')}
+                              <input
+                                type="number" min="0" step="0.01" value={lineOveragePrice}
+                                onChange={(e) => setLineOveragePrice(e.target.value)}
+                                data-testid="contract-line-overage-price"
+                                className="h-9 rounded-md border bg-background px-3 text-sm text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
+                              />
+                              {lineOveragePrice !== '' && !MONEY_RE.test(lineOveragePrice) && (
+                                <span className="text-xs text-destructive" data-testid="contract-line-overage-price-not-representable">
+                                  {t('contracts.contractEditor.addLine.priceNotRepresentable', { currency: contractCurrency })}
+                                </span>
+                              )}
+                            </label>
+                          )}
+                          {allowanceIncomplete && (
+                            <span className="text-amber-600 dark:text-amber-500">
+                              {t('contracts.contractEditor.addLine.allowanceRequired')}
+                            </span>
+                          )}
+                        </>
+                      )}
+                    </fieldset>
+                  )}
                   {catalogItems.length > 0 && (
                     <div className="flex flex-col gap-1 text-xs text-muted-foreground">
                       {t('contracts.contractEditor.addLine.linkCatalogItemOptional')}
-                      {lineCatalogId ? (
+                      {lineCatalogItem ? (
                         <span className="inline-flex h-9 items-center gap-1.5 self-start rounded-md border bg-muted/40 px-2.5 text-sm text-foreground" data-testid="contract-line-catalog-picked">
-                          <span className="font-medium">{catalogItems.find((i) => i.id === lineCatalogId)?.name ?? t('contracts.contractEditor.addLine.itemFallback')}</span>
-                          <button type="button" onClick={() => setLineCatalogId('')} aria-label={t('contracts.contractEditor.addLine.clearCatalogLink')} className="ml-1 text-muted-foreground hover:text-foreground">×</button>
+                          <span className="font-medium">{lineCatalogItem.name}</span>
+                          <button type="button" onClick={() => setLineCatalogItem(null)} aria-label={t('contracts.contractEditor.addLine.clearCatalogLink')} className="ml-1 text-muted-foreground hover:text-foreground">×</button>
                         </span>
                       ) : (
                         <CatalogItemPicker
                           items={catalogItems}
+                          currencyCode={contractCurrency ?? ''}
                           includeBundles={false}
                           onSelect={(it) => {
-                            setLineCatalogId(it.id);
+                            // No client-side price copy: the server resolves the
+                            // contract-currency price (and taxable) from the catalog.
+                            setLineCatalogItem(it);
                             if (!lineDesc.trim()) setLineDesc(it.name);
-                            setLinePrice(it.unitPrice);
                           }}
                           testId="contract-line-catalog-picker"
                           placeholder={t('contracts.contractEditor.addLine.searchCatalog')}
@@ -1008,7 +1708,10 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
                   )}
                   <label className="flex items-center gap-2 text-sm">
                     <input
-                      type="checkbox" checked={lineTaxable} onChange={(e) => setLineTaxable(e.target.checked)}
+                      type="checkbox"
+                      checked={lineCatalogItem ? (catalogPrice?.taxable ?? lineCatalogItem.taxable) : lineTaxable}
+                      disabled={lineCatalogItem != null}
+                      onChange={(e) => { if (!lineCatalogItem) setLineTaxable(e.target.checked); }}
                       data-testid="contract-line-taxable"
                     />
                     {t('contracts.contractEditor.addLine.taxable')}
@@ -1022,7 +1725,7 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
                   </span>
                   {can('contracts', 'write') && (
                     <button
-                      type="button" onClick={() => void addLine()} disabled={busy || !lineDesc.trim()}
+                      type="button" onClick={() => void addLine()} disabled={busy || !linesEditable || !lineDesc.trim() || catalogPriceUnresolved || roleLineMissingRoles || groupLineMissingGroup || allowanceIncomplete}
                       data-testid="add-line-btn"
                       className="inline-flex h-9 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
                     >
@@ -1056,6 +1759,8 @@ export default function ContractEditor({ detail, presetOrgId, onChanged }: Props
                     {t('contracts.contractEditor.estimate.includesLiveCounts')}
                   </p>
                 )}
+                <DeviceCoverageNotice uncovered={liveEstimate?.uncoveredDevices} orgId={orgId || null} />
+                <OverageNotice overages={liveEstimate?.overages} />
                 {!liveEstimate && estimateFailed && (
                   <p className="mt-1 text-xs text-amber-600 dark:text-amber-500" data-testid="contract-estimate-stale">
                     {estimate.hasAuto

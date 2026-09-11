@@ -17,6 +17,7 @@ export default defineConfig({
       'src/__tests__/integration/**',
       // Real-PostgreSQL exact request-pool role checks have a dedicated runner.
       'src/db/requestDatabaseRole.integration.test.ts',
+      'src/db/auditRetentionDefault.integration.test.ts',
       // Real-driver integration test for the inbound email pipeline. It needs the
       // integration setup (real postgres pool + autoMigrate seed) and is run by
       // vitest.integration.config.ts — not the unit runner, which has no DB.
@@ -30,6 +31,9 @@ export default defineConfig({
       // inboundEmail exclusion above.
       'src/services/vulnerability*.integration.test.ts',
       'src/services/aiToolsVulnerability.integration.test.ts',
+      // Real-DB backup queue lifecycle proof (#4923); runs under the
+      // integration config's setup (truncating), never the unit runner.
+      'src/services/backupProgress.integration.test.ts',
       'src/services/cpeMap.integration.test.ts',
       'src/services/cpeResolution.integration.test.ts',
       'src/services/exploitFeeds.integration.test.ts',
@@ -127,11 +131,6 @@ export default defineConfig({
       // the no-DB unit runner would fail it on connect. Belongs to
       // vitest.integration.config.ts (registered in its include list).
       'src/jobs/intentReleaseWorkerM365Headless.integration.test.ts',
-      // Two-replica runtime extension reconcile + failure policy (Task 8,
-      // issue #2619): imports `__tests__/integration/setup` (real postgres
-      // pool) and forks real child processes against `:5433`. Belongs to
-      // vitest.integration.config.ts (already in its include).
-      'src/extensions/twoReplicaReconcile.integration.test.ts',
       // Disabled built-in extension's table-existence probe against a real
       // server: imports `__tests__/integration/setup` (real postgres pool) and
       // provisions its own throwaway database. Belongs to
@@ -151,6 +150,12 @@ export default defineConfig({
       // list). NOT the same file as the co-located mocked unit suite
       // `mfaStepUpGrant.test.ts`, which stays on this runner.
       'src/services/mfaStepUpGrant.integration.test.ts',
+      // Track D real-PostgreSQL suites. These import the shared integration
+      // setup and are owned by vitest.integration.config.ts.
+      'src/services/peripheralEffectivePolicy.integration.test.ts',
+      'src/services/peripheralPolicyState.integration.test.ts',
+      'src/services/agentRollback.integration.test.ts',
+      'src/services/agentRollbackResult.integration.test.ts',
       // Enrollment-key cleanup sweep real-DB test (#2775 live-bootstrap-token
       // exemption): imports `__tests__/integration/setup` (real postgres pool
       // + autoMigrate) and lives in src/jobs/ outside the
@@ -171,6 +176,16 @@ export default defineConfig({
       // `src/__tests__/integration/**` glob, so the no-DB unit runner would
       // fail it on connect. Belongs to vitest.integration.config.ts.
       'src/routes/enrollmentKeysExpiredFilter.integration.test.ts',
+      // Real-DB suites owned by vitest.integration.config.ts (#3778).
+      'src/services/invoiceService.issue.integration.test.ts',
+      'src/services/invoicePdf.integration.test.ts',
+      // Canary for issue #4046: asserts the process observes a non-UTC
+      // offset. It must ONLY run under the pinned non-UTC pass
+      // (vitest.config.tz.ts, TZ=America/Denver), where it belongs — it is
+      // excluded here deliberately, not because it doesn't apply to the
+      // unit runner: it WOULD fail on this (UTC) runner, since that is
+      // exactly the point of the check.
+      'src/__tests__/tzPinCanary.test.ts',
     ],
     setupFiles: ['src/__tests__/setup.ts'],
     coverage: {

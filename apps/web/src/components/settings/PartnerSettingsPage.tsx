@@ -3,6 +3,7 @@ import {
   Bell,
   Building2,
   Globe,
+  KeyRound,
   Loader2,
   LogIn,
   MonitorSmartphone,
@@ -27,8 +28,11 @@ import PartnerDefaultsTab from './PartnerDefaultsTab';
 import type { PinnableVersions } from './AgentVersionPinSelectors';
 import PartnerBrandingTab from './PartnerBrandingTab';
 import PartnerAiBudgetsTab from './PartnerAiBudgetsTab';
+import PartnerAiProviderTab from './PartnerAiProviderTab';
 import PartnerRemoteAccessTab from './PartnerRemoteAccessTab';
 import PartnerCompanyTab from './PartnerCompanyTab';
+import PartnerModulesCard from './PartnerModulesCard';
+import type { ServiceManagementMode } from '@/stores/orgStore';
 import PartnerRegionalTab, { DEFAULT_BUSINESS_HOURS } from './PartnerRegionalTab';
 import LoginBrandingCard from './LoginBrandingCard';
 import type {
@@ -54,7 +58,7 @@ import { useTranslation } from 'react-i18next';
 import { i18n } from '@/lib/i18n';
 import { normalizeLocale } from '@/lib/appearance';
 
-type TabKey = 'company' | 'regional' | 'security' | 'notifications' | 'eventLogs' | 'defaults' | 'branding' | 'loginBranding' | 'aiBudgets' | 'remoteAccess' | 'ticketing';
+type TabKey = 'company' | 'regional' | 'security' | 'notifications' | 'eventLogs' | 'defaults' | 'branding' | 'loginBranding' | 'aiBudgets' | 'aiProvider' | 'remoteAccess' | 'ticketing';
 
 type Partner = {
   id: string;
@@ -67,6 +71,11 @@ type Partner = {
   // Plain-text signature appended to outbound customer emails (quote sends).
   emailSignature?: string | null;
   settings: PartnerSettings;
+  // #5075 W04 — which service-desk/billing module this partner runs.
+  // `undefined` on every render before the partner fetch resolves, and also on
+  // an API too old to send it. The card treats both the same way: display
+  // 'native', publish nothing to the store (see PartnerModulesCard's prop doc).
+  serviceManagementMode?: ServiceManagementMode;
   createdAt: string;
 };
 
@@ -106,6 +115,7 @@ const TAB_GROUPS: { label: string; tabs: TabDef[] }[] = [
       { key: 'notifications', hash: 'notifications', label: 'partnerSettingsPage.tabs.notifications.label', description: 'partnerSettingsPage.tabs.notifications.description', icon: Bell, enforced: true },
       { key: 'ticketing', hash: 'ticketing', label: 'partnerSettingsPage.tabs.ticketing.label', description: 'partnerSettingsPage.tabs.ticketing.description', icon: Ticket, selfSaving: true },
       { key: 'aiBudgets', hash: 'ai-budgets', label: 'partnerSettingsPage.tabs.aiBudgets.label', description: 'partnerSettingsPage.tabs.aiBudgets.description', icon: Wallet, enforced: true },
+      { key: 'aiProvider', hash: 'ai-provider', label: 'partnerSettingsPage.tabs.aiProvider.label', description: 'partnerSettingsPage.tabs.aiProvider.description', icon: KeyRound, selfSaving: true },
     ],
   },
   {
@@ -145,7 +155,7 @@ function getTabFromHash(): TabKey | null {
 // The per-tab keys whose form state participates in dirty tracking. Self-saving
 // tabs (Ticketing, Login Branding) persist independently and are never "dirty"
 // from this page's perspective.
-type SnapshotKey = Exclude<TabKey, 'ticketing' | 'loginBranding'>;
+type SnapshotKey = Exclude<TabKey, 'ticketing' | 'loginBranding' | 'aiProvider'>;
 type Snapshot = Record<SnapshotKey, string>;
 
 // Exported for unit-testing without mounting the full component.
@@ -204,6 +214,11 @@ export default function PartnerSettingsPage() {
   const [defaultsData, setDefaultsData] = useState<InheritableDefaultSettings>({});
   const [brandingData, setBrandingData] = useState<InheritableBrandingSettings>({});
   const [aiBudgetsData, setAiBudgetsData] = useState<InheritableAiBudgetSettings>({});
+  // The AI Budgets tab's alert-threshold box can hold text that does not parse;
+  // it never reaches `aiBudgetsData`, so saving while it is red would persist
+  // the previous ladder and report success (#4388 W03). The input reports true
+  // again when it unmounts, so leaving the tab never strands the Save button.
+  const [aiBudgetsValid, setAiBudgetsValid] = useState(true);
   const [remoteAccessData, setRemoteAccessData] = useState<InheritableRemoteAccessSettings>({});
   // Registered agent/watchdog versions for the pin selectors (#2124).
   const [pinnableVersions, setPinnableVersions] = useState<PinnableVersions | null>(null);
@@ -541,7 +556,7 @@ export default function PartnerSettingsPage() {
             {t('partnerSettingsPage.selfSaving')}
           </p>
         ) : (
-          <button type="button" onClick={handleSave} disabled={saving || !isDirty}
+          <button type="button" onClick={handleSave} disabled={saving || !isDirty || !aiBudgetsValid}
             className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:opacity-50">
             {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
             {saving ? t('common:states.saving') : t('partnerSettingsPage.saveSettings')}
@@ -575,7 +590,8 @@ export default function PartnerSettingsPage() {
 
           {/* Company Tab */}
           {activeTab === 'company' && (
-            <PartnerCompanyTab
+            <div className="space-y-6">
+              <PartnerCompanyTab
               name={companyName}
               address={address}
               contact={{
@@ -595,6 +611,8 @@ export default function PartnerSettingsPage() {
                 setContactWebsite(c.website || '');
               }}
             />
+              <PartnerModulesCard serviceManagementMode={partner?.serviceManagementMode} />
+            </div>
           )}
 
           {/* Regional Tab */}
@@ -652,7 +670,15 @@ export default function PartnerSettingsPage() {
 
           {activeTab === 'aiBudgets' && (
             <section className="rounded-lg border bg-card p-6 shadow-xs">
-              <PartnerAiBudgetsTab data={aiBudgetsData} onChange={setAiBudgetsData} />
+              <PartnerAiBudgetsTab data={aiBudgetsData} onChange={setAiBudgetsData} onValidityChange={setAiBudgetsValid} />
+            </section>
+          )}
+
+          {/* AI Provider: self-contained BYOK card with its own load/save (the
+              top-level "Save Settings" button does not apply here). */}
+          {activeTab === 'aiProvider' && (
+            <section className="rounded-lg border bg-card p-6 shadow-xs">
+              <PartnerAiProviderTab />
             </section>
           )}
 

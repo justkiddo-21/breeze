@@ -12,10 +12,10 @@ import { eq, and, sql, desc, inArray } from 'drizzle-orm';
 import { getBullMQConnection } from '../services/redis';
 import { createInstrumentedQueue } from '../services/bullmqQueue';
 import { isReusableState } from '../services/bullmqUtils';
-import { sendCommandToAgent, isAgentConnected } from '../routes/agentWs';
-import { buildMonitorCommand } from '../routes/monitors';
+import { dispatchCommandToAgent, isAgentConnectedAnywhere } from '../services/agentCommandRelay';
+import { buildMonitorCommand } from '../services/monitorCommands';
 import { isCooldownActive, setCooldown } from '../services/alertCooldown';
-import { resolveAlert } from '../services/alertService';
+import { resolveAlert, createSourcedAlert } from '../services/alertService';
 import { assertQueueJobName, parseQueueJobData } from '../services/bullmqValidation';
 import {
   monitorQueueJobDataSchema,
@@ -114,10 +114,13 @@ function createMonitorWorker(): Worker<MonitorJobData> {
           // whole enqueue loop (~20s on the EU fleet), starving the pool (#1105).
           return await processScheduler();
         case 'check-monitor':
-          return await runWithSystemDbAccess(() => {
-            assertQueueJobName(MONITOR_QUEUE, job, 'check-monitor');
-            return processCheckMonitor(data);
-          });
+          // NOT wrapped in runWithSystemDbAccess here (final-review fix,
+          // #4084/#1105): processCheckMonitor calls the agentCommandRelay
+          // facade (isAgentConnectedAnywhere, dispatchCommandToAgent — Redis/WS
+          // I/O), and manages its own short-lived system DB context around
+          // just its reads, closing it before that I/O runs.
+          assertQueueJobName(MONITOR_QUEUE, job, 'check-monitor');
+          return await processCheckMonitor(data);
         case 'process-check-result':
           return await runWithSystemDbAccess(() => {
             assertQueueJobName(MONITOR_QUEUE, job, 'process-check-result');
@@ -137,10 +140,23 @@ function createMonitorWorker(): Worker<MonitorJobData> {
   );
 }
 
-async function processCheckMonitor(data: CheckMonitorJobData): Promise<{
-  dispatched: boolean;
-  agentId: string | null;
-}> {
+/**
+ * Outcome of the check-monitor read phase (#1105 final-review fix, #4084).
+ * Discriminated so the monitor-missing / inactive / ok branches read the
+ * cause off the type rather than off guard order.
+ */
+type CheckMonitorInputs =
+  | { status: 'monitor-missing' }
+  | { status: 'inactive' }
+  | { status: 'ok'; monitor: typeof networkMonitors.$inferSelect; agentId: string | null };
+
+/**
+ * Phase 1 of a check-monitor job: read the monitor row and select the
+ * execution agent inside ONE short system DB context. Nothing here talks to
+ * Redis or the agent WebSocket, so the pooled connection is released before
+ * the connectivity check and dispatch (#1105).
+ */
+async function loadCheckMonitorInputs(data: CheckMonitorJobData): Promise<CheckMonitorInputs> {
   const [monitor] = await db
     .select()
     .from(networkMonitors)
@@ -148,31 +164,54 @@ async function processCheckMonitor(data: CheckMonitorJobData): Promise<{
     .limit(1);
 
   if (!monitor) {
-    console.error(`[MonitorWorker] Monitor ${data.monitorId} not found`);
-    return { dispatched: false, agentId: null };
+    return { status: 'monitor-missing' };
   }
 
   if (!monitor.isActive) {
-    console.log(`[MonitorWorker] Monitor ${data.monitorId} is inactive, skipping check`);
-    return { dispatched: false, agentId: null };
+    return { status: 'inactive' };
   }
 
   const agentId = await selectExecutionAgentForMonitor(monitor);
+  return { status: 'ok', monitor, agentId };
+}
 
-  if (!agentId || !isAgentConnected(agentId)) {
+export async function processCheckMonitor(data: CheckMonitorJobData): Promise<{
+  dispatched: boolean;
+  agentId: string | null;
+}> {
+  // Phase 1 — the monitor read and agent selection inside ONE short system DB
+  // context, which then CLOSES.
+  const inputs = await runWithSystemDbAccess(() => loadCheckMonitorInputs(data));
+
+  switch (inputs.status) {
+    case 'monitor-missing':
+      console.error(`[MonitorWorker] Monitor ${data.monitorId} not found`);
+      return { dispatched: false, agentId: null };
+    case 'inactive':
+      console.log(`[MonitorWorker] Monitor ${data.monitorId} is inactive, skipping check`);
+      return { dispatched: false, agentId: null };
+  }
+
+  const { monitor, agentId } = inputs;
+
+  // Phase 2 — connectivity check and the agent WebSocket dispatch, both with
+  // NO DB context open (#1105). dispatchCommandToAgent does Redis/WS I/O via
+  // the agentCommandRelay facade; holding a transaction across it is what
+  // pinned pooled connections idle-in-transaction.
+  if (!agentId || !(await isAgentConnectedAnywhere(agentId))) {
     console.warn(`[MonitorWorker] No online agent for org ${data.orgId}`);
     return { dispatched: false, agentId: null };
   }
 
   const command = buildMonitorCommand(monitor);
-  const sent = sendCommandToAgent(agentId, command);
+  const outcome = await dispatchCommandToAgent(agentId, command, { priority: 'probe' });
 
-  if (!sent) {
-    console.error(`[MonitorWorker] Failed to send check command to agent ${agentId}`);
+  if (outcome.status !== 'sent') {
+    console.error(`[MonitorWorker] Check dispatch ${outcome.status} for agent ${agentId}`);
     return { dispatched: false, agentId };
   }
 
-  console.log(`[MonitorWorker] Check dispatched to agent ${agentId} for monitor ${data.monitorId}`);
+  console.log(`[MonitorWorker] Check dispatched to agent ${agentId} for monitor ${data.monitorId} (${outcome.via})`);
   return { dispatched: true, agentId };
 }
 
@@ -387,11 +426,16 @@ async function evaluateMonitorAlertRules(
     const message = rule.message
       ?? `${condition.detail}. Target: ${monitor.target}. Status: ${result.status}.`;
 
-    await db.insert(alerts).values({
-      ruleId: null,
+    // #5241: route through the shared create+publish path. A raw
+    // `db.insert(alerts)` here left the alert visible only in the inbox —
+    // notifications, escalation, automations and AI verdicts all hang off the
+    // `alert.triggered` event this publishes. Dedupe/cooldown stay above,
+    // keyed on the monitor alert rule rather than an `alertRules` row.
+    const alertId = await createSourcedAlert({
       deviceId: alertDeviceId,
+      // Alert rows always take the DEVICE's org; monitors are org-scoped and
+      // resolveMonitorAlertDevice only returns devices in monitor.orgId.
       orgId: monitor.orgId,
-      status: 'active',
       severity: rule.severity,
       title,
       message,
@@ -407,8 +451,25 @@ async function evaluateMonitorAlertRules(
         error: result.error ?? null,
         threshold: rule.threshold ?? null
       },
-      triggeredAt: new Date()
+      publisher: 'monitor-worker',
+      // `source` is supplied by createSourcedAlert from `context.source`.
+      eventPayload: {
+        monitorId: monitor.id,
+        alertRuleId: rule.id,
+        monitorType: monitor.monitorType,
+        target: monitor.target
+      }
     });
+
+    if (!alertId) {
+      // Insert produced no row, so nothing was published. Leave the cooldown
+      // unset so the next check retries instead of silently swallowing the
+      // breach for the whole cooldown window.
+      console.error(
+        `[MonitorWorker] Failed to create alert for monitor ${monitor.id} rule ${rule.id}; will retry on next check`
+      );
+      continue;
+    }
 
     await setCooldown(rule.id, alertDeviceId, MONITOR_ALERT_COOLDOWN_MINUTES);
   }

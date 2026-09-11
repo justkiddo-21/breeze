@@ -21,6 +21,14 @@ vi.mock('@/lib/navigation', () => ({
   navigateTo: vi.fn(),
 }));
 
+// RemoveDeviceDialog (#3987) fetches the env-driven uninstall drain window on
+// open. Mocked at the service boundary so it does not land in this file's
+// fetchWithAuth call-count assertions, which pin exactly which requests the
+// banner itself makes.
+vi.mock('../../services/deviceActions', () => ({
+  fetchRemovalConfig: vi.fn(async () => ({ uninstallDrainWindowHours: 72 })),
+}));
+
 const fetchWithAuthMock = vi.mocked(fetchWithAuth);
 const showToastMock = vi.mocked(showToast);
 
@@ -104,7 +112,7 @@ describe('PossibleReplacementBanner (#2764)', () => {
     expect(within(dialog).getByText(/OLD-LAPTOP-01/)).toBeInTheDocument();
     // The confirm button carries DeviceActions' own label, not a paraphrase.
     expect(screen.getByTestId('possible-replacement-confirm')).toHaveTextContent(
-      'Decommission',
+      'Remove',
     );
     // Only the initial summary GET — no DELETE has gone out.
     expect(fetchWithAuthMock).toHaveBeenCalledTimes(1);
@@ -112,6 +120,28 @@ describe('PossibleReplacementBanner (#2764)', () => {
       expect.anything(),
       expect.objectContaining({ method: 'DELETE' }),
     );
+  });
+
+  // #3987: the banner used to issue its own bodyless DELETE — the one Remove
+  // surface that could not queue the agent uninstall at all. It now asks the
+  // same question every other Remove asks, and sends the answer.
+  it('Remove old device asks about the agent and sends uninstallAgent in the DELETE body', async () => {
+    fetchWithAuthMock
+      .mockResolvedValueOnce(jsonResponse(oldDevicePayload({ status: 'offline' })))
+      .mockResolvedValueOnce(jsonResponse({ success: true }))
+      .mockResolvedValueOnce(jsonResponse(oldDevicePayload({ status: 'decommissioned' })));
+
+    render(<PossibleReplacementBanner possibleReplacementOfDeviceId={OLD_DEVICE_ID} />);
+
+    fireEvent.click(await screen.findByTestId('possible-replacement-decommission'));
+    expect(await screen.findByTestId('remove-choice-uninstall')).toBeChecked();
+    fireEvent.click(screen.getByTestId('possible-replacement-confirm'));
+
+    await waitFor(() => {
+      const del = fetchWithAuthMock.mock.calls.find(([, init]) => init?.method === 'DELETE');
+      expect(del).toBeDefined();
+      expect(JSON.parse(String(del![1]?.body))).toEqual({ uninstallAgent: true });
+    });
   });
 
   it('sends nothing and closes the dialog when the confirm is cancelled', async () => {
@@ -148,8 +178,11 @@ describe('PossibleReplacementBanner (#2764)', () => {
     fireEvent.click(await screen.findByTestId('possible-replacement-confirm'));
 
     await waitFor(() =>
+      // #3987: the DELETE now carries the agent choice; uninstall is the default.
       expect(fetchWithAuthMock).toHaveBeenCalledWith(`/devices/${OLD_DEVICE_ID}`, {
         method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uninstallAgent: true }),
       }),
     );
 

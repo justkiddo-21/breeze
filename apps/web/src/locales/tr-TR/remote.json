@@ -196,7 +196,7 @@
       "justNow": "Az önce",
       "minutesAgo": "{{count}}m önce"
     },
-    "title": "Başlık",
+    "title": "Dosya Etkinliği",
     "unverifiedHint": "Doğrulanmamış İpucu"
   },
   "fileManager": {
@@ -236,7 +236,7 @@
       "scanned": "Taranan: {{count}} dosya",
       "selected": "Seçilen: {{count}} · {{size}}",
       "threshold": "Eşik",
-      "title": "Başlık",
+      "title": "Disk Analizi",
       "trigger": "Tetikleyici: {{value}}"
     },
     "dismiss": "Kapat",
@@ -246,6 +246,7 @@
       "copy": "Kopyalanamadı",
       "delete": "Silinemedi",
       "download": "İndirilemedi",
+      "downloadTooLarge": "İndirilemeyecek kadar büyük ({{size}}). Dosya tarayıcısı en fazla {{max}} boyutunda dosya aktarır.",
       "loadDirectory": "Dizin yüklenemedi",
       "move": "Taşınamadı",
       "readFile": "Dosya okunamadı",
@@ -259,7 +260,7 @@
     "moveTo": "Şuraya Taşı",
     "selectedCount": "Seçilen Sayı",
     "size": "Boyut",
-    "title": "Başlık",
+    "title": "Dosya Yöneticisi",
     "transfers": "Transferler",
     "trash": "Çöp Kutusu",
     "selectedCount_one": "{{count}} seçildi",
@@ -439,10 +440,10 @@
       "generic": "Bir hata oluştu"
     },
     "refreshStatus": "Durumu Yenile",
-    "title": "Başlık"
+    "title": "Dosya Yöneticisi"
   },
   "remoteTerminal": {
-    "connectedBang": "Bağlantılı Patlama",
+    "connectedBang": "Bağlandı!",
     "connectingTo": "{{hostname}}'ye bağlanılıyor...",
     "copySelection": "Seçimi Kopyala",
     "disconnect": "Bağlantıyı kes",
@@ -615,7 +616,7 @@
     "noServicesFound": "Hiçbir Hizmet Bulunamadı",
     "ok": "Tamam",
     "page": "Sayfa {{current}} / {{total}}",
-    "refreshHint": "Yenileme İpucu",
+    "refreshHint": "Hizmetleri kontrol etmek için yenilemeyi deneyin.",
     "restartService": "Hizmeti Yeniden Başlatın",
     "searchPlaceholder": "Arama Yer Tutucusu",
     "serviceConfirm": "{{action}} hizmetini {{service}} yapmak istediğinizden emin misiniz?",

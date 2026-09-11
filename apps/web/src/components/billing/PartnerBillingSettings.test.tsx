@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import PartnerBillingSettings from './PartnerBillingSettings';
 import { fetchWithAuth } from '../../stores/auth';
+import { partnerCurrencyCache } from '@/lib/partnerCurrencyCache';
 
 vi.mock('../../stores/auth', () => ({ fetchWithAuth: vi.fn() }));
 vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
@@ -80,6 +81,29 @@ describe('PartnerBillingSettings', () => {
     });
   });
 
+  /**
+   * The partner reporting currency is cached module-wide (partnerCurrencyCache)
+   * and the approximate-total cache is bound to its generation. Without a reset
+   * on save, an admin who switches the reporting currency keeps reading the old
+   * currency — labels AND converted "≈ approximate" totals — until logout.
+   */
+  it('resets the cached partner currency on a successful save so stale money labels/totals cannot survive', async () => {
+    fetchMock.mockImplementation(async (_input: string, opts?: RequestInit) => {
+      if (opts?.method === 'PATCH') return json({ data: {} });
+      return json({ currencyCode: 'USD', defaultTaxRate: null, invoiceNumberPrefix: 'INV', invoiceTermsDays: 30, invoiceFooter: null });
+    });
+    partnerCurrencyCache.value = 'USD';
+    const generationBefore = partnerCurrencyCache.generation;
+
+    render(<PartnerBillingSettings />);
+    await waitFor(() => expect(screen.getByTestId('partner-billing-settings')).toBeInTheDocument());
+    fireEvent.change(screen.getByTestId('partner-billing-currency'), { target: { value: 'EUR' } });
+    fireEvent.click(screen.getByTestId('partner-billing-save'));
+
+    await waitFor(() => expect(partnerCurrencyCache.value).toBeNull());
+    expect(partnerCurrencyCache.generation).toBeGreaterThan(generationBefore);
+  });
+
   it('sends autoTaxHardware in the PATCH body and toggles it via checkbox', async () => {
     fetchMock.mockImplementation(async (_input: string, opts?: RequestInit) => {
       if (opts?.method === 'PATCH') return json({ data: {} });
@@ -103,6 +127,50 @@ describe('PartnerBillingSettings', () => {
       const patch = fetchMock.mock.calls.find((c) => c[0] === '/partner/billing-settings' && (c[1] as RequestInit)?.method === 'PATCH');
       expect(patch).toBeTruthy();
       expect(JSON.parse((patch![1] as RequestInit).body as string)).toMatchObject({ autoTaxHardware: false });
+    });
+  });
+
+  it('#3205 W07: the appendix checkbox round-trips', async () => {
+    fetchMock.mockImplementation(async (_input: string, opts?: RequestInit) => {
+      if (opts?.method === 'PATCH') return json({ data: {} });
+      return json({
+        currencyCode: 'USD', defaultTaxRate: null, invoiceNumberPrefix: 'INV', invoiceTermsDays: 30,
+        invoiceDeviceAppendix: true, invoiceFooter: null,
+      });
+    });
+    render(<PartnerBillingSettings />);
+    const box = await screen.findByTestId('partner-billing-device-appendix') as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    fireEvent.click(box);
+    fireEvent.click(screen.getByTestId('partner-billing-save'));
+    await waitFor(() => {
+      const patch = fetchMock.mock.calls.find((c) => c[0] === '/partner/billing-settings' && (c[1] as RequestInit)?.method === 'PATCH');
+      expect(JSON.parse((patch![1] as RequestInit).body as string)).toMatchObject({ invoiceDeviceAppendix: false });
+    });
+  });
+
+  it('#3205 W07: keeps an enabled appendix default on an unrelated settings save', async () => {
+    fetchMock.mockImplementation(async (_input: string, opts?: RequestInit) => {
+      if (opts?.method === 'PATCH') return json({ data: {} });
+      return json({
+        currencyCode: 'USD', defaultTaxRate: null, invoiceNumberPrefix: 'INV', invoiceTermsDays: 30,
+        invoiceDeviceAppendix: true, invoiceFooter: null,
+      });
+    });
+    render(<PartnerBillingSettings />);
+    const box = await screen.findByTestId('partner-billing-device-appendix') as HTMLInputElement;
+    expect(box.checked).toBe(true);
+
+    fireEvent.change(screen.getByTestId('partner-billing-prefix'), { target: { value: 'ACME' } });
+    fireEvent.click(screen.getByTestId('partner-billing-save'));
+
+    await waitFor(() => {
+      const patch = fetchMock.mock.calls.find((c) => c[0] === '/partner/billing-settings' && (c[1] as RequestInit)?.method === 'PATCH');
+      expect(patch).toBeTruthy();
+      expect(JSON.parse((patch![1] as RequestInit).body as string)).toMatchObject({
+        invoiceNumberPrefix: 'ACME',
+        invoiceDeviceAppendix: true,
+      });
     });
   });
 

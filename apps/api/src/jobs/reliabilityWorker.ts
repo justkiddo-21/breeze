@@ -8,6 +8,8 @@ import { createInstrumentedQueue } from '../services/bullmqQueue';
 import { computeAndPersistDeviceReliability, computeAndPersistOrgReliability } from '../services/reliabilityScoring';
 import { captureException } from '../services/sentry';
 import { isReusableState } from '../services/bullmqUtils';
+import { jobSchedule } from './scheduleRegistry';
+import { attachWorkerObservability } from './workerObservability';
 
 const { db } = dbModule;
 // #1105 (duration variant): withSystemDbAccessContext holds a DB transaction
@@ -168,7 +170,7 @@ async function scheduleReliabilityScan(): Promise<void> {
     },
     {
       jobId: 'reliability-scan-orgs',
-      repeat: { pattern: '0 2 * * *' },
+      repeat: { pattern: jobSchedule('reliability-scoring') },
       removeOnComplete: { count: 10 },
       removeOnFail: { count: 50 },
     }
@@ -177,6 +179,7 @@ async function scheduleReliabilityScan(): Promise<void> {
 
 export async function initializeReliabilityWorker(): Promise<void> {
   reliabilityWorker = createReliabilityWorker();
+  attachWorkerObservability(reliabilityWorker, 'reliabilityWorker');
   reliabilityWorker.on('error', (error) => {
     console.error('[ReliabilityWorker] Worker error:', error);
     captureException(error);

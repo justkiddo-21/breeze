@@ -1,21 +1,28 @@
 name: CI
 
 on:
+  # Emergency lane. `main` is behind the merge queue, so every landing has
+  # already run this whole suite on its merge-group ref; a `push` trigger on
+  # main would only rerun the same suite and cancel itself on the next landing
+  # (observed 2026-09-07: 59 of 80 main runs cancelled). The one way untested
+  # code reaches main is an admin bypass merge — whoever does that MUST run
+  # `gh workflow run CI --ref main` so main-red-alert can evaluate it.
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - 'apps/docs/**'
-      - '**/*.md'
-      - '**/*.mdx'
+  # Merge queue: the queue builds a temporary merge ref and needs the same
+  # `CI Success` check as a PR. No path filters here on purpose — the queue is
+  # the last gate before main and always runs the full suite.
+  merge_group:
+  # No `paths-ignore` here on purpose. The merge queue requires `CI Success`
+  # on every PR, including docs-only ones, and a path-filtered workflow simply
+  # never reports for a PR outside its paths. The old answer was other
+  # workflows (`ci-docs-only.yml`, `docs-ci.yml`) reporting their own
+  # `CI Success`, but several workflows sharing one check name is a race: a
+  # mixed docs+code PR got all of them, and whichever finished last won the
+  # required-check slot. Now this workflow runs on every PR, the `changes` job
+  # classifies the diff, code jobs are skipped on a docs-only PR, and
+  # `ci-success` is the only reporter.
   pull_request:
     branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - 'apps/docs/**'
-      - '**/*.md'
-      - '**/*.mdx'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -31,9 +38,101 @@ permissions:
   contents: read
 
 jobs:
+  # ─── Docs-only detection ─────────────────────────────────────────────
+  # Classifies the PR diff so a docs-only PR (docs/**, apps/docs/**, *.md,
+  # *.mdx — the set `ci-docs-only.yml` and `docs-ci.yml` used to own) skips
+  # every code job, runs only `docs-check`, and still gets a `CI Success`,
+  # which the merge queue requires before it will enqueue anything. Only
+  # `pull_request` is classified: a merge-group ref and a manual dispatch run
+  # everything, exactly as before.
+  #
+  # Fail-closed by construction: `ci-success` only honours the bypass when this
+  # output is the literal string `false`. If this job fails, is skipped, or
+  # emits nothing, the code jobs are skipped (their `if:` sees an empty output)
+  # AND `ci-success` still asserts on them — so the PR goes red, never green.
+  changes:
+    name: Detect Code Changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+      docs: ${{ steps.classify.outputs.docs }}
+    steps:
+      - name: Checkout (classifier script only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Classify changed files
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" != "pull_request" ]]; then
+            echo "Event ${EVENT_NAME}: not a PR, running the full suite."
+            echo "code=true" >> "${GITHUB_OUTPUT}"
+            echo "docs=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          # The PR files API needs no checkout and sees renames/deletes too.
+          # Any failure here aborts the job (set -e), which fails closed above.
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename' \
+            | bash .github/scripts/classify-pr-paths.sh \
+            | tee -a "${GITHUB_OUTPUT}"
+
+  # ─── Docs check ─────────────────────────────────────────────────────
+  # Was `docs-ci.yml`, whose job was ALSO named `CI Success` — the third
+  # reporter of that check name. It is now a plain job here, gated on the
+  # classifier's `docs` output and asserted by ci-success, which also means it
+  # finally runs in the merge queue (docs-ci.yml had no merge_group trigger).
+  # `docs-automation-retirement.test.mjs` pins the deterministic steps.
+  docs-check:
+    name: Docs Check
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.docs == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Also runs in `lint`, but lint is skipped on a docs-only PR.
+      - name: Guard retired AI documentation automation
+        run: pnpm test:docs-automation
+
+      - name: Check documentation
+        run: pnpm --filter @breeze/docs check
+
+      - name: Build documentation
+        run: pnpm --filter @breeze/docs build
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -51,9 +150,19 @@ jobs:
         run: |
           bash scripts/check-guided-setup-compose-rewrites.sh
           bash scripts/check-guided-setup-default-project.sh
-          bash scripts/check-guided-setup-db-urls.sh
+          bash scripts/check-selfhost-db-urls.sh
           bash scripts/check-guided-setup-env-roundtrip.sh
+          bash scripts/check-guided-setup-local-certs-backfill.sh
           bash scripts/check-guided-setup-placeholders.sh
+          bash scripts/check-guided-setup-systemd-unit.sh
+
+      # docker/Caddyfile.prod is shared by hosted production and every
+      # self-hosted install, so the CADDY_LOCAL_CERTS opt-in must be a strict
+      # no-op when empty. That is a property of the Caddyfile ADAPTER, invisible
+      # to grep, so this adapts the real file with the variable empty, unset and
+      # set and diffs the results. Skips itself if Docker is unavailable.
+      - name: Guard Caddyfile internal-CA opt-in
+        run: bash scripts/check-caddyfile-local-certs.sh
 
       # The quickstart tells self-hosters to `cp .env.example .env` and bring the
       # stack up, so a BREEZE_VERSION whose images were never published breaks
@@ -76,6 +185,15 @@ jobs:
 
       - name: Test community README automation
         run: pnpm test:community-readme
+
+      - name: Test mobile native CI contract
+        run: node --test .github/scripts/mobile-native-ci.test.mjs
+
+      - name: Test docs-only CI contract
+        run: node --test .github/scripts/classify-pr-paths.test.mjs
+
+      - name: Verify temporary CI apt source isolation
+        run: node --test .github/scripts/prepare-ci-apt-sources.test.mjs
 
       - name: Guard retired AI documentation automation
         run: pnpm test:docs-automation
@@ -100,6 +218,8 @@ jobs:
   typecheck:
     name: Type Check
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     env:
       # tsc on the full apps/api project (dense Drizzle types) + astro check
       # exceed Node's default heap on the type-heaviest branches. Give the
@@ -135,6 +255,8 @@ jobs:
   test-api:
     name: Test API
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -174,6 +296,26 @@ jobs:
       - name: Run API tests
         run: pnpm test --filter=@breeze/api
 
+      # Timezone-correctness regression gate (#4046): GitHub-hosted runners
+      # default to UTC, and nothing else in this job or in vitest.config.ts
+      # overrides that. A test asserting timezone-correcting behavior (e.g.
+      # comparing an offsetless-timestamp-derived value against a UTC epoch)
+      # is dormant by construction under UTC — the assertion can collapse to
+      # `0 === 0` and stay green forever while the underlying conversion is
+      # missing or wrong. That is exactly how #4018's TZ bug shipped past
+      # 25,000+ green tests. Re-run just the auth/SSO/MFA/passkey suites
+      # (vitest.config.tz.ts) under a fixed non-UTC zone so a regression of
+      # that shape fails here instead of passing vacuously — not the full
+      # suite a second time, since only timestamp/timezone arithmetic is
+      # offset-sensitive. TZ is set here, at the step level, before the Node
+      # process starts: assigning process.env.TZ from inside a test file has
+      # no effect, because Node/V8 cache the resolved zone at first Date/Intl
+      # use within a process.
+      - name: Run API tests (auth/SSO, pinned non-UTC TZ)
+        env:
+          TZ: America/Denver
+        run: pnpm --filter=@breeze/api test:tz
+
       - name: Run load-test static contract tests
         run: pnpm test:load-static
 
@@ -189,6 +331,20 @@ jobs:
       # coverage and the input-sourced/list-style detector against regressions.
       - name: Run site-scope coverage contract test
         run: pnpm --filter=@breeze/api test:site-scope-coverage
+
+      # #4522 — invoiceService.issue.integration.test.ts and
+      # invoicePdf.integration.test.ts were reported as unmatched by any
+      # include list in vitest.integration.config.ts (they run in the
+      # blocking `integration-test` job today, but nothing asserted that
+      # the config's include/exclude lists stay in sync with the files
+      # that actually exist on disk — a newly-added *.integration.test.ts
+      # file could silently fall out of coverage forever). This contract
+      # test is pure static analysis (reads the integration config's own
+      # include/exclude arrays, walks `src/**/*.integration.test.ts` from
+      # disk, no DB/Redis), so it runs here in the fast, blocking job
+      # rather than `integration-test`.
+      - name: Run integration-suite coverage contract test
+        run: pnpm --filter=@breeze/api test:integration-suite-coverage
 
       # RLS session-context contract test (vitest.config.rls.ts). Gates the
       # APPLICATION half of the tenant-isolation contract: that
@@ -215,6 +371,8 @@ jobs:
   test-m365-graph-read-executor:
     name: Test M365 Graph Read Executor
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -241,6 +399,8 @@ jobs:
   test-m365-graph-actions-executor:
     name: Test M365 Graph Actions Executor
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -267,6 +427,8 @@ jobs:
   test-m365-communications-executor:
     name: Test M365 Communications Executor
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     services:
       postgres:
         image: postgres:16-alpine
@@ -314,6 +476,8 @@ jobs:
   check-migrations:
     name: Check Migrations
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     services:
       postgres:
         image: postgres:16
@@ -341,6 +505,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
 
       - name: Setup pnpm
@@ -360,6 +526,9 @@ jobs:
       # Migrating an EMPTY DB below cannot catch edits to already-shipped
       # migrations (no recorded checksums to mismatch) — but autoMigrate
       # refuses to boot on them in prod. Enforce immutability statically.
+      - name: Release-lineage and migration-guard tests
+        run: pnpm test:release-lineage
+
       - name: Shipped-migration immutability guard
         run: bash scripts/check-migration-immutability.sh
 
@@ -382,6 +551,8 @@ jobs:
   check-migrations-nonsuperuser:
     name: Check Migrations (non-superuser)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     services:
       postgres:
         image: postgres:16
@@ -441,6 +612,8 @@ jobs:
   test-web:
     name: Test Web
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -464,11 +637,13 @@ jobs:
       - name: Run Web tests
         run: pnpm test --filter=@breeze/web
 
-  # Not yet wired into ci-success / branch protection — see #3139. Promote to
-  # required once the job proves stable.
+  # REQUIRED check: asserted in ci-success (see #3941, and #3139 for the
+  # original gap).
   test-mobile:
     name: Test Mobile
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -496,9 +671,120 @@ jobs:
         working-directory: apps/mobile
         run: pnpm exec tsc --noEmit
 
+  # Native compilation catches incompatible RN/Expo modules that JS tests miss.
+  # Resolve paths on Linux so unrelated PRs never allocate a macOS runner.
+  mobile-native-changes:
+    name: Detect Mobile Native Changes
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      mobile: ${{ github.event_name == 'workflow_dispatch' || steps.changes.outputs.mobile == 'true' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Detect mobile build inputs
+        id: changes
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          # PRs and merge groups compare against main; a manual dispatch on main
+          # has no `before`, so it falls through to the default branch (mobile: true).
+          base: ${{ github.event.repository.default_branch }}
+          filters: |
+            mobile:
+              - 'apps/mobile/**'
+              - 'packages/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - '.npmrc'
+              - '.node-version'
+              - '.nvmrc'
+              - 'patches/**'
+              - '.github/workflows/ci.yml'
+              - '.github/scripts/mobile-native-ci.test.mjs'
+
+  build-mobile-ios:
+    name: Build Mobile iOS (Simulator)
+    needs: [mobile-native-changes]
+    # Docs-only gating is inherited: when `changes` reports no code change,
+    # `mobile-native-changes` is skipped, its output is empty, and this
+    # condition is false. `mobile-native-ci.test.mjs` pins these two lines.
+    if: needs.mobile-native-changes.outputs.mobile == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      CI: '1'
+      # Debug simulator compilation needs neither release config nor uploads.
+      SENTRY_DISABLE_AUTO_UPLOAD: 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .node-version
+          cache: 'pnpm'
+
+      - name: Install mobile dependencies
+        run: pnpm install --filter breeze-mobile... --frozen-lockfile
+
+      - name: Show native toolchain
+        run: |
+          xcodebuild -version
+          pod --version
+
+      - name: Generate iOS project
+        working-directory: apps/mobile
+        run: pnpm exec expo prebuild --platform ios --no-install
+
+      - name: Install CocoaPods
+        working-directory: apps/mobile/ios
+        run: pod install
+
+      - name: Compile unsigned iOS simulator app
+        working-directory: apps/mobile/ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -workspace BreezeRMM.xcworkspace \
+            -scheme BreezeRMM \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/breeze-ios-derived-data" \
+            -jobs 2 \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee "$RUNNER_TEMP/breeze-ios-build.log"
+
+      - name: Upload native build log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mobile-ios-build-log
+          path: ${{ runner.temp }}/breeze-ios-build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
   test-portal:
     name: Test Portal
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -522,9 +808,49 @@ jobs:
       - name: Run Portal tests
         run: pnpm test --filter=@breeze/portal
 
+  # The Viewer's TypeScript tests (transports, keymap, protocol, paste, …) ran
+  # in no CI job at all until issue #3410 added a regression test here and found
+  # the gap — only the Rust half (apps/viewer/src-tauri) was covered, by
+  # rust-check. Uses test:run because the package's `test` script is watch mode.
+  # Covers tests + types only: @breeze/viewer still defines no `lint` script, so
+  # `turbo run lint` skips it and the repo-wide Lint job does not reach it.
+  test-viewer:
+    name: Test Viewer
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .node-version
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Viewer tests
+        run: pnpm --filter=@breeze/viewer test:run
+
+      - name: Run Viewer type check
+        working-directory: apps/viewer
+        run: pnpm exec tsc --noEmit
+
   test-office-addin-core:
     name: Test Office Add-in Core
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -554,6 +880,8 @@ jobs:
   test-excel-addin:
     name: Test Excel Add-in
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -580,6 +908,8 @@ jobs:
   test-word-addin:
     name: Test Word Add-in
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -609,6 +939,8 @@ jobs:
   test-powerpoint-addin:
     name: Test PowerPoint Add-in
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -647,6 +979,8 @@ jobs:
   test-outlook-addin:
     name: Test Outlook Add-in
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -676,6 +1010,8 @@ jobs:
   security-audit:
     name: Security Audit
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -719,6 +1055,20 @@ jobs:
       - name: Run supply-chain hardening guard
         run: bash scripts/security/check-supply-chain-hardening.sh
 
+      # release.yml and releaseAssetTrust.ts independently encode "which agent-family
+      # Windows assets ship unsigned". When they drifted in v0.105.0, the API rejected
+      # the four unsigned exes and aborted the ENTIRE binary sync — freezing
+      # agent_versions at 0.104.0 in both prod regions for nine days, and surfacing as a
+      # 404 on Linux and macOS too, which were signed correctly (#3504).
+      # The guard's own parser is tested first, deliberately. This check reads two
+      # hand-written declarations, so a parser regression would make it silently
+      # find nothing to compare — indistinguishable from passing.
+      - name: Test release trust allowlist guard
+        run: node --test scripts/security/check-release-trust-allowlist.test.mjs
+
+      - name: Run release trust allowlist drift guard
+        run: node scripts/security/check-release-trust-allowlist.mjs
+
       - name: Run M365 signing secret runtime smoke
         run: bash scripts/security/check-m365-graph-read-runtime.sh
 
@@ -744,10 +1094,19 @@ jobs:
       - name: Run agent mTLS edge policy guard
         run: pnpm check:agent-mtls-edge-policy
 
+      # #4497: scripts/backup.sh and scripts/restore.sh used to pass
+      # DATABASE_URL (password included) directly on pg_dump's/pg_restore's/
+      # psql's argv, visible to any local user via `ps` for the whole
+      # dump/restore. Covers the PG* URL-splitting helper's parsing and
+      # statically guards both scripts against reintroducing the pattern.
+      - name: Test pg connection env helper (#4497)
+        run: pnpm test:pg-connect-env
+
   build-api:
     name: Build API
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [lint, typecheck, changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -791,7 +1150,8 @@ jobs:
   build-m365-graph-read-executor:
     name: Build M365 Graph Read Executor
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [lint, typecheck, changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -824,7 +1184,8 @@ jobs:
   build-m365-graph-actions-executor:
     name: Build M365 Graph Actions Executor
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [lint, typecheck, changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -859,7 +1220,8 @@ jobs:
   build-m365-communications-executor:
     name: Build M365 Communications Executor
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [lint, typecheck, changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -894,7 +1256,8 @@ jobs:
   build-web:
     name: Build Web
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [lint, typecheck, changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -919,7 +1282,9 @@ jobs:
         run: pnpm build --filter=@breeze/web
 
       - name: Install Chromium for CSP guard
-        run: pnpm --filter @breeze/web exec playwright install --with-deps chromium
+        uses: ./.github/actions/install-chromium
+        with:
+          run-prefix: pnpm --filter @breeze/web exec
 
       - name: CSP drift guard (real-browser)
         run: pnpm --filter @breeze/web run csp:guard
@@ -934,7 +1299,8 @@ jobs:
   build-portal:
     name: Build Portal
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [lint, typecheck, changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -972,7 +1338,8 @@ jobs:
   build-agent:
     name: Build Agent (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ${{ matrix.runner }}
-    needs: [lint]
+    needs: [lint, changes]
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -1085,6 +1452,8 @@ jobs:
   agent-windows-manifest-guard:
     name: Agent Windows manifest guard
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1119,6 +1488,8 @@ jobs:
   test-agent:
     name: Test Agent
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1152,7 +1523,8 @@ jobs:
   test-agent-windows:
     name: Test Agent (Windows)
     runs-on: windows-latest
-    needs: [lint]
+    needs: [lint, changes]
+    if: needs.changes.outputs.code == 'true'
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -1233,11 +1605,122 @@ jobs:
       # sessionbroker. Note the #3007 bug itself was NOT a data race — sendSeq
       # was already atomic — so -race would not have caught it; the regression
       # test asserts receiver-visible ordering instead.
+      #
+      # ./internal/elevaccount is the fourth instance of the eventlog/logging
+      # gap, found by #4587: the whole package is netapi32 account lifecycle
+      # behind //go:build windows, and the only Windows-tagged test it had was
+      # a compile-time interface assertion that no job ran. The bug it shipped
+      # was precisely a netapi32 status code the Windows-only code mishandled
+      # (NERR_UserNotFound on an account that was never provisioned, which is
+      # the DEFAULT state of every agent that never enabled PAM), so a gate
+      # that never executes on Windows could not have caught it and cannot
+      # catch the next one. Verified the same way as logging and ipc: with
+      # GOOS=windows GOARCH=amd64 CGO_ENABLED=0 the package vets, its test
+      # binary compiles, and its Windows dependency graph contains no
+      # remote/desktop and no cgo. Its two behavioural tests assert against the
+      # real netapi32 and skip loudly, rather than pass, on a host where
+      # ~breeze_elev exists or local-account queries are not permitted.
+      # ./internal/executor is the fifth instance of the same gap (#3525):
+      # limits_windows.go's setProcessGroup/hideWindow and the new Job Object
+      # containment are Windows-only, and limits_windows_test.go had never
+      # executed anywhere. Verified like logging/ipc/elevaccount: with
+      # GOOS=windows GOARCH=amd64 CGO_ENABLED=0 it vets and its test binary
+      # compiles. It differs from those three in one way that matters — its
+      # Windows dependency graph DOES contain remote/desktop, via
+      # privilege -> remote/tools — which is harmless here (CGO_ENABLED=0 is
+      # exactly the configuration remote/desktop's !cgo files are written for)
+      # but is why it must stay out of the race step below.
+      # ./internal/winsvcinstall is the SCM half of `service install` for both the
+      # agent and the watchdog, extracted in #5299. Its package IS listed here
+      # rather than relying on internal/agentapp, which is NOT on this list (its
+      # inherited Windows reds are tracked in #2523) — a //go:build windows test
+      # left next to the installer would therefore have run on no job at all,
+      # which is the exact vacuous-gate failure the steps below guard against.
+      # Most of the package is deliberately untagged so the install sequence
+      # (sample before stop, stop before staging the binary, confirm RUNNING
+      # before claiming it) also executes in the Linux `test-agent` job; the
+      # windows-tagged half is the mgr adapter plus its command-line quoting and
+      # SCM-state mapping tests, which can only run here. Verified like logging
+      # and ipc: with GOOS=windows GOARCH=amd64 CGO_ENABLED=0 the package vets,
+      # its test binary compiles, and its Windows dependency graph contains no
+      # remote/desktop, no cgo, and no other first-party package.
       - name: Run Windows Go tests
         working-directory: agent
         env:
           CGO_ENABLED: "0"
-        run: go test ./internal/sessionbroker ./internal/eventlog ./internal/ipc ./internal/logging ./internal/state ./internal/watchdog ./internal/backup/vss ./cmd/breeze-watchdog
+        run: go test ./internal/sessionbroker ./internal/eventlog ./internal/elevaccount ./internal/ipc ./internal/logging ./internal/state ./internal/watchdog ./internal/backup/vss ./internal/executor ./internal/winsvcinstall ./cmd/breeze-watchdog
+
+      # The step above runs without -v, so a t.Skip is indistinguishable from a
+      # pass in its output. That matters here more than usual: elevaccount's two
+      # behavioural tests are the ONLY live-syscall coverage anywhere of the
+      # #4587 fix, and they skip by design when ~breeze_elev already exists or
+      # when local-account queries are refused. A silent skip would leave the
+      # real netapi32 path — the actual blast radius of the bug — with zero
+      # coverage while CI stayed green, which is the same vacuous-gate failure
+      # the collectors and backup steps below already guard against. Assert both
+      # actually PASSED.
+      - name: Run Windows elevation-account absence tests (must not skip)
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/elevaccount -run '^Test(VerifyClean|Deprovision)TreatsAbsentAccountAsClean$' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          $skips = @($out | Select-String -Pattern '^--- SKIP: Test').Count
+          if ($skips -ne 0) { throw "$skips of the absent-account tests SKIPPED - the runner could not reach the never-provisioned state they assert against, so the #4587 netapi32 fix has no live coverage here" }
+          if ($passes -ne 2) { throw "expected exactly 2 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
+
+      # The policy-state registry collector decides whether a batch uploads with
+      # `replace: true` — which deletes every prior row for the device. That
+      # "complete vs partial" judgement is Windows-only code (#3529), so it
+      # executes nowhere else in CI: the macOS/Linux jobs compile the !windows
+      # stub instead. Same -run filter + PASS count as the steps around it,
+      # because the package's inherited Windows backlog (#2523) is still red.
+      - name: Run Windows policy registry state completeness tests
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/collectors -run '^TestWindowsCollectRegistryStateCompleteness$' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          if ($passes -ne 1) { throw "expected exactly 1 top-level PASS line, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
+
+      # Software inventory has platform-specific registry behavior. Keep this
+      # filtered until the inherited Windows package backlog in #2523 is green,
+      # and count PASS lines so a rename cannot turn the gate vacuously green.
+      - name: Run Windows software inventory observation tests
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/collectors -run '^TestWindowsCollectObservation(SourceEvidenceAndGlobalCap|AllApplicableSourcesFailed|CompleteWhenApplicableSourcesSucceed)$' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          if ($passes -ne 3) { throw "expected exactly 3 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
+
+      # internal/collectors as a whole is not on the list above (it has never
+      # been vetted for Windows reds), but its command runners set WaitDelay so
+      # a descendant that inherits PowerShell's stdout handle cannot hang a
+      # collector forever — and handle inheritance is the one behaviour with no
+      # cross-platform equivalent. Run just the self-exec subprocess tests that
+      # cover capture bounds, cancellation, and inherited pipes on the OS they
+      # were written for.
+      - name: Run Windows collector command-runner tests
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        run: go test ./internal/collectors -run '^TestCollectorCommand|^TestCappedBuffer' -v
 
       # internal/backup is the third instance of the same gap: its
       # upload_error_class_codes_windows_test.go pins the Win32 permanent-error
@@ -1277,11 +1760,22 @@ jobs:
           if ($passes -ne 14) { throw "expected exactly 14 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
 
       # -race requires cgo, which remote/desktop cannot satisfy on Windows, so
-      # this covers only packages that do not import it (heartbeat and agentapp
-      # do, transitively). Same package set as the step above: sessionbroker is
-      # the concurrency-critical one — session-keyed helper admission, the
-      # lifecycle registry, and Job Object ownership all live there — so it is
-      # the one that most needs the detector on the OS it actually ships to.
+      # this covers only packages that do not import it (heartbeat, agentapp and
+      # executor do, transitively). Same package set as the step above MINUS
+      # those: sessionbroker is the concurrency-critical one — session-keyed
+      # helper admission, the lifecycle registry, and Job Object ownership all
+      # live there — so it is the one that most needs the detector on the OS it
+      # actually ships to.
+      #
+      # ./internal/executor belongs to the CGO_ENABLED=0 step above and NOT
+      # here: it reaches remote/desktop via privilege -> remote/tools (#3525
+      # added the package to the list above and briefly to this one, which went
+      # red). The concrete failure is that dxgi_windows.go and
+      # dxgi_capture_windows.go are `//go:build windows && !cgo`, so with cgo ON
+      # their comVtblFn/dxgiCapturer/procDeleteObject definitions vanish while
+      # the plain-`windows` files that reference them stay. Check the import
+      # graph before adding anything else here:
+      #   GOOS=windows go list -deps ./internal/<pkg> | grep remote/desktop
       - name: Run Windows race tests
         working-directory: agent
         run: go test -race ./internal/sessionbroker ./internal/eventlog ./internal/ipc ./internal/state ./internal/watchdog ./cmd/breeze-watchdog
@@ -1295,6 +1789,8 @@ jobs:
   lint-agent:
     name: Lint Agent (Go)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     # CGO off (matches test-agent): the agent's only cgo files are the linux
     # X11/pcap capture backends, whose C headers are not on the runner. vet +
     # lint cover the CGO-off build; the cgo backends are compiled by build-agent.
@@ -1336,6 +1832,8 @@ jobs:
   test-agent-race:
     name: Test Agent (race)
     runs-on: macos-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -1385,7 +1883,8 @@ jobs:
   windows-runtime-smoke:
     name: Windows Runtime Smoke
     runs-on: windows-latest
-    needs: [lint]
+    needs: [lint, changes]
+    if: needs.changes.outputs.code == 'true'
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -1531,6 +2030,8 @@ jobs:
   rust-check:
     name: Rust Check (Tauri apps)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     timeout-minutes: 35
 
     steps:
@@ -1540,6 +2041,20 @@ jobs:
           persist-credentials: false
 
       - name: Install Tauri system dependencies
+        # Bound the STEP, not just the commands inside it. The per-command
+        # deadlines below sum to ~27.75m worst case (3 attempts x 8m, plus two
+        # 90s dpkg recoveries, plus 45s of backoff), and the job budget is 35m
+        # JOB-wide — so a worst-case apt would leave ~7m for Rust toolchain
+        # setup, a cold `cargo check` on two webkit2gtk-linked crates, and the
+        # viewer tests. On a cache miss that is not enough, and the job would
+        # die on GitHub's generic "job timed out" with no diagnostic: the exact
+        # failure #3730 reported and this step exists to prevent, merely
+        # relocated from apt to whatever ran last.
+        #
+        # 12m caps apt at roughly a third of the budget and fires as a labelled
+        # step timeout, leaving 23m for the Rust work regardless of how badly
+        # the mirror behaves.
+        timeout-minutes: 12
         run: |
           # The Azure apt mirror (azure.archive.ubuntu.com) is intermittently
           # degraded and can crawl at 1-4 min/package, blowing this job's
@@ -1547,24 +2062,62 @@ jobs:
           # reds `main` and fires main-red-alert with zero code signal (#1605).
           # Switch to the canonical mirror and retry update+install with
           # backoff so a slow mirror doesn't masquerade as a build failure.
+          #
+          # The retry loop above only helps when apt EXITS non-zero. Observed
+          # failures instead STALL: apt stops emitting output right after the
+          # InRelease fetches and never returns, so no attempt ever completes
+          # and the job burns its full 35-minute budget without logging a single
+          # retry warning (#3730). Give each phase its own deadline so a stall
+          # fails fast and the retry logic can actually run.
+          #
+          # `timeout` is invoked under sudo (not `timeout sudo ...`) so it
+          # signals apt-get itself as root; wrapping sudo would kill the wrapper
+          # and leave a root apt-get orphaned holding the dpkg lock.
+          #
+          # Deadlines bound each apt phase so a stall fails fast with a real
+          # message instead of consuming the job. Counting the --kill-after
+          # grace on every bound (each deadline can run to deadline + 30s),
+          # three attempts plus two recovery runs plus the sleeps come to
+          # ~27.75m — which is why the step-level timeout above exists: sized
+          # against the job budget alone, that worst case starves everything
+          # after it. Normal runs finish in well under a minute, so these are
+          # roughly 10x headroom rather than tight.
           sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' \
             /etc/apt/sources.list \
             /etc/apt/sources.list.d/*.list \
             /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          CI_APT_DIR=$(mktemp -d)
+          trap 'rm -rf -- "$CI_APT_DIR"' EXIT
+          node .github/scripts/prepare-ci-apt-sources.mjs /etc/apt "$CI_APT_DIR"
+          APT_SOURCES=(-o "Dir::Etc::sourcelist=$CI_APT_DIR/sources.list"
+                       -o "Dir::Etc::sourceparts=$CI_APT_DIR/sources.list.d")
           install_deps() {
-            sudo apt-get update && \
-            sudo apt-get install -y --no-install-recommends \
+            sudo timeout --kill-after=30s 2m apt-get update "${APT_SOURCES[@]}" \
+              -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3 && \
+            sudo timeout --kill-after=30s 5m apt-get install -y --no-install-recommends "${APT_SOURCES[@]}" \
+              -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3 \
               libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
           }
-          for attempt in 1 2 3; do
+          attempts=3
+          for attempt in $(seq 1 "${attempts}"); do
             if install_deps; then
               echo "Tauri system dependencies installed (attempt ${attempt})."
               exit 0
             fi
-            echo "::warning::apt install failed (attempt ${attempt}/3); retrying in $((attempt * 15))s"
+            if [ "${attempt}" -eq "${attempts}" ]; then
+              break
+            fi
+            echo "::warning::apt install failed (attempt ${attempt}/${attempts}); retrying in $((attempt * 15))s"
+            # A killed apt can leave the dpkg lock held or a package
+            # half-configured; clear that or the retry just fails on the lock.
+            # Bounded too: dpkg runs maintainer scripts and can block on its
+            # own, and an unbounded recovery would reintroduce the very stall
+            # this step exists to prevent.
+            sudo timeout --kill-after=30s 60s dpkg --configure -a || \
+              echo "::warning::dpkg --configure -a recovery failed after attempt ${attempt}; this can mean a genuinely broken runner (corrupted dpkg state, disk full) rather than a slow mirror — check this run's logs if all ${attempts} attempts fail."
             sleep $((attempt * 15))
           done
-          echo "::error::Failed to install Tauri system dependencies after 3 attempts."
+          echo "::error::Failed to install Tauri system dependencies after ${attempts} attempts."
           exit 1
 
       - name: Setup Rust
@@ -1573,7 +2126,7 @@ jobs:
           toolchain: stable
 
       - name: Rust cache
-        uses: swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             apps/helper/src-tauri -> target
@@ -1608,6 +2161,8 @@ jobs:
   rust-check-windows:
     name: Rust Check (Windows)
     runs-on: windows-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     timeout-minutes: 30
     permissions:
       contents: read
@@ -1636,7 +2191,7 @@ jobs:
 
       - name: Rust cache
         if: steps.changes.outputs.cargo == 'true'
-        uses: swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             apps/helper/src-tauri -> target
@@ -1673,7 +2228,8 @@ jobs:
   integration-test:
     name: Integration Tests (shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [lint, typecheck, changes]
+    if: needs.changes.outputs.code == 'true'
     strategy:
       # Report every shard's result — a red shard must not cancel the others
       # (same rationale as the no-bail rule inside the suite: masking stacked
@@ -1810,62 +2366,23 @@ jobs:
             exit 1
           fi
           PGID="$(cat /tmp/ee-boot.pgid 2>/dev/null || echo "$BOOT_PID")"
-          # Guarded like the two failure branches above: under this step's
-          # default `bash -e`, an unguarded `kill` on an already-exited
-          # group (e.g. the process crashed on its own between logging the
-          # built-in load line and this kill) would abort the step on a bare
-          # "process not found" with no log content, making a correct
-          # migration load look like an unexplained CI failure. Dump the log
-          # so it's diagnosable either way — and then decide: an already-dead
-          # group that ALSO logged the fatal sentinel is a genuine boot
-          # failure that merely happened to log the built-in line first, and
-          # must fail the step rather than be waved through.
-          if ! kill -- "-$PGID" 2>/dev/null; then
-            echo "API process group had already exited after logging the built-in load line — dumping its output:"
-            cat /tmp/ee-workspace-boot.log
-            if grep -q "$FATAL" /tmp/ee-workspace-boot.log; then
-              echo "The API logged the built-in load line and then FAILED startup — the schema this step is"
-              echo "supposed to guarantee may be incomplete, so the workspace integration suite below would"
-              echo "fail confusingly. Failing here instead."
-              exit 1
-            fi
-            echo "::warning::API exited on its own after loading built-in extensions (no startup failure logged); migrations were applied, continuing."
-          fi
-          # Bound the wait for graceful shutdown instead of an unbounded
-          # `wait "$BOOT_PID"`, which could otherwise eat the whole job
-          # ceiling if the process ignores SIGTERM or hangs mid-shutdown.
-          # Poll the GROUP, not $BOOT_PID: the leader (pnpm's wrapper) can
-          # exit seconds before the node/tsx descendants finish shutting
-          # down, and watching only the leader cuts the grace period short
-          # (observed on the first live run of this step). Count only
-          # NON-ZOMBIE members: `kill -0` "succeeds" against a zombie, but a
-          # zombie is dead — unreaped only because its parent died with it —
-          # and cannot touch the DB. The step's shell cannot reap
-          # grandchildren; init does so asynchronously after SIGKILL, so a
-          # zombie-only group must be treated as gone, not as a survivor
-          # (also observed live: `[node]`/`[esbuild] <defunct>` tripping a
-          # naive `kill -0 -- -PGID` assert).
-          live_in_group() {
-            ps -eo pgid=,stat= | awk -v p="$PGID" '$1 == p && $2 !~ /^Z/' | wc -l
-          }
-          for _ in $(seq 1 30); do
-            [ "$(live_in_group)" -gt 0 ] || break
-            sleep 1
-          done
-          kill -9 -- "-$PGID" 2>/dev/null || true
+          # Teardown (SIGTERM → bounded grace → SIGKILL → fail closed on a
+          # survivor) lives in scripts/ci/stop-ee-boot-group.sh rather than
+          # inline here, so its branches are reachable by a real test:
+          # apps/api/src/config/eeBootStopGroup.test.ts drives them with
+          # stubbed `kill`/`ps` and with genuine process groups. While this was
+          # inline YAML the only thing a test could assert was the workflow's
+          # text, which is how the ESRCH-vs-EPERM conflation (#3471) survived
+          # two earlier hardening passes on this same step. The script
+          # discriminates a group that is already gone (ESRCH — benign, its
+          # migrations landed) from one that is alive but refuses the signal
+          # (EPERM — a live API that would keep writing to this DB shard, so a
+          # hard failure naming the PGID).
+          bash scripts/ci/stop-ee-boot-group.sh "$PGID" /tmp/ee-workspace-boot.log "$FATAL"
+          # Reap the setsid leader. `wait` only works in the shell that spawned
+          # the job, so it cannot move into the script; it runs after the
+          # teardown has already proved the group is gone, so it cannot hang.
           wait "$BOOT_PID" 2>/dev/null || true
-          # Fail CLOSED on a genuinely surviving process group — but give
-          # SIGKILL a moment to land before judging (delivery is async).
-          for _ in $(seq 1 10); do
-            [ "$(live_in_group)" -gt 0 ] || break
-            sleep 1
-          done
-          if [ "$(live_in_group)" -gt 0 ]; then
-            echo "API process group $PGID survived SIGTERM and SIGKILL. A live API would keep writing to"
-            echo "this step's DB shard and poison the workspace integration suite that runs next."
-            ps -eo pid,pgid,stat,cmd | awk -v pgid="$PGID" '$2 == pgid' || true
-            exit 1
-          fi
 
       - name: Integration-test workspace (ee)
         if: matrix.shard == 1
@@ -1940,7 +2457,8 @@ jobs:
   smoke-test:
     name: Smoke Test
     runs-on: ubuntu-latest
-    needs: [lint, typecheck]
+    needs: [lint, typecheck, changes]
+    if: needs.changes.outputs.code == 'true'
     continue-on-error: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 15
 
@@ -1999,6 +2517,14 @@ jobs:
           # hosted SaaS from self-hosted, gates the email-verification flow on
           # /auth/register-partner. CI runs in self-hosted mode.
           IS_HOSTED=false
+          # RMM-QA-164: fresh installs now seed the system Partner Admin role
+          # with force_mfa=true, so the bootstrap admin would be minted
+          # mfa=false and get 428 mfa_enrollment_required on every
+          # authMiddleware-gated GET below. This sweep is about endpoint
+          # reachability, not the MFA wall (proven by the real-Postgres
+          # suites), so use the documented relief valve. The stored flag is
+          # still asserted with the valve off — see the step after login.
+          MFA_FORCE_FOR_PARTNER_ADMIN=false
           # Required in production by the Wave 3 live-authorization epoch
           # rollout — compat until the fleet drains version-one writers.
           EVENT_PERMISSION_EPOCH_MODE=compat
@@ -2062,7 +2588,44 @@ jobs:
           fi
           echo "::add-mask::${TOKEN}"
           echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
+          # RMM-QA-164 (D6): the behavioural mfaEnrollmentRequired assertion
+          # below only discriminates a compose-wiring regression when the
+          # container's resolved value actually differs from the code
+          # default. mfaForcePartnerAdmin() now defaults to false (#4491),
+          # matching this stack's .env, so an UNMAPPED variable would produce
+          # the identical container-resolved value and this assertion would
+          # pass on a broken mapping too. Read the container's own env
+          # directly first so a dropped mapping is still caught regardless of
+          # which way the code default points.
+          RESOLVED=$(docker compose -f docker-compose.yml -f docker-compose.override.yml.ci \
+            exec -T api printenv MFA_FORCE_FOR_PARTNER_ADMIN || true)
+          echo "api container MFA_FORCE_FOR_PARTNER_ADMIN='${RESOLVED}' (expected 'false': set in .env)"
+          if [ "${RESOLVED}" != "false" ]; then
+            echo "ERROR: docker-compose.yml did not thread MFA_FORCE_FOR_PARTNER_ADMIN from .env into the api container"
+            exit 1
+          fi
+          # ...and then confirm it's actually honoured end to end.
+          ENROLL=$(echo "${RESPONSE}" | jq -r '.mfaEnrollmentRequired')
+          echo "mfaEnrollmentRequired=${ENROLL} (expected false: relief valve set in .env)"
+          if [ "${ENROLL}" != "false" ]; then
+            echo "ERROR: relief valve MFA_FORCE_FOR_PARTNER_ADMIN=false was not honoured by the api container"
+            exit 1
+          fi
           echo "Login successful."
+
+      - name: Assert seeded Partner Admin stores force_mfa=true (RMM-QA-164)
+        run: |
+          # The finding's headline symptom was "fresh stack stored false".
+          # This reads the seeded global template straight from Postgres,
+          # independent of the relief valve (which only affects enforcement).
+          STORED=$(docker compose -f docker-compose.yml -f docker-compose.override.yml.ci \
+            exec -T postgres psql -U breeze -d breeze -tAc \
+            "SELECT force_mfa FROM roles WHERE name = 'Partner Admin' AND is_system AND partner_id IS NULL")
+          echo "roles.force_mfa for the seeded system Partner Admin template: '${STORED}'"
+          if [ "${STORED}" != "t" ]; then
+            echo "ERROR: fresh-stack seed stored force_mfa='${STORED}' (expected 't')"
+            exit 1
+          fi
 
       - name: Smoke test API endpoints
         env:
@@ -2191,15 +2754,450 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.yml -f docker-compose.override.yml.ci down -v || true
 
+  # ─── Guided installer smoke (self-host) ───────────────────────────────
+  # Runs scripts/guided-setup.sh end to end on the runner — the real installer,
+  # this PR's docker-compose.yml/.env.example/Caddyfile, locally built images —
+  # then asserts what a self-hoster hits in the first ten minutes: the stack is
+  # healthy through the packaged Caddy, the bootstrap admin can sign in, a
+  # session survives a page load through the quickstart's SSH-tunnel topology
+  # (https://localhost:8443 vs CORS_ALLOWED_ORIGINS=https://localhost), and the
+  # reboot-startup systemd unit really enables/starts/stops/starts the stack.
+  # Both #4201 defects and the tunnel login loop only ever surfaced on
+  # customers' hosts because nothing executed the installer before release.
+  # Same policy as smoke-test: non-blocking on PRs, required on main.
+  guided-setup-smoke:
+    name: Guided Setup Smoke (self-host installer)
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck, changes]
+    if: needs.changes.outputs.code == 'true'
+    continue-on-error: ${{ github.event_name == 'pull_request' }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install socat (stands in for the quickstart's `ssh -L 8443:127.0.0.1:443`)
+        run: |
+          CI_APT_DIR=$(mktemp -d)
+          trap 'rm -rf -- "$CI_APT_DIR"' EXIT
+          node .github/scripts/prepare-ci-apt-sources.mjs /etc/apt "$CI_APT_DIR"
+          APT_SOURCES=(-o "Dir::Etc::sourcelist=$CI_APT_DIR/sources.list"
+                       -o "Dir::Etc::sourceparts=$CI_APT_DIR/sources.list.d")
+          sudo apt-get update -qq "${APT_SOURCES[@]}"
+          sudo apt-get install -y -qq socat "${APT_SOURCES[@]}"
+
+      # The installer pins images by BREEZE_VERSION; build this checkout's
+      # api/web/portal under that tag so `docker compose up` uses them
+      # (the pull for these local-only tags fails, which the installer treats
+      # as non-fatal — the documented bring-your-own-images path). The agent
+      # binaries image is pulled from GHCR like the Smoke Test job does.
+      - name: Build api/web/portal images under the ci-smoke tag
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/guided-smoke-build
+          docker build -f docker/Dockerfile.api -t ghcr.io/lanternops/breeze/api:ci-smoke .             > /tmp/guided-smoke-build/api.log 2>&1 &
+          API_PID=$!
+          docker build -f docker/Dockerfile.web --build-arg PUBLIC_API_URL=             -t ghcr.io/lanternops/breeze/web:ci-smoke .             > /tmp/guided-smoke-build/web.log 2>&1 &
+          WEB_PID=$!
+          docker build -f apps/portal/Dockerfile --build-arg PORTAL_BASE_PATH=/portal --build-arg PUBLIC_API_URL=             -t ghcr.io/lanternops/breeze/portal:ci-smoke .             > /tmp/guided-smoke-build/portal.log 2>&1 &
+          PORTAL_PID=$!
+          FAIL=0
+          for pair in "api:${API_PID}" "web:${WEB_PID}" "portal:${PORTAL_PID}"; do
+            name="${pair%%:*}"; pid="${pair##*:}"
+            if wait "${pid}"; then
+              echo "built ghcr.io/lanternops/breeze/${name}:ci-smoke"
+            else
+              echo "::error::docker build failed for ${name}"
+              tail -60 "/tmp/guided-smoke-build/${name}.log"
+              FAIL=1
+            fi
+          done
+          [ "${FAIL}" -eq 0 ]
+
+      - name: Mask the fixed bootstrap credential before the installer prints it
+        run: echo "::add-mask::ci-smoke-bootstrap-credential-32-chars"
+
+      - name: Run the guided installer end to end
+        run: bash scripts/smoke-guided-setup.sh
+
+      - name: Assert self-hosted trust mode does not deny remote sessions
+        run: |
+          set -euo pipefail
+          DEVICE_ID=8d93bc26-30d6-4b76-a7df-f8cc79d2dd98
+          docker exec breeze-postgres psql -v ON_ERROR_STOP=1 -U breeze -d breeze <<SQL
+          INSERT INTO devices (id, org_id, site_id, agent_id, hostname, os_type, os_version, architecture, agent_version, status)
+          SELECT '${DEVICE_ID}', o.id, s.id, 'guided-smoke-offline-agent', 'guided-smoke-offline', 'linux', 'test', 'amd64', '0.0.0-test', 'offline'
+          FROM organizations o
+          JOIN sites s ON s.org_id = o.id
+          WHERE o.slug = 'default-organization'
+          ORDER BY s.created_at
+          LIMIT 1
+          ON CONFLICT (id) DO UPDATE SET status = 'offline';
+          SQL
+          SEEDED_DEVICE=$(docker exec breeze-postgres psql -At -U breeze -d breeze \
+            -c "SELECT id FROM devices WHERE id = '${DEVICE_ID}'" || true)
+          if [ -z "${SEEDED_DEVICE}" ]; then
+            DEVICE_ID=00000000-0000-4000-8000-000000000000
+          fi
+          LOGIN_BODY=$(curl -skf -X POST https://localhost/api/v1/auth/login \
+            -H 'Content-Type: application/json' \
+            -H 'Origin: https://localhost' \
+            --data '{"email":"ci-admin@breeze.local","password":"ci-smoke-bootstrap-credential-32-chars"}')
+          jq -e '.mfaEnrollmentRequired == false' <<<"${LOGIN_BODY}" >/dev/null || {
+            echo "ERROR: installer smoke role-MFA relief valve did not survive reboot"
+            exit 1
+          }
+          TOKEN=$(jq -er '.tokens.accessToken' <<<"${LOGIN_BODY}")
+          RESPONSE=$(curl -sk -o /tmp/guided-trust-response -w '%{http_code}' \
+            -X POST https://localhost/api/v1/remote/sessions \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H 'Content-Type: application/json' \
+            --data "{\"deviceId\":\"${DEVICE_ID}\",\"type\":\"desktop\"}")
+          BODY=$(cat /tmp/guided-trust-response)
+          if [ "${RESPONSE}" = "403" ] && grep -q 'TRUST_' <<<"${BODY}"; then
+            echo "ERROR: self-hosted POST /remote/sessions was blocked by partner trust (${RESPONSE}): ${BODY}"
+            exit 1
+          fi
+          case "${RESPONSE}" in
+            2??|400|404) ;; # 404 is expected if the device (seeded or placeholder) is not yet resolved by the API
+            *) echo "ERROR: unexpected POST /remote/sessions response (${RESPONSE}): ${BODY}"; exit 1 ;;
+          esac
+          echo "Remote session trust smoke passed (${RESPONSE})."
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: bash scripts/smoke-guided-setup.sh logs || true
+
+      - name: Teardown
+        if: always()
+        run: bash scripts/smoke-guided-setup.sh teardown || true
+
+  auth-browser-transition-browser-contract:
+    name: Auth Browser Transition (Chromium)
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck, changes]
+    if: needs.changes.outputs.code == 'true'
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: breeze_test
+          POSTGRES_PASSWORD: breeze_test
+          POSTGRES_DB: breeze_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U breeze_test -d breeze_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://breeze_test:breeze_test@localhost:5432/breeze_test
+      DATABASE_URL_APP: postgresql://breeze_app:breeze_test@localhost:5432/breeze_test
+      BREEZE_APP_DB_PASSWORD: breeze_test
+      POSTGRES_PASSWORD: breeze_test
+      REDIS_URL: redis://localhost:6379
+      JWT_SECRET: ci-auth-transition-k7x9Qm4pR2vL8nW5jT3yF6hB0cA1dE4gI7
+      APP_ENCRYPTION_KEY: e9367714341ea19491ff7cd095d1a97e15ae3f7962416723ecfb29a89ed71eb9
+      MFA_ENCRYPTION_KEY: e86f8b88f2c058d428de55c4abec1b50a3cd960a7205dffdb65be8130abbb777
+      NODE_ENV: test
+      E2E_MODE: 'true'
+      AUTO_MIGRATE: 'false'
+      API_PORT: '3005'
+      FORCE_HTTPS: 'false'
+      AUTH_BROWSER_TRANSITIONS_ENFORCED: 'true'
+      AUTH_BROWSER_TERMINAL_PREPARATION_ENABLED: 'true'
+      CF_ACCESS_TRUST_ENABLED: 'true'
+      CF_ACCESS_TEAM_DOMAIN: ci-browser-contract.cloudflareaccess.com
+      CF_ACCESS_AUD: ci-browser-contract-audience
+      DASHBOARD_URL: http://127.0.0.1:3005
+      E2E_AUTH_TRANSITION_API_URL: http://127.0.0.1:3005
+      E2E_ADMIN_EMAIL: admin@breeze.local
+      E2E_ADMIN_PASSWORD: BreezeAdmin123!
+      AUTH_TRANSITION_TEST_CONTROL_SECRET: ci-auth-transition-test-control-v1-7Kp4mQ9x
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .node-version
+          cache: 'pnpm'
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install browser-contract dependencies
+        working-directory: e2e-tests
+        run: npm ci
+
+      - name: Install Chromium
+        uses: ./.github/actions/install-chromium
+        with:
+          working-directory: e2e-tests
+
+      - name: Migrate and seed auth contract database
+        run: |
+          pnpm --filter=@breeze/api db:migrate
+          pnpm --filter=@breeze/api db:seed
+
+      - name: Start guarded API test process
+        run: |
+          pnpm --filter=@breeze/api exec tsx src/index.ts > auth-browser-transition-api.log 2>&1 &
+          echo $! > auth-browser-transition-api.pid
+          timeout 120 bash -c 'until curl -sf http://127.0.0.1:3005/health/ready; do sleep 2; done'
+
+      - name: Run Chromium auth transition contract
+        run: pnpm --dir e2e-tests exec playwright test --config=playwright.auth-browser-transition.config.ts
+
+      - name: Show API log on failure
+        if: failure()
+        run: tail -300 auth-browser-transition-api.log || true
+
+      - name: Stop guarded API test process
+        if: always()
+        run: |
+          if [ -f auth-browser-transition-api.pid ]; then
+            kill "$(cat auth-browser-transition-api.pid)" || true
+          fi
+
+  # ─── Portal dev-mode hydration guard (#3906) ─────────────────────────────
+  # Regression cover for #3906: every portal React island SSR'd correctly
+  # behind Caddy in a dev-mode stack and then silently failed to hydrate, so
+  # the portal e2e assertions kept passing against dead markup. The guard that
+  # actually catches it is `waitForHydration()` (e2e-tests/pages/hydration.ts),
+  # which can only fail against a REAL dev-mode stack with Caddy in front of
+  # the portal at /portal — the exact shape PR #4540 fixed and the one shape
+  # nothing in CI ran. (The other Playwright job here,
+  # auth-browser-transition-browser-contract, uses a narrow config with a bare
+  # API process, no web/portal dev servers and no Caddy.) Until this job
+  # existed, a #3906-class regression could only be caught in a hand-brought-up
+  # stack.
+  #
+  # NON-BLOCKING FOR NOW: `continue-on-error: true`, and deliberately absent
+  # from `ci-success`'s `needs` list and from its result checks — a flake or a
+  # Docker hiccup in a job this heavy must not red a PR while we learn how
+  # stable it is.
+  # PROMOTION CRITERION: after a week of green runs on main, drop
+  # `continue-on-error`, add `portal-dev-e2e` to `ci-success`'s `needs`, and
+  # add a `PORTAL_DEV_E2E_RESULT != "success"` clause to its check script.
+  portal-dev-e2e:
+    name: Portal Dev E2E (hydration, non-blocking)
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck, changes]
+    if: needs.changes.outputs.code == 'true'
+    continue-on-error: true
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .node-version
+
+      # The stack is brought up by the repo's own wt-stack tooling
+      # (scripts/dev/wt-stack) rather than a CI-only compose invocation, so this
+      # job tracks the dev stack developers actually run: pg + redis + api + web
+      # + portal + caddy from docker-compose.yml + .override.yml.dev +
+      # .override.yml.worktree, code-mounted, on ephemeral host ports, with
+      # e2e-tests/seed-fixtures.sql seeded into Postgres and a descriptor
+      # (.breeze-stack.json) that playwright.config.ts already knows how to read.
+      #
+      # wt-stack requires a root .env: the base compose file guards a dozen
+      # values with `${VAR:?}` and resolves every image ref from it. wt-stack
+      # writes .env.stack itself for the dev-only values and passes it LAST, so
+      # for the handful of keys set in both places (POSTGRES_*, the peppers,
+      # TURN_SECRET, BREEZE_PORTAL_IMAGE_REF) .env.stack wins; they are repeated
+      # here only so this file stays valid if that list ever changes.
+      #
+      # BREEZE_BOOTSTRAP_ADMIN_* is deliberately NOT set: with NODE_ENV
+      # development (docker-compose.override.yml.dev) the API's first-boot seed
+      # then creates admin@breeze.local / BreezeAdmin123!, which is the account
+      # the wt-stack descriptor hands to Playwright.
+      - name: Create .env for the dev stack
+        run: |
+          cat > .env <<'EOF'
+          BREEZE_VERSION=ci-portal-dev-e2e
+          POSTGRES_USER=breeze
+          POSTGRES_PASSWORD=breeze
+          POSTGRES_DB=breeze
+          REDIS_PASSWORD=ci-portal-dev-e2e-redis-pw
+          JWT_SECRET=ci-portal-dev-e2e-k7x9Qm4pR2vL8nW5jT3yF6hB0cA1dE4gI7
+          # Signs partner reconstruction export cursors (#2506). 32 random bytes, base64.
+          PARTNER_API_CURSOR_SIGNING_KEY=nJ4B7uS2xielQGyxLoBLcPCPey5FyilPeVQbGL10CDo=
+          AGENT_ENROLLMENT_SECRET=ci-portal-dev-e2e-agent-enrollment-Hy4Bz9Mp2Wq6
+          APP_ENCRYPTION_KEY=e9367714341ea19491ff7cd095d1a97e15ae3f7962416723ecfb29a89ed71eb9
+          MFA_ENCRYPTION_KEY=e86f8b88f2c058d428de55c4abec1b50a3cd960a7205dffdb65be8130abbb777
+          ENROLLMENT_KEY_PEPPER=ci-portal-dev-e2e-enrollment-pepper-Hy4Bz9Mp2W
+          MFA_RECOVERY_CODE_PEPPER=ci-portal-dev-e2e-mfa-recovery-pepper-Nq8Zx2
+          TURN_SECRET=ci-portal-dev-e2e-turn-secret
+          # Wave 3.5d / Wave 4 runtime config — `${VAR:?}` guards in the base compose.
+          EVENT_PERMISSION_EPOCH_MODE=compat
+          REMOTE_ACCESS_ADMISSION_MODE=open
+          REMOTE_WS_AUTH_MODE=post_upgrade
+          REMOTE_WS_REDIS_TOPOLOGY=standalone-single-primary
+          # Caddy terminates plain HTTP on an ephemeral port here (the dev stack
+          # has no TLS), so the API must not demand https on forwarded requests.
+          FORCE_HTTPS=false
+          # The built-in Workspace extension defaults ON in the dev override; its
+          # migrations are pure cost for a portal hydration run, so keep it off.
+          BREEZE_WORKSPACE_ENABLED=false
+          # tests/ai-agents.spec.ts (#5048) needs the AI agents page enabled;
+          # the spec skips itself when GET /ai/agents/tool-catalog is not 200.
+          BREEZE_AI_AGENTS_ENABLED=true
+          # This job tests portal hydration and billing UI, not MFA enrollment.
+          # Keep the stored forced-MFA flag; suppress only its role component.
+          MFA_FORCE_FOR_PARTNER_ADMIN=false
+          # Image refs — the base docker-compose.yml requires all of these via
+          # `${VAR:?}` before profile filtering, even though the dev override
+          # builds api/web/portal from this checkout and stubs binaries-init.
+          BREEZE_API_IMAGE_REF=ghcr.io/lanternops/breeze/api:latest
+          BREEZE_WEB_IMAGE_REF=ghcr.io/lanternops/breeze/web:latest
+          BREEZE_PORTAL_IMAGE_REF=ghcr.io/lanternops/breeze/portal:latest
+          BREEZE_BINARIES_IMAGE_REF=ghcr.io/lanternops/breeze/binaries:latest
+          CADDY_IMAGE_REF=caddy:2-alpine
+          POSTGRES_IMAGE_REF=pgvector/pgvector:pg16
+          REDIS_IMAGE_REF=redis:7-alpine
+          COTURN_IMAGE_REF=coturn/coturn:latest
+          EOF
+
+      # e2e-tests is deliberately OUTSIDE the pnpm workspace
+      # (pnpm-workspace.yaml covers apps/*, packages/* and ee/* only), so it
+      # installs standalone. It ships no pnpm-lock.yaml — only the
+      # package-lock.json the auth-browser-transition job's `npm ci` uses — and
+      # pnpm's CI frozen-lockfile default is a no-op when no pnpm lockfile
+      # exists, so this resolves fresh rather than failing.
+      - name: Install e2e-tests dependencies
+        working-directory: e2e-tests
+        run: pnpm install --ignore-workspace
+
+      # apt 403 guard lives in the composite action (see its description).
+      - name: Install Chromium
+        uses: ./.github/actions/install-chromium
+        with:
+          run-prefix: pnpm exec
+          working-directory: e2e-tests
+
+      # `pnpm wt-stack up` without a workspace install: the CLI imports nothing
+      # but node builtins and its own sibling modules, so e2e-tests' tsx runs it
+      # directly and a multi-minute root `pnpm install` is avoided. It must run
+      # from the repo root — the CLI derives the compose project name, the
+      # env-file paths and the descriptor location from process.cwd().
+      - name: Bring up the dev-mode stack (Caddy fronting the portal at /portal)
+        run: ./e2e-tests/node_modules/.bin/tsx scripts/dev/wt-stack/cli.ts up --rebuild
+
+      - name: Show the stack descriptor
+        run: cat .breeze-stack.json
+
+      - name: Verify hydration fixture MFA posture
+        run: |
+          BASE=$(jq -er '.baseUrl' .breeze-stack.json)
+          LOGIN=$(curl -fsS -X POST "${BASE}/api/v1/auth/login" \
+            -H 'Content-Type: application/json' \
+            --data "$(jq -c '.admin' .breeze-stack.json)")
+          jq -e '.mfaEnrollmentRequired == false' <<<"${LOGIN}" >/dev/null || {
+            echo "ERROR: hydration fixture did not receive the role-MFA relief valve"
+            exit 1
+          }
+          PG_CONTAINER=$(jq -er '.pgContainer' .breeze-stack.json)
+          STORED=$(docker exec "${PG_CONTAINER}" psql -U breeze -d breeze -tAc \
+            "SELECT force_mfa FROM roles WHERE name = 'Partner Admin' AND scope = 'partner' AND is_system AND partner_id IS NULL AND org_id IS NULL")
+          [ "${STORED}" = "t" ] || {
+            echo "ERROR: hydration fixture's system Partner Admin must still store force_mfa=true"
+            exit 1
+          }
+
+      # multi-currency.spec.ts is the only `waitForHydration` caller whose flow
+      # reaches the portal — its `public-quote-accept` step is the exact
+      # assertion #3906 broke and #4540 fixed.
+      # `quote-contract-proposal.spec.ts` is the only other `waitForHydration`
+      # caller and is EXCLUDED on purpose: it has a known, unrelated
+      # pre-existing failure earlier in the WEB flow (AuthOverlay /
+      # session-expired on the contracts tab) and never gets as far as its
+      # portal step. Add it here once that is fixed.
+      # portal-visibility.spec.ts (#4562 W10) also waits for hydration (its
+      # login island), and this is the only job that stands up Caddy fronting
+      # the portal, so it is the only place the customer-facing portal is
+      # exercised at all. It depends on the portal rows in
+      # e2e-tests/seed-fixtures.sql.
+      - name: Run the portal hydration specs
+        run: ./e2e-tests/node_modules/.bin/tsx scripts/dev/wt-stack/cli.ts test -- tests/multi-currency.spec.ts tests/portal-visibility.spec.ts tests/ai-agents.spec.ts
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: portal-dev-e2e-playwright-report
+          path: |
+            e2e-tests/playwright-report
+            e2e-tests/test-results
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Container logs on failure
+        if: failure()
+        run: |
+          for c in $(docker ps -aq); do
+            echo "===== $(docker inspect -f '{{ .Name }}' "${c}") ====="
+            docker logs --tail 200 "${c}" 2>&1 || true
+          done
+
+      # `wt-stack down` passes --env-file .env.stack, which only exists once
+      # `up` has started; guard so a failure before that leaves a one-line note
+      # instead of a compose stack trace in the log.
+      - name: Teardown
+        if: always()
+        run: |
+          if [ -f .env.stack ]; then
+            ./e2e-tests/node_modules/.bin/tsx scripts/dev/wt-stack/cli.ts down || true
+          else
+            echo "No .env.stack — the stack was never brought up; nothing to tear down."
+          fi
+
   # Summary job that depends on all other jobs for branch protection
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [lint, typecheck, test-api, test-m365-graph-read-executor, test-m365-graph-actions-executor, test-m365-communications-executor, test-web, test-portal, test-office-addin-core, test-excel-addin, test-word-addin, test-powerpoint-addin, test-outlook-addin, security-audit, build-api, build-m365-graph-read-executor, build-m365-graph-actions-executor, build-m365-communications-executor, build-web, build-portal, build-agent, test-agent, test-agent-windows, windows-runtime-smoke, integration-test, check-migrations-nonsuperuser, rust-check, smoke-test]
+    needs: [changes, docs-check, lint, typecheck, test-api, test-m365-graph-read-executor, test-m365-graph-actions-executor, test-m365-communications-executor, test-web, test-mobile, mobile-native-changes, build-mobile-ios, test-portal, test-viewer, test-office-addin-core, test-excel-addin, test-word-addin, test-powerpoint-addin, test-outlook-addin, security-audit, build-api, build-m365-graph-read-executor, build-m365-graph-actions-executor, build-m365-communications-executor, build-web, build-portal, build-agent, test-agent, test-agent-windows, windows-runtime-smoke, integration-test, check-migrations-nonsuperuser, rust-check, smoke-test, guided-setup-smoke, auth-browser-transition-browser-contract]
     if: ${{ !cancelled() }}
     steps:
       - name: Check all jobs passed
         env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CODE_CHANGED: ${{ needs.changes.outputs.code }}
+          DOCS_CHANGED: ${{ needs.changes.outputs.docs }}
+          DOCS_CHECK_RESULT: ${{ needs.docs-check.result }}
           LINT_RESULT: ${{ needs.lint.result }}
           TYPECHECK_RESULT: ${{ needs.typecheck.result }}
           TEST_API_RESULT: ${{ needs.test-api.result }}
@@ -2207,7 +3205,12 @@ jobs:
           TEST_M365_GRAPH_ACTIONS_EXECUTOR_RESULT: ${{ needs.test-m365-graph-actions-executor.result }}
           TEST_M365_COMMUNICATIONS_EXECUTOR_RESULT: ${{ needs.test-m365-communications-executor.result }}
           TEST_WEB_RESULT: ${{ needs.test-web.result }}
+          TEST_MOBILE_RESULT: ${{ needs.test-mobile.result }}
+          MOBILE_NATIVE_CHANGES_RESULT: ${{ needs.mobile-native-changes.result }}
+          MOBILE_NATIVE_REQUIRED: ${{ needs.mobile-native-changes.outputs.mobile }}
+          BUILD_MOBILE_IOS_RESULT: ${{ needs.build-mobile-ios.result }}
           TEST_PORTAL_RESULT: ${{ needs.test-portal.result }}
+          TEST_VIEWER_RESULT: ${{ needs.test-viewer.result }}
           TEST_OFFICE_ADDIN_CORE_RESULT: ${{ needs.test-office-addin-core.result }}
           TEST_EXCEL_ADDIN_RESULT: ${{ needs.test-excel-addin.result }}
           TEST_WORD_ADDIN_RESULT: ${{ needs.test-word-addin.result }}
@@ -2228,16 +3231,38 @@ jobs:
           CHECK_MIGRATIONS_NONSUPERUSER_RESULT: ${{ needs.check-migrations-nonsuperuser.result }}
           RUST_CHECK_RESULT: ${{ needs.rust-check.result }}
           SMOKE_TEST_RESULT: ${{ needs.smoke-test.result }}
+          GUIDED_SETUP_SMOKE_RESULT: ${{ needs.guided-setup-smoke.result }}
+          AUTH_BROWSER_TRANSITION_BROWSER_CONTRACT_RESULT: ${{ needs.auth-browser-transition-browser-contract.result }}
           IS_PR: ${{ github.event_name == 'pull_request' }}
         run: |
-          if [[ "${LINT_RESULT}" != "success" ]] || \
+          # Fail closed: only a successful path check may skip native compilation. The
+          # mobile-native-changes/build-mobile-ios checks are folded into this single
+          # unconditional blocking condition (rather than a separate leading if statement)
+          # because the ci-success gating contract test only recognizes one such block and
+          # asserts every required job's result is checked inside it.
+          # Docs-only bypass, fail-closed: the code-job assertions are skipped ONLY
+          # when the classifier succeeded AND reported the literal `false`. An
+          # empty output (classifier failed, skipped, or printed nothing) falls
+          # through to the assertions, where every skipped code job fails them.
+          # docs-check is the mirror image: required unless `docs` is literally
+          # `false`, so an empty output demands a docs-check that never ran.
+          if [[ "${CHANGES_RESULT}" != "success" ]] || \
+             { [[ "${DOCS_CHANGED}" != "false" ]] && [[ "${DOCS_CHECK_RESULT}" != "success" ]]; } || \
+             { [[ "${CODE_CHANGED}" != "false" ]] && { \
+             [[ "${LINT_RESULT}" != "success" ]] || \
              [[ "${TYPECHECK_RESULT}" != "success" ]] || \
              [[ "${TEST_API_RESULT}" != "success" ]] || \
              [[ "${TEST_M365_GRAPH_READ_EXECUTOR_RESULT}" != "success" ]] || \
              [[ "${TEST_M365_GRAPH_ACTIONS_EXECUTOR_RESULT}" != "success" ]] || \
              [[ "${TEST_M365_COMMUNICATIONS_EXECUTOR_RESULT}" != "success" ]] || \
              [[ "${TEST_WEB_RESULT}" != "success" ]] || \
+             [[ "${TEST_MOBILE_RESULT}" != "success" ]] || \
+             [[ "${MOBILE_NATIVE_CHANGES_RESULT}" != "success" ]] || \
+             { [[ "${MOBILE_NATIVE_REQUIRED}" == "true" ]] && [[ "${BUILD_MOBILE_IOS_RESULT}" != "success" ]]; } || \
+             { [[ "${MOBILE_NATIVE_REQUIRED}" != "true" ]] && [[ "${MOBILE_NATIVE_REQUIRED}" != "false" ]]; } || \
+             { [[ "${MOBILE_NATIVE_REQUIRED}" == "false" ]] && [[ "${BUILD_MOBILE_IOS_RESULT}" != "skipped" ]]; } || \
              [[ "${TEST_PORTAL_RESULT}" != "success" ]] || \
+             [[ "${TEST_VIEWER_RESULT}" != "success" ]] || \
              [[ "${TEST_OFFICE_ADDIN_CORE_RESULT}" != "success" ]] || \
              [[ "${TEST_EXCEL_ADDIN_RESULT}" != "success" ]] || \
              [[ "${TEST_WORD_ADDIN_RESULT}" != "success" ]] || \
@@ -2256,13 +3281,23 @@ jobs:
              [[ "${WINDOWS_RUNTIME_SMOKE_RESULT}" != "success" ]] || \
              [[ "${INTEGRATION_TEST_RESULT}" != "success" ]] || \
              [[ "${CHECK_MIGRATIONS_NONSUPERUSER_RESULT}" != "success" ]] || \
-             [[ "${RUST_CHECK_RESULT}" != "success" ]]; then
+             [[ "${AUTH_BROWSER_TRANSITION_BROWSER_CONTRACT_RESULT}" != "success" ]] || \
+             [[ "${RUST_CHECK_RESULT}" != "success" ]]; }; }; then
             echo "One or more required jobs failed"
             exit 1
+          fi
+          if [[ "${CODE_CHANGED}" == "false" ]]; then
+            echo "Docs-only PR: code jobs skipped, docs-check passed; the merge queue runs the full suite before merge."
+            exit 0
           fi
           # Smoke test: non-blocking on PRs, required on main
           if [[ "${IS_PR}" != "true" ]] && [[ "${SMOKE_TEST_RESULT}" != "success" ]]; then
             echo "Smoke test failed on main branch push"
+            exit 1
+          fi
+          # Guided installer smoke: same policy — non-blocking on PRs, required on main
+          if [[ "${IS_PR}" != "true" ]] && [[ "${GUIDED_SETUP_SMOKE_RESULT}" != "success" ]]; then
+            echo "Guided setup smoke failed on main branch push"
             exit 1
           fi
           echo "All required jobs passed!"
@@ -2278,7 +3313,9 @@ jobs:
     name: Main Red Alert
     runs-on: ubuntu-latest
     needs: [ci-success]
-    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Fires on the emergency lane only (manual dispatch on main after an admin
+    # bypass merge). Queue landings were evaluated before they merged.
+    if: always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     permissions:
       issues: write
     steps:
@@ -2289,28 +3326,105 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           SHA: ${{ github.sha }}
         run: |
-          set -euo pipefail
+          # NOTE: deliberately no `-e`. This job is a notifier, not a gate, and
+          # it is a normal job in the CI workflow — so an unhandled failure here
+          # turns an otherwise fully green run red at the workflow and
+          # check-suite level. That happened on a transient
+          # `HTTP 503 ... api.github.com/graphql` with 41/41 real jobs green and
+          # `CI Success` itself passing (#3692). Under `set -e` an
+          # assignment-only command takes the exit status of its command
+          # substitution, so a failed `gh issue list` aborted the script before
+          # the `case` block ever ran. Every call is handled explicitly below.
+          set -uo pipefail
+
+          # RETRIES ARE FOR READS ONLY.
+          #
+          # The GitHub API returns transient 5xx often enough that a single
+          # attempt is the actual bug here, but a retried WRITE is worse than a
+          # missed one: if the server accepted `gh issue create` and only the
+          # response was lost, retrying opens a second ci-red issue. Same for
+          # `issue comment`. Reads are idempotent, so only they are retried; the
+          # mutations below get one attempt and an annotation if they fail, and
+          # self-heal on the next push to main or a re-run of this job.
+          #
+          # Progress goes to STDERR, never stdout: this is called inside
+          # `existing=$(gh_read_retry gh issue list ...)`, and anything on stdout
+          # is captured into that variable. Writing the retry notice to stdout
+          # made `existing` the notice text with the issue number glued on the
+          # end, so the next call became `gh issue close "gh call failed...42"`.
+          # Caught by driving this script against a stubbed `gh`; no linter sees
+          # it.
+          gh_read_retry() {
+            local attempt
+            for attempt in 1 2 3; do
+              if "$@"; then
+                return 0
+              fi
+              echo "gh read failed (attempt ${attempt}/3): $*" >&2
+              # No sleep after the final attempt — there is no fourth.
+              if [ "$attempt" -lt 3 ]; then
+                sleep $(( attempt * 5 ))
+              fi
+            done
+            return 1
+          }
+
+          # Unchanged from before: one attempt, errors swallowed. The common
+          # failure is "already exists", which is why stderr is discarded.
           gh label create ci-red --repo "$GITHUB_REPOSITORY" \
             --color B60205 --description "CI is failing on main" 2>/dev/null || true
-          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --label ci-red --state open \
-            --json number --jq ".[0].number // empty")
+
+          # Read the current state FIRST, and treat "could not read" as its own
+          # outcome rather than folding it into "none found". Defaulting to an
+          # empty string on failure would make the failure branch below open a
+          # SECOND ci-red issue every red push while the API is degraded.
+          if existing=$(gh_read_retry gh issue list --repo "$GITHUB_REPOSITORY" --label ci-red --state open \
+            --json number --jq ".[0].number // empty"); then
+            :
+          else
+            echo "::error::Could not read ci-red issues after 3 attempts; skipping reconciliation for this run."
+            echo "ci-success result was '$RESULT'. State is unchanged and will reconcile on the next push to main, or by re-running this job."
+            exit 0
+          fi
+
           short_sha="${SHA:0:8}"
           case "$RESULT" in
             success)
               if [ -n "$existing" ]; then
                 gh issue close "$existing" --repo "$GITHUB_REPOSITORY" \
-                  --comment "Main is green again as of \`$short_sha\`: $RUN_URL"
+                  --comment "Main is green again as of \`$short_sha\`: $RUN_URL" \
+                  || {
+                    echo "::error::Failed to close ci-red issue #$existing; it will close on the next green main run."
+                    {
+                      echo "### main-red-alert: failed to close ci-red issue #$existing"
+                      echo "Main is green again as of \`$short_sha\`, but closing ci-red issue #$existing failed. It will self-heal on the next green push to main, or can be closed manually. Run: $RUN_URL"
+                    } >> "$GITHUB_STEP_SUMMARY"
+                  }
               fi
               ;;
             failure)
               if [ -n "$existing" ]; then
                 gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
-                  --body "Still red at \`$short_sha\`: $RUN_URL"
+                  --body "Still red at \`$short_sha\`: $RUN_URL" \
+                  || {
+                    echo "::error::Failed to comment on ci-red issue #$existing; the issue is already open, so main-red state is still tracked."
+                    {
+                      echo "### main-red-alert: failed to comment on ci-red issue #$existing"
+                      echo "Main is still red at \`$short_sha\`, but commenting on ci-red issue #$existing failed. The issue is already open, so main-red state is still tracked, but this run's failure is not recorded on it. Run: $RUN_URL"
+                    } >> "$GITHUB_STEP_SUMMARY"
+                  }
               else
                 body=$(printf "CI failed on a main push at \`%s\`.\n\nRun: %s\n\nThis issue is managed by the main-red-alert job: it stays open while main is red and closes automatically on the next green main run." "$short_sha" "$RUN_URL")
                 gh issue create --repo "$GITHUB_REPOSITORY" --label ci-red \
                   --title "CI is red on main" \
-                  --body "$body"
+                  --body "$body" \
+                  || {
+                    echo "::error::Failed to open a ci-red issue for $short_sha — main is RED and untracked. Re-run this job once the API recovers."
+                    {
+                      echo "### :rotating_light: main-red-alert: failed to open ci-red issue"
+                      echo "Main failed at \`$short_sha\`, and opening a ci-red tracking issue also failed. **Main is red and untracked** — this will not self-heal until the next push to main. Re-run this job once the GitHub API recovers, or file the tracking issue by hand. Run: $RUN_URL"
+                    } >> "$GITHUB_STEP_SUMMARY"
+                  }
               fi
               ;;
             *)

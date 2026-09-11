@@ -48,6 +48,10 @@ import { writeAuditEvent } from '../services/auditEvents';
 import { publishEvent, type EventType } from '../services/eventBus';
 import { mirrorElevationDecisionToExecution } from '../services/pamToolActionGovernance';
 import { evaluatePamRules, type PamRuleCandidate } from '../services/pamRuleEngine';
+import {
+  describePamRuleTierDrift,
+  PAM_RULE_TIER_UNREACHABLE_CODE,
+} from '../services/pamRuleTierDrift';
 import { assertApprovalAssurance, StepUpRequiredError, ReauthRequiredError } from '../services/authenticatorAssurance';
 import { generateApprovalAssertionOptions } from '../services/approverWebAuthn';
 import { requireCurrentPasswordStepUp, requireFreshMfaStepUp } from './auth/helpers';
@@ -57,6 +61,11 @@ import {
   elevationRiskTierToName,
 } from '@breeze/shared';
 import { resolveOrgIdForWrite } from './softwarePolicies';
+import {
+  createPamDecisionIntent,
+  requestPamCleanup,
+  type PamActuationRef,
+} from '../services/pamActuationLifecycle';
 
 /**
  * Thrown inside the respond transaction when an ai_tool_action elevation is
@@ -109,6 +118,32 @@ const PREVIEW_SAMPLE_CAP = 10;
 
 const ACTIVE_STATUSES = ['approved', 'auto_approved', 'actuating'] as const;
 
+type PamRouteTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+async function cleanupPamRuleActuations(
+  tx: PamRouteTx,
+  input: { ruleId: string; orgId: string },
+): Promise<number> {
+  const result = await tx.execute<Record<string, unknown> & { id: string }>(sql`
+    SELECT id
+    FROM elevation_requests
+    WHERE org_id = ${input.orgId}
+      AND status IN ('approved', 'auto_approved', 'actuating')
+      AND metadata ->> 'pam_rule_id' = ${input.ruleId}
+    ORDER BY id
+    FOR UPDATE
+  `);
+  const rows = ((result as { rows?: Array<{ id: string }> }).rows ?? result) as Array<{ id: string }>;
+  for (const row of rows) {
+    await tx
+      .update(elevationRequests)
+      .set({ status: 'revoked', revokedAt: new Date(), revokedReason: 'PAM rule removed', updatedAt: new Date() })
+      .where(and(eq(elevationRequests.id, row.id), inArray(elevationRequests.status, [...ACTIVE_STATUSES])));
+    await requestPamCleanup(tx, { elevationRequestId: row.id, cause: 'policy_removed' });
+  }
+  return rows.length;
+}
+
 // Aliased user joins for the three decider columns (left joins — all three
 // ids are nullable). Reads run under the request's RLS context: a decider the
 // caller's users-policy can't see simply yields a null name (the UI falls
@@ -116,6 +151,58 @@ const ACTIVE_STATUSES = ['approved', 'auto_approved', 'actuating'] as const;
 const approvedByUser = alias(users, 'approved_by_user');
 const deniedByUser = alias(users, 'denied_by_user');
 const revokedByUser = alias(users, 'revoked_by_user');
+
+const pamEnforcementProjection = {
+  enforcementStatus: sql<string | null>`(
+    SELECT a.observed_state FROM pam_actuations a
+    WHERE a.elevation_request_id = ${elevationRequests.id}
+    ORDER BY a.request_revision DESC LIMIT 1
+  )`,
+  enforcementGeneration: sql<number | null>`(
+    SELECT a.generation FROM pam_actuations a
+    WHERE a.elevation_request_id = ${elevationRequests.id}
+    ORDER BY a.request_revision DESC LIMIT 1
+  )`,
+  enforcementReason: sql<string | null>`(
+    SELECT a.failure_code FROM pam_actuations a
+    WHERE a.elevation_request_id = ${elevationRequests.id}
+    ORDER BY a.request_revision DESC LIMIT 1
+  )`,
+  endpointObservedAt: sql<Date | null>`(
+    SELECT r.observed_at
+    FROM pam_actuation_results r
+    JOIN pam_actuations a ON a.id = r.actuation_id AND a.generation = r.generation
+    WHERE a.elevation_request_id = ${elevationRequests.id}
+    ORDER BY r.received_at DESC, r.id DESC LIMIT 1
+  )`,
+  cleanupReceivedAt: sql<Date | null>`(
+    SELECT r.received_at
+    FROM pam_actuation_results r
+    JOIN pam_actuations a ON a.id = r.actuation_id AND a.generation = r.generation
+    WHERE a.elevation_request_id = ${elevationRequests.id}
+      AND a.desired_state = 'cleanup' AND r.result_kind = 'received'
+    ORDER BY r.received_at DESC, r.id DESC LIMIT 1
+  )`,
+};
+
+function enforcementResponse(row: {
+  enforcementStatus?: string | null;
+  enforcementGeneration?: number | null;
+  enforcementReason?: string | null;
+  endpointObservedAt?: Date | null;
+  cleanupReceivedAt?: Date | null;
+}) {
+  return {
+    enforcementStatus: row.enforcementStatus ?? null,
+    enforcementGeneration: row.enforcementGeneration ?? null,
+    enforcementReason: row.enforcementReason ?? null,
+    endpointObservedAt: row.endpointObservedAt ?? null,
+    cleanupReceivedAt: row.cleanupReceivedAt ?? null,
+    manualRemediationDisposition: row.enforcementStatus === 'legacy_untracked'
+      ? 'blocked_manual_remediation'
+      : null,
+  };
+}
 
 export const pamRoutes = new Hono();
 pamRoutes.use('*', authMiddleware);
@@ -201,6 +288,7 @@ pamRoutes.get('/elevation-requests', requirePamRead, zValidator('query', listQue
         deniedByName: deniedByUser.name,
         revokedByName: revokedByUser.name,
         matchedPolicyName: softwarePolicies.name,
+        ...pamEnforcementProjection,
       })
       .from(elevationRequests)
       .leftJoin(devices, eq(elevationRequests.deviceId, devices.id))
@@ -246,6 +334,7 @@ pamRoutes.get('/elevation-requests', requirePamRead, zValidator('query', listQue
         pamRuleId,
         pamRuleName,
         decisionSource,
+        ...enforcementResponse(r),
         // Surfaced from metadata so "Create rule from this request" can seed a
         // command-line / parent-image criterion (uac_intercept captures both).
         commandLine: typeof meta.command_line === 'string' ? meta.command_line : null,
@@ -281,6 +370,7 @@ pamRoutes.get('/active', requirePamRead, async (c) => {
       approvedByName: approvedByUser.name,
       deniedByName: deniedByUser.name,
       revokedByName: revokedByUser.name,
+      ...pamEnforcementProjection,
     })
     .from(elevationRequests)
     .leftJoin(devices, eq(elevationRequests.deviceId, devices.id))
@@ -301,6 +391,7 @@ pamRoutes.get('/active', requirePamRead, async (c) => {
       approvedByName: r.approvedByName,
       deniedByName: r.deniedByName,
       revokedByName: r.revokedByName,
+      ...enforcementResponse(r),
     })),
   });
 });
@@ -448,6 +539,7 @@ pamRoutes.post(
           kind: 'ok';
           row: { id: string; orgId: string; deviceId: string; flowType: string };
           newStatus: string;
+          actuation: PamActuationRef;
         };
     try {
       result = await db.transaction(async (tx) => {
@@ -462,6 +554,10 @@ pamRoutes.post(
             executionId: elevationRequests.executionId,
             riskTier: elevationRequests.riskTier,
             subjectUserId: elevationRequests.subjectUserId,
+            subjectUsername: elevationRequests.subjectUsername,
+            targetExecutablePath: elevationRequests.targetExecutablePath,
+            targetExecutableHash: elevationRequests.targetExecutableHash,
+            revision: elevationRequests.revision,
           })
           .from(elevationRequests)
           .where(eq(elevationRequests.id, id))
@@ -558,6 +654,23 @@ pamRoutes.post(
           occurredAt: now,
         });
 
+        const expiresAt = approve
+          ? new Date(now.getTime() + durationMinutes * 60_000)
+          : null;
+        const actuation = await createPamDecisionIntent(tx, {
+          request: {
+            id: row.id,
+            orgId: row.orgId,
+            deviceId: row.deviceId,
+            targetExecutablePath: row.targetExecutablePath ?? '',
+            targetExecutableHash: row.targetExecutableHash,
+            subjectUsername: row.subjectUsername,
+          },
+          requestRevision: row.revision,
+          decision: approve ? 'approved' : 'denied',
+          expiresAt,
+        });
+
         // ai_tool_action rows: mirror the decision onto the linked
         // ai_tool_executions row the SDK gate is polling — in the SAME
         // transaction (Phase 1, security finding A). If the execution is no
@@ -574,7 +687,7 @@ pamRoutes.post(
           }
         }
 
-        return { kind: 'ok' as const, row, newStatus: updated[0]!.status };
+        return { kind: 'ok' as const, row, newStatus: updated[0]!.status, actuation };
       });
     } catch (err) {
       if (err instanceof StepUpRequiredError) {
@@ -679,7 +792,14 @@ pamRoutes.post(
     // NOTE: actuation of approved uac_intercept rows stays on the existing
     // admin actuate route (#960) until #1150 makes the agent the credential
     // authority — approving here does not enqueue an agent command.
-    return c.json({ success: true, id: result.row.id, status: result.newStatus });
+    return c.json({
+      success: true,
+      id: result.row.id,
+      status: result.newStatus,
+      enforcementStatus: result.actuation.desiredState === 'active'
+        ? 'pending_dispatch'
+        : 'cleanup_pending',
+    });
   },
 );
 
@@ -757,7 +877,12 @@ pamRoutes.post(
         occurredAt: now,
       });
 
-      return { kind: 'ok' as const, row };
+      const actuation = await requestPamCleanup(tx, {
+        elevationRequestId: row.id,
+        cause: 'revoked',
+      });
+
+      return { kind: 'ok' as const, row, actuation };
     });
 
     if (result.kind === 'not_found') {
@@ -797,7 +922,12 @@ pamRoutes.post(
     // NOTE: for tech_jit_admin the agent-side group-flip undo command is
     // #1150 scope; until it lands, revoke is a server-side state change
     // (the expiry enforcer provides the time-bound safety net).
-    return c.json({ success: true, id: result.row.id, status: 'revoked' });
+    return c.json({
+      success: true,
+      id: result.row.id,
+      status: 'revoked',
+      enforcementStatus: 'cleanup_pending',
+    });
   },
 );
 
@@ -933,6 +1063,33 @@ function validateRuleShape(rule: RuleCriteriaShape): string | null {
   return null;
 }
 
+/**
+ * #3128: reject a tool-action rule pinned to a risk tier its tool selector can
+ * no longer resolve to. Tool tiers are static code that ships with the API, so
+ * a re-classification (#3105 moved three read-only execute_command
+ * commandTypes from Tier 3 to Tier 2) can leave a stored rule permanently
+ * unmatchable — and the engine's exact-equality match makes that silent.
+ *
+ * Deliberately NOT folded into validateRuleShape: that one feeds a Zod
+ * superRefine on create, which would emit the generic validation-failure body.
+ * Calling this from both handlers gives create and update the SAME
+ * machine-readable 400, and keeps the check off the preview endpoint — a
+ * dry-run must stay able to demonstrate that a stale rule matches nothing.
+ *
+ * Fails OPEN for an unrecognised tool name (see describePamRuleTierDrift).
+ */
+function tierDriftResponse(
+  rule: RuleCriteriaShape & { matchNegate?: readonly string[] | null },
+): { error: string; code: string; validTiers: number[] } | null {
+  const drift = describePamRuleTierDrift(rule);
+  if (!drift) return null;
+  return {
+    error: drift.message,
+    code: PAM_RULE_TIER_UNREACHABLE_CODE,
+    validTiers: drift.validTiers,
+  };
+}
+
 const createRuleSchema = ruleBaseSchema.superRefine((rule, ctx) => {
   const err = validateRuleShape(rule);
   if (err) ctx.addIssue({ code: z.ZodIssueCode.custom, message: err });
@@ -980,7 +1137,18 @@ pamRoutes.get('/rules', requirePamRead, async (c) => {
     .from(pamRules)
     .where(where)
     .orderBy(pamRules.priority, pamRules.createdAt);
-  return c.json({ success: true, rules: rows });
+  // #3128: surface tier drift so the UI can badge a rule that can no longer
+  // match. Computed per response rather than stored — the tool tier tables are
+  // code, so the answer changes on deploy, not on write.
+  const rules = rows.map((row) => {
+    const drift = describePamRuleTierDrift(row);
+    return {
+      ...row,
+      matchRiskTierStale: drift != null,
+      matchRiskTierValidTiers: drift?.validTiers ?? null,
+    };
+  });
+  return c.json({ success: true, rules });
 });
 
 pamRoutes.post('/rules', requirePamWrite, requireMfa(), zValidator('json', createRuleSchema), async (c) => {
@@ -999,6 +1167,11 @@ pamRoutes.post('/rules', requirePamWrite, requireMfa(), zValidator('json', creat
   // ability. Mirrors the canAccessSite gate on the elevation handlers.
   if (perms?.allowedSiteIds && !canAccessSite(perms, payload.siteId ?? '')) {
     return c.json({ error: 'Site access denied' }, 403);
+  }
+
+  const tierDrift = tierDriftResponse(payload);
+  if (tierDrift) {
+    return c.json(tierDrift, 400);
   }
 
   const [created] = await db
@@ -1240,9 +1413,15 @@ pamRoutes.patch('/rules/:id', requirePamWrite, requireMfa(), zValidator('json', 
     return c.json({ error: shapeError }, 400);
   }
 
-  const [updated] = await db
-    .update(pamRules)
-    .set({
+  // Validate the MERGED tier selector: a PATCH that only moves matchRiskTier
+  // must be checked against the rule's STORED matchToolName (and vice versa).
+  const mergedTierDrift = tierDriftResponse(merged);
+  if (mergedTierDrift) {
+    return c.json(mergedTierDrift, 400);
+  }
+
+  const [updated] = await db.transaction(async (tx) => {
+    const result = await tx.update(pamRules).set({
       ...(payload.siteId !== undefined ? { siteId: payload.siteId } : {}),
       ...(payload.name !== undefined ? { name: payload.name } : {}),
       ...(payload.description !== undefined ? { description: payload.description } : {}),
@@ -1281,8 +1460,13 @@ pamRoutes.patch('/rules/:id', requirePamWrite, requireMfa(), zValidator('json', 
         : {}),
       updatedAt: new Date(),
     })
-    .where(eq(pamRules.id, id!))
-    .returning();
+      .where(eq(pamRules.id, id!))
+      .returning();
+    if (payload.enabled === false && existing.enabled) {
+      await cleanupPamRuleActuations(tx, { ruleId: id!, orgId: existing.orgId });
+    }
+    return result;
+  });
 
   writeAuditEvent(c, {
     orgId: existing.orgId,
@@ -1317,7 +1501,10 @@ pamRoutes.delete('/rules/:id', requirePamWrite, requireMfa(), async (c) => {
     return c.json({ error: 'Site access denied' }, 403);
   }
 
-  await db.delete(pamRules).where(eq(pamRules.id, id!));
+  await db.transaction(async (tx) => {
+    await cleanupPamRuleActuations(tx, { ruleId: id!, orgId: existing.orgId });
+    await tx.delete(pamRules).where(eq(pamRules.id, id!));
+  });
 
   writeAuditEvent(c, {
     orgId: existing.orgId,

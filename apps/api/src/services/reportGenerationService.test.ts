@@ -11,9 +11,13 @@ vi.mock('../db', () => ({
 import { db } from '../db';
 import type { ReportExecutionAuthority } from './siteScope';
 import {
+  assertReportExecutionPreflight,
+  generateDeviceInventoryReport,
   generateReport,
+  StoredArtifactOnlyReportError,
   type ReportType,
 } from './reportGenerationService';
+import { reportTypeEnum } from '../db/schema/reports';
 
 const ORG_ID = '11111111-1111-4111-8111-111111111111';
 const OTHER_ORG_ID = '22222222-2222-4222-8222-222222222222';
@@ -29,6 +33,10 @@ const REPORT_TYPES: readonly ReportType[] = [
   'executive_summary',
   'security_compliance_posture',
 ];
+/** Every `ReportType` that is NOT generated on demand. P2-3 added the first
+ *  one: a weekly AI narrative's artifact is written once by the agent run and
+ *  only ever read back — there is no query that could reproduce it. */
+const STORED_ARTIFACT_ONLY_TYPES: readonly ReportType[] = ['ai_org_narrative'];
 
 const capturedWhere: SQL[] = [];
 
@@ -57,12 +65,22 @@ function authority(
   orgId = ORG_ID,
 ): ReportExecutionAuthority {
   return {
+    principalKind: 'user',
     scope: kind === 'restricted'
       ? { version: 1, kind, orgId, siteIds }
       : { version: 1, kind, orgId },
     principalUserId: USER_ID,
     capturedAt: new Date('2026-07-25T12:00:00.000Z'),
     fingerprint: kind === 'restricted' ? 'a'.repeat(64) : 'f'.repeat(64),
+  };
+}
+
+function portalAuthority(): ReportExecutionAuthority {
+  return {
+    principalKind: 'portal_user',
+    scope: { version: 1, kind: 'unrestricted', orgId: ORG_ID },
+    capturedAt: new Date('2026-07-25T12:00:00.000Z'),
+    fingerprint: 'f'.repeat(64),
   };
 }
 
@@ -127,6 +145,46 @@ describe('generateReport mandatory execution authority', () => {
     },
   );
 
+  it.each(['executive_summary', 'security_compliance_posture'] as const)(
+    'allows portal-user authority for %s',
+    async (type) => {
+      await expect(generateReport(type, ORG_ID, {}, portalAuthority()))
+        .resolves.toBeDefined();
+    },
+  );
+
+  it.each([
+    'device_inventory',
+    'software_inventory',
+    'alert_summary',
+    'compliance',
+    'performance',
+    'ai_org_narrative',
+  ] as const)('rejects portal-user authority for %s before querying', async (type) => {
+    await expect(generateReport(type, ORG_ID, {}, portalAuthority()))
+      .rejects.toThrow(/portal|authority|report type/i);
+    expect(db.select).not.toHaveBeenCalled();
+  });
+
+  it('rejects portal-user authority at a non-canonical generator entry point', async () => {
+    await expect(
+      generateDeviceInventoryReport(ORG_ID, {}, portalAuthority()),
+    ).rejects.toThrow(/portal|authority|report type/i);
+    expect(db.select).not.toHaveBeenCalled();
+  });
+
+  it.each(['executive_summary', 'security_compliance_posture'] as const)(
+    'allows portal-user authority through the shared preflight for %s',
+    (type) => {
+      expect(() => assertReportExecutionPreflight(
+        ORG_ID,
+        {},
+        portalAuthority(),
+        type,
+      )).not.toThrow();
+    },
+  );
+
   it.each(REPORT_TYPES)(
     '%s binds the exact restricted site scope and never Site B',
     async (type) => {
@@ -157,4 +215,60 @@ describe('generateReport mandatory execution authority', () => {
       expect(renderedParams()).not.toContain(SITE_B);
     },
   );
+});
+
+/**
+ * P2-3 (#4190) — `ai_org_narrative` is a STORED artifact, not a generated one.
+ * Its `report_runs` row is written once, inside the agent run's transaction
+ * (`persistNarrativeReport`), from a model-authored narrative that no query
+ * could reproduce. Every generation entry point must therefore refuse it
+ * rather than fall through to a `never` check whose message ("Invalid report
+ * type") would read as a bug in the type union.
+ */
+describe('stored-artifact-only report types (P2-3)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    capturedWhere.length = 0;
+    vi.mocked(db.select).mockReturnValue(selectChain([]));
+  });
+
+  it.each(STORED_ARTIFACT_ONLY_TYPES)(
+    '%s is refused by the dispatch switch before any query runs',
+    async (type) => {
+      await expect(
+        generateReport(type, ORG_ID, {}, authority('unrestricted')),
+      ).rejects.toBeInstanceOf(StoredArtifactOnlyReportError);
+      expect(db.select).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(STORED_ARTIFACT_ONLY_TYPES)(
+    '%s is refused by the ZERO-SAFE branch too, which the dispatch switch never reaches',
+    async (type) => {
+      // A restricted-empty authority short-circuits into `zeroSafeReport`
+      // before the dispatch switch — a second exhaustive switch, and the one
+      // that would otherwise hand back a plausible-looking empty report for a
+      // document that exists.
+      await expect(
+        generateReport(type, ORG_ID, {}, authority('restricted', [])),
+      ).rejects.toBeInstanceOf(StoredArtifactOnlyReportError);
+      expect(db.select).not.toHaveBeenCalled();
+    },
+  );
+
+  it('carries the stable code routes map to 409', async () => {
+    const error = await generateReport('ai_org_narrative', ORG_ID, {}, authority('unrestricted'))
+      .catch((e: unknown) => e as StoredArtifactOnlyReportError);
+
+    expect(error).toBeInstanceOf(StoredArtifactOnlyReportError);
+    expect((error as StoredArtifactOnlyReportError).code).toBe('stored_artifact_only');
+  });
+
+  it('the API-local ReportType union covers exactly the DB enum, with no type unaccounted for', () => {
+    // Drift guard: `reportGenerationService.ts` keeps its own union rather than
+    // deriving from the pgEnum, and a value added to one and not the other is
+    // a `never`-check failure at a call site far from either file.
+    expect([...REPORT_TYPES, ...STORED_ARTIFACT_ONLY_TYPES].sort())
+      .toEqual([...reportTypeEnum.enumValues].sort());
+  });
 });

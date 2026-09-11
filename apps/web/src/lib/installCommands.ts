@@ -1,7 +1,13 @@
 export interface InstallCommandOptions {
   /** Breeze API origin, e.g. https://eu.2breeze.app */
   apiUrl: string;
-  /** Base URL for direct Windows binary downloads (GitHub releases) */
+  /**
+   * Base URL for direct Windows binary downloads — our fork's signed GitHub
+   * release (KResLab-signed breeze-agent-windows-amd64.exe + trust cert +
+   * watchdog + user-helper). Kept instead of upstream's API-route download so
+   * Windows gets our signed binary, not the API's 302 to the upstream unsigned
+   * one.
+   */
   ghBase: string;
   /** Enrollment token from the Add Device / setup flow */
   token: string;
@@ -143,10 +149,28 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
   // native exe exit codes do not trip $ErrorActionPreference.
   const winSecretFlag = enrollmentSecret ? ` --enrollment-secret "${enrollmentSecret}"` : '';
   const winThrow = (step: string) => `if($LASTEXITCODE){throw "Breeze: ${step} failed (exit code $LASTEXITCODE)"}`;
+  // Go 1.22+ (the agent's pinned toolchain, agent/go.mod) cannot run below
+  // Windows 10 / Server 2016 (#4608) -- check the OS floor before spending a
+  // download on a box that can never run the agent. Mirrors the MSI's
+  // `VersionNT >= 1000` LaunchCondition in agent/installer/breeze.wxs:
+  // Windows 10 and every Server release from 2016 onward report OS major
+  // version 10, so `.Major -lt 10` is exactly that same floor.
+  const winOsFloorCheck =
+    `$osv=[System.Environment]::OSVersion.Version; ` +
+    `if($osv.Major -lt 10)` +
+    `{throw "Breeze: Windows 10 or Windows Server 2016 or later is required (detected $($osv.Major).$($osv.Minor))"}`;
   const winMzCheck =
     `$b=[IO.File]::ReadAllBytes("$pwd\\breeze-agent.exe"); ` +
     `if($b.Length -lt 2 -or $b[0] -ne 0x4D -or $b[1] -ne 0x5A)` +
     `{throw "Breeze: downloaded file is not a Windows executable - a captive portal or web filter may be intercepting this network"}`;
+  // Older Windows PowerShell 5.1 hosts (e.g. Windows Server 2016) can default
+  // SecurityProtocol to Ssl3, Tls with no Tls12, which makes
+  // Invoke-WebRequest fail before the agent is even downloaded ("Could not
+  // create SSL/TLS secure channel", #4586). OR the flag into the existing
+  // value rather than replacing it, so Tls13 stays enabled where present.
+  const winTlsCheck =
+    `[Net.ServicePointManager]::SecurityProtocol = ` +
+    `[Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12`;
   // certutil -addstore requires Administrator, same as `service install`
   // below — no separate elevation prompt beyond what the script already needs.
   const winTrustCert = trustCertUrl
@@ -169,6 +193,8 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
     : '';
   const windows =
     `$ErrorActionPreference='Stop'; ` +
+    `${winOsFloorCheck}; ` +
+    `${winTlsCheck}; ` +
     `Invoke-WebRequest -Uri "${ghBase}/breeze-agent-windows-amd64.exe" -OutFile breeze-agent.exe; ` +
     `${winMzCheck}; ` +
     `${winTrustCert}` +

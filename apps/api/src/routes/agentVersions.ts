@@ -10,16 +10,40 @@ import {
   requireMfa,
   requirePermission,
   requireScope,
+  type AuthContext,
 } from "../middleware/auth";
 import { platformAdminMiddleware } from "../middleware/platformAdmin";
 import { writeRouteAudit } from "../services/auditEvents";
 import { syncFromGitHub } from "../services/binarySync";
+import { captureException } from "../services/sentry";
+import { ResponseTooLargeError, SsrfBlockedError } from "../services/urlSafety";
 import { getBinaryEdition } from "../services/binaryEdition";
-import { getGithubReleaseVersion } from "../services/binarySource";
+import { getBinarySource, getGithubReleaseVersion } from "../services/binarySource";
+import {
+  getPromotedComponentVersion,
+  getPromotedAgentVersionForDisplay,
+} from "../services/promotedAgentVersion";
+import { getOrgAgentVersionPinsBatch } from "../services/orgAgentVersionPins";
 import { PERMISSIONS } from "../services/permissions";
-import { verifyReleaseArtifactManifestAsset } from "../services/releaseArtifactManifest";
+import {
+  verifyReleaseArtifactManifestAsset,
+  ReleaseAssetNotDistributableError,
+  ReleaseManifestAssetLookupError,
+  ReleaseManifestSignatureError,
+  verifyManifestSignatureAgainstOfficialKeysOnly,
+} from "../services/releaseArtifactManifest";
 import { EDITION_HOSTED, EDITION_SELF_HOST } from "../services/releaseAssetTrust";
-import { getActivePublicKeys as getActiveDeploymentSigningPubKeys } from "../services/manifestSigning";
+import {
+  getActivePublicKeys as getActiveDeploymentSigningPubKeys,
+  getActiveTrustKeyset,
+} from "../services/manifestSigning";
+
+// The one key ID hard-bound in every agent build to the embedded LanternOps
+// release-signing public key (agent/internal/updater/updater.go, ~line 395).
+// Any OTHER signingKeyId value is either a `deploy-*` per-deployment key
+// (manifest_signing_keys) or unrecognized/absent (legacy normalized rows
+// predating signingKeyId).
+const OFFICIAL_MANIFEST_SIGNING_KEY_ID = "release-artifact-manifest-ed25519";
 
 // Map Go GOOS / user-facing platform names to DB platform names
 const PLATFORM_MAP: Record<string, string> = {
@@ -61,6 +85,13 @@ const latestQuerySchema = z.object({
   platform: platformEnum,
   arch: architectureEnum,
   component: componentEnum.optional().default("agent"),
+});
+
+// Issue #5285: comma-separated orgIds for GET /agent-versions/effective. A
+// generous but bounded cap (below) keeps one caller from turning this into an
+// unbounded fan-out; the query itself is otherwise as cheap as GET /orgs.
+const effectiveVersionsQuerySchema = z.object({
+  orgIds: z.string().min(1),
 });
 
 const downloadParamsSchema = z.object({
@@ -242,6 +273,95 @@ export async function verifyEd25519ManifestSignature(
   });
 }
 
+// Verifies `signature` against exactly ONE raw 32-byte Ed25519 key — the
+// deploy-* single-key-row branch of verifyManifestSignatureForSigningKeyId
+// below. Deliberately duplicates the small signature-bytes check inline
+// (rather than refactoring the well-tested verifyEd25519ManifestSignature
+// above to take a caller-supplied key list) so that function's existing
+// logging/soft-pass semantics — which several tests pin — stay untouched.
+function verifyEd25519SignatureAgainstSingleRawKey(
+  manifest: string,
+  signature: string,
+  rawKey: Buffer,
+): boolean {
+  if (rawKey.length !== 32) return false;
+  let signatureBytes: Buffer;
+  try {
+    signatureBytes = Buffer.from(signature, "base64");
+  } catch {
+    return false;
+  }
+  if (signatureBytes.length !== 64) return false;
+
+  try {
+    const spki = Buffer.concat([
+      Buffer.from("302a300506032b6570032100", "hex"),
+      rawKey,
+    ]);
+    const publicKey = createPublicKey({ key: spki, format: "der", type: "spki" });
+    return verifySignature(
+      null,
+      Buffer.from(manifest, "utf8"),
+      publicKey,
+      signatureBytes,
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Key-ID-aware verification for the LEGACY (non schema-v1) manifest shape —
+// Task 2 (#3836). Mirrors the agent's exact-ID semantics (agent/internal/
+// updater/updater.go verifyManifestSignature, ~line 769): when a key ID is
+// present it binds verification to that ONE key, with no fallback across
+// the rest of the trusted set. This narrows what an EXPLICIT signingKeyId
+// can accept — it never widens acceptance relative to the prior whole-set
+// behavior, and unrecognized/absent IDs keep exactly that prior behavior.
+//
+//  - OFFICIAL_MANIFEST_SIGNING_KEY_ID: the OFFICIAL configured key set
+//    (RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS / getConfiguredPublicKeys via
+//    verifyManifestSignatureAgainstOfficialKeysOnly) ONLY — a DB deployment
+//    key must never satisfy a claim of official provenance.
+//  - `deploy-*`: exactly the one manifest_signing_keys row with that keyId
+//    — env keys and every OTHER deploy key must NOT satisfy it. A missing
+//    row (rotated out, never existed, DB load failure) fails closed.
+//  - absent/unrecognized (legacy normalized rows predating signingKeyId, or
+//    any other value): unchanged whole-set verifyEd25519ManifestSignature
+//    behavior — this task narrows what an explicit ID accepts, it does not
+//    newly require one.
+async function verifyManifestSignatureForSigningKeyId(
+  manifest: string,
+  signature: string,
+  signingKeyId: string | null | undefined,
+): Promise<boolean> {
+  const id = signingKeyId?.trim();
+
+  if (id === OFFICIAL_MANIFEST_SIGNING_KEY_ID) {
+    return verifyManifestSignatureAgainstOfficialKeysOnly(manifest, signature);
+  }
+
+  if (id && id.startsWith("deploy-")) {
+    let keyset: { keyId: string; publicKeyB64: string }[];
+    try {
+      keyset = await getActiveTrustKeyset();
+    } catch (err) {
+      console.warn(
+        `[agentVersions] Failed to load manifest_signing_keys for signingKeyId=${id} lookup (failing closed):`,
+        err,
+      );
+      return false;
+    }
+    const row = keyset.find((k) => k.keyId === id);
+    if (!row) return false;
+    const rawKey = Buffer.from(row.publicKeyB64, "base64");
+    return verifyEd25519SignatureAgainstSingleRawKey(manifest, signature, rawKey);
+  }
+
+  return verifyEd25519ManifestSignature(manifest, signature, {
+    allowEmptyKeysetSoftPass: true,
+  });
+}
+
 function assetNameFromDownloadUrl(downloadUrl: string): string | null {
   try {
     const parsed = new URL(downloadUrl);
@@ -251,6 +371,74 @@ function assetNameFromDownloadUrl(downloadUrl: string): string | null {
   } catch {
     return null;
   }
+}
+
+// D1 (issue #3836): canonical asset-name resolution for schema-v1
+// release-artifact manifests.
+//
+// validateReleaseManifest's schema-v1 branch used to derive the manifest
+// asset name to look up SOLELY from assetNameFromDownloadUrl(downloadUrl) —
+// the URL's last path segment. That is correct for a GitHub-sourced
+// downloadUrl (".../releases/download/v1.0.0/breeze-agent-linux-amd64") but
+// wrong for a BINARY_SOURCE=local row: registerFromOfficialManifest
+// (services/binarySync.ts) stores a server-relative downloadUrl
+// (".../api/v1/agents/download/{os}/{arch}" — see
+// buildServerRelativeAgentDownloadUrl above), whose last path segment is the
+// ARCH, not an asset name. Every local-mode row's schema-v1 lookup therefore
+// searched the manifest for e.g. "amd64", never found it, and the failure
+// collapsed into invalid_release_manifest_signature — a fleet-wide 409 on
+// every agent heartbeat for a correctly-signed row.
+//
+// This function reproduces EXACTLY the filenames binarySync.ts's
+// scanBinaryDir/parseBinaryFilename (agent/watchdog/backup) and
+// USER_HELPER_TARGETS (user-helper) produce for every (component, platform,
+// arch) triple this server can register locally — see the cross-check list
+// in the D1 unit tests. It is the preferred source of truth for those
+// shapes; assetNameFromDownloadUrl(downloadUrl) remains the fallback for
+// every other (component, platform) combination, INCLUDING component=
+// "helper" (see that branch below for why it always falls through) and the
+// GitHub-sourced case, so behavior for BINARY_SOURCE=github rows is
+// unchanged.
+export function canonicalReleaseAssetName(
+  component: string,
+  platform: string,
+  architecture: string,
+): string | null {
+  // DB / manifest platform values use "macos"; on-disk/release asset
+  // filenames use Go's GOOS naming, "darwin".
+  const goos = platform === "macos" ? "darwin" : platform;
+  const isKnownArch = architecture === "amd64" || architecture === "arm64";
+  if (!isKnownArch) return null;
+
+  if (component === "agent" || component === "watchdog" || component === "backup") {
+    if (goos !== "windows" && goos !== "linux" && goos !== "darwin") return null;
+    const suffix = goos === "windows" ? ".exe" : "";
+    return `breeze-${component}-${goos}-${architecture}${suffix}`;
+  }
+
+  // breeze-user-helper (#816/#1878): Windows-only GUI-subsystem sibling of
+  // breeze-agent.
+  if (component === "user-helper") {
+    if (goos !== "windows") return null;
+    return `breeze-user-helper-windows-${architecture}.exe`;
+  }
+
+  // component="helper" (the Tauri Helper app) has NO canonical raw-binary
+  // name here: its real registration is HELPER_TARGETS
+  // (services/binarySync.ts, ~line 59) — windows -> breeze-helper-windows.msi,
+  // darwin (amd64 AND arm64, same file) -> breeze-helper-macos.dmg, linux ->
+  // breeze-helper-linux.AppImage. That shape is per-OS, not per-arch, and
+  // isn't derivable from (component, platform, arch) alone (darwin/amd64 and
+  // darwin/arm64 both resolve to the SAME asset name). An earlier version of
+  // this function returned "breeze-desktop-helper-darwin-<arch>" for
+  // component="helper" — that is a DIFFERENT artifact (the raw Mach-O binary
+  // bundled inside the agent .pkg, never its own agentVersions row) and,
+  // being non-null, wrongly WON over the correct URL-basename fallback for
+  // real BINARY_SOURCE=github helper rows, which would have 409'd them.
+  // Falling through to the final `return null` below lets
+  // assetNameFromDownloadUrl(downloadUrl) resolve "helper" instead, which is
+  // correct for every helper row that exists today.
+  return null;
 }
 
 // Server-origin discovery for handing agents a download URL that matches
@@ -294,10 +482,18 @@ function dbPlatformToRouteOs(dbPlatform: string): string {
 // is distinct from `helper` (the Tauri Helper app). It has its own route; it
 // was omitted here originally, so the agent fell back to the github URL and the
 // host check rejected the user-helper auto-update (#1878, sibling of #646).
+//
+// `version` (#5159) pins the redirect to one exact release instead of the
+// promoted one. Without it the response's checksum (read from the requested
+// agent_versions row) and the route's bytes (the promoted row) can be
+// different builds — which is precisely what happens to an org running a
+// pinned pilot version under AGENT_AUTO_PROMOTE=false, leaving every device
+// stuck in "Updating" on an unfixable size/checksum mismatch.
 function buildServerRelativeAgentDownloadUrl(
   dbPlatform: string,
   architecture: string,
   component: string,
+  version?: string,
 ): string | null {
   if (
     component !== "agent" &&
@@ -313,19 +509,34 @@ function buildServerRelativeAgentDownloadUrl(
     return null;
   }
   const os = dbPlatformToRouteOs(dbPlatform);
+  const query = version ? `?version=${encodeURIComponent(version)}` : "";
   if (component === "helper") {
-    return `${origin}/api/v1/agents/download/helper/${os}/${architecture}`;
+    return `${origin}/api/v1/agents/download/helper/${os}/${architecture}${query}`;
   }
   if (component === "user-helper") {
-    return `${origin}/api/v1/agents/download/user-helper/${os}/${architecture}`;
+    return `${origin}/api/v1/agents/download/user-helper/${os}/${architecture}${query}`;
   }
   if (component === "watchdog") {
-    return `${origin}/api/v1/agents/download/watchdog/${os}/${architecture}`;
+    return `${origin}/api/v1/agents/download/watchdog/${os}/${architecture}${query}`;
   }
   if (component === "backup") {
-    return `${origin}/api/v1/agents/download/backup/${os}/${architecture}`;
+    return `${origin}/api/v1/agents/download/backup/${os}/${architecture}${query}`;
   }
-  return `${origin}/api/v1/agents/download/${os}/${architecture}`;
+  return `${origin}/api/v1/agents/download/${os}/${architecture}${query}`;
+}
+
+// Which version (if any) to pin the server-relative download URL to.
+//
+// Only BINARY_SOURCE=github can honour a pin: that branch of the download
+// route builds a per-tag GitHub asset URL. Local mode streams the single
+// build baked into the binaries volume and has nothing to select from, so
+// passing a version there would only turn a working download into a 409.
+// The "unknown" sentinel (binarySync's locally-registered rows with no
+// version file) is not a release tag either — see getRegisteredComponentVersion.
+function downloadUrlVersionPin(version: string): string | undefined {
+  if (getBinarySource() !== "github") return undefined;
+  if (version === "unknown") return undefined;
+  return version;
 }
 
 export async function validateReleaseManifest(args: {
@@ -338,6 +549,7 @@ export async function validateReleaseManifest(args: {
   downloadUrl: string;
   checksum: string;
   fileSize?: number | bigint | null;
+  signingKeyId?: string | null;
 }): Promise<{ ok: true } | { ok: false; reason: string }> {
   if (!args.manifest || !args.signature) {
     return { ok: false, reason: "signed_release_manifest_required" };
@@ -352,7 +564,33 @@ export async function validateReleaseManifest(args: {
   }
 
   if (parsed.schemaVersion === 1 && Array.isArray(parsed.assets)) {
-    const assetName = assetNameFromDownloadUrl(args.downloadUrl);
+    // Task 2 (#3836) key-ID-aware guard: verifyReleaseArtifactManifestAsset
+    // below only ever trusts the OFFICIAL configured key set
+    // (getConfiguredPublicKeys) — it has no DB-deployment-key code path, so
+    // a schema-v1 row can only ever validly prove OFFICIAL provenance. A
+    // `deploy-*` (or other non-official) signingKeyId reaching this branch
+    // can never be honestly satisfied: an official signature wouldn't
+    // verify against an agent's TOFU-pinned deploy key either, so accepting
+    // it here would just be a claim the agent itself would reject. Reject
+    // before even asking whether the signature verifies, since no outcome
+    // of that check could make the ID claim true. No row
+    // registerFromOfficialManifest/getReleaseAssetMetadata (binarySync.ts)
+    // produces today hits this — it's defense in depth against a
+    // future/corrupted row.
+    const claimedKeyId = args.signingKeyId?.trim();
+    if (claimedKeyId && claimedKeyId !== OFFICIAL_MANIFEST_SIGNING_KEY_ID) {
+      return { ok: false, reason: "invalid_release_manifest_signature" };
+    }
+
+    // D1 (#3836): canonical resolution wins when the (component, platform,
+    // arch) shape is known — the URL basename stays only as a fallback for
+    // shapes canonicalReleaseAssetName doesn't recognize (e.g. a genuine
+    // GitHub-sourced downloadUrl). See canonicalReleaseAssetName's own
+    // comment for why the URL-basename-only approach was wrong for
+    // BINARY_SOURCE=local rows.
+    const assetName =
+      canonicalReleaseAssetName(args.component, args.platform, args.arch) ??
+      assetNameFromDownloadUrl(args.downloadUrl);
     if (!assetName) {
       return { ok: false, reason: "release_manifest_metadata_mismatch" };
     }
@@ -373,7 +611,42 @@ export async function validateReleaseManifest(args: {
         return { ok: false, reason: "release_manifest_metadata_mismatch" };
       }
       return { ok: true };
-    } catch {
+    } catch (err) {
+      // D3 (#3836): verifyReleaseArtifactManifestAsset verifies the Ed25519
+      // signature FIRST, unconditionally, before it ever attempts an asset
+      // lookup or a distributability check (releaseArtifactManifest.ts) — so
+      // reaching either typed branch below already implies a signature that
+      // verified. That preserves the #641 anti-probing property: a reason
+      // more specific than "signature invalid" is only ever returned after a
+      // real signature check passed. Never leak `err.message` to the agent
+      // response body — log it server-side only.
+      if (err instanceof ReleaseAssetNotDistributableError) {
+        console.error(
+          "[agentVersions] Release asset not distributable:",
+          err.message,
+        );
+        return { ok: false, reason: "release_asset_not_distributable" };
+      }
+      if (err instanceof ReleaseManifestAssetLookupError) {
+        console.error(
+          "[agentVersions] Release manifest asset lookup failed:",
+          err.message,
+        );
+        return { ok: false, reason: "release_manifest_asset_lookup_failed" };
+      }
+      if (err instanceof ReleaseManifestSignatureError) {
+        console.error(
+          "[agentVersions] Release manifest signature verification failed:",
+          err.message,
+        );
+        return { ok: false, reason: "invalid_release_manifest_signature" };
+      }
+      // Any unrecognized error shape — fail closed to the least-specific
+      // reason rather than assume it's safe to be more specific.
+      console.error(
+        "[agentVersions] Unrecognized error verifying release manifest asset, failing closed:",
+        err instanceof Error ? err.message : err,
+      );
       return { ok: false, reason: "invalid_release_manifest_signature" };
     }
   }
@@ -382,10 +655,17 @@ export async function validateReleaseManifest(args: {
   // specific `release_manifest_metadata_mismatch` reason to a caller whose
   // signature was forged, we let attackers probe which DB-row field would
   // have mismatched without ever holding a valid signing key (#641).
+  //
+  // Task 2 (#3836): key-ID-aware dispatch replaces the unconditional
+  // whole-set verifyEd25519ManifestSignature call — see
+  // verifyManifestSignatureForSigningKeyId's own comment for the exact
+  // binding this enforces.
   if (
-    !(await verifyEd25519ManifestSignature(args.manifest, args.signature, {
-      allowEmptyKeysetSoftPass: true,
-    }))
+    !(await verifyManifestSignatureForSigningKeyId(
+      args.manifest,
+      args.signature,
+      args.signingKeyId,
+    ))
   ) {
     return { ok: false, reason: "invalid_release_manifest_signature" };
   }
@@ -407,6 +687,62 @@ export async function validateReleaseManifest(args: {
 
   return { ok: true };
 }
+
+// GET /agent-versions/effective?orgIds=a,b,c — issue #5285. The Devices list
+// "Agent Version" column needs each visible org's EFFECTIVE agent-version
+// target (its agentVersionPins.agent pin, or the globally promoted version
+// when unpinned) to colour-code device rows by relation to it. Resolved ONCE
+// per page load across every visible org (this one request), never per row —
+// the caller (DevicesPage) calls this after loading /orgs, not per device.
+//
+// Mounted BEFORE the "/:version/download" family below (this file has no
+// "/:orgId"-shaped route to collide with, but keeping static paths ahead of
+// param routes is the house style in this file).
+agentVersionRoutes.get(
+  "/effective",
+  authMiddleware,
+  requireScope("organization", "partner", "system"),
+  zValidator("query", effectiveVersionsQuerySchema),
+  async (c) => {
+    const auth = c.get("auth") as AuthContext;
+    const { orgIds: orgIdsParam } = c.req.valid("query");
+
+    // Silently drop an orgId the caller cannot access rather than 403ing the
+    // whole request — a stale/foreign id on the query string (e.g. a device
+    // row from an org the caller lost access to mid-session) should not sink
+    // every other org's badge, and dropping it never confirms or denies that
+    // the id exists (same posture as GET /orgs' accessible-scope filter).
+    // Capped well above any real page's distinct-org count so one caller
+    // can't turn this into an unbounded fan-out.
+    const requested = [
+      ...new Set(
+        orgIdsParam
+          .split(",")
+          .map((id) => id.trim())
+          .filter(Boolean),
+      ),
+    ].slice(0, 200);
+    const allowed = requested.filter((id) => auth.canAccessOrg(id));
+
+    if (allowed.length === 0) {
+      return c.json({ data: {} });
+    }
+
+    // The pin batch is per-org; the promoted fallback is edition-wide, so it
+    // is resolved ONCE for the whole request regardless of org count.
+    const [pinsByOrg, promoted] = await Promise.all([
+      getOrgAgentVersionPinsBatch(allowed),
+      getPromotedAgentVersionForDisplay(),
+    ]);
+
+    const data: Record<string, string | null> = {};
+    for (const orgId of allowed) {
+      data[orgId] = pinsByOrg[orgId]?.agent ?? promoted;
+    }
+
+    return c.json({ data });
+  },
+);
 
 // GET /agent-versions/latest - Get latest version info for platform/arch
 // This endpoint is public (no auth) so agents can check for updates
@@ -441,6 +777,15 @@ agentVersionRoutes.get(
           eq(agentVersions.edition, getBinaryEdition()),
         ),
       )
+      // MUST match the tiebreak in services/promotedAgentVersion.ts, which
+      // resolves the bytes these checksums are verified against (#3499).
+      // Nothing enforces one promoted row per (component, platform, arch,
+      // edition) — the invariant is maintained by demote-then-insert, not a
+      // unique constraint — so if only one of the two ordered, a duplicate
+      // isLatest row would make them select DIFFERENT rows and hand out a
+      // checksum for a release the download route does not serve. That is
+      // #3499 all over again, and silent.
+      .orderBy(desc(agentVersions.createdAt))
       .limit(1);
 
     if (!latestVersion) {
@@ -456,6 +801,11 @@ agentVersionRoutes.get(
       platform,
       arch,
       component,
+      // Pin to the exact row this checksum came from. The promoted row IS what
+      // the versionless route resolves, so this is normally the same release —
+      // but pinning removes the last way the two can select different rows
+      // (a duplicate isLatest row breaking the ORDER BY tiebreak).
+      downloadUrlVersionPin(latestVersion.version),
     );
 
     return c.json({
@@ -533,6 +883,7 @@ agentVersionRoutes.get(
       downloadUrl: versionInfo.downloadUrl,
       checksum: versionInfo.checksum,
       fileSize: versionInfo.fileSize,
+      signingKeyId: versionInfo.signingKeyId,
     });
     if (!manifestCheck.ok) {
       return c.json(
@@ -544,33 +895,51 @@ agentVersionRoutes.get(
       );
     }
 
+    // #5159: pin the server-relative URL to the version that was actually
+    // requested, so the bytes the download route redirects to are the same
+    // release as the checksum/manifest returned below. Before this, the URL
+    // was versionless and the route served the PROMOTED release — fine while
+    // the pin and the promotion agreed, and an unfixable checksum mismatch
+    // whenever they did not (an org agentVersionPins pilot under
+    // AGENT_AUTO_PROMOTE=false, which resolvePinnedUpgradeTarget deliberately
+    // allows, #2124).
+    const versionPin = downloadUrlVersionPin(versionInfo.version);
+
     // breeze-backup is version-slaved to the agent but requested by EXACT
     // version (unlike agent/helper/watchdog, which always want "latest").
-    // The versionless /download/backup/:os/:arch route can only ever serve
-    // whatever the server currently considers latest (BINARY_VERSION /
-    // BREEZE_VERSION — see binarySource.getGithubReleaseVersion). Rewriting
-    // to that route for a NON-current backup version would hand an agent
-    // healing to an older pinned version newer bytes than it asked for; the
-    // updater verifies checksum+manifest against the pinned version and
-    // fails safe, but can never actually heal. So for component=backup only,
-    // rewrite exclusively when this row IS the exact version the versionless
-    // route would serve — it matches the server's own pinned version
-    // (getGithubReleaseVersion). isLatest is NOT sufficient: production runs
-    // AGENT_AUTO_PROMOTE=false, so after deploying server version Y the DB's
-    // isLatest rows can still point at the still-rolling-out fleet version X.
-    // An agent pinned to X would then get rewritten to the versionless route,
-    // which serves Y's bytes — checksum verification fails fleet-wide for the
-    // entire deploy-to-promote window. Every other component keeps the
-    // unconditional rewrite.
-    const backupVersionIsServableByVersionlessRoute =
-      versionInfo.component !== "backup" ||
-      versionInfo.version === getGithubReleaseVersion();
+    // When the URL carries no version pin, the versionless route can only ever
+    // serve ONE release, so rewriting a NON-servable backup version to it
+    // would hand an agent healing to an older pinned version different bytes
+    // than it asked for; the updater verifies checksum+manifest against the
+    // pinned version and fails safe, but can never actually heal. So for
+    // component=backup only, and only when the URL cannot be pinned, rewrite
+    // exclusively when this row IS the one that route serves.
+    //
+    // A version pin makes the question moot: the route then resolves that
+    // exact row (getRegisteredComponentVersion) rather than the promoted one.
+    // What remains is local mode, where the route streams the single build in
+    // the binaries volume — the env-resolved version, which is what this guard
+    // has always compared against there.
+    let backupVersionIsServableByVersionlessRoute = true;
+    if (!versionPin && versionInfo.component === "backup") {
+      const versionlessRouteServes =
+        getBinarySource() === "github"
+          ? ((await getPromotedComponentVersion(
+              "backup",
+              dbPlatformToRouteOs(versionInfo.platform),
+              versionInfo.architecture,
+            )) ?? getGithubReleaseVersion())
+          : getGithubReleaseVersion();
+      backupVersionIsServableByVersionlessRoute =
+        versionInfo.version === versionlessRouteServes;
+    }
 
     const serverRelativeUrl = backupVersionIsServableByVersionlessRoute
       ? buildServerRelativeAgentDownloadUrl(
           versionInfo.platform,
           versionInfo.architecture,
           versionInfo.component,
+          versionPin,
         )
       : null;
 
@@ -626,6 +995,7 @@ agentVersionRoutes.post(
       downloadUrl: data.downloadUrl,
       checksum: data.checksum,
       fileSize: data.fileSize,
+      signingKeyId: data.signingKeyId,
     });
     if (!createManifestCheck.ok) {
       return c.json(
@@ -741,8 +1111,48 @@ agentVersionRoutes.post(
       // short registration instead of assuming a clean sync.
       return c.json(result);
     } catch (err) {
+      // A guard refusal (#4262) is not a routine sync failure: it means the
+      // release host resolved to a private/loopback/link-local address, which
+      // is a DNS-hijack signal. Left in the generic branch it became a 422 with
+      // no server-side trace at all — no log, no Sentry (writeRouteAudit only
+      // runs on success), so nobody could reconstruct it later. Log and
+      // escalate, and answer 502: the fault is upstream, not in the request.
+      // The response deliberately does NOT echo err.resolvedIps — internal
+      // addresses stay in the server-side log.
+      if (err instanceof SsrfBlockedError) {
+        console.error(
+          `[agentVersions] sync-github REFUSED by the SSRF guard (host=${err.hostname ?? "?"}, resolved=${err.resolvedIps?.join(", ") ?? "n/a"})`,
+        );
+        captureException(err, c, {
+          release_sync_failure_reason: "ssrf-blocked",
+          release_sync_context: "sync-github-route",
+        });
+        return c.json(
+          {
+            error:
+              "Release sync refused: the release host resolved to a private or link-local address. Check DNS and egress on the API host.",
+          },
+          502,
+        );
+      }
+      if (err instanceof ResponseTooLargeError) {
+        console.error(
+          `[agentVersions] sync-github aborted: response exceeded the ${err.maxBytes}-byte ceiling`,
+        );
+        captureException(err, c, {
+          release_sync_failure_reason: "response-too-large",
+          release_sync_context: "sync-github-route",
+        });
+        return c.json(
+          {
+            error: `Release sync aborted: the release host returned a body over the ${err.maxBytes}-byte limit.`,
+          },
+          502,
+        );
+      }
       const msg = err instanceof Error ? err.message : String(err);
       const status = msg.includes("GitHub API error") ? 502 : 422;
+      console.error(`[agentVersions] sync-github failed: ${msg}`);
       return c.json({ error: msg }, status);
     }
   },
@@ -891,6 +1301,7 @@ agentVersionRoutes.post(
         fileSize: agentVersions.fileSize,
         releaseManifest: agentVersions.releaseManifest,
         manifestSignature: agentVersions.manifestSignature,
+        signingKeyId: agentVersions.signingKeyId,
       })
       .from(agentVersions)
       .where(
@@ -947,6 +1358,7 @@ agentVersionRoutes.post(
         downloadUrl: row.downloadUrl,
         checksum: row.checksum,
         fileSize: row.fileSize,
+        signingKeyId: row.signingKeyId,
       });
       if (!check.ok) {
         invalidTargets.push({

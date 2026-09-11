@@ -15,6 +15,11 @@ vi.mock('./aiTools', () => ({
       manage_configuration_policy: 1,
       get_configuration_policy: 1,
       configuration_policy_compliance: 1,
+      // RMM-QA-176 D9: real base tier is 2 (aiToolsConfigPolicy.ts registerTool
+      // { tier: 2, name: 'manage_policy_feature_link' }). Without it here,
+      // checkGuardrails short-circuits on "Unknown tool" at tier 4 and every
+      // assertion below would be vacuous.
+      manage_policy_feature_link: 2,
       // Playbook tools
       list_playbooks: 1,
       execute_playbook: 3,
@@ -35,6 +40,9 @@ vi.mock('./aiTools', () => ({
       manage_catalog: 2,
       manage_contracts: 2,
       manage_quotes: 2,
+      // P2-5 (#4192): mirrors the real registry entry
+      // (`aiAgentSdkTools.ts` TOOL_TIERS.manage_ai_agents = 3).
+      manage_ai_agents: 3,
     };
     return tiers[toolName];
   }),
@@ -270,6 +278,171 @@ describe('checkGuardrails — fleet tool tier escalation', () => {
       });
       expect(result.tier).toBe(3);
       expect(result.requiresApproval).toBe(true);
+    });
+  });
+
+  // --- execute_command: command-type-aware headline + impact text (#5173) ---
+  //
+  // Before this, buildApprovalDescription emitted the raw call signature for
+  // EVERY execute_command call ('Execute "kill_process" command on device
+  // 74e15ef8...'), and the "High impact" box fell through to the tool's
+  // catalog description ("Execute a system command on a device.") — true of
+  // every call, not what THIS call does. These builders produce a
+  // call-specific headline from the actual commandType + payload; a
+  // commandType this map doesn't recognise, or a payload missing the field a
+  // recognised commandType needs, falls back to the pre-existing generic
+  // wording so nothing regresses.
+  describe('execute_command command-type-aware description (#5173)', () => {
+    const DEVICE_ID = '74e15ef8-1234-5678-9abc-def012345678';
+
+    it('kill_process names the process and PID from payload', () => {
+      const result = checkGuardrails('execute_command', {
+        deviceId: DEVICE_ID,
+        commandType: 'kill_process',
+        payload: { pid: 2920, processName: 'SupportAssistAgent.exe' },
+      });
+      expect(result.description).toBe(
+        'Kill process "SupportAssistAgent.exe" (PID 2920) on device 74e15ef8...'
+      );
+    });
+
+    it('kill_process falls back to PID alone when no process name is given', () => {
+      const result = checkGuardrails('execute_command', {
+        deviceId: DEVICE_ID,
+        commandType: 'kill_process',
+        payload: { pid: 2920 },
+      });
+      expect(result.description).toBe('Kill process PID 2920 on device 74e15ef8...');
+    });
+
+    it('kill_process names the process alone when no PID is given', () => {
+      const result = checkGuardrails('execute_command', {
+        deviceId: DEVICE_ID,
+        commandType: 'kill_process',
+        payload: { processName: 'SupportAssistAgent.exe' },
+      });
+      expect(result.description).toBe('Kill process "SupportAssistAgent.exe" on device 74e15ef8...');
+    });
+
+    it('kill_process falls back to the generic signature when payload has neither field (no regression)', () => {
+      const result = checkGuardrails('execute_command', {
+        deviceId: DEVICE_ID,
+        commandType: 'kill_process',
+      });
+      expect(result.description).toBe('Execute "kill_process" command on device 74e15ef8...');
+    });
+
+    it.each([
+      ['start_service', 'Start service "Spooler" on device 74e15ef8...'],
+      ['stop_service', 'Stop service "Spooler" on device 74e15ef8...'],
+      ['restart_service', 'Restart service "Spooler" on device 74e15ef8...'],
+    ])('%s names the service from payload.name', (commandType, expected) => {
+      const result = checkGuardrails('execute_command', {
+        deviceId: DEVICE_ID,
+        commandType,
+        payload: { name: 'Spooler' },
+      });
+      expect(result.description).toBe(expected);
+    });
+
+    it.each(['start_service', 'stop_service', 'restart_service'])(
+      '%s falls back to the generic signature without a service name (no regression)',
+      (commandType) => {
+        const result = checkGuardrails('execute_command', {
+          deviceId: DEVICE_ID,
+          commandType,
+        });
+        expect(result.description).toBe(`Execute "${commandType}" command on device 74e15ef8...`);
+      }
+    );
+
+    // sweep 2026-09-08 row 19: models calling execute_command directly send
+    // `payload.serviceName` (the field name manage_services exposes on ITS
+    // OWN input schema) rather than `payload.name` (what manage_services
+    // internally normalizes it to before calling into commandQueue). The
+    // persisted action_arguments for a real approval looked like
+    // `{ commandType: 'restart_service', payload: { serviceName: 'Spooler' } }`
+    // — the builder read only `payload.name`, got null, and fell back to the
+    // generic "Execute \"restart_service\" command" wording.
+    it.each([
+      ['start_service', 'Start service "Spooler" on device 74e15ef8...'],
+      ['stop_service', 'Stop service "Spooler" on device 74e15ef8...'],
+      ['restart_service', 'Restart service "Spooler" on device 74e15ef8...'],
+    ])('%s names the service from payload.serviceName (row 19)', (commandType, expected) => {
+      const result = checkGuardrails('execute_command', {
+        deviceId: DEVICE_ID,
+        commandType,
+        payload: { serviceName: 'Spooler' },
+      });
+      expect(result.description).toBe(expected);
+    });
+
+    it('prefers payload.serviceName over payload.name when both are present', () => {
+      const result = checkGuardrails('execute_command', {
+        deviceId: DEVICE_ID,
+        commandType: 'restart_service',
+        payload: { serviceName: 'Spooler', name: 'ignored' },
+      });
+      expect(result.description).toBe('Restart service "Spooler" on device 74e15ef8...');
+    });
+
+    it('file_read names the target path', () => {
+      const result = checkGuardrails('execute_command', {
+        deviceId: DEVICE_ID,
+        commandType: 'file_read',
+        payload: { path: 'C:\\Windows\\System32\\drivers\\etc\\hosts' },
+      });
+      expect(result.description).toBe(
+        'Read file "C:\\Windows\\System32\\drivers\\etc\\hosts" on device 74e15ef8...'
+      );
+    });
+
+    it('file_list falls back to a plain "List files" headline without a path', () => {
+      const result = checkGuardrails('execute_command', {
+        deviceId: DEVICE_ID,
+        commandType: 'file_list',
+      });
+      expect(result.description).toBe('List files on device 74e15ef8...');
+    });
+
+    it('event_logs_query names the log', () => {
+      const result = checkGuardrails('execute_command', {
+        deviceId: DEVICE_ID,
+        commandType: 'event_logs_query',
+        payload: { logName: 'Security' },
+      });
+      expect(result.description).toBe('Query "Security" event log on device 74e15ef8...');
+    });
+
+    it('event_logs_query falls back to a plain "Query event log" headline without a logName', () => {
+      const result = checkGuardrails('execute_command', {
+        deviceId: DEVICE_ID,
+        commandType: 'event_logs_query',
+      });
+      expect(result.description).toBe('Query event log on device 74e15ef8...');
+    });
+
+    it('list_processes, list_services, event_logs_list, file_list get plain-English headlines', () => {
+      expect(
+        checkGuardrails('execute_command', { deviceId: DEVICE_ID, commandType: 'list_processes' }).description
+      ).toBe('List running processes on device 74e15ef8...');
+      expect(
+        checkGuardrails('execute_command', { deviceId: DEVICE_ID, commandType: 'list_services' }).description
+      ).toBe('List services on device 74e15ef8...');
+      expect(
+        checkGuardrails('execute_command', { deviceId: DEVICE_ID, commandType: 'event_logs_list' }).description
+      ).toBe('List event logs on device 74e15ef8...');
+      expect(
+        checkGuardrails('execute_command', { deviceId: DEVICE_ID, commandType: 'file_list', payload: { path: 'C:\\Users' } }).description
+      ).toBe('List files in "C:\\Users" on device 74e15ef8...');
+    });
+
+    it('an unrecognised commandType keeps the pre-existing generic shape (no regression)', () => {
+      const result = checkGuardrails('execute_command', {
+        deviceId: DEVICE_ID,
+        commandType: 'definitely_not_a_command',
+      });
+      expect(result.description).toBe('Execute "definitely_not_a_command" command on device 74e15ef8...');
     });
   });
 
@@ -553,6 +726,130 @@ describe('checkGuardrails — manage_tickets tier escalation', () => {
     expect(result.tier).toBe(3);
     expect(result.requiresApproval).toBe(true);
   });
+
+  // P2-4 (#4191): new ticket-triage actions, same family as update_fields.
+  it('link_device and draft resolve to Tier 2 (auto-execute + audit)', () => {
+    for (const action of ['link_device', 'draft']) {
+      const result = checkGuardrails('manage_tickets', { action });
+      expect(result.tier).toBe(2);
+      expect(result.allowed).toBe(true);
+      expect(result.requiresApproval).toBe(false);
+    }
+  });
+});
+
+describe('buildApprovalDescription — manage_tickets copy (P2-4, #4191)', () => {
+  const TICKET_ID = '11111111-2222-3333-4444-555555555555';
+
+  it('update_fields lists field names only, never values (category ids elided along with everything else)', () => {
+    const result = checkGuardrails('manage_tickets', {
+      action: 'update_fields',
+      ticketId: TICKET_ID,
+      fields: { categoryId: 'cat-secret-uuid', priority: 'urgent' },
+    });
+    expect(result.description).toBe(`Update ticket #${TICKET_ID.slice(0, 8)}... fields (categoryId, priority)`);
+    expect(result.description).not.toContain('cat-secret-uuid');
+    expect(result.description).not.toContain('urgent');
+  });
+
+  it('link_device names the hostname being linked', () => {
+    const result = checkGuardrails('manage_tickets', {
+      action: 'link_device',
+      ticketId: TICKET_ID,
+      hostname: 'WKS-042',
+    });
+    expect(result.description).toBe(`Link device WKS-042 to ticket #${TICKET_ID.slice(0, 8)}...`);
+  });
+
+  it('comment (AI triage note) never echoes note content', () => {
+    const result = checkGuardrails('manage_tickets', {
+      action: 'comment',
+      ticketId: TICKET_ID,
+      content: 'the secret triage note body',
+    });
+    expect(result.description).toBe(`Post private AI triage note on ticket #${TICKET_ID.slice(0, 8)}...`);
+    expect(result.description).not.toContain('secret triage note body');
+  });
+
+  it('draft names the kind (reply vs resolution note) and never echoes content', () => {
+    const reply = checkGuardrails('manage_tickets', {
+      action: 'draft', ticketId: TICKET_ID, kind: 'reply', content: 'secret draft body',
+    });
+    expect(reply.description).toBe(`Store AI reply draft on ticket #${TICKET_ID.slice(0, 8)}...`);
+    expect(reply.description).not.toContain('secret draft body');
+
+    const resolution = checkGuardrails('manage_tickets', {
+      action: 'draft', ticketId: TICKET_ID, kind: 'resolution_note',
+    });
+    expect(resolution.description).toBe(`Store AI resolution note draft on ticket #${TICKET_ID.slice(0, 8)}...`);
+  });
+
+  it('never includes ticket subject or description text for any action', () => {
+    const result = checkGuardrails('manage_tickets', {
+      action: 'update_fields',
+      ticketId: TICKET_ID,
+      fields: { subject: 'super secret subject', description: 'super secret body' },
+    });
+    expect(result.description).not.toContain('super secret subject');
+    expect(result.description).not.toContain('super secret body');
+  });
+
+  it('other manage_tickets actions keep the pre-existing generic description shape (no regression)', () => {
+    const result = checkGuardrails('manage_tickets', { action: 'assign', ticketId: TICKET_ID });
+    expect(result.description).toBe('manage_tickets: assign');
+  });
+});
+
+// Final review (P2-5, #4192): approving a promotion does more than grant one
+// key. `cloneValuesFromEffective` (supervisedKeyGrant.ts) materializes the
+// partner's CURRENT policy as a per-org `ai_agents` row whenever the org has
+// none — which, under partner-wide-first, is the COMMON case. From that
+// moment the org follows the partner only where the merge is tighten-only: a
+// partner that later WIDENS (a new tool in the allowlist, a raised limit, a
+// new recipient) no longer reaches that org. The audit row records
+// `clonedFromEffective` AFTER the fact; the consent text the second approver
+// reads is the only place that can say it BEFORE.
+describe('buildApprovalDescription — manage_ai_agents copy (P2-5, #4192)', () => {
+  const OVERRIDE_CLAUSE =
+    '(creates a per-organization agent policy override if this organization does not already have one)';
+
+  it('authorize_supervised_key names the op key AND the per-org policy override the approval creates', () => {
+    const result = checkGuardrails('manage_ai_agents', {
+      action: 'authorize_supervised_key',
+      kind: 'triage',
+      opKey: 'manage_services:restart',
+      orgId: '44444444-4444-4444-4444-444444444444',
+    });
+
+    expect(result.description).toBe(
+      'Authorize the AI agent to run "manage_services:restart" without an approval '
+      + `for this organization in future runs ${OVERRIDE_CLAUSE}`,
+    );
+  });
+
+  it('states the override side effect even when opKey is missing (no arg echo beyond the key)', () => {
+    const result = checkGuardrails('manage_ai_agents', { action: 'authorize_supervised_key' });
+
+    expect(result.description).toContain('"unknown"');
+    expect(result.description).toContain(OVERRIDE_CLAUSE);
+  });
+
+  it('never echoes anything but the op key — kind and org id stay out of the approval text', () => {
+    const result = checkGuardrails('manage_ai_agents', {
+      action: 'authorize_supervised_key',
+      kind: 'triage',
+      opKey: 'manage_services:restart',
+      orgId: '44444444-4444-4444-4444-444444444444',
+    });
+
+    expect(result.description).not.toContain('44444444');
+    expect(result.description).not.toContain('triage');
+  });
+
+  it('other manage_ai_agents actions keep the generic description shape (no regression)', () => {
+    const result = checkGuardrails('manage_ai_agents', { action: 'rotate_something' });
+    expect(result.description).toBe('manage_ai_agents: rotate_something');
+  });
 });
 
 describe('checkGuardrails — billing and proposal action tier escalation', () => {
@@ -621,6 +918,28 @@ describe('checkToolPermission — manage_tickets RBAC map', () => {
     const result = await checkToolPermission('manage_tickets', {}, auth);
     expect(result).toBe('Missing required "action" argument for tool "manage_tickets"');
     expect(hasPermission).not.toHaveBeenCalled();
+  });
+
+  // P2-4 (#4191): deliberately 'tickets.update', not 'tickets.write' — no
+  // seeded role grants tickets:update, so these two agent-only executors
+  // fail closed for the interactive/RBAC path even if hasPermission is (by
+  // test double) told to allow everything else.
+  it('requires tickets.update for link_device action', async () => {
+    vi.mocked(getUserPermissions).mockResolvedValue({ roleId: 'operator' } as any);
+    vi.mocked(hasPermission).mockReturnValue(false);
+
+    const result = await checkToolPermission('manage_tickets', { action: 'link_device' }, auth);
+    expect(result).toContain('requires tickets.update');
+    expect(hasPermission).toHaveBeenCalledWith(expect.anything(), 'tickets', 'update');
+  });
+
+  it('requires tickets.update for draft action', async () => {
+    vi.mocked(getUserPermissions).mockResolvedValue({ roleId: 'operator' } as any);
+    vi.mocked(hasPermission).mockReturnValue(false);
+
+    const result = await checkToolPermission('manage_tickets', { action: 'draft' }, auth);
+    expect(result).toContain('requires tickets.update');
+    expect(hasPermission).toHaveBeenCalledWith(expect.anything(), 'tickets', 'update');
   });
 });
 
@@ -815,5 +1134,76 @@ describe('tier action tables are pairwise disjoint per tool', () => {
       }
     }
     expect(dupes).toEqual([]);
+  });
+});
+
+// ─── RMM-QA-176 D9: manage_policy_feature_link maintenance escalation ────────
+
+describe('manage_policy_feature_link maintenance escalation (RMM-QA-176 D9)', () => {
+  it('escalates add of a maintenance link to tier 3, supervised', () => {
+    const check = checkGuardrails('manage_policy_feature_link', {
+      action: 'add', configPolicyId: 'p1', featureType: 'maintenance',
+    });
+    expect(check.tier).toBe(3);
+    expect(check.requiresApproval).toBe(true);
+    expect(check.approvalScope).toBe('supervised');
+  });
+
+  it('escalates update of a maintenance link to tier 3, supervised', () => {
+    const check = checkGuardrails('manage_policy_feature_link', {
+      action: 'update', configPolicyId: 'p1', featureLinkId: 'l1', featureType: 'maintenance',
+    });
+    expect(check.tier).toBe(3);
+    expect(check.approvalScope).toBe('supervised');
+  });
+
+  it('leaves every OTHER feature type at the tool base tier 2 — the gate stays narrow', () => {
+    for (const featureType of ['patch', 'monitoring', 'backup', 'alert_rule']) {
+      const check = checkGuardrails('manage_policy_feature_link', {
+        action: 'add', configPolicyId: 'p1', featureType,
+      });
+      expect(check.tier, `${featureType} must not escalate`).toBe(2);
+      expect(check.requiresApproval).toBe(false);
+    }
+  });
+
+  it('leaves list at tier 2 and remove at its existing tier 3', () => {
+    expect(checkGuardrails('manage_policy_feature_link', { action: 'list', configPolicyId: 'p1' }).tier).toBe(2);
+    const remove = checkGuardrails('manage_policy_feature_link', { action: 'remove', configPolicyId: 'p1', featureLinkId: 'l1' });
+    expect(remove.tier).toBe(3);
+    expect(remove.approvalScope).toBe('supervised');
+  });
+
+  it('a READ action is never escalated by a stray featureType argument', () => {
+    // The predicate's action guard, not its ordering, is what protects reads:
+    // `list` carries no write capability, so a caller passing
+    // featureType:'maintenance' alongside it must not be pushed into an
+    // approval that the MCP transport then denies outright. Drops of the
+    // `action === 'add' || action === 'update'` clause turn this red.
+    const check = checkGuardrails('manage_policy_feature_link', {
+      action: 'list', configPolicyId: 'p1', featureType: 'maintenance',
+    });
+    expect(check.tier).toBe(2);
+    expect(check.requiresApproval).toBe(false);
+  });
+
+  it('fails CLOSED on a non-string featureType rather than falling through to tier 2', () => {
+    // A caller sending featureType: { $ne: 'maintenance' } or an array must not
+    // slip past the predicate into auto-execute. Strict === 'maintenance' means
+    // anything else stays tier 2 — which is the correct outcome ONLY because a
+    // non-'maintenance' value cannot create a maintenance link either (the
+    // handler's own featureType is what addFeatureLink writes). Pinned so a
+    // future loosening of the predicate is a deliberate act.
+    const check = checkGuardrails('manage_policy_feature_link', {
+      action: 'add', configPolicyId: 'p1', featureType: ['maintenance'],
+    });
+    expect(check.tier).toBe(2);
+  });
+
+  it('names the feature type in the approval description', () => {
+    const check = checkGuardrails('manage_policy_feature_link', {
+      action: 'add', configPolicyId: 'p1', featureType: 'maintenance',
+    });
+    expect(check.description).toContain('maintenance');
   });
 });

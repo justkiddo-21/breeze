@@ -243,6 +243,9 @@ const reconcileManifestSchema = z
         z
           .object({
             sourcePath: z.string().min(1),
+            // Stable pre-VSS path (D12): must survive re-adoption or the
+            // index falls back to the shadow-copy device path.
+            originalPath: z.string().min(1).optional(),
             backupPath: z.string().min(1),
             size: z.number().nonnegative().optional(),
             modTime: z.string().optional(),
@@ -532,7 +535,7 @@ function jobCoversWriteTime(job: AdoptableJob, writtenAt: Date, now: Date): bool
  * computation — the last of which is what finally makes the snapshot visible
  * to retention.
  */
-function manifestToCommandResult(params: {
+export function manifestToCommandResult(params: {
   snapshotId: string;
   manifestText: string;
   matchedBy: 'job-snapshot-id' | 'time-window';
@@ -552,6 +555,7 @@ function manifestToCommandResult(params: {
       file.modTime && Number.isFinite(Date.parse(file.modTime)) ? file.modTime : undefined;
     return {
       sourcePath: file.sourcePath,
+      originalPath: file.originalPath,
       backupPath: file.backupPath,
       size: file.size !== undefined ? Math.trunc(file.size) : undefined,
       modTime,
@@ -951,7 +955,7 @@ export async function reconcileOrphanedBackupSnapshots(params: {
       `bucket, so time-window matching is disabled. These snapshots stay stranded until their jobs carry a ` +
       `snapshot id.`;
     console.warn(message);
-    captureMessage(message, 'warning');
+    captureMessage(message, { eventCode: 'backup_snapshot_ambiguous_destination' });
   }
 
   return {

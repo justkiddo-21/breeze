@@ -1,12 +1,13 @@
 import { Hono } from 'hono';
 import type { WSContext } from 'hono/ws';
+import type Redis from 'ioredis';
 import { z } from 'zod';
 import { eq, and, notInArray, sql } from 'drizzle-orm';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { db, withDbAccessContext, withSystemDbAccessContext, runOutsideDbContext } from '../db';
 import { dbWriteExpectingRows } from '../db/dbWriteExpectingRows';
 import { commandCasPriorStatusTags } from '../services/commandCasDiagnostics';
-import { devices, deviceCommands, discoveryJobs, scriptExecutions, scriptExecutionBatches, remoteSessions, backupJobs, restoreJobs, tunnelSessions, supportSessions } from '../db/schema';
+import { devices, deviceCommands, discoveryJobs, scriptExecutions, scriptExecutionBatches, remoteSessions, backupJobs, restoreJobs, tunnelSessions, supportSessions, organizations } from '../db/schema';
 import {
   handleTerminalOutput,
   getActiveTerminalSession,
@@ -18,7 +19,7 @@ import { enqueueDiscoveryResults, type DiscoveredHostResult, type DeviceAdjacenc
 import { enqueueBackupResults } from '../jobs/backupWorker';
 import { enqueueSnmpPollResults, type SnmpMetricResult } from '../jobs/snmpWorker';
 import { enqueueMonitorCheckResult, recordMonitorCheckResult, type MonitorCheckResult } from '../jobs/monitorWorker';
-import { isRedisAvailable } from '../services/redis';
+import { getRedis, isRedisAvailable } from '../services/redis';
 import { isIP } from 'node:net';
 import { processDeviceIPHistoryUpdate } from '../services/deviceIpHistory';
 import { processBackupVerificationResult } from './backup/verificationService';
@@ -33,6 +34,7 @@ import {
   applyBackupProgress,
   applyBackupStartedAck,
   isBackupStartedAck,
+  isBackupQueuedAck,
   isLegacyBackupTimeoutResult,
   tryParseBackupResultPayload,
 } from '../services/backupProgress';
@@ -60,6 +62,7 @@ import { getActiveTrustKeyset } from '../services/manifestSigning';
 import { resolvePendingAgentCommand } from '../services/agentCommandAwait';
 import {
   applySoftwareInstallResult,
+  reconcileSoftwareInstallResult,
   SW_INSTALL_COMMAND_ID_REGEX,
 } from '../services/softwareDeploymentResult';
 import { PG_UUID_REGEX, UUID_REGEX } from '../utils/uuid';
@@ -71,10 +74,22 @@ import {
 import { commandResultHandlers, normalizeDiscoveryHosts } from '../services/commandResultHandlers';
 
 import { terminalPayloadErasureSet } from '../services/sensitiveCommandPayload';
+import { applyCommandAutomationTerminal } from '../services/automationTerminalEvidence';
 import { commandAcceptsAgentResultCondition } from '../services/commandResultAcceptance';
 import { redactResultAgainstCommandSecrets } from '../services/commandSecretRedaction';
+import { INSTANCE_ID } from '../services/instanceIdentity';
+import { clearAgentPresence, clearAgentPresenceUnfenced, setAgentPresence, refreshAgentPresence } from '../services/agentPresence';
+import { breezeRole } from '../config/env';
+import { partnerTrustMode } from '../config/partnerTrustMode';
+import type { PartnerTrustState } from '../db/schema/orgs';
+import {
+  evaluateCapability,
+  isLifecycleCommand,
+  loadTrustState,
+  partnerIdForDevice,
+} from '../services/partnerTrust';
 /** Capabilities advertised to agents in the post-connect `connected` message. */
-export const AGENT_WS_CAPABILITIES = ['terminal_output_base64', 'backup_run_async'] as const;
+export const AGENT_WS_CAPABILITIES = ['terminal_output_base64', 'backup_run_async', 'backup_queue_async'] as const;
 
 declare module 'hono' {
   interface ContextVariableMap {
@@ -183,9 +198,72 @@ const TERMINAL_TRANSITION_FAMILIES_ON_VALIDATION_FAILURE = new Set<CriticalResul
   'restore',
 ]);
 
-// Store active WebSocket connections by agentId
-// Map<agentId, WSContext>
-const activeConnections = new Map<string, WSContext>();
+interface ActiveAgentConnection {
+  ws: WSContext;
+  partnerId: string | null;
+  trustState: PartnerTrustState;
+}
+
+// Store active WebSocket connections and their connect-time trust snapshot by agentId.
+const activeConnections = new Map<string, ActiveAgentConnection>();
+
+const PARTNER_TRUST_CHANGED_CHANNEL = 'partner-trust:changed';
+let partnerTrustSubscriber: Redis | null = null;
+let partnerTrustSubscriptionPromise: Promise<void> | null = null;
+
+export async function handleTrustChanged(msg: unknown): Promise<void> {
+  let parsed: unknown = msg;
+  if (typeof msg === 'string') {
+    try {
+      parsed = JSON.parse(msg);
+    } catch {
+      return;
+    }
+  }
+  if (!parsed || typeof parsed !== 'object') return;
+
+  const { partnerId, trustState } = parsed as {
+    partnerId?: unknown;
+    trustState?: unknown;
+  };
+  if (
+    typeof partnerId !== 'string'
+    || !['probation', 'trusted', 'restricted'].includes(String(trustState))
+  ) {
+    return;
+  }
+
+  for (const connection of activeConnections.values()) {
+    if (connection.partnerId === partnerId) {
+      connection.trustState = trustState as PartnerTrustState;
+    }
+  }
+}
+
+function initializePartnerTrustSubscription(): Promise<void> {
+  if (partnerTrustSubscriptionPromise) return partnerTrustSubscriptionPromise;
+  const redis = getRedis();
+  if (!redis || typeof redis.duplicate !== 'function') return Promise.resolve();
+
+  const subscriber = redis.duplicate({ connectionName: 'breeze:agent-ws:partner-trust' });
+  partnerTrustSubscriber = subscriber;
+  subscriber.on('message', (channel: string, message: string) => {
+    if (channel === PARTNER_TRUST_CHANGED_CHANNEL) {
+      void handleTrustChanged(message);
+    }
+  });
+  subscriber.on('error', (error: Error) => {
+    console.error('[AgentWs] Partner-trust Redis subscriber error:', error.message);
+  });
+  partnerTrustSubscriptionPromise = subscriber.subscribe(PARTNER_TRUST_CHANGED_CHANNEL)
+    .then(() => undefined)
+    .catch((error: unknown) => {
+      console.error('[AgentWs] Failed to subscribe to partner-trust changes:', error);
+      partnerTrustSubscriber = null;
+      partnerTrustSubscriptionPromise = null;
+    });
+  return partnerTrustSubscriptionPromise;
+}
 
 // Delivery epoch, monotonic per agent. Bumped every time a socket is installed
 // in `activeConnections`, so every command is dispatched on a known epoch.
@@ -212,7 +290,7 @@ function installAgentSocketEpoch(agentId: string): number {
  * identity rules out a socket that was never installed at all.
  */
 function ownsCurrentAgentSocket(agentId: string, ws: WSContext, epoch: number): boolean {
-  return agentSocketEpochs.get(agentId) === epoch && activeConnections.get(agentId) === ws;
+  return agentSocketEpochs.get(agentId) === epoch && activeConnections.get(agentId)?.ws === ws;
 }
 
 /**
@@ -224,6 +302,7 @@ function ownsCurrentAgentSocket(agentId: string, ws: WSContext, epoch: number): 
 function evictAgentSocket(agentId: string): void {
   activeConnections.delete(agentId);
   agentSocketEpochs.delete(agentId);
+  void clearAgentPresenceUnfenced(agentId);
 }
 
 // Track per-agent ping/pong state for stale connection detection
@@ -625,6 +704,16 @@ export interface AgentCommand {
 type AgentDbContext = {
   deviceId: string;
   orgId: string;
+  /**
+   * #4673 W02 — the MSP that owns this device's org, from the auth select's
+   * join to `organizations` (NOT NULL, so always present after a successful
+   * token validation). Feeds `currentPartnerId` on every org context this
+   * socket opens, so Wave 1's SELECT-only partner-wide branches can match.
+   *
+   * Read-only axis. It must never be spread into `accessiblePartnerIds`,
+   * which is the write-capable partner-AXIS predicate.
+   */
+  partnerId: string;
   role?: AgentCredentialRole;
 };
 
@@ -729,8 +818,14 @@ export async function validateAgentToken(
         pendingTokenExpiresAt: devices.pendingTokenExpiresAt,
         status: devices.status,
         agentTokenSuspendedAt: devices.agentTokenSuspendedAt,
+        // #4673 W02 — owning MSP, for `currentPartnerId` on this socket's org
+        // contexts. INNER join: org_id and partner_id are both NOT NULL behind
+        // an FK, so a device with no org row is not authenticable anyway, and a
+        // LEFT join would silently degrade it to the pre-W02 blind behaviour.
+        partnerId: organizations.partnerId,
       })
       .from(devices)
+      .innerJoin(organizations, eq(organizations.id, devices.orgId))
       .where(eq(devices.agentId, agentId))
       .limit(1);
     return row ?? null;
@@ -813,6 +908,7 @@ export async function validateAgentToken(
     ctx: {
       deviceId: device.id,
       orgId: device.orgId,
+      partnerId: device.partnerId,
       role: match.role,
     },
   };
@@ -1289,12 +1385,12 @@ export async function processOrphanedCommandResult(
     // the backup completes. Treat it as a progress ping, not a terminal
     // result.
     const startedAckPayload = tryParseBackupResultPayload(result.result, result.stdout);
-    if (isBackupStartedAck(startedAckPayload)) {
+    if (isBackupStartedAck(startedAckPayload) || isBackupQueuedAck(startedAckPayload)) {
       // applyBackupStartedAck's guarded update no-ops (returns false) when the
       // job is already terminal — only log the "started-ack" line when it
       // actually applied, so an incident timeline isn't misled by a started-ack
       // that landed after the job had already completed/failed/been reaped.
-      const startedAckApplied = await applyBackupStartedAck({ jobId: backupJob.id, deviceId: backupJob.deviceId });
+      const startedAckApplied = await applyBackupStartedAck({ jobId: backupJob.id, deviceId: backupJob.deviceId, queued: isBackupQueuedAck(startedAckPayload) });
       if (startedAckApplied) {
         console.log(`[AgentWs] Backup job ${backupJob.id} started-ack from agent ${agentId}`);
       } else {
@@ -1490,17 +1586,26 @@ export async function processOrphanedCommandResult(
  * follow-up, now bounded by short per-operation wraps instead of a
  * message-long one.
  */
-async function runWithAgentOrgDbAccess<T>(label: string, orgId: string, fn: () => Promise<T>): Promise<T> {
+async function runWithAgentOrgDbAccess<T>(
+  label: string,
+  orgId: string,
+  partnerId: string,
+  fn: () => Promise<T>,
+): Promise<T> {
   return withDbAccessContext(
     {
       scope: 'organization',
       orgId,
       accessibleOrgIds: [orgId],
-      // Agents are org-scoped; they have no access to partner-level tables.
+      // Partner-AXIS access gates `breeze_has_partner_access`, which admits
+      // WRITES to partner-owned rows. Agents get none of it — this stays empty.
       accessiblePartnerIds: [],
-      // Agents don't browse the catalog as org users; null disables the
-      // partner-wide read branch (safe).
-      currentPartnerId: null,
+      // #4673 W02 — the device org's owning MSP. Feeds the
+      // `breeze.current_partner_id` GUC that Wave 1's SELECT-ONLY branches read
+      // (`org_id IS NULL AND partner_id = breeze_current_partner_id()`), so an
+      // agent socket can see its own MSP's partner-wide config directly.
+      // A separate, read-only axis from `accessiblePartnerIds` above.
+      currentPartnerId: partnerId,
       label
     },
     fn
@@ -1530,7 +1635,12 @@ async function processCommandResult(
   agentId: string,
   result: z.infer<typeof commandResultSchema>,
   deviceId: string | undefined,
-  orgId: string
+  orgId: string,
+  // #4673 W02 — threaded in (rather than re-looked-up) so every short-lived
+  // org context this function opens carries the same `currentPartnerId` the
+  // socket authenticated with. Without it these contexts would be the one
+  // remaining agent path where partner-wide rows stay invisible.
+  partnerId: string
 ): Promise<void> {
   try {
     // #2434 chokepoint — FIRST statement, so "any agent result that enters this
@@ -1561,7 +1671,7 @@ async function processCommandResult(
     // the ambient db, so they need the tenant context the removed
     // message-level wrap used to provide.
     if (!UUID_REGEX.test(result.commandId)) {
-      await runWithAgentOrgDbAccess('agentWs.commandResult.orphaned', orgId, () =>
+      await runWithAgentOrgDbAccess('agentWs.commandResult.orphaned', orgId, partnerId, () =>
         processOrphanedCommandResult(agentId, deviceId ?? '', result)
       );
       return;
@@ -1646,7 +1756,7 @@ async function processCommandResult(
       // Discovery and SNMP commands are dispatched directly via WebSocket
       // without creating a deviceCommands record. Handle them here (short org
       // wrap for the same reason as the non-UUID branch above, #3021).
-      await runWithAgentOrgDbAccess('agentWs.commandResult.orphaned', orgId, () =>
+      await runWithAgentOrgDbAccess('agentWs.commandResult.orphaned', orgId, partnerId, () =>
         processOrphanedCommandResult(agentId, deviceId ?? '', result)
       );
       return;
@@ -1689,7 +1799,8 @@ async function processCommandResult(
     // the per-type handler dispatch further down) script_executions. The
     // name-based heuristic pass at the top of this function stays: it catches
     // secrets this command never carried, which the exact pass cannot see.
-    // Inert until PR4c — no command carries an envelope yet.
+    // Live since PR4c-2: scriptDispatch sets `secretEnv` for `tenantSecret`
+    // parameters, so script commands can carry a sealed envelope.
     const { result: normalizedResult, stdout } = redactResultAgainstCommandSecrets(
       { id: command.id, type: command.type, deviceId: resolvedDeviceId, payload: command.payload },
       rawNormalizedResult,
@@ -1721,6 +1832,7 @@ async function processCommandResult(
     // (resolved ONLY on the 0-row branch, so the happy path pays nothing) is
     // what tells those apart in Sentry. Non-throwing, so the stale-result
     // early-return keeps its existing behaviour.
+    const terminalCompletedAt = new Date();
     const updatedCommands = await runOutsideDbContext(() =>
       withSystemDbAccessContext(() =>
         dbWriteExpectingRows(
@@ -1730,7 +1842,7 @@ async function processCommandResult(
               .update(deviceCommands)
               .set({
                   status: normalizedResult.status === 'completed' ? 'completed' : 'failed',
-                  completedAt: new Date(),
+                  completedAt: terminalCompletedAt,
                   result: buildStoredCommandResult(command.type, normalizedResult, stdout),
                   ...terminalPayloadErasureSet(),
               })
@@ -1756,6 +1868,14 @@ async function processCommandResult(
       console.warn(`[AgentWs] Ignoring stale or already-processed command result ${result.commandId} for agent ${agentId}`);
       return;
     }
+
+    await applyCommandAutomationTerminal({
+      commandId: result.commandId,
+      result: normalizedResult,
+      output: stdout ?? null,
+      error: normalizedResult.error ?? normalizedResult.stderr ?? null,
+      completedAt: terminalCompletedAt,
+    });
 
     // Finding #8: emit the append-only audit event for a WS-ingested command
     // result, matching the REST path (routes/agents/commands.ts). Placed
@@ -1793,7 +1913,7 @@ async function processCommandResult(
           try {
             // Short org wrap (#3021): handlers touch RLS-guarded org tables
             // through the ambient db (same as the happy-path dispatch below).
-            await runWithAgentOrgDbAccess('agentWs.commandResult.handler', orgId, () =>
+            await runWithAgentOrgDbAccess('agentWs.commandResult.handler', orgId, partnerId, () =>
               rejectedHandler({ agentId, command, commandId: result.commandId, result: normalizedResult, resolvedDeviceId: resolvedDeviceId!, stdout })
             );
           } catch (handlerErr) {
@@ -1816,7 +1936,7 @@ async function processCommandResult(
         const { handleDrCommandResult } = await import('./backup/drResultHandler');
         // Short org wrap (#3021): DR result persistence reads/writes
         // RLS-guarded org tables through the ambient db.
-        await runWithAgentOrgDbAccess('agentWs.commandResult.drResult', orgId, () =>
+        await runWithAgentOrgDbAccess('agentWs.commandResult.drResult', orgId, partnerId, () =>
           handleDrCommandResult({
             commandId: result.commandId,
             commandType: command.type,
@@ -1843,6 +1963,28 @@ async function processCommandResult(
       }
     }
 
+    // #5128 — software installs now arrive here. A software_install pushed over
+    // this socket used to carry the synthetic
+    // `sw-install-<deployment>-<device>-<attempt>` id and was reconciled by the
+    // regex branch above; new dispatches persist a device_commands row FIRST and
+    // push with its UUID, so they land on this generic path instead. Without
+    // this the deployment_results row would strand as `pending` forever on the
+    // websocket transport. The regex branch above is kept for frames already in
+    // flight from before the deploy. Reconciliation is idempotent (guarded on
+    // status='pending' + matching attempt), so a result that reaches BOTH
+    // transports is still applied once.
+    if (command.type === 'software_install') {
+      try {
+        // Short org wrap (#3021): deployment_results is an RLS-guarded org table.
+        await runWithAgentOrgDbAccess('agentWs.commandResult.softwareInstall', orgId, partnerId, () =>
+          reconcileSoftwareInstallResult(command, resolvedDeviceId!, normalizedResult)
+        );
+      } catch (err) {
+        console.error(`[AgentWs] Failed to reconcile software-install result ${result.commandId}:`, err);
+        captureException(err);
+      }
+    }
+
     // Dispatch to per-command-type handler if one is registered.
     // Short org wrap (#3021): handlers read/write RLS-guarded org tables
     // (script_executions, discovery_jobs, backup/restore jobs, …) through the
@@ -1850,7 +1992,7 @@ async function processCommandResult(
     // why the wrap sits here instead of around the whole message.
     const handler = commandResultHandlers[command.type];
     if (handler) {
-      await runWithAgentOrgDbAccess('agentWs.commandResult.handler', orgId, () =>
+      await runWithAgentOrgDbAccess('agentWs.commandResult.handler', orgId, partnerId, () =>
         handler({ agentId, command, commandId: result.commandId, result: normalizedResult, resolvedDeviceId: resolvedDeviceId!, stdout })
       );
     }
@@ -1881,15 +2023,25 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
    * sessionId) — they become a Sentry tag and part of the grouping message.
    */
   const runWithAgentDbAccess = async <T>(label: string, fn: () => Promise<T>): Promise<T> => {
-    return runWithAgentOrgDbAccess(label, agentDb.orgId, fn);
+    return runWithAgentOrgDbAccess(label, agentDb.orgId, agentDb.partnerId, fn);
   };
 
   // The delivery epoch this handler set owns, stamped when its socket is
   // installed. Zero until then, which never matches a live epoch.
   let socketEpoch = 0;
 
+  // Fencing token for this connection's presence lease (wave 3.5b, #4084).
+  // Generated once per handler set so a superseded socket's delayed
+  // onClose/onError can never delete a newer connection's lease — the
+  // server-side Lua compare-and-delete only acts when the token matches.
+  const connectionToken = randomUUID();
+
   return {
     onOpen: async (_event: unknown, ws: WSContext) => {
+      const trustMode = partnerTrustMode();
+      if (trustMode !== 'off') {
+        await initializePartnerTrustSubscription();
+      }
       // Finding #4: enforce the one-socket-per-agent invariant. A second socket
       // for the same agentId would otherwise overwrite the map entry WITHOUT
       // closing the previous socket, leaving an orphaned-but-authorized socket
@@ -1897,7 +2049,7 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
       // revocation/disconnect (which only act on the mapped socket) miss it.
       // Close the previous socket before replacing it so `activeConnections`
       // stays authoritative and disconnectAgent can never miss a live socket.
-      const previousWs = activeConnections.get(agentId);
+      const previousWs = activeConnections.get(agentId)?.ws;
       if (previousWs && previousWs !== ws) {
         try {
           previousWs.close(4002, 'Superseded by newer connection');
@@ -1913,9 +2065,35 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
         agentPingStates.delete(agentId);
       }
 
+      // Trust mode off preserves the pre-gate connection path without trust DB reads.
+      // Shadow/enforce keep the socket open but fail closed in the cached snapshot
+      // whenever partner or trust resolution is missing or unavailable.
+      let partnerId: string | null = null;
+      let trustState: PartnerTrustState = 'trusted';
+      if (trustMode !== 'off') {
+        try {
+          partnerId = await partnerIdForDevice(agentDb.deviceId);
+          const trust = partnerId ? await loadTrustState(partnerId) : null;
+          if (!trust) {
+            trustState = 'restricted';
+            console.warn(`[AgentWs] Partner trust unresolved for device ${agentDb.deviceId}; restricting connection`);
+          } else {
+            trustState = trust.trustState;
+          }
+        } catch {
+          trustState = 'restricted';
+          console.warn(`[AgentWs] Partner trust resolution failed for device ${agentDb.deviceId}; restricting connection`);
+        }
+      }
+
       // Store connection and stamp this socket's delivery epoch.
-      activeConnections.set(agentId, ws);
+      activeConnections.set(agentId, {
+        ws,
+        partnerId,
+        trustState,
+      });
       socketEpoch = installAgentSocketEpoch(agentId);
+      void setAgentPresence(agentId, { instanceId: INSTANCE_ID, connectionToken });
       console.log(`Agent ${agentId} connected via WebSocket. Active connections: ${activeConnections.size}`);
 
       // Update device status under tenant DB context. Pending commands are
@@ -2074,6 +2252,13 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
           const state = agentPingStates.get(agentId);
           if (state) {
             state.lastPongAt = Date.now();
+            void refreshAgentPresence(agentId, connectionToken).then((refreshed) => {
+              // Self-heal: an evict-path unconditional delete may have raced a
+              // reconnect; if we are still the live socket, re-establish the lease.
+              if (!refreshed && activeConnections.get(agentId)?.ws === ws) {
+                return setAgentPresence(agentId, { instanceId: INSTANCE_ID, connectionToken });
+              }
+            });
           }
           return;
         }
@@ -2083,6 +2268,11 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
           const state = agentPingStates.get(agentId);
           if (state) {
             state.lastPongAt = Date.now();
+            void refreshAgentPresence(agentId, connectionToken).then((refreshed) => {
+              if (!refreshed && activeConnections.get(agentId)?.ws === ws) {
+                return setAgentPresence(agentId, { instanceId: INSTANCE_ID, connectionToken });
+              }
+            });
           }
         }
 
@@ -2218,11 +2408,30 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
                 ? expectedSessionId
                 : null;
             if (sessionId && fastResult.event === 'peer_disconnected') {
+              // #5300: the no-video watchdog records the swallowed capture
+              // error via Session.StopWithReason/LastStopReason and the agent
+              // rides it here as `stopReason` (agentWs.desktop.peerDisconnected
+              // path — heartbeat.sendDesktopDisconnectNotification). Every
+              // other disconnect (peer-connection grace timeout, lifetime
+              // policy, operator stop, darwin handoff) omits the field, so
+              // this stays null for them, same as before this change.
+              const stopReason = redactSecretsFromOutput(
+                typeof fastResult.stopReason === 'string' ? fastResult.stopReason.slice(0, 1024) : ''
+              ) || null;
               try {
                 await runWithAgentDbAccess('agentWs.desktop.peerDisconnected', async () => {
                   const result = await db
                     .update(remoteSessions)
-                    .set({ status: 'disconnected', endedAt: new Date() })
+                    .set({
+                      status: 'disconnected',
+                      endedAt: new Date(),
+                      // Only fills errorMessage when it's still empty — never
+                      // overwrites a startup-probe failure text (#5284/#5295)
+                      // that a `desk-start` failure already stored there.
+                      ...(stopReason
+                        ? { errorMessage: sql`COALESCE(${remoteSessions.errorMessage}, ${stopReason})` }
+                        : {}),
+                    })
                     .where(
                       and(
                         eq(remoteSessions.id, sessionId),
@@ -2460,7 +2669,8 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
               agentId,
               parsed.data as z.infer<typeof commandResultSchema>,
               authenticatedAgent.deviceId,
-              authenticatedAgent.orgId
+              authenticatedAgent.orgId,
+              authenticatedAgent.partnerId
             );
             ws.send(JSON.stringify({
               type: 'ack',
@@ -2629,11 +2839,12 @@ onClose: async (_event: unknown, ws: WSContext) => {
       // Only remove from active connections if this ws is still the current one.
       // A reconnecting agent may have already replaced us in the map — deleting
       // the new connection's entry would make the agent unreachable.
-      if (activeConnections.get(agentId) === ws) {
+      if (activeConnections.get(agentId)?.ws === ws) {
         activeConnections.delete(agentId);
         if (agentSocketEpochs.get(agentId) === socketEpoch) {
           agentSocketEpochs.delete(agentId);
         }
+        void clearAgentPresence(agentId, connectionToken);
         console.log(`Agent ${agentId} disconnected. Active connections: ${activeConnections.size}`);
 
         // Update device status to offline (but preserve 'updating' — let
@@ -2689,11 +2900,12 @@ onClose: async (_event: unknown, ws: WSContext) => {
         clearInterval(pingState.pingInterval);
         agentPingStates.delete(agentId);
       }
-if (activeConnections.get(agentId) === ws) {
+if (activeConnections.get(agentId)?.ws === ws) {
         activeConnections.delete(agentId);
         if (agentSocketEpochs.get(agentId) === socketEpoch) {
           agentSocketEpochs.delete(agentId);
         }
+        void clearAgentPresence(agentId, connectionToken);
       }
       if (agentDb) {
         void runWithAgentDbAccess('agentWs.onError.markOffline', async () => {
@@ -2877,6 +3089,12 @@ const desktopCommandResultSchema = z.object({
     // server-side, but must be accepted so the result isn't dropped as
     // malformed (#2307).
     stopped: z.boolean().optional(),
+    // #5300: rides alongside a `peer_disconnected` event when the session's
+    // Session.LastStopReason() was non-empty — currently only the no-video
+    // watchdog's swallowed capture error. Bounded to match the agent's own
+    // cap (Session.StopWithReason / desktopStopReasonMaxBytes). Absent on
+    // every routine disconnect and from any agent build predating this field.
+    stopReason: z.string().max(300).optional(),
   }).strict().optional(),
 }).passthrough();
 
@@ -2958,7 +3176,7 @@ function recordCrossTenantDrop(agentId: string, deviceId: string | undefined, ki
     }
 
     // Close any active WS for this agent so it has to re-auth (and fail).
-    const activeWs = activeConnections.get(agentId);
+    const activeWs = activeConnections.get(agentId)?.ws;
     if (activeWs) {
       try {
         activeWs.close(4001, 'Token suspended');
@@ -2991,6 +3209,30 @@ function clearCrossTenantDropCounter(agentId: string) {
 // state across `it()` cases. Not exported for production use.
 export function __resetCrossTenantDropsForTest() {
   crossTenantDrops.clear();
+}
+
+// Test-only: install a fake agent socket directly into `activeConnections`
+// without going through the real WS upgrade/auth handshake. Needed by the
+// wave 3.5b (#4084) relay integration suite, which needs a "locally connected"
+// agent on ONE simulated process while dispatching from another. Never usable
+// in production — a real socket must come through createAgentWsHandlers.
+export function registerConnection(
+  agentId: string,
+  ws: { send(data: string): void },
+  trust: { partnerId: string; trustState: PartnerTrustState } = {
+    partnerId: 'test-partner',
+    trustState: 'trusted',
+  },
+): void {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('registerConnection is test-only');
+  }
+  activeConnections.set(agentId, { ws: ws as never, ...trust });
+  installAgentSocketEpoch(agentId);
+}
+
+export function __installAgentSocketForTest(agentId: string, ws: { send(data: string): void }): void {
+  registerConnection(agentId, ws);
 }
 
 /**
@@ -3060,19 +3302,50 @@ export function createAgentWsRoutes(upgradeWebSocket: Function): Hono {
 }
 
 /**
+ * Wave 3.5b (#4084): a worker-role process never holds agent sockets — this
+ * throws rather than letting a socket-local entry point silently return
+ * false/empty, which would otherwise read as "every agent is offline" instead
+ * of "this process cannot answer that question at all". Callers on a process
+ * that may own sockets (`all`/`api`) must route through
+ * dispatchCommandToAgent/isAgentConnectedAnywhere (services/agentCommandRelay.ts)
+ * once BREEZE_ROLE=worker is actually in use (3.5d, #4086).
+ */
+function assertSocketLocalDispatchAllowed(fn: string): void {
+  if (breezeRole() === 'worker') {
+    throw new Error(
+      `[BREEZE_ROLE] ${fn} is socket-local and cannot run in the worker role — `
+      + 'use dispatchCommandToAgent/isAgentConnectedAnywhere (services/agentCommandRelay.ts)',
+    );
+  }
+}
+
+/**
  * Send a command to a connected agent via WebSocket
  * Returns true if the command was sent, false if agent is not connected
  */
 export function sendCommandToAgent(agentId: string, command: AgentCommand): boolean {
-  const ws = activeConnections.get(agentId);
-  if (!ws) {
+  assertSocketLocalDispatchAllowed('sendCommandToAgent');
+  const conn = activeConnections.get(agentId);
+  if (!conn) {
     return false;
+  }
+
+  const mode = partnerTrustMode();
+  if (mode !== 'off' && conn.trustState !== 'trusted' && !isLifecycleCommand(command.type)) {
+    if (mode === 'enforce') return false;
+    if (conn.partnerId) {
+      void evaluateCapability('device_execute', {
+        partnerId: conn.partnerId,
+        commandType: command.type,
+        detail: { via: 'ws_fast_path' },
+      });
+    }
   }
 
   try {
     const json = JSON.stringify(command);
     // Send command directly - agent expects {id, type, payload} at top level
-    ws.send(json);
+    conn.ws.send(json);
     recordOrphanedResultExpectation(agentId, command);
     return true;
   } catch (error) {
@@ -3103,10 +3376,10 @@ export type AgentWsDisconnectResult = 'closed' | 'close-failed' | 'not-connected
  * a live-but-orphaned socket.
  */
 export function disconnectAgent(agentId: string, code: number = 4040, reason: string = 'orgId changed, reconnect required'): AgentWsDisconnectResult {
-  const ws = activeConnections.get(agentId);
-  if (!ws) return 'not-connected';
+  const conn = activeConnections.get(agentId);
+  if (!conn) return 'not-connected';
   try {
-    ws.close(code, reason);
+    conn.ws.close(code, reason);
   } catch (error) {
     console.error(`disconnectAgent(${agentId.slice(0,12)}) close threw:`, error);
     captureException(error instanceof Error ? error : new Error(String(error)));
@@ -3121,6 +3394,7 @@ export function disconnectAgent(agentId: string, code: number = 4040, reason: st
  * Check if an agent is connected via WebSocket
  */
 export function isAgentConnected(agentId: string): boolean {
+  assertSocketLocalDispatchAllowed('isAgentConnected');
   return activeConnections.has(agentId);
 }
 
@@ -3148,13 +3422,13 @@ export function broadcastToAgents(
   let sent = 0;
   const payload = JSON.stringify(message);
 
-  for (const [agentId, ws] of activeConnections) {
+  for (const [agentId, conn] of activeConnections) {
     if (filter && !filter(agentId)) {
       continue;
     }
 
     try {
-      ws.send(payload);
+      conn.ws.send(payload);
       sent++;
     } catch (error) {
       console.error(`Failed to broadcast to agent ${agentId}:`, error);

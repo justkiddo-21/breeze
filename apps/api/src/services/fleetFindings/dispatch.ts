@@ -27,7 +27,9 @@
  *     shape compatible with this dispatcher's one-command-per-target model.
  *   - 'script' actionKind (not a commandType) -> CommandTypes.SCRIPT ('script'),
  *     requires `scriptId`; payload built from the resolved script row,
- *     mirroring aiToolsScripts.ts's `run_script` tool.
+ *     mirroring aiToolsScripts.ts's `run_script` tool. RESTRICTED to scripts
+ *     whose parameters are all `runtime`-sourced — see
+ *     {@link REMEDIATION_BOUND_PARAMETER_ERROR}.
  */
 import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
 
@@ -46,11 +48,49 @@ import type { AuthContext } from '../../middleware/auth';
 import { CommandTypes, queueCommandForExecution } from '../commandQueue';
 import { terminalPayloadErasureSet } from '../sensitiveCommandPayload';
 import { captureException } from '../sentry';
+import { checkScriptMaintenanceSuppression } from '../scriptMaintenanceGate';
+import { hasTenantVariableBoundParameters } from '../sourcedParameters';
 import { getFleetFinding } from './query';
 
 /** Real commandType values a caller may request under `actionKind: 'command'`. */
 export const REMEDIATION_COMMAND_TYPE_ALLOWLIST = ['restart_service', 'reboot'] as const;
 export type RemediationCommandType = (typeof REMEDIATION_COMMAND_TYPE_ALLOWLIST)[number];
+
+/**
+ * #3409 PR4c-2. Fleet remediation is the FOURTH script-dispatch path and the
+ * only one that does not go through `dispatchScriptToDevice`
+ * (`services/scriptDispatch.ts`) — it owns its own bulk target/result model,
+ * so it never calls `resolveSourcedParameters`, never opens the tenant
+ * variable scope, and never seals a `secretEnvEnvelope`. A script declaring a
+ * bound (non-`runtime`) parameter therefore cannot be dispatched from here
+ * without silently running with that binding UNRESOLVED — `BREEZE_VAR_*`
+ * unset, `BREEZE_PARAM_*` empty, and no error anywhere. For a `tenantSecret`
+ * that is the exact silent-wrong-run PR4c exists to prevent, so this path
+ * refuses the script instead, at run creation AND again at dispatch.
+ */
+export const REMEDIATION_BOUND_PARAMETER_ERROR =
+  'Scripts with server-resolved parameters (variables, secrets, device fields) cannot be used for fleet remediation yet';
+
+/**
+ * Does this script declare ANY parameter whose value the SERVER must resolve?
+ *
+ * `hasTenantVariableBoundParameters` (`services/sourcedParameters.ts`, the one
+ * authority) answers this for the two variable-backed sources; `builtin` and
+ * `deviceCustomField` are equally unresolvable on this path, so they are
+ * folded in with the same deliberately-tolerant element-by-element scan. A
+ * `source` that is present but not the string `'runtime'` counts as bound even
+ * when the rest of the element fails to parse — a binding we cannot READ must
+ * never be downgraded to "the caller may supply it".
+ */
+function hasServerResolvedParameters(parameters: unknown): boolean {
+  if (hasTenantVariableBoundParameters(parameters)) return true;
+  if (!Array.isArray(parameters)) return false;
+  return parameters.some((element) => {
+    if (element === null || typeof element !== 'object') return false;
+    const source = (element as { source?: unknown }).source;
+    return typeof source === 'string' && source !== 'runtime';
+  });
+}
 
 interface RemediateRequestBase {
   parameters: Record<string, unknown>;
@@ -70,10 +110,32 @@ interface RemediateRequestBase {
  * half of the same contract.
  */
 export type RemediateRequest =
-  | (RemediateRequestBase & { actionKind: 'script'; scriptId: string })
+  | (RemediateRequestBase & {
+      actionKind: 'script';
+      scriptId: string;
+      /**
+       * Operator-chosen run context for this run (#4888). Absent = use the
+       * script's saved default, which is what every run did before the Fix
+       * flow's picker stopped throwing this value away. 'elevated' is
+       * deliberately absent from the union, mirroring `executeScriptSchema`:
+       * elevation stays a property of the saved script, never a launch-time
+       * choice.
+       */
+      runAs?: 'system' | 'user';
+    })
   | (RemediateRequestBase & { actionKind: 'command'; commandType: RemediationCommandType });
 
-export type RemediationSkipReason = 'site_denied' | 'not_member' | 'decommissioned' | 'unreachable';
+export type RemediationSkipReason =
+  | 'site_denied'
+  | 'not_member'
+  | 'decommissioned'
+  | 'unreachable'
+  // #4919 — the device is inside a maintenance window that suppresses
+  // scripts (or one we could not evaluate, which fails closed). Written
+  // at DISPATCH time only: a window that is open now may well be shut by
+  // the time a queued run reaches this chunk, so classifying at run
+  // creation would skip devices that were perfectly runnable.
+  | 'maintenance_window';
 
 export interface RemediationSkippedTarget {
   deviceId: string;
@@ -346,6 +408,11 @@ export async function createRemediationRun(
         actionKind: req.actionKind,
         scriptId: req.actionKind === 'script' ? req.scriptId : null,
         commandType: req.actionKind === 'command' ? req.commandType : null,
+        // #4888 — pinned at creation, exactly like scriptId/parameterSnapshot,
+        // so a later edit to the script row cannot retroactively change the
+        // context the operator authorised. NULL keeps the historical
+        // behaviour: fall back to the script's saved default at dispatch.
+        runAs: req.actionKind === 'script' ? req.runAs ?? null : null,
         parameterSnapshot: req.parameters ?? {},
         status,
         targetCount,
@@ -400,7 +467,7 @@ async function validateRemediationScript(
   findingOrgId: string
 ): Promise<{ error?: string }> {
   const [script] = await db
-    .select({ id: scripts.id, orgId: scripts.orgId })
+    .select({ id: scripts.id, orgId: scripts.orgId, parameters: scripts.parameters })
     .from(scripts)
     .where(and(eq(scripts.id, scriptId), isNull(scripts.deletedAt)))
     .limit(1);
@@ -410,6 +477,12 @@ async function validateRemediationScript(
   }
   if (script.orgId !== null && script.orgId !== findingOrgId) {
     return { error: 'Script does not belong to an accessible organization' };
+  }
+  // Refuse at CREATION so the caller gets a 400 they can act on, rather than a
+  // run that queues and then fails every target. See
+  // REMEDIATION_BOUND_PARAMETER_ERROR for why this path cannot resolve them.
+  if (hasServerResolvedParameters(script.parameters)) {
+    return { error: REMEDIATION_BOUND_PARAMETER_ERROR };
   }
   return {};
 }
@@ -551,7 +624,18 @@ export async function dispatchRunChunk(runId: string, chunkIndex: number): Promi
   // 500-target run cannot produce 500 identical issues.
   let reportedUnexpected = false;
 
-  let scriptPayload: { language: string; content: string; timeoutSeconds: number; runAs: string } | null = null;
+  let scriptPayload: {
+    language: string;
+    content: string;
+    timeoutSeconds: number;
+    runAs: string;
+    acknowledgedSecurityPatterns: string[];
+  } | null = null;
+  // Why the reason is a variable: a script that GAINED a bound parameter since
+  // run creation is unavailable to this path for a different reason than one
+  // that was deleted or re-tenanted, and "Script no longer available" would
+  // send the operator looking for a deletion that never happened.
+  let scriptUnavailableReason = 'Script no longer available';
   if (run.actionKind === 'script' && run.scriptId) {
     // Re-fetch under the SAME guards as validateRemediationScript at
     // creation time: non-deleted, and either org-less (system/universal
@@ -566,11 +650,28 @@ export async function dispatchRunChunk(runId: string, chunkIndex: number): Promi
         content: scripts.content,
         timeoutSeconds: scripts.timeoutSeconds,
         runAs: scripts.runAs,
+        parameters: scripts.parameters,
+        // #5129 — re-read at dispatch time, not snapshotted at run creation:
+        // the script row can be edited in between (same reason this whole
+        // re-fetch exists), and an acknowledgement revoked since then must not
+        // keep authorising runs.
+        acknowledgedSecurityPatterns: scripts.acknowledgedSecurityPatterns,
       })
       .from(scripts)
       .where(and(eq(scripts.id, run.scriptId), isNull(scripts.deletedAt)))
       .limit(1);
-    scriptPayload = script && (script.orgId === null || script.orgId === run.orgId) ? script : null;
+    if (script && (script.orgId === null || script.orgId === run.orgId)) {
+      // Defence in depth for #3409 PR4c-2: `validateRemediationScript` already
+      // refused this script at creation, but the re-fetch exists precisely
+      // because the row can be EDITED in between — and adding a bound
+      // parameter is the edit that turns an accepted run into one that would
+      // dispatch with the binding unresolved. Fail the targets loudly instead.
+      if (hasServerResolvedParameters(script.parameters)) {
+        scriptUnavailableReason = REMEDIATION_BOUND_PARAMETER_ERROR;
+      } else {
+        scriptPayload = script;
+      }
+    }
   }
 
   for (const target of pendingTargets) {
@@ -583,6 +684,31 @@ export async function dispatchRunChunk(runId: string, chunkIndex: number): Promi
     if (deviceStatus !== 'online') {
       await markTargetSkipped(runId, target.targetDeviceUuid, 'unreachable');
       continue;
+    }
+
+    // #4919 — fleet remediation is the one script path that does NOT go
+    // through `dispatchScriptToDevice`, so it does not inherit that seam's
+    // maintenance gate and has to call the shared gate itself. Scoped to
+    // `actionKind === 'script'` on purpose: `suppressScripts` is a statement
+    // about running scripts, and the command kinds this path also dispatches
+    // (reboot, restart_service) are governed by their own policies rather
+    // than by that flag. Checked BEFORE the atomic claim so a suppressed
+    // target is never flipped to `queued` and walked back — same discipline
+    // as the liveness check above.
+    if (run.actionKind === 'script') {
+      const maintenance = await checkScriptMaintenanceSuppression(target.targetDeviceUuid);
+      if (maintenance.suppressed) {
+        if (maintenance.reason === 'check_failed') {
+          // A fault in the safety check, not the operator's schedule. Recording
+          // it as a `skipped` target would bury a maintenance-config outage
+          // inside a status operators read as "nothing to see here" — this run
+          // never verified it was safe to run, and that is a failure.
+          await markTargetFailed(runId, target.targetDeviceUuid, maintenance.message);
+          continue;
+        }
+        await markTargetSkipped(runId, target.targetDeviceUuid, 'maintenance_window');
+        continue;
+      }
     }
 
     // Claim the target atomically BEFORE dispatching: a plain SELECT-then-
@@ -617,16 +743,35 @@ export async function dispatchRunChunk(runId: string, chunkIndex: number): Promi
 
       if (run.actionKind === 'script') {
         if (!scriptPayload) {
-          throw new Error('Script no longer available');
+          throw new Error(scriptUnavailableReason);
         }
         type = CommandTypes.SCRIPT;
+        // #3409 PR4c-2: `parameters` here is the caller's snapshot verbatim —
+        // this path has no server-side resolution and NO secret envelope, so
+        // only runtime-sourced scripts ever reach it (guarded twice above).
+        // Adding a bound parameter to this payload requires routing the path
+        // through `dispatchScriptToDevice` first, not a resolver call here.
         payload = {
           scriptId: run.scriptId,
           language: scriptPayload.language,
           content: scriptPayload.content,
           timeoutSeconds: scriptPayload.timeoutSeconds,
-          runAs: scriptPayload.runAs,
+          // #4888 — the operator's choice, pinned on the run at creation,
+          // wins over the script's saved default. Before this the picker
+          // rendered a System / logged-in-user select and the answer was
+          // dropped on the floor (`_runAs` in FixPickerModal.tsx), so a
+          // remediation always ran in whatever context the script row
+          // happened to carry. `?? scriptPayload.runAs` is what keeps every
+          // pre-#4888 run (run_as NULL) behaving identically.
+          runAs: run.runAs ?? scriptPayload.runAs,
           parameters: run.parameterSnapshot ?? {},
+          // #5129 — this is the FOURTH script-dispatch path and the only one
+          // that does not go through `dispatchScriptToDevice` (see the file
+          // docblock), so it has to list the field itself. Omitted when empty
+          // so the wire is unchanged for scripts that acknowledge nothing.
+          ...((scriptPayload.acknowledgedSecurityPatterns ?? []).length > 0
+            ? { acknowledgedSecurityPatterns: scriptPayload.acknowledgedSecurityPatterns }
+            : {}),
         };
       } else {
         const commandType = run.commandType as RemediationCommandType | null;

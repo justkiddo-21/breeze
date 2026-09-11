@@ -77,6 +77,23 @@ const updateChain = () => ({
   }),
 });
 
+// `db.update` is stubbed with `mockReturnValue(updateChain())`, so every update
+// in a run records its payload on the SAME `set` spy. Reading that one call
+// history gives the ordered list of every UPDATE the call made, which is what
+// these tests assert on — never a positional index into `db.update.mock.results`
+// (all of whose entries share that value). #5128 added a per-execution
+// `{ status: 'queued' }` write inside the dispatch loop, which shifted every
+// such index by one.
+const allUpdateSets = (): Record<string, unknown>[] => {
+  const results = vi.mocked(db.update).mock.results;
+  if (results.length === 0) return [];
+  return (results[0]!.value as { set: { mock: { calls: unknown[][] } } }).set.mock.calls.map(
+    (call) => call[0] as Record<string, unknown>,
+  );
+};
+
+const hasDevicesFailed = (payload: Record<string, unknown>) => 'devicesFailed' in payload;
+
 const baseScript = (overrides: Record<string, unknown> = {}) => ({
   id: 'script-1',
   orgId: 'org-a',
@@ -125,9 +142,12 @@ describe('executeScriptOnDevices — cross-org isolation', () => {
       auth: multiOrgAuth,
     });
 
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.status).toBe(400);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.admission).toMatchObject({
+        status: 'rejected',
+        targets: [{ requestedDeviceId: 'device-1', admission: 'denied', reasonCode: 'script_org_mismatch' }],
+      });
     }
     // No dispatch for the cross-org device.
     expect(dispatchScriptToDevice).not.toHaveBeenCalled();
@@ -146,8 +166,9 @@ describe('executeScriptOnDevices — cross-org isolation', () => {
 
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.executions).toHaveLength(1);
-      expect(result.executions[0]!.deviceId).toBe('device-1');
+      expect(result.admission.targets).toEqual([expect.objectContaining({
+        requestedDeviceId: 'device-1', admission: 'admitted',
+      })]);
     }
   });
 
@@ -164,7 +185,7 @@ describe('executeScriptOnDevices — cross-org isolation', () => {
 
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.executions).toHaveLength(1);
+      expect(result.admission.targets[0]).toMatchObject({ requestedDeviceId: 'device-1', admission: 'admitted' });
     }
   });
 
@@ -186,9 +207,10 @@ describe('executeScriptOnDevices — cross-org isolation', () => {
 
     expect(result.ok).toBe(true);
     if (result.ok) {
-      const targetedIds = result.executions.map((e) => e.deviceId);
-      expect(targetedIds).toContain('device-a');
-      expect(targetedIds).not.toContain('device-b');
+      expect(result.admission.targets).toEqual([
+        expect.objectContaining({ requestedDeviceId: 'device-a', admission: 'admitted' }),
+        { requestedDeviceId: 'device-b', admission: 'denied', reasonCode: 'script_org_mismatch' },
+      ]);
     }
   });
 
@@ -215,12 +237,9 @@ describe('executeScriptOnDevices — cross-org isolation', () => {
 
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.batchIds).toHaveLength(2);
-      expect(result.batchIds).toEqual(['batch-org-a', 'batch-org-b']);
-      // A multi-org run has no single batch that represents the whole run —
-      // `batchId` (the legacy scalar) must stay null rather than silently
-      // pointing at one arbitrary org's slice. `batchIds` is the complete list.
-      expect(result.batchId).toBeNull();
+      expect(result.admission.targets.map((target) => target.batchId)).toEqual([
+        'batch-org-a', 'batch-org-a', 'batch-org-b',
+      ]);
     }
 
     // Two batch inserts: org-a with 2 devices targeted, org-b with 1.
@@ -243,8 +262,11 @@ describe('executeScriptOnDevices — cross-org isolation', () => {
       'device-3': 'batch-org-b',
     });
 
-    // Final status update covers both created batches.
-    expect(db.update).toHaveBeenCalledTimes(1);
+    // Four updates: one `{ status: 'queued' }` execution write per
+    // admitted-but-undelivered device (#5128), then ONE final batch-status
+    // update covering both created batches.
+    expect(db.update).toHaveBeenCalledTimes(4);
+    expect(allUpdateSets()).toHaveLength(4);
   });
 });
 
@@ -264,9 +286,9 @@ describe('executeScriptOnDevices — per-device dispatch failures (#3409 PR2 Tas
         baseDevice({ id: 'device-c', orgId: 'org-b' }),
       ]) as any);
     vi.mocked(dispatchScriptToDevice)
-      .mockResolvedValueOnce({ ok: true, commandId: 'cmd-a', executionId: 'exec-a', delivered: false, deliveryOutcome: 'no_agent', executedAt: null, ignoredParameters: [] })
+      .mockResolvedValueOnce({ ok: true, commandId: 'cmd-a', executionId: 'exec-a', delivered: false, deliveryOutcome: 'no_agent', executedAt: null, deliverBy: new Date('2026-09-13T00:00:00Z'), runAs: 'system' as const, targetSessionId: null, ignoredParameters: [] })
       .mockResolvedValueOnce({ ok: false, code: 'unresolved_variables', error: 'Could not resolve variable(s): repo_url' })
-      .mockResolvedValueOnce({ ok: true, commandId: 'cmd-c', executionId: 'exec-c', delivered: false, deliveryOutcome: 'no_agent', executedAt: null, ignoredParameters: [] });
+      .mockResolvedValueOnce({ ok: true, commandId: 'cmd-c', executionId: 'exec-c', delivered: false, deliveryOutcome: 'no_agent', executedAt: null, deliverBy: new Date('2026-09-13T00:00:00Z'), runAs: 'system' as const, targetSessionId: null, ignoredParameters: [] });
 
     const result = await executeScriptOnDevices({
       scriptId: 'script-1',
@@ -276,12 +298,11 @@ describe('executeScriptOnDevices — per-device dispatch failures (#3409 PR2 Tas
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.executions.map((e) => e.deviceId)).toEqual(['device-a', 'device-c']);
-    expect(result.failures).toEqual([
-      { deviceId: 'device-b', code: 'unresolved_variables', error: expect.any(String) },
+    expect(result.admission.targets).toEqual([
+      expect.objectContaining({ requestedDeviceId: 'device-a', admission: 'admitted' }),
+      expect.objectContaining({ requestedDeviceId: 'device-b', admission: 'excluded', reasonCode: 'unresolved_variables' }),
+      expect.objectContaining({ requestedDeviceId: 'device-c', admission: 'admitted' }),
     ]);
-    // Still targeted all three — the failure didn't truncate the fan-out.
-    expect(result.devicesTargeted).toBe(3);
   });
 
   it('writes a failed script_executions row for the failed device, not nothing', async () => {
@@ -292,7 +313,7 @@ describe('executeScriptOnDevices — per-device dispatch failures (#3409 PR2 Tas
         baseDevice({ id: 'device-b', orgId: 'org-b' }),
       ]) as any);
     vi.mocked(dispatchScriptToDevice)
-      .mockResolvedValueOnce({ ok: true, commandId: 'cmd-a', executionId: 'exec-a', delivered: false, deliveryOutcome: 'no_agent', executedAt: null, ignoredParameters: [] })
+      .mockResolvedValueOnce({ ok: true, commandId: 'cmd-a', executionId: 'exec-a', delivered: false, deliveryOutcome: 'no_agent', executedAt: null, deliverBy: new Date('2026-09-13T00:00:00Z'), runAs: 'system' as const, targetSessionId: null, ignoredParameters: [] })
       .mockResolvedValueOnce({ ok: false, code: 'unresolved_variables', error: 'Could not resolve variable(s): repo_url' });
 
     await executeScriptOnDevices({
@@ -327,7 +348,7 @@ describe('executeScriptOnDevices — per-device dispatch failures (#3409 PR2 Tas
         baseDevice({ id: 'device-b', orgId: 'org-b' }),
       ]) as any);
     vi.mocked(dispatchScriptToDevice)
-      .mockResolvedValueOnce({ ok: true, commandId: 'cmd-a', executionId: 'exec-a', delivered: false, deliveryOutcome: 'no_agent', executedAt: null, ignoredParameters: [] })
+      .mockResolvedValueOnce({ ok: true, commandId: 'cmd-a', executionId: 'exec-a', delivered: false, deliveryOutcome: 'no_agent', executedAt: null, deliverBy: new Date('2026-09-13T00:00:00Z'), runAs: 'system' as const, targetSessionId: null, ignoredParameters: [] })
       .mockResolvedValueOnce({ ok: false, code: 'unresolved_variables', error: 'Could not resolve variable(s): repo_url' });
 
     const result = await executeScriptOnDevices({
@@ -338,16 +359,190 @@ describe('executeScriptOnDevices — per-device dispatch failures (#3409 PR2 Tas
 
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    // devicesTargeted was set once at batch-creation time (both devices were
-    // targeted) and must not be decremented by a later per-device failure.
-    expect(result.devicesTargeted).toBe(2);
+    expect(result.admission.targets).toHaveLength(2);
+    expect(result.admission.status).toBe('partially_queued');
 
-    // db.update calls: one devicesFailed increment for the failed device's
-    // batch, plus the final batch-status update.
-    const updateCalls = vi.mocked(db.update).mock.results;
-    expect(updateCalls).toHaveLength(2);
-    const devicesFailedSetCall = updateCalls[0]!.value.set.mock.calls[0][0];
-    expect(devicesFailedSetCall).toHaveProperty('devicesFailed');
+    // db.update calls: the admitted device's `queued` execution write (#5128),
+    // one devicesFailed increment for the failed device's batch, and the final
+    // batch-status update. Exactly ONE of them touches devicesFailed.
+    const sets = allUpdateSets();
+    expect(sets).toHaveLength(3);
+    expect(sets.filter(hasDevicesFailed)).toHaveLength(1);
+  });
+});
+
+// #3409 PR4c-2: the claim-time secret gate ALREADY wrote the failed
+// script_executions row and ALREADY spent the batch's devicesFailed slot
+// before dispatch returned. The fan-out must report the device as failed
+// without writing a SECOND row or double-counting the batch.
+describe('executeScriptOnDevices — dispatch codes the gate already recorded', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(db.insert).mockReturnValue(insertReturning([{ id: 'inserted-1' }]) as any);
+    vi.mocked(db.update).mockReturnValue(updateChain() as any);
+  });
+
+  const twoDeviceSelect = () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(scriptSelectChain([baseScript({ orgId: 'org-b' })]) as any)
+      .mockReturnValueOnce(devicesSelectChain([
+        baseDevice({ id: 'device-a', orgId: 'org-b' }),
+        baseDevice({ id: 'device-b', orgId: 'org-b' }),
+      ]) as any);
+  };
+
+  const okDispatch = (suffix: string) => ({
+    ok: true as const,
+    commandId: `cmd-${suffix}`,
+    executionId: `exec-${suffix}`,
+    delivered: false,
+    deliveryOutcome: 'no_agent' as const,
+  // #5128: every ok dispatch now reports its delivery deadline.
+  deliverBy: new Date('2026-09-13T00:00:00Z'),
+    executedAt: null,
+    ignoredParameters: [],
+    runAs: 'system' as const,
+    targetSessionId: null,
+  });
+
+  it('reports agent_upgrade_required_recorded in failures without a second execution insert or batch increment', async () => {
+    twoDeviceSelect();
+    vi.mocked(dispatchScriptToDevice)
+      .mockResolvedValueOnce(okDispatch('a'))
+      .mockResolvedValueOnce({
+        ok: false,
+        code: 'agent_upgrade_required_recorded',
+        error: 'Agent upgrade required: ...; script not executed',
+      });
+
+    const result = await executeScriptOnDevices({
+      scriptId: 'script-1',
+      deviceIds: ['device-a', 'device-b'],
+      auth: multiOrgAuth,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.admission.targets).toEqual([
+      expect.objectContaining({ requestedDeviceId: 'device-a', admission: 'admitted' }),
+      expect.objectContaining({ requestedDeviceId: 'device-b', admission: 'excluded', reasonCode: 'agent_upgrade_required_recorded' }),
+    ]);
+
+    // db.insert's chain is a single shared mock: call 0 is the batch insert.
+    // A second `.values(...)` call would be the duplicate failed-execution row.
+    const insertChain = vi.mocked(db.insert).mock.results[0]!.value;
+    expect(insertChain.values.mock.calls).toHaveLength(1);
+    // The only db.updates left are the admitted device's `queued` execution
+    // write (#5128) and the final batch-status write — NO devicesFailed
+    // increment (the gate already spent that slot).
+    const sets = allUpdateSets();
+    expect(sets).toHaveLength(2);
+    expect(sets.filter(hasDevicesFailed)).toHaveLength(0);
+  });
+
+  // #3409 PR4c-2 review finding 3 — THE regression this split exists for.
+  // 'agent_upgrade_required' is overwhelmingly the ENQUEUE preflight's
+  // refusal, which returns BEFORE any script_executions row is written. While
+  // it shared a code with the claim-time gate it was suppressed here, so a
+  // batch of 10 devices with 3 pre-PR4b agents showed 7 accounted rows and
+  // `devicesCompleted + devicesFailed >= devicesTargeted` never held — the
+  // batch could never finalize.
+  it('DOES write the row and increment the batch for the ENQUEUE agent_upgrade_required refusal', async () => {
+    twoDeviceSelect();
+    vi.mocked(dispatchScriptToDevice)
+      .mockResolvedValueOnce(okDispatch('a'))
+      .mockResolvedValueOnce({
+        ok: false,
+        code: 'agent_upgrade_required',
+        error: 'Agent upgrade required: ...; script not executed',
+      });
+
+    const result = await executeScriptOnDevices({
+      scriptId: 'script-1',
+      deviceIds: ['device-a', 'device-b'],
+      auth: multiOrgAuth,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.admission.targets[1]).toMatchObject({
+      requestedDeviceId: 'device-b', admission: 'excluded', reasonCode: 'agent_upgrade_required',
+    });
+
+    const insertChain = vi.mocked(db.insert).mock.results[0]!.value;
+    expect(insertChain.values.mock.calls).toHaveLength(2);
+    expect(insertChain.values.mock.calls[1][0]).toMatchObject({
+      deviceId: 'device-b',
+      orgId: 'org-b',
+      status: 'failed',
+    });
+    // Three updates: the admitted device's `queued` execution write (#5128),
+    // the failed device's devicesFailed increment, and the final batch status.
+    const sets = allUpdateSets();
+    expect(sets).toHaveLength(3);
+    expect(sets.filter(hasDevicesFailed)).toHaveLength(1);
+  });
+
+  // The claim gate's infrastructure-fault path writes NOTHING (it cannot know
+  // whether the gate's terminal write landed), so its refusal must also take
+  // the ordinary per-device failure row.
+  it('DOES write the row and increment the batch for secret_gate_unavailable', async () => {
+    twoDeviceSelect();
+    vi.mocked(dispatchScriptToDevice)
+      .mockResolvedValueOnce(okDispatch('a'))
+      .mockResolvedValueOnce({
+        ok: false,
+        code: 'secret_gate_unavailable',
+        error: 'The server could not verify ...; script not executed',
+      });
+
+    const result = await executeScriptOnDevices({
+      scriptId: 'script-1',
+      deviceIds: ['device-a', 'device-b'],
+      auth: multiOrgAuth,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const insertChain = vi.mocked(db.insert).mock.results[0]!.value;
+    expect(insertChain.values.mock.calls).toHaveLength(2);
+    expect(allUpdateSets().filter(hasDevicesFailed)).toHaveLength(1);
+  });
+
+  it('still writes the row and increments the batch for a code the gate did NOT record', async () => {
+    twoDeviceSelect();
+    vi.mocked(dispatchScriptToDevice)
+      .mockResolvedValueOnce(okDispatch('a'))
+      .mockResolvedValueOnce({
+        ok: false,
+        code: 'secret_delivery_unavailable',
+        error: 'Secret delivery is not configured on this server',
+      });
+
+    const result = await executeScriptOnDevices({
+      scriptId: 'script-1',
+      deviceIds: ['device-a', 'device-b'],
+      auth: multiOrgAuth,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.admission.targets[1]).toMatchObject({
+      requestedDeviceId: 'device-b', admission: 'excluded', reasonCode: 'secret_delivery_unavailable',
+    });
+
+    const insertChain = vi.mocked(db.insert).mock.results[0]!.value;
+    expect(insertChain.values.mock.calls).toHaveLength(2);
+    expect(insertChain.values.mock.calls[1][0]).toMatchObject({
+      deviceId: 'device-b',
+      orgId: 'org-b',
+      status: 'failed',
+    });
+    // Three updates: the admitted device's `queued` execution write (#5128),
+    // the failed device's devicesFailed increment, and the final batch status.
+    const sets = allUpdateSets();
+    expect(sets).toHaveLength(3);
+    expect(sets.filter(hasDevicesFailed)).toHaveLength(1);
   });
 });
 
@@ -369,8 +564,8 @@ describe('executeScriptOnDevices — ignored bound parameters (#3409 PR3 §2.2)'
     // the same set — the caller must still see each key exactly once, and a
     // key only one device reported must not be dropped.
     vi.mocked(dispatchScriptToDevice)
-      .mockResolvedValueOnce({ ok: true, commandId: 'cmd-a', executionId: 'exec-a', delivered: false, deliveryOutcome: 'no_agent', executedAt: null, ignoredParameters: ['api_key', 'site_code'] })
-      .mockResolvedValueOnce({ ok: true, commandId: 'cmd-b', executionId: 'exec-b', delivered: false, deliveryOutcome: 'no_agent', executedAt: null, ignoredParameters: ['api_key'] });
+      .mockResolvedValueOnce({ ok: true, commandId: 'cmd-a', executionId: 'exec-a', delivered: false, deliveryOutcome: 'no_agent', executedAt: null, deliverBy: new Date('2026-09-13T00:00:00Z'), runAs: 'system' as const, targetSessionId: null, ignoredParameters: ['api_key', 'site_code'] })
+      .mockResolvedValueOnce({ ok: true, commandId: 'cmd-b', executionId: 'exec-b', delivered: false, deliveryOutcome: 'no_agent', executedAt: null, deliverBy: new Date('2026-09-13T00:00:00Z'), runAs: 'system' as const, targetSessionId: null, ignoredParameters: ['api_key'] });
 
     const result = await executeScriptOnDevices({
       scriptId: 'script-1',
@@ -389,7 +584,7 @@ describe('executeScriptOnDevices — ignored bound parameters (#3409 PR3 §2.2)'
       .mockReturnValueOnce(scriptSelectChain([baseScript({ orgId: 'org-b' })]) as any)
       .mockReturnValueOnce(devicesSelectChain([baseDevice({ id: 'device-a', orgId: 'org-b' })]) as any);
     vi.mocked(dispatchScriptToDevice)
-      .mockResolvedValueOnce({ ok: true, commandId: 'cmd-a', executionId: 'exec-a', delivered: false, deliveryOutcome: 'no_agent', executedAt: null, ignoredParameters: [] });
+      .mockResolvedValueOnce({ ok: true, commandId: 'cmd-a', executionId: 'exec-a', delivered: false, deliveryOutcome: 'no_agent', executedAt: null, deliverBy: new Date('2026-09-13T00:00:00Z'), runAs: 'system' as const, targetSessionId: null, ignoredParameters: [] });
 
     const result = await executeScriptOnDevices({
       scriptId: 'script-1',
@@ -416,7 +611,7 @@ describe('executeScriptOnDevices — ignored bound parameters (#3409 PR3 §2.2)'
       // failed device contributes nothing — the surviving device is what keeps
       // the warning alive for the run.
       .mockResolvedValueOnce({ ok: false, code: 'unresolved_parameters', error: 'Unresolved script parameter(s): no value for required parameter(s) "region"' })
-      .mockResolvedValueOnce({ ok: true, commandId: 'cmd-b', executionId: 'exec-b', delivered: false, deliveryOutcome: 'no_agent', executedAt: null, ignoredParameters: ['api_key'] });
+      .mockResolvedValueOnce({ ok: true, commandId: 'cmd-b', executionId: 'exec-b', delivered: false, deliveryOutcome: 'no_agent', executedAt: null, deliverBy: new Date('2026-09-13T00:00:00Z'), runAs: 'system' as const, targetSessionId: null, ignoredParameters: ['api_key'] });
 
     const result = await executeScriptOnDevices({
       scriptId: 'script-1',
@@ -428,7 +623,7 @@ describe('executeScriptOnDevices — ignored bound parameters (#3409 PR3 §2.2)'
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.ignoredParameters).toEqual(['api_key']);
-    expect(result.failures).toHaveLength(1);
+    expect(result.admission.targets[0]).toMatchObject({ admission: 'excluded', reasonCode: 'unresolved_parameters' });
   });
 });
 
@@ -560,6 +755,7 @@ const maintenanceStatus = (overrides: { active: boolean; suppressScripts: boolea
   suppressPatching: false,
   suppressAutomations: false,
   rebootIfPending: false,
+  windowEndsAt: null,
 });
 
 describe('executeScriptOnDevices — maintenance window suppression', () => {
@@ -570,7 +766,7 @@ describe('executeScriptOnDevices — maintenance window suppression', () => {
     vi.mocked(checkDeviceMaintenanceWindow).mockResolvedValue(maintenanceStatus({ active: false, suppressScripts: false }));
   });
 
-  it('returns 409 with maintenanceSuppressedDeviceIds when every target device is in a script-suppressing maintenance window', async () => {
+  it('returns a typed rejection when every target device is in a script-suppressing maintenance window', async () => {
     vi.mocked(db.select)
       .mockReturnValueOnce(scriptSelectChain([baseScript({ orgId: 'org-b' })]) as any)
       .mockReturnValueOnce(devicesSelectChain([baseDevice({ id: 'device-1', orgId: 'org-b' })]) as any);
@@ -582,11 +778,11 @@ describe('executeScriptOnDevices — maintenance window suppression', () => {
       auth: multiOrgAuth,
     });
 
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.status).toBe(409);
-      expect(result.maintenanceSuppressedDeviceIds).toEqual(['device-1']);
-    }
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.admission).toMatchObject({
+      status: 'rejected',
+      targets: [{ requestedDeviceId: 'device-1', admission: 'suppressed', reasonCode: 'maintenance_suppressed' }],
+    });
     expect(dispatchScriptToDevice).not.toHaveBeenCalled();
   });
 
@@ -611,8 +807,11 @@ describe('executeScriptOnDevices — maintenance window suppression', () => {
 
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.maintenanceSuppressedDeviceIds).toEqual(['device-1']);
-      expect(result.executions.map((e) => e.deviceId)).toEqual(['device-2']);
+      expect(result.admission.status).toBe('partially_queued');
+      expect(result.admission.targets).toEqual([
+        { requestedDeviceId: 'device-1', admission: 'suppressed', reasonCode: 'maintenance_suppressed' },
+        expect.objectContaining({ requestedDeviceId: 'device-2', admission: 'admitted' }),
+      ]);
     }
   });
 });

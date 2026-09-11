@@ -18,12 +18,16 @@ import { captureException } from '../services/sentry';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { contracts } from '../db/schema';
 import { generateDueInvoice } from '../services/contractService';
+import { buildAutomationEligibleOrgPredicate } from '../services/tenantStatus';
 import { runContractRenewalSweep } from '../services/contractRenewal';
 import { issueInvoice } from '../services/invoiceService';
 import { sendInvoiceEmail } from '../services/invoicePdf';
+import { jobSchedule } from './scheduleRegistry';
+import { attachWorkerObservability } from './workerObservability';
 
 const CONTRACT_QUEUE = 'contract-jobs';
-const BILLING_SWEEP_CRON = '0 5 * * *'; // daily 05:00, before the invoice overdue sweep (06:00)
+// Daily, before the invoice overdue sweep in the same hour lane.
+const BILLING_SWEEP_CRON = jobSchedule('contract-billing-sweep');
 
 let contractQueue: Queue | null = null;
 let contractWorker: Worker | null = null;
@@ -45,11 +49,16 @@ export async function runContractBillingSweep(asOf: Date = new Date()): Promise<
 
   const due = await runOutsideDbContext(() =>
     withSystemDbAccessContext(() =>
-      db.select({ id: contracts.id }).from(contracts).where(
+      db.select({ id: contracts.id, orgId: contracts.orgId }).from(contracts).where(
         and(
           eq(contracts.status, 'active' as never),
           isNotNull(contracts.nextBillingAt),
-          lte(contracts.nextBillingAt, today)
+          lte(contracts.nextBillingAt, today),
+          // Org-lifecycle Wave 4: same gate as the renewal/overdue sweeps —
+          // an archived tenant must not keep generating (and auto-issuing +
+          // emailing) invoices from inside its purge countdown. Structurally
+          // identical to runContractRenewalSweep, so it is fixed with it.
+          buildAutomationEligibleOrgPredicate(contracts.orgId)
         )
       )
     )
@@ -65,6 +74,34 @@ export async function runContractBillingSweep(asOf: Date = new Date()): Promise<
         withSystemDbAccessContext(() => generateDueInvoice(row.id, asOf))
       );
       if (res.generated) billed++;
+      // Wave 3 (#3775): a catalog line billed at the contract snapshot because
+      // the price book has no row in the contract's currency is never silent —
+      // one structured warning per gap so ops can fill the book.
+      for (const gap of res.priceBookGaps) {
+        console.warn(
+          '[contract-billing] price-book gap: contract %s line %s item %s has no %s price — billed at the contract snapshot',
+          row.id, gap.contractLineId, gap.catalogItemId, gap.currencyCode
+        );
+      }
+      // #3205: a role-billed contract with devices no line covers (unclassified
+      // 'unknown' devices, or roles with no line) still bills — but never silently.
+      if (res.uncoveredDevices && res.uncoveredDevices.total > 0) {
+        console.warn(
+          '[contract-billing] uncovered devices: contract %s has %d billable device(s) no line bills — %s',
+          row.id, res.uncoveredDevices.total, JSON.stringify(res.uncoveredDevices.byRole)
+        );
+      }
+      // #3205 W04 (#4607): overage the operator chose NOT to auto-bill. Never
+      // silent — the money is on the table and only a human can decide to raise
+      // the allowance or add a line. BILLED overage gets no warning: it is on
+      // the invoice, so it is not silence.
+      for (const o of res.overages) {
+        if (o.mode !== 'flag') continue;
+        console.warn(
+          '[contract-billing] flagged overage: contractId=%s orgId=%s lineId=%s counted=%d included=%d overage=%d overageMode=%s',
+          row.id, row.orgId, o.contractLineId, o.counted, o.included, o.overage, o.mode
+        );
+      }
     } catch (err) {
       failed++;
       console.error('[ContractWorker] generation failed', `contractId=${row.id}`, err instanceof Error ? err.message : err);
@@ -139,6 +176,7 @@ export async function scheduleContractJobs(): Promise<void> {
 export async function initializeContractWorkers(): Promise<void> {
   try {
     contractWorker = createContractWorker();
+  attachWorkerObservability(contractWorker, 'contractWorker');
 
     contractWorker.on('error', (error) => {
       console.error('[ContractWorker] Worker error:', error);

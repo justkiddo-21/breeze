@@ -1,0 +1,90 @@
+{
+  "title": "Genehmigungen",
+  "description": "Prüfen Sie Aktionen mit großer Auswirkung, die auf Ihre Entscheidung warten.",
+  "loading": "Genehmigungen werden geladen…",
+  "loadError": "Genehmigungen konnten nicht geladen werden. Versuchen Sie es erneut.",
+  "retry": "Erneut versuchen",
+  "empty": {
+    "title": "Keine ausstehenden Genehmigungen",
+    "description": "Neue Anfragen erscheinen hier, sobald Ihre Entscheidung erforderlich ist."
+  },
+  "requestedBy": "Angefordert von {{client}}",
+  "proposedByAgent": "Vorgeschlagen von {{agent}} (KI-Agent)",
+  "targetDevice": "Zielgerät: {{hostname}}",
+  "batch": {
+    "approveAll": "Alle genehmigen ({{count}})",
+    "declineAll": "Alle ablehnen ({{count}})",
+    "groupTitle": "{{count}} ähnliche Anfragen · {{tool}}",
+    "moreHostnames": "+{{count}} weitere",
+    "denyConfirmSummary": "Dies lehnt {{count}} Anfragen für {{org}} ab."
+  },
+  "filters": {
+    "orgLabel": "Organisation",
+    "allOrganizations": "Alle Organisationen ({{count}})",
+    "orgOption": "{{name}} ({{count}} ausstehend)",
+    "searchLabel": "Suche",
+    "searchPlaceholder": "Suche nach Aktion, Gerät oder Agent…",
+    "sortLabel": "Sortieren nach",
+    "sortExpiringSoonest": "Läuft bald ab",
+    "sortNewest": "Neueste",
+    "showingLoaded": "{{shown}} von {{loaded}} geladenen werden angezeigt",
+    "clearFilters": "Filter zurücksetzen",
+    "noMatches": {
+      "title": "Keine Genehmigungen entsprechen Ihren Filtern",
+      "description": "Versuchen Sie eine andere Organisation oder einen anderen Suchbegriff, oder setzen Sie Ihre Filter zurück."
+    }
+  },
+  "risk": {
+    "low": "Niedriges Risiko",
+    "medium": "Mittleres Risiko",
+    "high": "Hohes Risiko",
+    "critical": "Kritisches Risiko"
+  },
+  "denyPrompt": "Warum lehnen Sie diese Anfrage ab? Eine Begründung ist optional.",
+  "denyReasonPlaceholder": "Optional – wird der anfragenden Person mitgeteilt",
+  "confirmDeny": "Ablehnung bestätigen",
+  "cancel": "Abbrechen",
+  "deny": "Ablehnen",
+  "approve": "Genehmigen",
+  "deciding": "Wird gesendet…",
+  "expiresIn": "Läuft in {{minutes}} Min. ab",
+  "expiresSoon": "Läuft in weniger als einer Minute ab",
+  "expired": "Abgelaufen",
+  "unknownOrganization": "Unbekannte Organisation",
+  "charCount": "{{count}}/{{max}}",
+  "approveToast": "{{action}} für {{org}} genehmigt",
+  "pagination": {
+    "showing": "{{shown}} von {{total}} werden angezeigt",
+    "showingCount": "{{shown}} werden angezeigt",
+    "loadMore": "Mehr laden",
+    "loadMoreError": "Weitere Elemente konnten nicht geladen werden. Versuchen Sie es erneut."
+  },
+  "errors": {
+    "noApproverDevice": "Registrieren Sie in Ihrem Profil ein Genehmigungsgerät und versuchen Sie es erneut.",
+    "notSoleApprover": "Eine andere berechtigte Person muss diese Anfrage genehmigen.",
+    "verificationFailed": "Die Überprüfung wurde abgebrochen oder ist fehlgeschlagen. Versuchen Sie es erneut.",
+    "alreadyDecided": "Über diese Anfrage wurde bereits entschieden.",
+    "expired": "Diese Anfrage ist abgelaufen, bevor eine Entscheidung getroffen wurde.",
+    "decisionFailed": "Die Entscheidung konnte nicht gesendet werden. Versuchen Sie es erneut.",
+    "batchStepUp": "Für diesen Stapel ist eine stärkere Anmeldung erforderlich. Genehmigen Sie die Anfragen einzeln.",
+    "batchNotHomogeneous": "Über diese Anfragen kann nicht mehr gemeinsam entschieden werden.",
+    "batchTooLarge": "Dieser Stapel enthält zu viele Anfragen, um sie gemeinsam zu entscheiden. Genehmigen Sie sie in kleineren Gruppen.",
+    "driftedFromBatch": "Diese Anfrage hat sich geändert und muss einzeln entschieden werden."
+  },
+  "registerDevice": "Gerät registrieren",
+  "alwaysAllow": {
+    "button": "Genehmigen und immer zulassen",
+    "confirm": {
+      "title": "Genehmigen und Vorautorisierung anfordern",
+      "message": "Damit wird die gerade angezeigte Anfrage genehmigt. Außerdem wird eine zweite genehmigende Person gebeten, {{opKey}} für den Agenten dieser Organisation vorzuautorisieren – das gilt nur für zukünftige Ausführungen und autorisiert weder diese Anfrage noch andere bereits wartende Entscheidungen rückwirkend.",
+      "action": "Genehmigen und anfordern"
+    },
+    "toasts": {
+      "requested": "Genehmigt. Eine zweite genehmigende Person muss die Vorautorisierung noch bestätigen, bevor dieser Vorgang unbeaufsichtigt ausgeführt wird; sie gilt nur für zukünftige Ausführungen."
+    },
+    "errors": {
+      "approvedPromoteFailed": "Genehmigt, aber die Anfrage zur Vorautorisierung konnte nicht gesendet werden. Versuchen Sie es erneut in den Agenteneinstellungen.",
+      "policyDecideDisabled": "Genehmigt. Die Vorautorisierung konnte nicht angefordert werden, da sie für diese Bereitstellung deaktiviert ist."
+    }
+  }
+}

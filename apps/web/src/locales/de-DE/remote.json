@@ -196,7 +196,7 @@
       "justNow": "Gerade eben",
       "minutesAgo": "Vor {{count}}m"
     },
-    "title": "Titel",
+    "title": "Dateiaktivität",
     "unverifiedHint": "Unbestätigter Hinweis"
   },
   "fileManager": {
@@ -236,7 +236,7 @@
       "scanned": "Gescannt: {{count}} Dateien",
       "selected": "Ausgewählt: {{count}} · {{size}}",
       "threshold": "Schwelle",
-      "title": "Titel",
+      "title": "Datenträgeranalyse",
       "trigger": "Auslöser: {{value}}"
     },
     "dismiss": "Schließen",
@@ -246,6 +246,7 @@
       "copy": "Kopieren fehlgeschlagen",
       "delete": "Fehler beim Löschen",
       "download": "Download fehlgeschlagen",
+      "downloadTooLarge": "Zu groß für den Download ({{size}}). Der Dateibrowser überträgt Dateien bis {{max}}.",
       "loadDirectory": "Das Verzeichnis konnte nicht geladen werden",
       "move": "Fehler beim Verschieben",
       "readFile": "Datei konnte nicht gelesen werden",
@@ -259,7 +260,7 @@
     "moveTo": "Verschieben nach",
     "selectedCount": "Ausgewählte Anzahl",
     "size": "Größe",
-    "title": "Titel",
+    "title": "Dateimanager",
     "transfers": "Dateiübertragungen",
     "trash": "Papierkorb",
     "selectedCount_one": "{{count}} ausgewählt",
@@ -439,10 +440,10 @@
       "generic": "Es ist ein Fehler aufgetreten"
     },
     "refreshStatus": "Status aktualisieren",
-    "title": "Titel"
+    "title": "Dateimanager"
   },
   "remoteTerminal": {
-    "connectedBang": "Verbundener Knall",
+    "connectedBang": "Verbunden!",
     "connectingTo": "Verbinden mit {{hostname}}...",
     "copySelection": "Auswahl kopieren",
     "disconnect": "Trennen",
@@ -615,7 +616,7 @@
     "noServicesFound": "Keine Dienste gefunden",
     "ok": "Okay",
     "page": "Seite {{current}} von {{total}}",
-    "refreshHint": "Hinweis aktualisieren",
+    "refreshHint": "Aktualisieren, um nach Diensten zu suchen.",
     "restartService": "Dienst neu starten",
     "searchPlaceholder": "Dienste suchen...",
     "serviceConfirm": "Möchten Sie den Dienst {{service}} wirklich {{action}}?",

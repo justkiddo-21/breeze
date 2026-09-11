@@ -7,6 +7,8 @@ import { getBullMQConnection } from '../services/redis';
 import { evaluateAuditBaselineDrift } from '../services/auditBaselineService';
 import { captureException } from '../services/sentry';
 import { isReusableState } from '../services/bullmqUtils';
+import { jobSchedule } from './scheduleRegistry';
+import { attachWorkerObservability } from './workerObservability';
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -131,7 +133,7 @@ async function scheduleRecurringJobs(): Promise<void> {
     { type: 'audit-policy-collection' },
     {
       jobId: 'audit-policy-collection-daily',
-      repeat: { pattern: '0 3 * * *' }, // Daily at 03:00 UTC
+      repeat: { pattern: jobSchedule('audit-policy-collection') },
       removeOnComplete: { count: 10 },
       removeOnFail: { count: 25 },
     }
@@ -142,7 +144,7 @@ async function scheduleRecurringJobs(): Promise<void> {
     { type: 'audit-drift-evaluator' },
     {
       jobId: 'audit-drift-evaluator-hourly',
-      repeat: { pattern: '0 * * * *' }, // Every hour on the hour
+      repeat: { pattern: jobSchedule('audit-drift-evaluator') },
       removeOnComplete: { count: 20 },
       removeOnFail: { count: 50 },
     }
@@ -151,6 +153,7 @@ async function scheduleRecurringJobs(): Promise<void> {
 
 export async function initializeAuditBaselineJobs(): Promise<void> {
   auditBaselineWorker = createAuditBaselineWorker();
+  attachWorkerObservability(auditBaselineWorker, 'auditBaselineJobs');
 
   auditBaselineWorker.on('error', (error) => {
     console.error('[AuditBaselineJobs] Worker error:', error);

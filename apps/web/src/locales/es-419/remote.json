@@ -196,7 +196,7 @@
       "justNow": "En este momento",
       "minutesAgo": "hace {{count}}m"
     },
-    "title": "Título",
+    "title": "Actividad de archivos",
     "unverifiedHint": "Pista no verificada"
   },
   "fileManager": {
@@ -236,7 +236,7 @@
       "scanned": "Escaneado: archivos {{count}}",
       "selected": "Seleccionado: {{count}} · {{size}}",
       "threshold": "Límite",
-      "title": "Título",
+      "title": "Inteligencia de disco",
       "trigger": "Activador: {{value}}"
     },
     "dismiss": "Descartar",
@@ -246,6 +246,7 @@
       "copy": "No se pudo copiar",
       "delete": "No se pudo eliminar",
       "download": "No se pudo descargar",
+      "downloadTooLarge": "Demasiado grande para descargar ({{size}}). El explorador de archivos transfiere archivos de hasta {{max}}.",
       "loadDirectory": "No se pudo cargar el directorio",
       "move": "No se pudo mover",
       "readFile": "No se pudo leer el archivo",
@@ -259,7 +260,7 @@
     "moveTo": "Convidar a",
     "selectedCount": "Recuento seleccionado",
     "size": "Tamaño",
-    "title": "Título",
+    "title": "Administrador de archivos",
     "transfers": "Transferencias",
     "trash": "Papelera",
     "selectedCount_one": "{{count}} seleccionado",
@@ -439,10 +440,10 @@
       "generic": "Se produjo un error"
     },
     "refreshStatus": "Actualizar estado",
-    "title": "Título"
+    "title": "Administrador de archivos"
   },
   "remoteTerminal": {
-    "connectedBang": "Explosión conectada",
+    "connectedBang": "¡Conectado!",
     "connectingTo": "Conectándose a {{hostname}}...",
     "copySelection": "Copiar selección",
     "disconnect": "Desconectar",
@@ -615,7 +616,7 @@
     "noServicesFound": "No se encontraron servicios",
     "ok": "De acuerdo",
     "page": "Página {{current}} de {{total}}",
-    "refreshHint": "Actualizar sugerencia",
+    "refreshHint": "Actualiza para buscar servicios.",
     "restartService": "Reiniciar servicio",
     "searchPlaceholder": "Buscar servicios...",
     "serviceConfirm": "¿Está seguro de que desea {{action}} el servicio {{service}}?",

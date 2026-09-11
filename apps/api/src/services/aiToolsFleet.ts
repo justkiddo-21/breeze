@@ -58,14 +58,26 @@ import {
   reportRuns,
 } from '../db/schema/reports';
 import { devices, sites } from '../db/schema';
+import { schedulePeripheralPolicyDevice } from '../jobs/peripheralJobs';
 import { eq, and, desc, sql, inArray, gte, lte, isNull, or, SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
+
+async function scheduleAiGroupPeripheralReconciliation(deviceIds: readonly string[]): Promise<void> {
+  await Promise.all([...new Set(deviceIds)].map((deviceId) =>
+    schedulePeripheralPolicyDevice(deviceId, 'ai_group_membership_changed').catch((error) => {
+      console.error(`[aiToolsFleet] failed to schedule peripheral reconciliation for ${deviceId}:`, error);
+    })
+  ));
+}
 import type { AiTool } from './aiTools';
 import type { UserPermissions } from './permissions';
 import { canManagePartnerWidePolicies, PARTNER_WIDE_WRITE_DENIED_MESSAGE } from './partnerWideAccess';
+import { filterWindowsToSiteScope, scopeWindowForRead } from './maintenanceSiteScope';
 import { deviceSiteDenied, deviceIdSiteDenied, resolveSiteAllowedDeviceIds } from './aiToolsSiteScope';
 import { checkAutomationTargetsWithinSiteScope } from './automationRuntime';
+import { scanProjectedAutomationRuns } from './automationReadProjection';
 import { assertReportExecutionPreflight } from './reportGenerationService';
+import { deleteDeviceGroup, DeviceGroupDeleteError } from './deviceGroupDelete';
 import {
   decodeSiteScope,
   intersectSiteScopes,
@@ -82,10 +94,18 @@ import {
   type PersistedSiteScopeColumns,
   type ReportAction,
   type ReportExecutionAuthority,
+  type UserReportExecutionAuthority,
 } from './siteScope';
 import { upsertPatchApproval, resolvePartnerIdForOrg } from '../routes/patches/helpers';
 import { sanitizeThrownToolError } from './aiToolErrors';
 import { listFleetFindings } from './fleetFindings/query';
+import {
+  AI_TRIAGE_SYSTEM_MANAGED_ERROR_CODE,
+  MANAGED_AUTOMATION_ERROR_CODE,
+  containsAiTriageAction,
+  isManagedAutomation,
+  managedAutomationOwnerIsLive,
+} from './aiAgents/managedAutomation';
 import type {
   FleetFindingKind,
   FleetFindingSeverity,
@@ -117,6 +137,7 @@ const aiReportDefinitionMetadataProjection = {
   executionScopeUserId: reports.executionScopeUserId,
   executionScopeFingerprint: reports.executionScopeFingerprint,
   executionScopeCapturedAt: reports.executionScopeCapturedAt,
+  executionScopePrincipalKind: reports.executionScopePrincipalKind,
 };
 
 const aiReportRunMetadataProjection = {
@@ -129,6 +150,7 @@ const aiReportRunMetadataProjection = {
   executionScopeUserId: reportRuns.executionScopeUserId,
   executionScopeFingerprint: reportRuns.executionScopeFingerprint,
   executionScopeCapturedAt: reportRuns.executionScopeCapturedAt,
+  executionScopePrincipalKind: reportRuns.executionScopePrincipalKind,
 };
 
 async function aiLiveReportAuthority(
@@ -136,11 +158,11 @@ async function aiLiveReportAuthority(
   orgId: string,
   action: ReportAction,
 ): Promise<
-  (Omit<ReportExecutionAuthority, 'scope'> & { scope: LiveSiteScopeV1 }) | null
+  (Omit<UserReportExecutionAuthority, 'scope'> & { scope: LiveSiteScopeV1 }) | null
 > {
   const result = await resolveRequestReportAuthority(auth, orgId, action);
   if (!result.ok || result.authority.scope.kind === 'legacy_unscoped') return null;
-  return result.authority as Omit<ReportExecutionAuthority, 'scope'> & {
+  return result.authority as Omit<UserReportExecutionAuthority, 'scope'> & {
     scope: LiveSiteScopeV1;
   };
 }
@@ -1238,11 +1260,14 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         // Site axis (app-layer only; RLS does NOT enforce it).
         if (deviceSiteDenied(auth, existing.siteId)) return JSON.stringify({ error: 'Group not found or access denied' });
 
-        await db.transaction(async (tx) => {
-          await tx.delete(deviceGroupMemberships).where(eq(deviceGroupMemberships.groupId, existing.id));
-          await tx.delete(groupMembershipLog).where(eq(groupMembershipLog.groupId, existing.id));
-          await tx.delete(deviceGroups).where(eq(deviceGroups.id, existing.id));
-        });
+        let result: Awaited<ReturnType<typeof deleteDeviceGroup>>;
+        try {
+          result = await deleteDeviceGroup(existing.id, existing.orgId);
+        } catch (err) {
+          if (err instanceof DeviceGroupDeleteError) return JSON.stringify({ error: err.message, code: err.code });
+          throw err;
+        }
+        await scheduleAiGroupPeripheralReconciliation(result.affectedDeviceIds);
         return JSON.stringify({ success: true, message: `Group "${existing.name}" deleted` });
       }
 
@@ -1279,6 +1304,8 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           .onConflictDoNothing()
           .returning({ deviceId: deviceGroupMemberships.deviceId });
 
+        await scheduleAiGroupPeripheralReconciliation(results.map(({ deviceId }) => deviceId));
+
         const skipped = deviceIdList.length - insertableIds.length;
         return JSON.stringify({ success: true, added: results.length, ...(skipped > 0 ? { skipped } : {}), message: `${results.length} device(s) added to group "${group.name}"${skipped > 0 ? ` (${skipped} skipped — outside org/site scope)` : ''}` });
       }
@@ -1308,13 +1335,16 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           return JSON.stringify({ success: true, removed: 0, ...(skipped > 0 ? { skipped } : {}), message: 'No in-scope devices to remove' });
         }
 
-        await db.delete(deviceGroupMemberships)
+        const removedMemberships = await db.delete(deviceGroupMemberships)
           .where(and(
             eq(deviceGroupMemberships.groupId, group.id),
             inArray(deviceGroupMemberships.deviceId, removableIds),
-          ));
+          ))
+          .returning({ deviceId: deviceGroupMemberships.deviceId });
 
-        return JSON.stringify({ success: true, removed: removableIds.length, ...(skipped > 0 ? { skipped } : {}), message: `Device(s) removed from group "${group.name}"${skipped > 0 ? ` (${skipped} skipped — outside org/site scope)` : ''}` });
+        await scheduleAiGroupPeripheralReconciliation(removedMemberships.map(({ deviceId }) => deviceId));
+
+        return JSON.stringify({ success: true, removed: removedMemberships.length, ...(skipped > 0 ? { skipped } : {}), message: `Device(s) removed from group "${group.name}"${skipped > 0 ? ` (${skipped} skipped — outside org/site scope)` : ''}` });
       }
 
       return JSON.stringify({ error: `Unknown action: ${action}` });
@@ -1359,6 +1389,12 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
       const action = input.action as string;
       const orgId = getOrgId(auth);
 
+      // NOTE (#3654): the create/update/delete blocks further down are dead —
+      // this guard and the `action` enum both exclude them. If they are ever
+      // re-enabled they MUST route through
+      // `checkMaintenanceTargetsWithinSiteScope` (services/maintenanceSiteScope),
+      // exactly as routes/maintenance.ts does: `maintenanceWindowWhere` below is
+      // org/partner only and does not defend the site axis.
       if (action === 'create' || action === 'update' || action === 'delete') {
         return JSON.stringify({
           error: `Action "${action}" is disabled. Maintenance windows must be managed through configuration policies. Use manage_policy_feature_link with featureType "maintenance" to configure maintenance windows on a policy.`,
@@ -1371,6 +1407,11 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         if (oc) conditions.push(oc);
 
         const limit = Math.min(Math.max(1, Number(input.limit) || 25), 100);
+        // The SQL limit lands before the site filter, so a site-restricted
+        // caller scans a wider (still bounded) page and the result is sliced to
+        // `limit` after filtering — otherwise other sites' windows crowd out the
+        // ones actually suppressing this caller's own fleet (#3654).
+        const scanLimit = auth.allowedSiteIds ? Math.min(Math.max(limit * 5, 100), 500) : limit;
         const rows = await db.select({
           id: maintenanceWindows.id,
           name: maintenanceWindows.name,
@@ -1381,12 +1422,22 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           status: maintenanceWindows.status,
           suppressAlerts: maintenanceWindows.suppressAlerts,
           suppressPatching: maintenanceWindows.suppressPatching,
+          // Site-axis inputs (#3654) — stripped from the reply below.
+          orgId: maintenanceWindows.orgId,
+          siteIds: maintenanceWindows.siteIds,
+          groupIds: maintenanceWindows.groupIds,
+          deviceIds: maintenanceWindows.deviceIds,
         }).from(maintenanceWindows)
           .where(conditions.length > 0 ? and(...conditions) : undefined)
           .orderBy(desc(maintenanceWindows.startTime))
-          .limit(limit);
+          .limit(scanLimit);
 
-        return JSON.stringify({ windows: rows, showing: rows.length });
+        // `maintenanceWindowWhere` is org/partner only; narrow to the caller's
+        // sites the same way GET /maintenance/windows does (#3654).
+        const visibleRows = (await filterWindowsToSiteScope(rows, { allowedSiteIds: auth.allowedSiteIds })).slice(0, limit);
+        const windows = visibleRows.map(({ orgId: _orgId, siteIds: _siteIds, groupIds: _groupIds, deviceIds: _deviceIds, ...rest }) => rest);
+
+        return JSON.stringify({ windows, showing: windows.length });
       }
 
       if (action === 'get') {
@@ -1398,13 +1449,19 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         const [win] = await db.select().from(maintenanceWindows).where(and(...conditions)).limit(1);
         if (!win) return JSON.stringify({ error: 'Maintenance window not found or access denied' });
 
+        // Site axis (#3654): a window reaching none of the caller's sites is not
+        // theirs to read, and its occurrences would disclose it too. A visible
+        // one comes back with its target arrays narrowed to the caller's scope.
+        const scopedWin = await scopeWindowForRead(win, { allowedSiteIds: auth.allowedSiteIds });
+        if (!scopedWin) return JSON.stringify({ error: 'Maintenance window not found or access denied' });
+
         const occurrences = await db.select()
           .from(maintenanceOccurrences)
           .where(eq(maintenanceOccurrences.windowId, win.id))
           .orderBy(desc(maintenanceOccurrences.startTime))
           .limit(10);
 
-        return JSON.stringify({ window: win, occurrences });
+        return JSON.stringify({ window: scopedWin, occurrences });
       }
 
       if (action === 'active_now') {
@@ -1425,6 +1482,11 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           targetType: maintenanceWindows.targetType,
           suppressAlerts: maintenanceWindows.suppressAlerts,
           suppressPatching: maintenanceWindows.suppressPatching,
+          // Site-axis inputs (#3654) — stripped from the reply below.
+          orgId: maintenanceWindows.orgId,
+          siteIds: maintenanceWindows.siteIds,
+          groupIds: maintenanceWindows.groupIds,
+          deviceIds: maintenanceWindows.deviceIds,
         }).from(maintenanceWindows)
           .where(and(...conditions));
 
@@ -1445,10 +1507,25 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           targetType: maintenanceWindows.targetType,
           suppressAlerts: maintenanceWindows.suppressAlerts,
           suppressPatching: maintenanceWindows.suppressPatching,
+          // Site-axis inputs (#3654) — stripped from the reply below.
+          orgId: maintenanceWindows.orgId,
+          siteIds: maintenanceWindows.siteIds,
+          groupIds: maintenanceWindows.groupIds,
+          deviceIds: maintenanceWindows.deviceIds,
         }).from(maintenanceWindows)
           .where(and(...scheduledConditions));
 
-        return JSON.stringify({ activeWindows: [...active, ...scheduled], count: active.length + scheduled.length });
+        // `maintenanceWindowWhere` is org/partner only; narrow to the caller's
+        // sites (#3654) before reporting what is suppressing their fleet.
+        const visibleActive = await filterWindowsToSiteScope(
+          [...active, ...scheduled],
+          { allowedSiteIds: auth.allowedSiteIds },
+        );
+        const activeWindows = visibleActive.map(
+          ({ orgId: _orgId, siteIds: _siteIds, groupIds: _groupIds, deviceIds: _deviceIds, ...rest }) => rest,
+        );
+
+        return JSON.stringify({ activeWindows, count: activeWindows.length });
       }
 
       if (action === 'create') {
@@ -1594,7 +1671,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         }
 
         const limit = Math.min(Math.max(1, Number(input.limit) || 25), 100);
-        const rows = await db.select({
+        const selectRows = () => db.select({
           id: automations.id,
           name: automations.name,
           description: automations.description,
@@ -1609,18 +1686,37 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           partnerId: automations.partnerId,
           conditions: automations.conditions,
         }).from(automations)
-          .where(conditions.length > 0 ? and(...conditions) : undefined)
-          .orderBy(desc(automations.createdAt))
-          .limit(limit);
+          .where(conditions.length > 0 ? and(...conditions) : undefined);
 
         // Site axis: omit automations whose resolvable target set escapes the
         // caller's site allowlist (only queries the DB for restricted callers).
-        let visible = rows;
-        if (auth.allowedSiteIds) {
-          const checks = await Promise.all(
-            rows.map((r) => checkAutomationTargetsWithinSiteScope(r as any, siteScopePerms(auth))),
-          );
-          visible = rows.filter((_, i) => checks[i]!.ok);
+        let visible: any[];
+        if (auth.allowedSiteIds !== undefined) {
+          visible = [];
+          const scanSize = 100;
+          let databaseOffset = 0;
+          while (visible.length < limit) {
+            const batch = await selectRows()
+              .orderBy(desc(automations.createdAt), desc(automations.id))
+              .limit(scanSize).offset(databaseOffset);
+            if (batch.length === 0) break;
+            for (const row of batch) {
+              if ((await checkAutomationTargetsWithinSiteScope(row as any, siteScopePerms(auth))).ok) {
+                visible.push(row);
+                if (visible.length === limit) break;
+              }
+            }
+            databaseOffset += batch.length;
+            if (batch.length < scanSize) break;
+          }
+          visible = visible.map((automation: any) => {
+            const { lastRunAt: _lastRunAt, runCount: _runCount, ...row } = automation;
+            return row;
+          });
+        } else {
+          visible = await selectRows()
+            .orderBy(desc(automations.createdAt), desc(automations.id))
+            .limit(limit);
         }
 
         return JSON.stringify({ automations: visible, showing: visible.length });
@@ -1638,6 +1734,10 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         const getDenied = await automationSiteDenied(auto);
         if (getDenied) return JSON.stringify({ error: getDenied });
 
+        if (auth.allowedSiteIds !== undefined) {
+          const { lastRunAt: _lastRunAt, runCount: _runCount, ...restricted } = auto;
+          return JSON.stringify({ automation: restricted });
+        }
         return JSON.stringify({ automation: auto });
       }
 
@@ -1654,16 +1754,26 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         if (historyDenied) return JSON.stringify({ error: historyDenied });
 
         const limit = Math.min(Math.max(1, Number(input.limit) || 25), 100);
-        const runs = await db.select()
-          .from(automationRuns)
-          .where(eq(automationRuns.automationId, auto.id))
-          .orderBy(desc(automationRuns.startedAt))
-          .limit(limit);
+        const page = auth.allowedSiteIds === undefined
+          ? await db.select()
+            .from(automationRuns)
+            .where(eq(automationRuns.automationId, auto.id))
+            .orderBy(desc(automationRuns.startedAt))
+            .limit(limit)
+          : (await scanProjectedAutomationRuns({
+            automationId: auto.id,
+            allowedSiteIds: auth.allowedSiteIds,
+            limit,
+          })).rows;
 
-        return JSON.stringify({ automationId: auto.id, runs, showing: runs.length });
+        return JSON.stringify({ automationId: auto.id, runs: page, showing: page.length });
       }
 
       if (action === 'create') {
+        // Defence behind the disabled-action gate in case create is re-enabled.
+        if (containsAiTriageAction(input.actions)) {
+          return JSON.stringify({ error: AI_TRIAGE_SYSTEM_MANAGED_ERROR_CODE });
+        }
         if (!orgId) return JSON.stringify({ error: 'Organization context required' });
         const [auto] = await db.insert(automations).values({
           orgId,
@@ -1688,6 +1798,14 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
         const [existing] = await db.select().from(automations).where(and(...conditions)).limit(1);
         if (!existing) return JSON.stringify({ error: 'Automation not found or access denied' });
+        if (isManagedAutomation(existing)) {
+          return JSON.stringify({ error: MANAGED_AUTOMATION_ERROR_CODE, agentId: existing.managedByAgentId });
+        }
+        // Mirrors the create branch: an ai_triage action is seeded per agent,
+        // never authored onto an existing row.
+        if (containsAiTriageAction(input.actions)) {
+          return JSON.stringify({ error: AI_TRIAGE_SYSTEM_MANAGED_ERROR_CODE });
+        }
 
         // Defense-in-depth (#2133): this action is disabled by the early
         // return above, but if it is ever re-enabled, mutating a partner-wide
@@ -1717,6 +1835,12 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
         const [existing] = await db.select().from(automations).where(and(...conditions)).limit(1);
         if (!existing) return JSON.stringify({ error: 'Automation not found or access denied' });
+        // Mirrors the REST delete route: a managed row becomes deletable once
+        // its agent is soft-disabled, because nothing else can ever remove it.
+        if (isManagedAutomation(existing)
+          && await managedAutomationOwnerIsLive(existing.managedByAgentId as string)) {
+          return JSON.stringify({ error: MANAGED_AUTOMATION_ERROR_CODE, agentId: existing.managedByAgentId });
+        }
 
         // Defense-in-depth (#2133): see the update-action gate above.
         if (existing.orgId === null && !canManagePartnerWidePolicies(auth)) {
@@ -1738,6 +1862,9 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
         const [existing] = await db.select().from(automations).where(and(...conditions)).limit(1);
         if (!existing) return JSON.stringify({ error: 'Automation not found or access denied' });
+        if (isManagedAutomation(existing)) {
+          return JSON.stringify({ error: MANAGED_AUTOMATION_ERROR_CODE, agentId: existing.managedByAgentId });
+        }
 
         // Toggling a partner-wide automation mutates behavior across every
         // org under the partner (#2133) — requires the partner-wide capability.
@@ -1764,6 +1891,9 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
         const [auto] = await db.select().from(automations).where(and(...conditions)).limit(1);
         if (!auto) return JSON.stringify({ error: 'Automation not found or access denied' });
+        if (isManagedAutomation(auto)) {
+          return JSON.stringify({ error: MANAGED_AUTOMATION_ERROR_CODE, agentId: auto.managedByAgentId });
+        }
 
         // Running a partner-wide automation fans actions out across every org
         // under the partner (#2133) — requires the partner-wide capability.
@@ -2133,6 +2263,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
               return JSON.stringify({ error: 'Report not found or access denied' });
             }
             executionAuthority = {
+              principalKind: 'user',
               scope: effectiveScope,
               principalUserId: access.authority.principalUserId,
               capturedAt: access.authority.capturedAt,
@@ -2168,6 +2299,9 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           const [run] = await db.insert(reportRuns).values({
             reportId,
             status: 'pending',
+            requestedByKind: 'user',
+            requestedByUserId: auth.user.id,
+            requestedByPortalUserId: null,
             ...persistedSiteScopeValues(executionAuthority),
           }).returning();
           runId = run?.id ?? null;
@@ -2427,6 +2561,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           executionScopeUserId: reportRuns.executionScopeUserId,
           executionScopeFingerprint: reportRuns.executionScopeFingerprint,
           executionScopeCapturedAt: reportRuns.executionScopeCapturedAt,
+          executionScopePrincipalKind: reportRuns.executionScopePrincipalKind,
         }).from(reportRuns)
           .innerJoin(reports, eq(reportRuns.reportId, reports.id))
           .where(and(

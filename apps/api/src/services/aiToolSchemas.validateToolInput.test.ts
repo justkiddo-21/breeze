@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { validateToolInput } from './aiToolSchemas';
+import { toolInputSchemas, validateToolInput } from './aiToolSchemas';
 
 const TEST_UUID = '00000000-0000-0000-0000-000000000001';
 
@@ -99,5 +99,61 @@ describe('set_device_context parenthesized input (#3094)', () => {
     if (!result.success) {
       expect(result.error).toContain('summary');
     }
+  });
+});
+
+// Multi-currency wave 4 (#3776): the assembly actions take an optional header
+// currency override. Spec §4 mandates the shared `currencyCodeSchema` for every
+// currency field — a bare `length(3)` would admit unsupported codes.
+describe('manage_invoices currencyCode (#3776)', () => {
+  const base = { action: 'assemble_from_org', orgId: TEST_UUID, from: '2026-06-01', to: '2026-06-30' };
+
+  it('accepts and normalizes a supported code', () => {
+    const r = toolInputSchemas.manage_invoices!.safeParse({ ...base, currencyCode: 'eur' });
+    expect(r.success).toBe(true);
+    if (r.success) expect((r.data as { currencyCode?: string }).currencyCode).toBe('EUR');
+  });
+
+  it('rejects an unknown code and a three-decimal code outside SUPPORTED_CURRENCIES', () => {
+    expect(validateToolInput('manage_invoices', { ...base, currencyCode: 'ZZZ' }).success).toBe(false);
+    expect(validateToolInput('manage_invoices', { ...base, currencyCode: 'BHD' }).success).toBe(false);
+  });
+
+  it('stays optional', () => {
+    expect(validateToolInput('manage_invoices', base)).toEqual({ success: true });
+  });
+});
+
+/**
+ * #4888 — `validateToolInput` is the FIRST gate an AI `run_script` call clears
+ * (aiTools.ts runs it before the handler exists), so the run-context pair has
+ * to be expressible here or the model simply cannot pass it, and 'elevated'
+ * has to be refused here as well as deeper in.
+ *
+ * Deliberately asserts on `toolInputSchemas.run_script.parse(...).runAs` and
+ * not merely on `validateToolInput(...).success`: a non-strict zod object
+ * accepts an unrecognised key and reports success while STRIPPING it, so a
+ * success-only assertion would pass even if the field had never been added.
+ */
+describe('run_script run context (#4888)', () => {
+  const base = { scriptId: TEST_UUID, deviceIds: [TEST_UUID] };
+
+  it('accepts runAs and targetSessionId, and keeps them after parsing', () => {
+    expect(validateToolInput('run_script', { ...base, runAs: 'user', targetSessionId: 3 }).success).toBe(true);
+
+    const parsed = toolInputSchemas.run_script!.parse({ ...base, runAs: 'user', targetSessionId: 3 }) as {
+      runAs?: string; targetSessionId?: number;
+    };
+    expect(parsed.runAs).toBe('user');
+    expect(parsed.targetSessionId).toBe(3);
+  });
+
+  it("refuses runAs: 'elevated' — elevation is not a launch-time choice on any path", () => {
+    const result = validateToolInput('run_script', { ...base, runAs: 'elevated' });
+    expect(result.success).toBe(false);
+  });
+
+  it('still accepts a call that names no run context at all', () => {
+    expect(validateToolInput('run_script', base).success).toBe(true);
   });
 });

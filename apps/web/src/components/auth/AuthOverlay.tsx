@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { bootstrapFromCfAccessRedirect, bootstrapFromSsoCode, restoreAccessTokenFromCookie, settleSsoLoginGate, useAuthStore } from '../../stores/auth';
+import { bootstrapFromCfAccessRedirect, bootstrapFromSsoCode, markSsoExchangeFailed, restoreAccessTokenFromCookieDetailed, setThrottleMaskMounted, settleSsoLoginGate, SSO_EXCHANGE_FAILED_LOGIN_PATH, useAuthStore } from '../../stores/auth';
 import { Loader2 } from 'lucide-react';
 import { navigateTo } from '../../lib/navigation';
+import * as Sentry from '@sentry/astro';
 // Initializes the shared i18next singleton. Islands hydrate independently, so
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
@@ -55,9 +56,68 @@ function consumeCfAccessLoginParam(): boolean {
   return true;
 }
 
+// Single owner of the "the SSO handoff is terminally dead, bounce with the
+// specific notice" redirect. Every failure path below routes through here so
+// the ordering can't drift apart between them.
+//
+// The problem (#3704): settling the gate releases every refresh queued behind
+// it, and a dead-cookie refresh's 401 evicts via handleSessionExpired, whose
+// `window.location.replace(…&reason=session-expired)` is a HARD navigation —
+// it aborts an in-flight soft one and overwrites the URL. The user then reads
+// "Your session expired", which points away from SSO and invites an infinite
+// retry loop, since signing in again just re-runs the same broken SSO round
+// trip. `navigateTo` is an async page transition, so issuing it un-awaited and
+// settling on the next line handed that race to the eviction every time.
+//
+// TWO mechanisms close it, because neither is sufficient alone:
+//
+//  1. Order. Awaiting the navigation means that by the time the gate opens the
+//     address bar is already on /login, where handleSessionExpired's own
+//     pathname guard makes its redirect a no-op. This holds whenever navigateTo
+//     completes a real Astro soft transition — `navigate()` resolves only after
+//     `history.replaceState` has moved the URL — which is the live path here,
+//     since AuthOverlay only ever renders under layouts that mount
+//     <ClientRouter />.
+//  2. Precedence. It does NOT hold on navigateTo's own fallback: when the
+//     transition throws, it fires `window.location.replace` and returns, having
+//     merely QUEUED a hard navigation, so the address bar has not moved yet and
+//     the guard in (1) misses. markSsoExchangeFailed() covers that gap by
+//     making the eviction redirect to the same URL instead of racing it.
+//
+// The eviction itself is still correct and still runs — the SSO exchange really
+// did fail. Only its generic *reason* was wrong.
+//
+// `finally`, not a plain sequence: waiting on the navigation must not become a
+// new way to deadlock. If it throws, the queued refreshes still have to be
+// released rather than hang on the gate's 15s timeout backstop.
+async function redirectToSsoExchangeFailed(): Promise<void> {
+  // Claimed BEFORE the navigation is issued, so an eviction that somehow beats
+  // us to the address bar still carries the SSO reason.
+  markSsoExchangeFailed();
+  try {
+    await navigateTo(SSO_EXCHANGE_FAILED_LOGIN_PATH, { replace: true });
+  } catch (err) {
+    // Deliberately narrow, and NOT dead code: navigateTo already absorbs a
+    // failed transition and falls back to window.location internally, so
+    // reaching here means that fallback ALSO threw — the document has no
+    // working navigation left. Retrying it here would fail for the same
+    // reason, so the remaining recovery is the eviction above (which now
+    // carries the SSO reason) and the 10s safety net. Report it: this branch
+    // should never fire, and if it does we want to know rather than infer it
+    // from a support ticket about a stuck spinner.
+    console.warn('[AuthOverlay] SSO error redirect failed', err);
+    Sentry.captureMessage('[AuthOverlay] SSO error redirect failed — no working navigation path', {
+      level: 'warning',
+      extra: { message: err instanceof Error ? err.message : String(err) },
+    });
+  } finally {
+    settleSsoLoginGate();
+  }
+}
+
 export default function AuthOverlay() {
   const { t } = useTranslation('auth');
-  const { isAuthenticated, isLoading, tokens, sessionExpiredReason } = useAuthStore();
+  const { isAuthenticated, isLoading, tokens, sessionExpiredReason, authThrottledUntil } = useAuthStore();
   const [isChecking, setIsChecking] = useState(true);
   const [isRecovering, setIsRecovering] = useState(false);
   const [recoverAttempted, setRecoverAttempted] = useState(false);
@@ -83,6 +143,12 @@ export default function AuthOverlay() {
       // `handleSessionExpired` owns the navigation this must stay dormant, or
       // its soft nav races the hard redirect and drops `next`/`reason`.
       if (state.sessionExpiredReason) return;
+      // A rate-limited refresh legitimately takes longer than this timer
+      // (the server's window is 60s). Bouncing to /login here would reinstate
+      // exactly the forced logout #3696 removes — the throttle mask below just
+      // reflects the wait; the auth store (not this timer) owns automatic
+      // recovery (#3984).
+      if (state.authThrottledUntil && state.authThrottledUntil > Date.now()) return;
       if (!state.isAuthenticated || !state.tokens?.accessToken) {
         redirectToLogin();
       }
@@ -127,8 +193,7 @@ export default function AuthOverlay() {
         // redirect and strip the error param.
         setIsRecovering(true);
         console.warn('[AuthOverlay] malformed ssoCode fragment; bouncing to login');
-        void navigateTo('/login?error=sso_exchange_failed', { replace: true });
-        settleSsoLoginGate();
+        void redirectToSsoExchangeFailed();
         return () => { cancelled = true; };
       }
       if (fragment.present && fragment.code) {
@@ -152,10 +217,10 @@ export default function AuthOverlay() {
               // dropping it re-arms the final !isAuthenticated branch, whose
               // bare `/login` redirect races this one and strips the error
               // param. The navigation below unmounts the overlay anyway.
-              // Gate settles AFTER the navigation is issued so a queued
-              // refresh's own eviction redirect can't beat this one.
-              void navigateTo('/login?error=sso_exchange_failed', { replace: true });
-              settleSsoLoginGate();
+              // Gate settles once that navigation has COMMITTED — merely
+              // issuing it first is not enough, see
+              // redirectToSsoExchangeFailed (#3704).
+              void redirectToSsoExchangeFailed();
               return;
             }
             settleSsoLoginGate();
@@ -199,11 +264,17 @@ export default function AuthOverlay() {
       setRecoverAttempted(true);
       setIsRecovering(true);
 
-      void restoreAccessTokenFromCookie().then((restored) => {
+      void restoreAccessTokenFromCookieDetailed().then((outcome) => {
         if (cancelled) return;
         setIsRecovering(false);
 
-        if (!restored) {
+        // 'throttled' (#3696) is NOT a dead session — the server rate-limited
+        // /auth/refresh and never judged the cookie. Bouncing to /login here is
+        // the forced-logout bug. The throttle mask below takes over: it shows
+        // why the page is waiting and retries when the window elapses.
+        if (outcome === 'throttled') return;
+
+        if (outcome !== 'restored') {
           redirectToLogin();
         }
       });
@@ -265,6 +336,33 @@ export default function AuthOverlay() {
     );
   }
 
+  // Refresh-throttle mask (#3696). Rendered AFTER the expiry branch (a real
+  // expiry always wins) but BEFORE the `fadeState === 'hidden'` early return,
+  // for the same reason the expiry mask is: by the time a mid-session refresh
+  // gets throttled this overlay has faded out and unmounted, and without this
+  // branch the user sees a fully-painted page whose every data call 401'd with
+  // no explanation — the silent variant of this bug, which is worse than the
+  // logout because it looks like real (empty) data.
+  //
+  // Non-destructive by construction: the session is untouched, nothing is
+  // logged out, and recovery is automatic.
+  //
+  // Gated on there being no usable access token, and that gate is load-bearing.
+  // The justification above only holds when the token is gone — that is what
+  // makes the data calls 401. A throttle can also arrive on a refresh the user
+  // never needed: AdminSessionManager runs a keepalive `refreshAccessToken()`
+  // on an interval while `isAuthenticated` (AdminSessionManager.tsx:308-320),
+  // so a 429 there lands while the access token is still valid and every data
+  // call is still succeeding. Masking that session would be wrong on its own,
+  // and the store's own throttle recovery (`scheduleThrottleReload`, #3984)
+  // ends with `window.location.reload()` — so an unconditional branch would
+  // throw away unsaved work to "recover" a session that was never impaired.
+  // (The store re-checks this same condition before it actually reloads, but
+  // this branch must stay in sync with it regardless.) See #3696 review.
+  if (authThrottledUntil !== null && !tokens?.accessToken) {
+    return <AuthThrottledMask retryAt={authThrottledUntil} />;
+  }
+
   if (fadeState === 'hidden') {
     return null;
   }
@@ -295,4 +393,95 @@ export default function AuthOverlay() {
 
 function redirectToLogin() {
   void navigateTo('/login', { replace: true });
+}
+
+/**
+ * Shown while POST /auth/refresh is rate-limited (#3696). The session is fine —
+ * this is a wait, not an eviction — so the copy must not say "expired".
+ *
+ * Purely a display: the countdown is cosmetic. The actual recovery reload is
+ * owned and scheduled by the auth store (`scheduleThrottleReload`, #3984) once
+ * its own bounded in-memory retry is exhausted — a full reload rather than an
+ * in-place retry because the web app is an Astro MPA whose access token is
+ * memory-only, so a fresh document is what re-runs the bootstrap refresh. This
+ * component used to independently reload at the end of its OWN countdown,
+ * racing the store's own retry-in-progress at the same deadline; the reload
+ * usually won, wasting the store's retry. Never re-add an automatic action
+ * here — the store is the single owner of recovery.
+ *
+ * Also tells the store (`setThrottleMaskMounted`) that a mask is actually on
+ * screen: the store's reload only fires while this is true, so a page that
+ * handles `AuthThrottledError` without ever mounting this mask (e.g.
+ * `ForcedMfaSetupPage`) never gets a reload it didn't ask for.
+ */
+function AuthThrottledMask({ retryAt }: { retryAt: number }) {
+  const { t } = useTranslation('auth');
+  const [secondsLeft, setSecondsLeft] = useState(() =>
+    Math.max(0, Math.ceil((retryAt - Date.now()) / 1000))
+  );
+
+  // Tells the store a mask is actually on screen to explain a reload — see
+  // `throttleMaskMounted` in stores/auth.ts. Separate effect (no `retryAt`
+  // dependency) so it toggles once per mount/unmount, not once per deadline.
+  useEffect(() => {
+    setThrottleMaskMounted(true);
+    return () => setThrottleMaskMounted(false);
+  }, []);
+
+  useEffect(() => {
+    const tick = () => {
+      const remaining = Math.max(0, Math.ceil((retryAt - Date.now()) / 1000));
+      setSecondsLeft(remaining);
+    };
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [retryAt]);
+
+  return (
+    <div
+      data-testid="auth-throttled-overlay"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-background"
+    >
+      <div className="max-w-sm text-center">
+        <Loader2 className="mx-auto h-8 w-8 animate-spin text-primary" />
+        <p className="mt-4 text-sm font-medium">
+          {t('common.refreshThrottledTitle', {
+            defaultValue: 'Too many requests — reconnecting',
+          })}
+        </p>
+        <p className="mt-2 text-sm text-muted-foreground">
+          {t('common.refreshThrottledBody', {
+            count: secondsLeft,
+            defaultValue: "You're still signed in. Retrying in {{count}}s…",
+          })}
+        </p>
+        <div className="mt-4 flex items-center justify-center gap-4">
+          <button
+            type="button"
+            data-testid="auth-throttled-retry"
+            className="text-sm text-primary underline underline-offset-4"
+            onClick={() => window.location.reload()}
+          >
+            {t('common.refreshThrottledRetry', { defaultValue: 'Retry now' })}
+          </button>
+          {/* Escape hatch: a client stuck in a repeating throttle would
+              otherwise have no way out of the mask short of clearing storage.
+              Signing out is always available and is never automatic — the
+              whole point of #3696 is that WE must not decide to sign them out. */}
+          <button
+            type="button"
+            data-testid="auth-throttled-signout"
+            className="text-sm text-muted-foreground underline underline-offset-4"
+            onClick={() => {
+              useAuthStore.getState().logout();
+              void navigateTo('/login', { replace: true });
+            }}
+          >
+            {t('common.signOut', { defaultValue: 'Sign Out' })}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }

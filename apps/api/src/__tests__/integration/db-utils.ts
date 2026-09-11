@@ -8,7 +8,7 @@
  * that will catch any actual type errors at runtime against a real database.
  */
 import { randomUUID } from 'crypto';
-import { getTestDb } from './setup';
+import { getTestDb, type TestDatabase } from './setup';
 import { hashPassword } from '../../services/password';
 import { createAccessToken, type TokenPayload } from '../../services/jwt';
 import {
@@ -20,9 +20,11 @@ import {
   partnerUsers,
   organizationUsers,
   permissions,
-  rolePermissions
+  rolePermissions,
+  catalogItems,
+  catalogItemPrices
 } from '../../db/schema';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 
 // Use any for database to avoid complex type inference issues in tests
 // Runtime errors will be caught by actual integration test execution
@@ -97,6 +99,8 @@ export interface CreatePartnerOptions {
   status?: 'pending' | 'active' | 'suspended' | 'churned';
   /** Set to a Date to soft-delete the partner (drives the deletedAt branch in tenantStatus.ts). */
   deletedAt?: Date | null;
+  /** ISO-4217 partner default currency (multi-currency). Defaults to 'USD'. */
+  currencyCode?: string;
 }
 
 export async function createPartner(options: CreatePartnerOptions = {}) {
@@ -115,7 +119,8 @@ export async function createPartner(options: CreatePartnerOptions = {}) {
       type: options.type || 'msp',
       plan: options.plan || 'pro',
       status: options.status || 'active',
-      deletedAt: options.deletedAt ?? null
+      deletedAt: options.deletedAt ?? null,
+      currencyCode: options.currencyCode ?? 'USD'
     })
     .returning();
 
@@ -134,6 +139,8 @@ export interface CreateOrganizationOptions {
   status?: 'active' | 'suspended' | 'trial' | 'churned';
   /** Set to a Date to soft-delete the org (drives the deletedAt branch in tenantStatus.ts). */
   deletedAt?: Date | null;
+  /** ISO-4217 org billing currency (multi-currency wave 1). Defaults to 'USD'. */
+  currencyCode?: string;
 }
 
 export async function createOrganization(options: CreateOrganizationOptions) {
@@ -145,6 +152,7 @@ export async function createOrganization(options: CreateOrganizationOptions) {
     .insert(organizations)
     .values({
       partnerId: options.partnerId,
+      currencyCode: options.currencyCode ?? 'USD',
       name: options.name || `Test Organization ${timestamp}-${rand}`,
       slug: options.slug || `test-org-${timestamp}-${rand}`,
       type: options.type || 'customer',
@@ -154,6 +162,55 @@ export async function createOrganization(options: CreateOrganizationOptions) {
     .returning();
 
   return org;
+}
+
+// ============================================
+// Catalog Utilities
+// ============================================
+
+export interface CreateCatalogItemWithPriceOptions {
+  partnerId: string;
+  name: string;
+  /** Currency of the single price-book row. */
+  currencyCode: string;
+  unitPrice: string;
+  costBasis?: string | null;
+  /** Defaults to currencyCode. */
+  costCurrency?: string;
+  itemType?: 'hardware' | 'software' | 'service';
+}
+
+/**
+ * Insert a catalog item plus ONE catalog_item_prices row (multi-currency wave
+ * 3). Document services resolve sell prices from the price book, never from
+ * the deprecated catalog_items.unit_price mirror, so a fixture item with no
+ * price-book row hits NO_PRICE_FOR_CURRENCY when a line is added from it.
+ * Caller supplies the DB context (system scope for seeds).
+ */
+export async function createCatalogItemWithPrice(opts: CreateCatalogItemWithPriceOptions): Promise<{ id: string }> {
+  const database = db();
+  const [item] = await database
+    .insert(catalogItems)
+    .values({
+      partnerId: opts.partnerId,
+      itemType: opts.itemType ?? 'service',
+      name: opts.name,
+      unitPrice: opts.unitPrice,
+      costBasis: opts.costBasis ?? null,
+      costCurrency: opts.costCurrency ?? opts.currencyCode,
+      billingType: 'one_time',
+      taxable: true,
+      isBundle: false
+    })
+    .returning({ id: catalogItems.id });
+  if (!item) throw new Error('createCatalogItemWithPrice: item insert returned no row');
+  await database.insert(catalogItemPrices).values({
+    itemId: item.id,
+    partnerId: opts.partnerId,
+    currencyCode: opts.currencyCode,
+    unitPrice: opts.unitPrice
+  });
+  return { id: item.id };
 }
 
 // ============================================
@@ -313,6 +370,12 @@ export interface SetupTestEnvironmentOptions {
   // optional fields.
   userOptions?: Partial<Omit<CreateUserOptions, 'partnerId' | 'orgId'>>;
   partnerOptions?: CreatePartnerOptions;
+  /**
+   * Overrides for the organization created by setupTestEnvironment — notably
+   * `currencyCode`, so an HTTP-level test can seed a non-USD org without a
+   * post-hoc `UPDATE organizations SET currency_code` (multi-currency #3778).
+   */
+  organizationOptions?: Partial<Omit<CreateOrganizationOptions, 'partnerId'>>;
   scope?: 'system' | 'partner' | 'organization';
   /**
    * Permissions granted to the created role. Defaults to a `*`/`*` wildcard
@@ -344,7 +407,10 @@ export async function setupTestEnvironment(
   // partner-scope tests create an MSP staff user (partner_id set, org_id
   // null); org-scope tests create a customer-org user (both set).
   const partner = await createPartner(options.partnerOptions);
-  const organization = await createOrganization({ partnerId: partner.id });
+  const organization = await createOrganization({
+    partnerId: partner.id,
+    ...options.organizationOptions,
+  });
   const site = await createSite({ orgId: organization.id });
   const user = await createUser({
     partnerId: partner.id,
@@ -455,4 +521,101 @@ export async function createIntegrationTestClient(
     put: (path: string, body?: unknown) => makeRequest('PUT', path, body),
     delete: (path: string) => makeRequest('DELETE', path)
   };
+}
+
+// ============================================
+// Deferrable-FK Replay Restoration
+// ============================================
+
+/**
+ * Restores the org-lifecycle deferrable-FK contract
+ * (`migrations/2026-09-12-100001-org-lifecycle-foundations.sql` Section 2)
+ * for the NAMED constraints only: every composite FK referencing an `org_id`
+ * column must be `DEFERRABLE INITIALLY IMMEDIATE`, because the org-merge
+ * transaction (Wave 2) runs `SET CONSTRAINTS ALL DEFERRED` and re-points
+ * parent+child `org_id` in separate statements — a non-deferrable composite
+ * FK breaks it. `orgLifecycleFoundations.integration.test.ts` asserts this
+ * against live `pg_constraint` state at test-run time, so it cannot
+ * distinguish "never fixed" from "fixed, then un-fixed by a later migration
+ * replay in the same shared test DB."
+ *
+ * A handful of already-shipped migrations, replayed raw by other integration
+ * suites for their own idempotency/regression coverage, unconditionally
+ * recreate a composite `org_id` FK non-deferrable — an unguarded
+ * `ALTER CONSTRAINT ... NOT DEFERRABLE` in the partner-export material-state
+ * hardening migration, and unconditional `DROP CONSTRAINT` + `ADD CONSTRAINT`
+ * (with no `DEFERRABLE` clause) in the m365 graph-read-consent and
+ * agent-originated-intents migrations. Per CLAUDE.md, never edit a shipped
+ * migration to "fix" this. Instead, every suite that replays one of these
+ * migrations raw must call this helper immediately after, naming the
+ * constraint(s) its own replay just un-deferred.
+ *
+ * `constraintNames` is REQUIRED and the repair is scoped to it. This helper
+ * used to run the migration's whole-database sweep, which repaired every
+ * non-deferrable composite `org_id` FK it found — including ones no replay
+ * had touched. That silently papered over a genuine defect: the three FKs
+ * added non-deferrable by `2026-10-01-100000-ai-agents-graduation-evidence.sql`
+ * were repaired by `m365ConnectionsRls` and `agentIntentConstraints` running
+ * earlier in the same CI shard, so the contract test read GREEN in CI for
+ * days while failing on any fresh database. A blanket sweep here cannot tell
+ * "damaged by the replay I just ran" from "shipped broken", and the second is
+ * exactly what the contract test exists to catch — so it must not be repaired.
+ *
+ * Throws when a named constraint does not exist, so a rename fails loudly here
+ * instead of silently leaving the contract un-restored.
+ *
+ * The initial mode is read from the catalog rather than hard-coded: the org
+ * lifecycle sweep's `INITIALLY IMMEDIATE` is the right default for the FKs it
+ * converted, but several later migrations declare a composite `org_id` FK
+ * `DEFERRABLE INITIALLY DEFERRED` on purpose
+ * (`2026-09-13-agent-rollback-lifecycle.sql`,
+ * `2026-09-28-100002-software-inventory-observations.sql`). Forcing IMMEDIATE
+ * would silently downgrade one the first time a caller named it, changing when
+ * Postgres checks that FK for the rest of the shard.
+ *
+ * Contract test: `orgIdFkDeferrabilityHelper.integration.test.ts`.
+ */
+export async function reapplyOrgIdFkDeferrability(
+  db: TestDatabase,
+  constraintNames: readonly string[],
+): Promise<void> {
+  if (constraintNames.length === 0) {
+    throw new Error(
+      'reapplyOrgIdFkDeferrability: name the constraint(s) your migration replay un-deferred. ' +
+        'A blanket sweep would hide genuinely non-deferrable composite org_id FKs from ' +
+        'orgLifecycleFoundations.integration.test.ts.',
+    );
+  }
+
+  const rows = (await db.execute(sql`
+    SELECT con.conname, con.conrelid::regclass::text AS child_table, con.condeferred
+    FROM pg_constraint con
+    WHERE con.contype = 'f'
+      AND con.connamespace = 'public'::regnamespace
+      AND con.conname IN (${sql.join(
+        constraintNames.map((name) => sql`${name}`),
+        sql`, `,
+      )})
+  `)) as unknown as Array<{ conname: string; child_table: string; condeferred: boolean }>;
+
+  const byName = new Map(rows.map((row) => [row.conname, row]));
+  const missing = constraintNames.filter((name) => !byName.has(name));
+  if (missing.length > 0) {
+    throw new Error(
+      `reapplyOrgIdFkDeferrability: no such foreign-key constraint(s) in public: ${missing.join(', ')}. ` +
+        'Was one renamed by a later migration? Update the caller.',
+    );
+  }
+
+  for (const { conname, child_table: childTable, condeferred } of byName.values()) {
+    // Keep whatever initial mode the constraint currently carries; a replay
+    // that knocked it to NOT DEFERRABLE also cleared condeferred, so those
+    // come back INITIALLY IMMEDIATE as the org-lifecycle sweep intends.
+    const initialMode = condeferred ? 'INITIALLY DEFERRED' : 'INITIALLY IMMEDIATE';
+    // `child_table` comes from regclass::text, which Postgres already quotes
+    // when the identifier needs it; conname is quoted here for the same reason.
+    await db.execute(
+      sql.raw(`ALTER TABLE ${childTable} ALTER CONSTRAINT "${conname}" DEFERRABLE ${initialMode}`),
+    );
+  }
 }

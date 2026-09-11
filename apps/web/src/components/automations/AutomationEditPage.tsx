@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ArrowLeft } from 'lucide-react';
+import { ArrowLeft, Bot } from 'lucide-react';
 import AutomationForm, { type ActionFormValues, type AutomationFormValues } from './AutomationForm';
 import { fetchWithAuth } from '../../stores/auth';
 import { useOrgStore } from '../../stores/orgStore';
@@ -16,7 +16,11 @@ import '../../lib/i18n';
 
 type Site = { id: string; name: string };
 type Group = { id: string; name: string };
-type Script = { id: string; name: string };
+// `runAs` (#4888): `GET /scripts` selects whole rows, so the saved run
+// context is already on the wire — surfaced on the type so the run_script
+// action's control can name the default it inherits ("Script default
+// (System)") the way the other launch surfaces do.
+type Script = { id: string; name: string; runAs?: 'system' | 'user' | 'elevated' };
 type NotificationChannel = { id: string; name: string; type: string };
 type SoftwareCatalogItem = { id: string; name: string; vendor?: string };
 
@@ -31,6 +35,31 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 
 function asString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * Narrows a stored `run_script` action's run context to the `script_run_as`
+ * enum (#4888).
+ *
+ * `'elevated'` is INCLUDED even though the control cannot hand it out: it is a
+ * legal stored value (`automationRuntime.normalizeAutomationActions` keeps
+ * it), and dropping it here would mean opening an elevated automation for an
+ * unrelated edit and silently downgrading it on save. `RunContextSelect`
+ * renders it as a disabled option so the value is visible and survives the
+ * round trip untouched.
+ */
+function asRunAs(value: unknown): 'system' | 'user' | 'elevated' | undefined {
+  return value === 'system' || value === 'user' || value === 'elevated' ? value : undefined;
+}
+
+/**
+ * #5128 W4 — read the stored offline behaviour back so opening an automation
+ * for edit shows what is actually in effect. Absent stays absent: an action
+ * saved before the field existed must round-trip byte-identically until the
+ * operator changes it (the API defaults it to 'queue').
+ */
+function asWhenOffline(value: unknown): 'queue' | 'skip' | undefined {
+  return value === 'queue' || value === 'skip' ? value : undefined;
 }
 
 function normalizeActionForForm(value: unknown): ActionFormValues {
@@ -55,7 +84,8 @@ function normalizeActionForForm(value: unknown): ActionFormValues {
   if (type === 'execute_command') {
     return {
       type,
-      command: asString(action.command) ?? ''
+      command: asString(action.command) ?? '',
+      whenOffline: asWhenOffline(action.whenOffline)
     };
   }
 
@@ -68,7 +98,13 @@ function normalizeActionForForm(value: unknown): ActionFormValues {
 
   return {
     type: 'run_script',
-    scriptId: asString(action.scriptId) ?? asString(action.script_id)
+    scriptId: asString(action.scriptId) ?? asString(action.script_id),
+    // #4888 — read the stored run-context override back so opening an
+    // automation for edit shows the choice that is actually in effect.
+    // Without this the form would render "Script default" for an action that
+    // overrides it, and the next save would erase the override.
+    runAs: asRunAs(action.runAs),
+    whenOffline: asWhenOffline(action.whenOffline)
   };
 }
 
@@ -76,7 +112,19 @@ function buildActionPayload(action: ActionFormValues) {
   if (action.type === 'run_script') {
     return {
       type: action.type,
-      scriptId: action.scriptId
+      scriptId: action.scriptId,
+      // #4888 — this builder reconstructs each action field by field rather
+      // than spreading the form values, so a field added to the form and NOT
+      // added here is silently dropped between the operator clicking Save and
+      // the request going out. That is precisely the bug #4888 was filed for
+      // (the Fix flow's discarded run-as select), so it must not be
+      // reintroduced one layer below the form. `undefined` is omitted by
+      // JSON.stringify, which is what "Script default" has to serialise to.
+      ...(action.runAs ? { runAs: action.runAs } : {}),
+      // #5128 W4 — same field-by-field discipline as runAs above: omitted when
+      // the operator never touched the control, so an untouched pre-#5128
+      // action still serialises exactly as it did.
+      ...(action.whenOffline ? { whenOffline: action.whenOffline } : {})
     };
   }
 
@@ -104,7 +152,8 @@ function buildActionPayload(action: ActionFormValues) {
 
   return {
     type: action.type,
-    command: action.command
+    command: action.command,
+    ...(action.whenOffline ? { whenOffline: action.whenOffline } : {})
   };
 }
 
@@ -115,6 +164,9 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
   const [error, setError] = useState<string>();
   const [defaultValues, setDefaultValues] = useState<Partial<AutomationFormValues>>();
   const [webhookUrl, setWebhookUrl] = useState<string>();
+  // #3824: a seeded, agent-owned automation is read-only — render a notice
+  // instead of the editor. The API 409s on save anyway.
+  const [managedByAgentId, setManagedByAgentId] = useState<string | null>(null);
   const [sites, setSites] = useState<Site[]>([]);
   const [groups, setGroups] = useState<Group[]>([]);
   const [scripts, setScripts] = useState<Script[]>([]);
@@ -138,6 +190,7 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
       }
       const data = await response.json();
       const automation = data.automation ?? data;
+      setManagedByAgentId(asString(automation.managedByAgentId) ?? null);
 
       const trigger = isPlainRecord(automation.trigger)
         ? automation.trigger
@@ -392,20 +445,35 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
         </div>
       )}
 
-      <AutomationForm
-        onSubmit={handleSubmit}
-        onCancel={handleCancel}
-        defaultValues={isNew ? { ownerScope: defaultOwnerScope, ...defaultValues } : defaultValues}
-        webhookUrl={webhookUrl}
-        showOwnerScope={isNew && isPartnerScope}
-        submitLabel={isNew ? t('automationEditPage.actions.create') : t('automationEditPage.actions.saveChanges')}
-        loading={saving}
-        sites={sites}
-        groups={groups}
-        scripts={scripts}
-        notificationChannels={notificationChannels}
-        softwareCatalog={softwareCatalog}
-      />
+      {managedByAgentId ? (
+        <div
+          className="rounded-lg border border-purple-500/40 bg-purple-500/10 p-6"
+          data-testid="automation-managed-notice"
+        >
+          <div className="flex items-center gap-2 text-purple-700 dark:text-purple-200">
+            <Bot className="h-5 w-5" />
+            <h2 className="text-sm font-semibold">{t('automationEditPage.managed.title')}</h2>
+          </div>
+          <p className="mt-2 text-sm text-muted-foreground">
+            {t('automationEditPage.managed.description')}
+          </p>
+        </div>
+      ) : (
+        <AutomationForm
+          onSubmit={handleSubmit}
+          onCancel={handleCancel}
+          defaultValues={isNew ? { ownerScope: defaultOwnerScope, ...defaultValues } : defaultValues}
+          webhookUrl={webhookUrl}
+          showOwnerScope={isNew && isPartnerScope}
+          submitLabel={isNew ? t('automationEditPage.actions.create') : t('automationEditPage.actions.saveChanges')}
+          loading={saving}
+          sites={sites}
+          groups={groups}
+          scripts={scripts}
+          notificationChannels={notificationChannels}
+          softwareCatalog={softwareCatalog}
+        />
+      )}
     </div>
   );
 }

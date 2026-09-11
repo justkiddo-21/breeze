@@ -13,7 +13,7 @@ import {
 } from '../../services/catalogService';
 import {
   writeCatalogItemImage, readCatalogItemImage, deleteCatalogItemImage,
-  fetchImageFromUrl, sniffImageMime, MAX_CATALOG_IMAGE_SIZE_BYTES,
+  fetchImageFromUrl, sniffImageMime, MAX_CATALOG_IMAGE_SIZE_BYTES, CATALOG_IMAGE_WEBP_REJECTED_MESSAGE,
 } from '../../services/catalogImageStorage';
 
 export const catalogItemRoutes = new Hono();
@@ -41,6 +41,8 @@ function handleServiceError(c: { json: (b: unknown, s: number) => Response }, er
 catalogItemRoutes.get('/', scopes, readPerm, zValidator('query', listCatalogQuerySchema), async (c) => {
   try {
     const query = c.req.valid('query');
+    // Pass the entire validated query through, including currencyCode; the service applies
+    // the currency filter and returns the matching prices with each catalog item.
     const rows = await listCatalogItems(query, catalogActorFrom(c));
     // A full page implies there may be more rows; expose the last id as the cursor so
     // the documented `cursor` query param is usable. `data` shape is unchanged (web reads body.data).
@@ -97,7 +99,8 @@ catalogItemRoutes.post('/:id/image',
       if (file.size > MAX_CATALOG_IMAGE_SIZE_BYTES) return c.json({ error: 'Image too large (max 5 MB)' }, 413);
       const buffer = Buffer.from(await file.arrayBuffer());
       const mime = sniffImageMime(buffer);
-      if (!mime) return c.json({ error: 'Unsupported image format. Allowed: PNG, JPEG, WebP.' }, 415);
+      if (!mime) return c.json({ error: 'Unsupported image format. Allowed: PNG, JPEG.' }, 415);
+      if (mime === 'image/webp') return c.json({ error: CATALOG_IMAGE_WEBP_REJECTED_MESSAGE }, 415);
       const written = await writeCatalogItemImage(id, actor.partnerId, mime, buffer);
       return c.json({ data: { imageId: written.id, mime, byteSize: written.byteSize } });
     } catch (err) { return handleServiceError(c, err); }
@@ -120,7 +123,10 @@ catalogItemRoutes.post('/:id/image/from-url',
       let mime: string, buffer: Buffer;
       try {
         ({ mime, buffer } = await fetchImageFromUrl(url));
-      } catch {
+      } catch (err) {
+        if (err instanceof Error && err.message === CATALOG_IMAGE_WEBP_REJECTED_MESSAGE) {
+          return c.json({ error: CATALOG_IMAGE_WEBP_REJECTED_MESSAGE }, 415);
+        }
         return c.json({ error: 'Could not download a valid image from that URL.' }, 400);
       }
       const written = await writeCatalogItemImage(id, actor.partnerId, mime, buffer);

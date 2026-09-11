@@ -7,10 +7,10 @@ import {
   Bell,
   Building2,
   CheckCircle2,
+  Contact,
   Copy,
   Check,
   CreditCard,
-  FileSignature,
   Fingerprint,
   Globe,
   Monitor,
@@ -19,9 +19,9 @@ import {
   Puzzle,
   ScrollText,
   Shield,
-  Ticket
+  Ticket,
+  Archive
 } from 'lucide-react';
-import ContractsList from '../contracts/ContractsList';
 import OrgBillingSettings from '../billing/OrgBillingSettings';
 import SettingsSectionNav, { type SettingsNavGroup } from './SettingsSectionNav';
 import OrgBrandingEditor from './OrgBrandingEditor';
@@ -34,18 +34,20 @@ import OrgNotificationSettings from './OrgNotificationSettings';
 import OrgSecuritySettings from './OrgSecuritySettings';
 import { OrgApprovalSecurityTab } from './OrgApprovalSecurityTab';
 import OrgEventLogSettings from './OrgEventLogSettings';
+import OrgAuditRetentionSettings from './OrgAuditRetentionSettings';
 import OrgRemoteAccessSettings from './OrgRemoteAccessSettings';
 import { useOrgStore } from '../../stores/orgStore';
 import { fetchWithAuth } from '../../stores/auth';
 import { navigateTo } from '@/lib/navigation';
 import { runAction, ActionError } from '@/lib/runAction';
 import { formatDate, formatTime as formatUserTime } from '@/lib/dateTimeFormat';
+import { isArchiveLifecycleOrg } from '@/lib/archiveLifecycle';
 import Pax8OrgTab from '../organizations/Pax8OrgTab';
 import ExtensionSlotHost from '../extensions/ExtensionSlotHost';
 
 type TabKey =
-  | 'general' | 'branding' | 'portal' | 'notifications' | 'security'
-  | 'approval-security' | 'event-logs' | 'remote-access' | 'ticketing' | 'contracts' | 'billing' | 'pax8'
+  | 'general' | 'contacts' | 'branding' | 'portal' | 'notifications' | 'security'
+  | 'approval-security' | 'event-logs' | 'audit-retention' | 'remote-access' | 'ticketing' | 'contracts' | 'billing' | 'pax8'
   | 'extensions';
 
 // Grouped sidebar definition — same anatomy as PartnerSettingsPage (shared
@@ -55,7 +57,12 @@ const TAB_GROUPS: (Omit<SettingsNavGroup, 'items'> & { items: (SettingsNavGroup[
     label: 'orgSettingsPage.nav.organization',
     items: [
       { key: 'general', hash: 'general', label: 'orgSettingsPage.nav.general', description: 'orgSettingsPage.nav.generalDescription', icon: Building2 },
-      { key: 'contracts', hash: 'contracts', label: 'orgSettingsPage.nav.contracts', description: 'orgSettingsPage.nav.contractsDescription', icon: FileSignature },
+      { key: 'contacts', hash: 'contacts', label: 'orgSettingsPage.nav.contacts', description: 'orgSettingsPage.nav.contactsDescription', icon: Contact },
+      // 'contracts' is intentionally NOT a nav item anymore — it moved to the
+      // organization record's Contracts & Billing tab (#5075 W03). It stays a
+      // resolvable TabKey (see getTabFromHash's explicit case below) purely so
+      // an old `#contracts` bookmark/link still redirects there instead of
+      // landing on General with a silently-ignored hash.
       { key: 'billing', hash: 'billing', label: 'orgSettingsPage.nav.billing', description: 'orgSettingsPage.nav.billingDescription', icon: CreditCard },
       { key: 'pax8', hash: 'pax8', label: 'orgSettingsPage.nav.pax8', description: 'orgSettingsPage.nav.pax8Description', icon: PackageOpen },
       { key: 'extensions', hash: 'extensions', label: 'orgSettingsPage.nav.extensions', description: 'orgSettingsPage.nav.extensionsDescription', icon: Puzzle },
@@ -75,6 +82,7 @@ const TAB_GROUPS: (Omit<SettingsNavGroup, 'items'> & { items: (SettingsNavGroup[
       { key: 'approval-security', hash: 'approval-security', label: 'orgSettingsPage.nav.approvalSecurity', description: 'orgSettingsPage.nav.approvalSecurityDescription', icon: Fingerprint },
       { key: 'remote-access', hash: 'remote-access', label: 'orgSettingsPage.nav.remoteAccess', description: 'orgSettingsPage.nav.remoteAccessDescription', icon: Monitor },
       { key: 'event-logs', hash: 'event-logs', label: 'orgSettingsPage.nav.eventLogs', description: 'orgSettingsPage.nav.eventLogsDescription', icon: ScrollText },
+      { key: 'audit-retention', hash: 'audit-retention', label: 'orgSettingsPage.nav.auditRetention', description: 'orgSettingsPage.nav.auditRetentionDescription', icon: Archive },
     ],
   },
   {
@@ -93,6 +101,10 @@ function getTabFromHash(): TabKey | null {
   if (typeof window === 'undefined') return null;
   const hash = window.location.hash.replace('#', '');
   const key = hash.split('/')[0] ?? '';
+  // 'contracts' has no nav entry (see TAB_GROUPS above) so it's absent from
+  // TAB_BY_KEY, but an old `#contracts` link must still resolve to the
+  // redirect effect rather than silently falling through to the default tab.
+  if (key === 'contracts') return 'contracts';
   return key in TAB_BY_KEY ? (key as TabKey) : null;
 }
 
@@ -107,6 +119,12 @@ type OrgDetails = {
   name: string;
   slug: string;
   status: string;
+  // Present on the archive-lifecycle shape the GET returns (see orgs.ts —
+  // `loadArchivedOrg` / the `isArchiveLifecycleRow` branch); absent otherwise.
+  // Since #4166 it also covers an org mid-archive-drain, so it is NOT the same
+  // test as `status === 'archived'` — see `isArchiveLifecycleOrg`.
+  archived?: boolean;
+  purgeAt?: string | null;
   type?: string;
   maxDevices?: number;
   settings?: {
@@ -269,8 +287,41 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
   const [typeDraft, setTypeDraft] = useState<string>('customer');
   const [savingType, setSavingType] = useState(false);
 
+  // Archive-lifecycle orgs are read-only: the update route 404s any PATCH here
+  // (an archived org is outside `accessibleOrgIds` and hits the
+  // LIFECYCLE_FROZEN_ORG_STATUSES guard; an archive-DRAINING org — #4166 — is
+  // outside `accessibleOrgIds` too and gets no lifecycle override), so writes
+  // must be refused client-side rather than surfacing that 404 as a bespoke
+  // error. The GET does NOT 404 for either — it returns the full row plus
+  // `archived: true` — so this signal is always available once loaded, and it
+  // has to be the FLAG rather than the status string: since #4166 the same GET
+  // also answers for a draining org, which would otherwise render a fully
+  // editable settings form whose every save could only fail.
+  const isArchived = isArchiveLifecycleOrg(orgDetails);
+  // Within that read-only set, an org whose agent uninstall is still running
+  // has not actually been archived yet — say so rather than claiming it has.
+  const isArchiveDraining = isArchived && orgDetails?.status === 'offboarding';
+
   const { currentOrgId, organizations } = useOrgStore();
   const effectiveOrgId = propOrgId || currentOrgId;
+
+  // Two settings tabs moved onto the organization record: contracts to its
+  // Contracts & Billing tab (#5075 W03) and contacts to its Contacts tab
+  // (#5075 W02). Both nav entries stay (they remain discoverable destinations
+  // from this page) but activating either hands off to the record rather than
+  // rendering stale UI here. One effect covers BOTH activation paths for each —
+  // a direct deep link (the mount/hashchange effect above sets `activeTab`) and
+  // a nav click (`switchTab` sets it too) funnel through the same state.
+  // `replace: true` on both: without it, Back returns to the dead settings tab,
+  // whose effect immediately redirects forward again — a Back-button trap.
+  useEffect(() => {
+    if (!effectiveOrgId) return;
+    if (activeTab === 'contracts') {
+      void navigateTo(`/organizations/${effectiveOrgId}#billing`, { replace: true });
+    } else if (activeTab === 'contacts') {
+      void navigateTo(`/organizations/${effectiveOrgId}#contacts`, { replace: true });
+    }
+  }, [activeTab, effectiveOrgId]);
 
   const fetchOrgDetails = useCallback(async () => {
     if (!effectiveOrgId) {
@@ -351,6 +402,10 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
 
   const handleSaveSettings = useCallback(async (section: string, data: Record<string, unknown>) => {
     if (!effectiveOrgId) return;
+    if (isArchived) {
+      setError(t('orgSettingsPage.archived.saveBlocked'));
+      return;
+    }
 
     try {
       const currentSettings = orgDetails?.settings || {};
@@ -381,10 +436,14 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
         setError(err instanceof Error ? err.message : t('orgSettingsPage.errors.saveSettings'));
       }
     }
-  }, [effectiveOrgId, orgDetails, fetchOrgDetails, t]);
+  }, [effectiveOrgId, orgDetails, isArchived, fetchOrgDetails, t]);
 
   const handleSaveName = useCallback(async () => {
     if (!effectiveOrgId) return;
+    if (isArchived) {
+      setError(t('orgSettingsPage.archived.saveBlocked'));
+      return;
+    }
     const trimmed = nameDraft.trim();
     if (!trimmed || trimmed === orgDetails?.name) return;
 
@@ -405,10 +464,14 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
     } finally {
       setSavingName(false);
     }
-  }, [effectiveOrgId, nameDraft, orgDetails, fetchOrgDetails, t]);
+  }, [effectiveOrgId, nameDraft, orgDetails, isArchived, fetchOrgDetails, t]);
 
   const handleSaveType = useCallback(async () => {
     if (!effectiveOrgId) return;
+    if (isArchived) {
+      setError(t('orgSettingsPage.archived.saveBlocked'));
+      return;
+    }
     if (typeDraft === (orgDetails?.type ?? 'customer')) return;
 
     try {
@@ -433,7 +496,7 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
     } finally {
       setSavingType(false);
     }
-  }, [effectiveOrgId, typeDraft, fetchOrgDetails, t]);
+  }, [effectiveOrgId, typeDraft, orgDetails, isArchived, fetchOrgDetails, t]);
 
   // Fallback display data — prefer fetched orgDetails; when accessed via URL prop the org
   // might not be in the store's organizations array, so fall back to a minimal object.
@@ -448,6 +511,9 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
   }, [saveState.hasUnsavedChanges, saveState.lastSavedAt, t]);
 
   const handleDirty = () => {
+    // Nothing can actually be saved on an archived org (see isArchived above),
+    // so never let a child editor's edits show a false "unsaved changes" pill.
+    if (isArchived) return;
     setSaveState(prev => ({ ...prev, hasUnsavedChanges: true }));
   };
 
@@ -556,6 +622,14 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
             locked={locked}
           />
         );
+      case 'audit-retention':
+        return effectiveOrgId ? (
+          <OrgAuditRetentionSettings
+            orgId={effectiveOrgId}
+            onDirty={handleDirty}
+            onSave={() => handleSave()}
+          />
+        ) : null;
       case 'remote-access':
         // No onDirty: every control on this tab persists immediately through
         // its own request, so the tab never holds unsaved draft state.
@@ -570,12 +644,14 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
             onSave={() => handleSave()}
           />
         ) : null;
+      case 'contacts':
+        // Redirected to the organization record's Contacts tab by the effect
+        // above — this case never actually renders ContactsCard here anymore.
+        return null;
       case 'contracts':
-        return effectiveOrgId ? (
-          <div data-testid="org-tab-contracts">
-            <ContractsList lockedOrgId={effectiveOrgId} />
-          </div>
-        ) : null;
+        // Redirected to the organization record's Contracts & Billing tab by
+        // the effect above; render nothing while that navigation happens.
+        return null;
       case 'billing':
         return effectiveOrgId ? (
           <div data-testid="org-tab-billing">
@@ -625,7 +701,8 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
                           void handleSaveName();
                         }
                       }}
-                      className="flex-1 rounded-md border bg-background px-3 py-1.5 text-base font-semibold focus:outline-hidden focus:ring-2 focus:ring-primary"
+                      disabled={isArchived}
+                      className="flex-1 rounded-md border bg-background px-3 py-1.5 text-base font-semibold focus:outline-hidden focus:ring-2 focus:ring-primary disabled:cursor-not-allowed disabled:opacity-50"
                       placeholder={t('orgSettingsPage.overview.organizationName')}
                       aria-label={t('orgSettingsPage.overview.organizationName')}
                     />
@@ -633,7 +710,7 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
                       type="button"
                       data-testid="org-name-save"
                       onClick={() => void handleSaveName()}
-                      disabled={savingName || !nameDraft.trim() || nameDraft.trim() === orgDetails?.name}
+                      disabled={isArchived || savingName || !nameDraft.trim() || nameDraft.trim() === orgDetails?.name}
                       className="inline-flex items-center rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       {savingName ? t('common:states.saving') : t('orgSettingsPage.actions.save')}
@@ -657,7 +734,8 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
                       data-testid="org-type-select"
                       value={typeDraft}
                       onChange={(e) => setTypeDraft(e.target.value)}
-                      className="flex-1 rounded-md border bg-background px-3 py-1.5 text-base font-semibold focus:outline-hidden focus:ring-2 focus:ring-primary"
+                      disabled={isArchived}
+                      className="flex-1 rounded-md border bg-background px-3 py-1.5 text-base font-semibold focus:outline-hidden focus:ring-2 focus:ring-primary disabled:cursor-not-allowed disabled:opacity-50"
                       aria-label={t('orgSettingsPage.overview.organizationType')}
                     >
                       <option value="customer">{t('orgSettingsPage.overview.types.customer')}</option>
@@ -667,7 +745,7 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
                       type="button"
                       data-testid="org-type-save"
                       onClick={() => void handleSaveType()}
-                      disabled={savingType || typeDraft === (orgDetails?.type ?? 'customer')}
+                      disabled={isArchived || savingType || typeDraft === (orgDetails?.type ?? 'customer')}
                       className="inline-flex items-center rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       {savingType ? t('common:states.saving') : t('orgSettingsPage.actions.save')}
@@ -770,6 +848,37 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
           </div>
         )}
       </header>
+
+      {isArchived && (
+        <div
+          data-testid="org-archived-banner"
+          className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 p-4 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100"
+        >
+          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
+          <div>
+            <p className="text-sm font-medium">
+              {/* Four LITERAL t() keys rather than one interpolated key name.
+                  keyUsage.test.ts can only verify keys it can read statically,
+                  and the i18n-dynamic escape hatch would opt these out of that
+                  check entirely. */}
+              {isArchiveDraining
+                ? orgDetails?.purgeAt
+                  ? t('orgSettingsPage.archived.drainBannerWithDate', { date: formatDate(orgDetails.purgeAt) })
+                  : t('orgSettingsPage.archived.drainBanner')
+                : orgDetails?.purgeAt
+                  ? t('orgSettingsPage.archived.bannerWithDate', { date: formatDate(orgDetails.purgeAt) })
+                  : t('orgSettingsPage.archived.banner')}
+            </p>
+            <a
+              href={`/settings/organizations#${displayOrg.id}`}
+              data-testid="org-archived-restore-link"
+              className="mt-2 inline-block text-xs font-medium underline hover:no-underline"
+            >
+              {t('orgSettingsPage.archived.restoreLink')}
+            </a>
+          </div>
+        </div>
+      )}
 
       {saveState.hasUnsavedChanges ? (
         <div className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 p-4 text-amber-900">

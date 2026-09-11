@@ -3,8 +3,9 @@
 import '../config/normalizeNodeEnv';
 import { db, withSystemDbAccessContext } from './index';
 import { roles, permissions, rolePermissions, scripts, alertTemplates, partners, organizations, sites, users, partnerUsers } from './schema';
+import { applyNewPartnerDefaultSettings } from '../services/partnerDefaultSettings';
 import { seedSystemTicketStatuses } from '../services/ticketConfigService';
-import { eq, and } from 'drizzle-orm';
+import { eq, and, isNull } from 'drizzle-orm';
 import { hashPassword } from '../services/password';
 
 const DEV_BOOTSTRAP_ADMIN_EMAIL = 'admin@breeze.local';
@@ -101,19 +102,23 @@ export function resolveBootstrapAdminConfig(
 // asserts every resource:action referenced by SYSTEM_ROLES below exists here.
 // This is intentionally a subset of PERMISSION_GRANTS (the shared registry):
 // the registry may define permissions no system role grants yet (e.g.
-// time_entries:*, automations:*) without those needing a seeded row — only
-// permissions a system role actually references must be seeded, or seedRoles
-// silently drops the grant.
+// automations:*) without those needing a seeded row — only permissions a
+// system role actually references must be seeded, or seedRoles silently drops
+// the grant. time_entries:* moved INTO this list with #4251, when the
+// technician roles started granting them.
 export const DEFAULT_PERMISSIONS = [
   // Backup / recovery
   { resource: 'backup', action: 'read', description: 'View backup and recovery resources' },
   { resource: 'backup', action: 'write', description: 'Create and manage backup and recovery resources' },
+  { resource: 'backup', action: 'cross_site_restore', description: 'Restore backup data across sites' },
 
   // Devices
   { resource: 'devices', action: 'read', description: 'View devices and their details' },
   { resource: 'devices', action: 'write', description: 'Create and update devices' },
   { resource: 'devices', action: 'delete', description: 'Delete/decommission devices' },
   { resource: 'devices', action: 'execute', description: 'Execute commands on devices' },
+
+  { resource: 'agent_rollback', action: 'create', description: 'Authorize a signed agent rollback' },
 
   // Network topology (discovery topology view + saved layout)
   { resource: 'topology', action: 'read', description: 'View network topology and saved layout' },
@@ -138,6 +143,12 @@ export const DEFAULT_PERMISSIONS = [
   { resource: 'tickets', action: 'read', description: 'View tickets, comments, and categories' },
   { resource: 'tickets', action: 'write', description: 'Create and update tickets, comments, and categories' },
   { resource: 'tickets', action: 'manage', description: 'Edit or delete any comment and reassign ticket organization' },
+
+  // Time entries (#4251). Seeded because Partner Technician grants them: the
+  // mobile start/stop timer (#3206 W05) calls routes gated on
+  // time_entries:write, and an unseeded grant is dropped silently by seedRoles.
+  { resource: 'time_entries', action: 'read', description: 'View time entries and timesheets' },
+  { resource: 'time_entries', action: 'write', description: 'Log and edit time entries' },
 
   // Microsoft 365 partner-global ticket mailbox administration
   { resource: 'ticket_mailbox', action: 'read', description: 'View Microsoft 365 ticket mailbox connection status' },
@@ -186,6 +197,7 @@ export const DEFAULT_PERMISSIONS = [
   // Audit
   { resource: 'audit', action: 'read', description: 'View audit logs' },
   { resource: 'audit', action: 'export', description: 'Export audit logs' },
+  { resource: 'audit', action: 'manage', description: 'Manage the audit log retention policy' },
 
   // Reports
   { resource: 'reports', action: 'read', description: 'View reports and report data' },
@@ -204,6 +216,12 @@ export const DEFAULT_PERMISSIONS = [
   { resource: 'ai_sessions', action: 'read_all',
     description: "View all users' AI session history (admin audit dashboard)" },
 
+  // AI agents (#3821)
+  { resource: 'ai_agents', action: 'read',
+    description: 'View AI agent policies' },
+  { resource: 'ai_agents', action: 'write',
+    description: 'Create, edit and disable AI agent policies' },
+
   // Action intents / durable approvals
   { resource: 'approvals', action: 'decide',
     description: 'Decide (approve/deny) pending action-intent approvals' },
@@ -214,23 +232,46 @@ export const DEFAULT_PERMISSIONS = [
 
 // Default system roles
 // Exported for the seed↔registry consistency test (seed.test.ts).
-export const SYSTEM_ROLES = [
+export interface SystemRoleDefinition {
+  name: string;
+  scope: 'partner' | 'organization';
+  description: string;
+  permissions: string[];
+  /**
+   * Stored on roles.force_mfa at seed time and reconciled false→true on
+   * re-seed (never lowered — see seedRoles()). RMM-QA-164: the
+   * 2026-05-25-f migration promised force_mfa=true for the system Partner
+   * Admin role, but on a fresh database it ran before seed() created the
+   * row, so the definition must carry the flag itself. Only Partner Admin
+   * is forced; every other system role is an MSP opt-in per that
+   * migration's header (D9).
+   */
+  forceMfa: boolean;
+}
+
+export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
   {
     name: 'Partner Admin',
     scope: 'partner' as const,
     description: 'Full access to partner and all organizations',
+    forceMfa: true,
     permissions: ['*:*']
   },
   {
     name: 'Partner Technician',
     scope: 'partner' as const,
     description: 'Access to assigned organizations, can execute scripts',
+    forceMfa: false,
     permissions: [
       'backup:read', 'backup:write',
       'devices:read', 'devices:execute',
       'scripts:read', 'scripts:execute',
       'alerts:read', 'alerts:acknowledge',
-      'tickets:read',
+      // #4251: a technician works tickets — comments, status, assignment — and
+      // logs time against them from the mobile timer (#3206 W05). tickets:manage
+      // (reassign org, edit any author's comment) stays an admin action.
+      'tickets:read', 'tickets:write',
+      'time_entries:read', 'time_entries:write',
       'ticket_mailbox:read',
       'reports:read', 'reports:write',
       'sites:read',
@@ -242,6 +283,7 @@ export const SYSTEM_ROLES = [
     name: 'Partner Viewer',
     scope: 'partner' as const,
     description: 'Read-only access to assigned organizations',
+    forceMfa: false,
     permissions: [
       'devices:read',
       'scripts:read',
@@ -257,6 +299,7 @@ export const SYSTEM_ROLES = [
     name: 'Partner Billing',
     scope: 'partner' as const,
     description: 'Full access to product catalog, quotes, invoices, and contracts',
+    forceMfa: false,
     permissions: [
       'catalog:read', 'catalog:write', 'catalog:delete',
       'quotes:read', 'quotes:write', 'quotes:send',
@@ -268,6 +311,7 @@ export const SYSTEM_ROLES = [
     name: 'Partner Billing Viewer',
     scope: 'partner' as const,
     description: 'Read-only access to product catalog, quotes, invoices, and contracts',
+    forceMfa: false,
     permissions: [
       'catalog:read',
       'quotes:read',
@@ -279,8 +323,9 @@ export const SYSTEM_ROLES = [
     name: 'Org Admin',
     scope: 'organization' as const,
     description: 'Full access within organization',
+    forceMfa: false,
     permissions: [
-      'backup:read', 'backup:write',
+      'backup:read', 'backup:write', 'backup:cross_site_restore',
       'devices:read', 'devices:write', 'devices:delete', 'devices:execute',
       'scripts:read', 'scripts:write', 'scripts:delete', 'scripts:execute',
       'alerts:read', 'alerts:write', 'alerts:acknowledge',
@@ -291,9 +336,16 @@ export const SYSTEM_ROLES = [
       'topology:read', 'topology:write',
       'remote:access',
       'audit:read',
+      'audit:manage',
       'vulnerabilities:accept_risk',
       'ai_sessions:read_all',
+      // An org admin may tighten their own org's agent policy. Creating a
+      // PARTNER-WIDE baseline additionally requires partner scope with
+      // org_access='all' (canManagePartnerWidePolicies), so this grant cannot
+      // reach across orgs.
+      'ai_agents:read', 'ai_agents:write',
       'approvals:decide',
+      'agent_rollback:create',
       // Tenant variables (#3409): managing the definitions is an admin task;
       // running a script that USES one only needs scripts:execute.
       'variables:read', 'variables:manage'
@@ -303,6 +355,7 @@ export const SYSTEM_ROLES = [
     name: 'Org Technician',
     scope: 'organization' as const,
     description: 'Execute scripts and manage devices',
+    forceMfa: false,
     permissions: [
       'devices:read', 'devices:write', 'devices:execute',
       'scripts:read', 'scripts:execute',
@@ -321,6 +374,7 @@ export const SYSTEM_ROLES = [
     name: 'Org Viewer',
     scope: 'organization' as const,
     description: 'Read-only access within organization',
+    forceMfa: false,
     permissions: [
       'devices:read',
       'scripts:read',
@@ -335,6 +389,7 @@ export const SYSTEM_ROLES = [
     name: 'Security Approver',
     scope: 'organization' as const,
     description: 'Review and waive (accept risk) / reopen vulnerability findings',
+    forceMfa: false,
     permissions: [
       'devices:read',
       'vulnerabilities:accept_risk'
@@ -344,6 +399,7 @@ export const SYSTEM_ROLES = [
     name: 'Partner Security Approver',
     scope: 'partner' as const,
     description: 'Review and waive (accept risk) / reopen vulnerability findings across assigned organizations',
+    forceMfa: false,
     permissions: [
       'devices:read',
       'organizations:read',
@@ -826,18 +882,46 @@ export async function seedRoles() {
   const permMap = new Map(allPerms.map(p => [p.resource + ':' + p.action, p.id]));
 
   for (const roleDef of SYSTEM_ROLES) {
-    // Check if role already exists
+    // RMM-QA-164: match ONLY the global system template of THIS definition
+    // (name + scope, is_system, no tenant axis). A name-only lookup could
+    // match a tenant copy (partner_id set, created by createPartner()), a
+    // custom is_system=false role that happens to share the name, or a
+    // global system row of the other scope — it would then skip creating
+    // the template and, with the reconcile and grants below, flip and
+    // over-privilege a row the seed never owned. Scope is pinned because the
+    // ownership boundary the reconcile migration enforces is
+    // scope='partner' AND is_system; the seed must not be looser. Tenant
+    // copies are reconciled by the 2026-10-11-170000 migration, not here.
     const [existing] = await db
       .select()
       .from(roles)
-      .where(eq(roles.name, roleDef.name))
+      .where(
+        and(
+          eq(roles.name, roleDef.name),
+          eq(roles.scope, roleDef.scope),
+          eq(roles.isSystem, true),
+          isNull(roles.partnerId),
+          isNull(roles.orgId),
+        ),
+      )
       .limit(1);
 
     let roleId: string;
 
     if (existing) {
       roleId = existing.id;
-      console.log('  Role exists:', roleDef.name);
+      if (roleDef.forceMfa && !existing.forceMfa) {
+        // One-directional: the definition may RAISE a stored flag, never
+        // lower one. Org Admin et al. are per-deployment opt-ins (see the
+        // 2026-05-25-f header), so "make it equal the definition" would
+        // silently revert an operator's choice on every db:seed. The UPDATE
+        // fires breeze_roles_permissions_epoch for the template's members
+        // (the bootstrap admin) — intended.
+        await db.update(roles).set({ forceMfa: true }).where(eq(roles.id, existing.id));
+        console.log('  Role reconciled (force_mfa):', roleDef.name);
+      } else {
+        console.log('  Role exists:', roleDef.name);
+      }
     } else {
       const [newRole] = await db
         .insert(roles)
@@ -845,7 +929,8 @@ export async function seedRoles() {
           name: roleDef.name,
           scope: roleDef.scope,
           description: roleDef.description,
-          isSystem: true
+          isSystem: true,
+          forceMfa: roleDef.forceMfa,
         })
         .returning();
 
@@ -1065,7 +1150,10 @@ export async function seedDefaultAdmin() {
           name: 'Default Partner',
           slug: 'default-partner',
           type: 'msp',
-          plan: 'enterprise'
+          plan: 'enterprise',
+          // #4520: keep the seeded dev partner on the same inbound opt-out
+          // default real partners get, so local behaviour matches production.
+          settings: applyNewPartnerDefaultSettings()
         })
         .returning();
       await seedSystemTicketStatuses(tx, newPartner!.id);
@@ -1091,10 +1179,18 @@ export async function seedDefaultAdmin() {
     orgId = existingOrg.id;
     console.log('  Default organization already exists.');
   } else {
+    const [partnerRow] = await db
+      .select({ currencyCode: partners.currencyCode })
+      .from(partners)
+      .where(eq(partners.id, partnerId))
+      .limit(1);
+    if (!partnerRow) throw new Error('Default partner not found');
+
     const [newOrg] = await db
       .insert(organizations)
       .values({
         partnerId,
+        currencyCode: partnerRow.currencyCode,
         name: 'Default Organization',
         slug: 'default-organization',
         type: 'customer',

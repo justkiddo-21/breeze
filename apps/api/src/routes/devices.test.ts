@@ -2,6 +2,36 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Hono } from 'hono';
 import { deviceRoutes } from './devices';
 
+const { evaluateCapability, partnerTrustMode, requireCapability } = vi.hoisted(() => {
+  const evaluateCapability = vi.fn(async (_cap?: string, _ctx?: unknown): Promise<any> => ({ allow: true }));
+  return {
+    evaluateCapability,
+    partnerTrustMode: vi.fn((): 'off' | 'shadow' | 'enforce' => 'off'),
+    requireCapability: vi.fn((capability: string) => async (c: any, next: any) => {
+      const auth = c.get('auth');
+      if (!auth?.partnerId) return next();
+      const decision = await evaluateCapability(capability, {
+        partnerId: auth.partnerId,
+        userId: auth.user?.id,
+        orgId: auth.orgId ?? undefined,
+      });
+      if (!decision.allow) {
+        return c.json({
+          error: decision.code,
+          capability: decision.capability,
+          reason: decision.reason,
+          reviewRequested: false,
+          meetingUrl: null,
+        }, 403);
+      }
+      return next();
+    }),
+  };
+});
+
+vi.mock('../services/partnerTrust', () => ({ evaluateCapability, requireCapability }));
+vi.mock('../config/partnerTrustMode', () => ({ partnerTrustMode }));
+
 vi.mock('../services', () => ({}));
 
 // core.ts (decommission handler) imports both terminateDeviceRemoteSessions and
@@ -77,15 +107,43 @@ vi.mock('drizzle-orm', () => {
     sql: sqlTag,
     desc: vi.fn((col: unknown) => ({ desc: col })),
     inArray: vi.fn((...args: unknown[]) => ({ inArray: args })),
+    // #5128: the decommission transaction cancels the device's pending
+    // commands EXCEPT self_uninstall, so it needs `ne`.
+    ne: vi.fn((...args: unknown[]) => ({ ne: args })),
+    isNull: vi.fn((...args: unknown[]) => ({ isNull: args })),
+    isNotNull: vi.fn((...args: unknown[]) => ({ isNotNull: args })),
+    gt: vi.fn((...args: unknown[]) => ({ gt: args })),
+    lt: vi.fn((...args: unknown[]) => ({ lt: args })),
+    or: vi.fn((...args: unknown[]) => ({ or: args })),
     count: vi.fn()
   };
 });
 
-vi.mock('../db', () => ({
-  runOutsideDbContext: vi.fn((fn) => fn()),
-  withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
-  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
-  db: {
+// #5128: the generic device-command routes now enqueue through the single
+// seam instead of a raw insert. Mocked here so this harness keeps testing the
+// ROUTE (auth, site scoping, response shape) rather than the seam, which has
+// its own suite in services/dispatchDeviceCommand.test.ts.
+const dispatchDeviceCommandMock = vi.hoisted(() => vi.fn());
+vi.mock('../services/dispatchDeviceCommand', () => ({
+  dispatchDeviceCommand: (...args: unknown[]) => dispatchDeviceCommandMock(...(args as [])),
+}));
+
+// #3986 task 7 follow-up — this harness previously had NO `db.transaction`
+// stub at all (not merely unimplemented: the property didn't exist), so the
+// decommission route's new `db.transaction(async (tx) => ...)` call threw
+// "db.transaction is not a function" and every DELETE /devices/:id request
+// 500'd. `transaction` resolves by invoking the callback with the SAME `db`
+// object as `tx` — every mocked db method (select/update/insert/...) is
+// therefore reachable identically whether the route calls it via `db.x` or
+// the transaction's `tx.x`, which is enough for a mock harness that doesn't
+// otherwise distinguish "inside a tx" from "outside one".
+//
+// Built INSIDE the factory (not as an outer top-level const): `vi.mock(...)`
+// calls are hoisted above top-level variable initializers, so a `dbMock`
+// declared outside this factory and merely referenced inside it would throw
+// "Cannot access 'dbMock' before initialization" at import time.
+vi.mock('../db', () => {
+  const dbMock: Record<string, ReturnType<typeof vi.fn>> = {
     select: vi.fn(() => ({
       from: vi.fn(() => ({
         where: vi.fn(() => ({
@@ -112,10 +170,43 @@ vi.mock('../db', () => ({
     // /devices and for any raw sql template. Returns an empty array
     // by default; tests override via vi.mocked(db.execute).mockResolvedValueOnce.
     execute: vi.fn(() => Promise.resolve([]))
-  }
+  };
+  dbMock.transaction = vi.fn((cb: (tx: unknown) => unknown) => cb(dbMock));
+
+  return {
+    // `getCurrentDbAccessContext` is listed even though no test here currently
+    // reaches it: GET /devices/:id resolves the remote-access launcher through
+    // `readWithPartnerAxisVisibility` (db/partnerAxisRead.ts), which imports
+    // all four context helpers BY NAME. A factory missing one throws
+    // "No <name> export is defined on the mock" at call time — and the route
+    // swallows that into `remoteAccessLaunchSkipReason: 'config_error'`, so a
+    // test could go on passing while silently exercising the failure branch
+    // instead of the real path. `undefined` models a request-scoped (non-system)
+    // caller, which is the shape these routes actually run in. See #3419.
+    getCurrentDbAccessContext: vi.fn(() => undefined),
+    runOutsideDbContext: vi.fn((fn) => fn()),
+    withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
+    withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+    db: dbMock
+  };
+});
+
+// DELETE /devices/:id conditionally calls queueDeviceUninstall(tx, ...) when
+// uninstallAgent is true. Its predicate/insert SQL is already covered on
+// compiled SQL by deviceUninstallDrain.test.ts; this file only needs the
+// route-level wiring stubbed so it doesn't hit the real service (which would
+// issue further un-mocked tx.select/tx.insert calls against dbMock's
+// generic chains and likely throw or behave unpredictably).
+vi.mock('../services/deviceUninstallDrain', () => ({
+  queueDeviceUninstall: vi.fn(),
 }));
 
-vi.mock('../db/schema', () => ({
+vi.mock('../db/schema', async (importOriginal) => ({
+  // routes/devices/actuateElevation.ts calls drizzle's alias(users, …) at
+  // import time (#4913), which needs a real table, not a plain-object stub.
+  users: (await importOriginal<typeof import('../db/schema')>()).users,
+  // routes/devices/events.ts builds module-level SQL fragments from auditLogs at import time (#4835).
+  auditLogs: { actorType: 'actorType', details: 'details', timestamp: 'timestamp', action: 'action' },
   devices: { id: 'id', orgId: 'orgId', siteId: 'siteId', status: 'status', hostname: 'hostname', displayName: 'displayName', osType: 'osType', lastSeenAt: 'lastSeenAt', createdAt: 'createdAt', updatedAt: 'updatedAt', tags: 'tags', agentVersion: 'agentVersion' },
   deviceHardware: { deviceId: 'deviceId' },
   deviceReliability: { deviceId: 'deviceId', reliabilityScore: 'reliabilityScore', trendDirection: 'trendDirection' },
@@ -128,6 +219,8 @@ vi.mock('../db/schema', () => ({
   sites: { id: 'id', orgId: 'orgId' },
   organizations: { id: 'id' },
   enrollmentKeys: { id: 'id', key: 'key', orgId: 'orgId' },
+  deviceStatusEnum: { enumValues: ['online', 'offline', 'maintenance', 'decommissioned', 'quarantined', 'updating', 'pending'] },
+  osTypeEnum: { enumValues: ['windows', 'macos', 'linux'] },
   discoveredAssetTypeEnum: { enumValues: ['workstation', 'server', 'printer', 'unknown'] },
   patchPolicies: {},
   alertRules: {},
@@ -171,11 +264,14 @@ vi.mock('../middleware/auth', () => ({
 }));
 
 import { db } from '../db';
+import { queueDeviceUninstall } from '../services/deviceUninstallDrain';
 
 describe('device routes', () => {
   let app: Hono;
 
   beforeEach(() => {
+    partnerTrustMode.mockReturnValue('off');
+    evaluateCapability.mockResolvedValue({ allow: true });
     // resetAllMocks clears mockReturnValueOnce queues, preventing test pollution
     vi.resetAllMocks();
     // Restore factory default chains
@@ -228,6 +324,11 @@ describe('device routes', () => {
       where: vi.fn(() => Promise.resolve())
     }) as any);
     vi.mocked(db.execute).mockImplementation(() => Promise.resolve([]) as any);
+    // resetAllMocks above also wipes db.transaction's implementation — restore
+    // the "tx === db" default (see the dbMock comment above the vi.mock('../db')
+    // call) so DELETE /devices/:id's `db.transaction(async (tx) => ...)` still
+    // resolves instead of throwing "db.transaction is not a function".
+    vi.mocked(db.transaction).mockImplementation((cb: any) => cb(db));
     // resetAllMocks above also wipes assertTtlWithinCapMock's implementation —
     // restore the permissive default (mirrors "no partner cap configured",
     // i.e. the product-default 525_600-minute ceiling from resolveEnrollmentDefaults).
@@ -241,6 +342,44 @@ describe('device routes', () => {
   });
 
   describe('POST /devices/onboarding-token', () => {
+    it('returns 403 for probation before minting an onboarding token', async () => {
+      const { authMiddleware } = await import('../middleware/auth');
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+          scope: 'organization',
+          orgId: 'org-123',
+          partnerId: 'partner-1',
+          accessibleOrgIds: ['org-123'],
+          canAccessOrg: (orgId: string) => orgId === 'org-123',
+          orgCondition: vi.fn(),
+        });
+        return next();
+      });
+      evaluateCapability.mockResolvedValueOnce({
+        allow: false,
+        code: 'TRUST_PROBATION',
+        capability: 'installer_distribute',
+        reason: 'probation_default_deny',
+      });
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual(expect.objectContaining({
+        error: 'TRUST_PROBATION',
+        capability: 'installer_distribute',
+      }));
+      expect(evaluateCapability).toHaveBeenCalledWith('installer_distribute', expect.objectContaining({
+        partnerId: 'partner-1',
+      }));
+      expect(db.select).not.toHaveBeenCalled();
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
     it('should require orgId for partner/system contexts with multiple accessible orgs', async () => {
       const { authMiddleware } = await import('../middleware/auth');
       vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
@@ -432,7 +571,7 @@ describe('device routes', () => {
       }
     });
 
-    it('defaults the token TTL to 60 minutes and honors a supplied ttlMinutes (#1108)', async () => {
+    it('defaults the token TTL to 30 days and honors a supplied ttlMinutes (#1108)', async () => {
       vi.stubEnv('AGENT_ENROLLMENT_SECRET', '');
 
       const captureExpiry = () => {
@@ -453,15 +592,19 @@ describe('device routes', () => {
         return Math.round((expiresAt.getTime() - Date.now()) / 60000);
       };
 
-      // Default (no ttlMinutes) → 60 min.
+      // Default (no ttlMinutes) → the ENROLLMENT_KEY_DEFAULT_TTL_MINUTES
+      // fallback, 30 days. This route mints a real `enrollment_keys` row, so it
+      // moved with the rest of the enrollment defaults: a token pasted into
+      // deployment tooling has to outlive the download day, which the old
+      // 60-minute window did not (US trial mass deploy, 2026-08-26).
       let valuesMock = captureExpiry();
       let res = await app.request('/devices/onboarding-token', {
         method: 'POST',
         headers: { Authorization: 'Bearer token' }
       });
       expect(res.status).toBe(200);
-      expect(expiryMinutesFrom(valuesMock)).toBeGreaterThanOrEqual(59);
-      expect(expiryMinutesFrom(valuesMock)).toBeLessThanOrEqual(61);
+      expect(expiryMinutesFrom(valuesMock)).toBeGreaterThanOrEqual(43_199);
+      expect(expiryMinutesFrom(valuesMock)).toBeLessThanOrEqual(43_201);
 
       // Supplied 1440 → ~24h.
       valuesMock = captureExpiry();
@@ -590,7 +733,7 @@ describe('device routes', () => {
     // `Content-Type: application/json` unconditionally. Under a plain
     // zValidator('json', ...) that combination 400s with a plain-text
     // "Malformed JSON in request body" and onboarding dies at the last step.
-    // The route must still mint a default 60-minute single-use token.
+    // The route must still mint a default-TTL single-use token.
     it('accepts a bodyless POST that still carries a JSON content-type (#2777)', async () => {
       vi.stubEnv('AGENT_ENROLLMENT_SECRET', '');
       const valuesMock = vi.fn().mockResolvedValue(undefined);
@@ -617,8 +760,8 @@ describe('device routes', () => {
       };
       expect(maxUsage).toBe(1);
       const minutes = Math.round((expiresAt.getTime() - Date.now()) / 60000);
-      expect(minutes).toBeGreaterThanOrEqual(59);
-      expect(minutes).toBeLessThanOrEqual(61);
+      expect(minutes).toBeGreaterThanOrEqual(43_199);
+      expect(minutes).toBeLessThanOrEqual(43_201);
     });
 
     // Same shape, but with an explicitly empty string body (what a
@@ -883,17 +1026,20 @@ describe('device routes', () => {
           })
         })
       } as any);
-      vi.mocked(db.insert).mockReturnValue({
-        values: vi.fn().mockReturnValue({
-          returning: vi.fn().mockResolvedValue([{
-            id: 'cmd-1',
-            deviceId: '11111111-2222-4333-8444-555555555555',
-            type: 'reboot',
-            status: 'pending',
-            createdAt: new Date()
-          }])
-        })
-      } as any);
+      // #5128: the row is created by the enqueue seam, not a raw insert here.
+      const deliverBy = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      dispatchDeviceCommandMock.mockResolvedValue({
+        ok: true,
+        command: {
+          id: 'cmd-1',
+          deviceId: '11111111-2222-4333-8444-555555555555',
+          type: 'reboot',
+          status: 'pending',
+          createdAt: new Date()
+        },
+        delivery: 'delivered',
+        deliverBy,
+      });
 
       const res = await app.request('/devices/11111111-2222-4333-8444-555555555555/commands', {
         method: 'POST',
@@ -905,6 +1051,44 @@ describe('device routes', () => {
       const body = await res.json();
       expect(body.id).toBe('cmd-1');
       expect(body.status).toBe('pending');
+      // #5128: the response now tells the caller how the command was handed
+      // over and when it expires if the device never comes back.
+      expect(body.delivery).toBe('delivered');
+      expect(body.deliverBy).toBe(deliverBy.toISOString());
+      expect(dispatchDeviceCommandMock).toHaveBeenCalledWith(
+        expect.objectContaining({ deviceId: '11111111-2222-4333-8444-555555555555', type: 'reboot' })
+      );
+    });
+
+    it('reports an offline device as queued rather than failing the request', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: '11111111-2222-4333-8444-555555555555', orgId: 'org-123', status: 'offline' }])
+          })
+        })
+      } as any);
+      dispatchDeviceCommandMock.mockResolvedValue({
+        ok: true,
+        command: {
+          id: 'cmd-2',
+          deviceId: '11111111-2222-4333-8444-555555555555',
+          type: 'reboot',
+          status: 'pending',
+          createdAt: new Date()
+        },
+        delivery: 'queued_offline',
+        deliverBy: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      });
+
+      const res = await app.request('/devices/11111111-2222-4333-8444-555555555555/commands', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ type: 'reboot' })
+      });
+
+      expect(res.status).toBe(201);
+      expect((await res.json()).delivery).toBe('queued_offline');
     });
 
     it('should reject generic script commands', async () => {
@@ -1033,6 +1217,12 @@ describe('device routes', () => {
       const body = await res.json();
       expect(body.success).toBe(true);
       expect(body.device.status).toBe('decommissioned');
+
+      // #3986 task 7's default-false safety invariant, exercised here because
+      // this call sends NO body at all (the bulk-remove call shape) — must
+      // NOT queue an uninstall, and the response must say so explicitly.
+      expect(body.uninstallQueued).toBe(false);
+      expect(queueDeviceUninstall).not.toHaveBeenCalled();
     });
 
     it('should reject decommissioning an already decommissioned device', async () => {

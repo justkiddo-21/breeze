@@ -7,6 +7,8 @@ import {
   fdbEntrySchema,
   sensitiveDataQueueJobDataSchema,
   desktopSessionFinalizationJobDataSchema,
+  routeEventJobDataSchema,
+  deliverEventJobDataSchema,
 } from './queueSchemas';
 
 describe('desktopSessionFinalizationJobDataSchema', () => {
@@ -72,8 +74,23 @@ describe('automationQueueJobDataSchema', () => {
       },
     },
     {
+      // Backward compatibility: pre-deploy execute-run jobs have no triggerContext.
       name: 'execute-run',
       payload: { type: 'execute-run', runId: 'run-1', targetDeviceIds: ['device-1'] },
+    },
+    {
+      name: 'execute-run (with triggerContext)',
+      payload: {
+        type: 'execute-run',
+        runId: 'run-1',
+        targetDeviceIds: ['device-1'],
+        triggerContext: {
+          alertId: 'alert-1',
+          eventId: 'evt-1',
+          severity: 'critical',
+          ruleId: null,
+        },
+      },
     },
     {
       name: 'trigger-config-policy-schedule (assignmentTargets[])',
@@ -140,6 +157,33 @@ describe('automationQueueJobDataSchema', () => {
       payload: { type: 'execute-run', runId: '', unexpected: true },
     },
     {
+      name: 'execute-run with an out-of-enum triggerContext severity',
+      payload: {
+        type: 'execute-run',
+        runId: 'run-1',
+        triggerContext: {
+          alertId: 'alert-1',
+          eventId: 'evt-1',
+          severity: 'urgent',
+          ruleId: 'rule-1',
+        },
+      },
+    },
+    {
+      name: 'execute-run with an unknown key inside triggerContext',
+      payload: {
+        type: 'execute-run',
+        runId: 'run-1',
+        triggerContext: {
+          alertId: 'alert-1',
+          eventId: 'evt-1',
+          severity: 'high',
+          ruleId: 'rule-1',
+          unexpected: true,
+        },
+      },
+    },
+    {
       name: 'trigger-config-policy-schedule with an out-of-enum level',
       payload: {
         type: 'trigger-config-policy-schedule',
@@ -187,7 +231,14 @@ describe('automationQueueJobDataSchema', () => {
 
 describe('sensitiveDataQueueJobDataSchema', () => {
   const validCases: Array<{ name: string; payload: Record<string, unknown> }> = [
-    { name: 'dispatch-scan', payload: { type: 'dispatch-scan', scanId: 'scan-1' } },
+    { name: 'manual dispatch-scan', payload: { type: 'dispatch-scan', scanId: 'scan-1', origin: 'manual' } },
+    {
+      name: 'scheduled dispatch-scan',
+      payload: {
+        type: 'dispatch-scan', scanId: 'scan-1', origin: 'policy_scheduler',
+        authorityGeneration: '5e2f7393-455c-4f27-86d4-30b21f708fa8',
+      },
+    },
     {
       name: 'schedule-policies',
       payload: { type: 'schedule-policies', scanAt: '2026-06-19T00:00:00.000Z' },
@@ -200,6 +251,11 @@ describe('sensitiveDataQueueJobDataSchema', () => {
 
   const malformedCases: Array<{ name: string; payload: Record<string, unknown> }> = [
     { name: 'dispatch-scan with empty scanId', payload: { type: 'dispatch-scan', scanId: '' } },
+    { name: 'legacy dispatch-scan with no origin', payload: { type: 'dispatch-scan', scanId: 'scan-1' } },
+    {
+      name: 'scheduled dispatch-scan with no generation',
+      payload: { type: 'dispatch-scan', scanId: 'scan-1', origin: 'policy_scheduler' },
+    },
     { name: 'schedule-policies missing scanAt', payload: { type: 'schedule-policies' } },
     {
       name: 'schedule-policies with an unexpected key',
@@ -387,3 +443,169 @@ describe('backupProcessResultSchema — agentStatus (#3000)', () => {
     }
   });
 });
+
+// Wave 3.5c dispatch queue (#4085 task 5).
+describe('routeEventJobDataSchema', () => {
+  const baseEvent = {
+    id: 'evt-1',
+    type: 'device.online',
+    orgId: 'org-1',
+    source: 'unit-test',
+    priority: 'normal' as const,
+    payload: { deviceId: 'dev-1' },
+    metadata: { timestamp: '2026-08-26T00:00:00.000Z' },
+  };
+
+  it('accepts a valid shadow-mode route-event job', () => {
+    const payload = {
+      v: 1 as const,
+      mode: 'shadow' as const,
+      event: baseEvent,
+      matchedSubscriberIds: ['automation-worker', 'webhook-delivery'],
+      queueSubscriberIds: ['automation-worker', 'webhook-delivery'],
+    };
+    expect(routeEventJobDataSchema.parse(payload)).toEqual(payload);
+  });
+
+  it('accepts a valid enforce-mode job with a proper subset queueSubscriberIds', () => {
+    const payload = {
+      v: 1 as const,
+      mode: 'enforce' as const,
+      event: baseEvent,
+      matchedSubscriberIds: ['automation-worker', 'webhook-delivery'],
+      queueSubscriberIds: ['webhook-delivery'],
+    };
+    expect(routeEventJobDataSchema.parse(payload)).toEqual(payload);
+  });
+
+  it('accepts optional siteId/audienceUserId and open payload/correlation fields on the event', () => {
+    const payload = {
+      v: 1 as const,
+      mode: 'shadow' as const,
+      event: {
+        ...baseEvent,
+        siteId: 'site-1',
+        audienceUserId: 'user-1',
+        payload: { nested: { anything: true } },
+        metadata: { ...baseEvent.metadata, correlationId: 'c-1', causationId: 'ca-1', userId: 'u-1' },
+      },
+      matchedSubscriberIds: [],
+      queueSubscriberIds: [],
+    };
+    expect(() => routeEventJobDataSchema.parse(payload)).not.toThrow();
+  });
+
+  it('rejects an unknown subscriber id (drift guard against eventSubscriberIds.ts)', () => {
+    const payload = {
+      v: 1 as const,
+      mode: 'shadow' as const,
+      event: baseEvent,
+      matchedSubscriberIds: ['not-a-real-subscriber'],
+      queueSubscriberIds: [],
+    };
+    expect(() => routeEventJobDataSchema.parse(payload)).toThrow();
+  });
+
+  it('rejects an unknown top-level key (.strict())', () => {
+    const payload = {
+      v: 1 as const,
+      mode: 'shadow' as const,
+      event: baseEvent,
+      matchedSubscriberIds: [],
+      queueSubscriberIds: [],
+      unexpected: true,
+    };
+    expect(() => routeEventJobDataSchema.parse(payload)).toThrow();
+  });
+
+  it('rejects an unknown top-level key on the nested event (.strict())', () => {
+    const payload = {
+      v: 1 as const,
+      mode: 'shadow' as const,
+      event: { ...baseEvent, unexpectedField: 'nope' },
+      matchedSubscriberIds: [],
+      queueSubscriberIds: [],
+    };
+    expect(() => routeEventJobDataSchema.parse(payload)).toThrow();
+  });
+
+  it('rejects a version other than 1 and a mode outside shadow|enforce', () => {
+    expect(() =>
+      routeEventJobDataSchema.parse({
+        v: 2,
+        mode: 'shadow',
+        event: baseEvent,
+        matchedSubscriberIds: [],
+        queueSubscriberIds: [],
+      }),
+    ).toThrow();
+    expect(() =>
+      routeEventJobDataSchema.parse({
+        v: 1,
+        mode: 'off',
+        event: baseEvent,
+        matchedSubscriberIds: [],
+        queueSubscriberIds: [],
+      }),
+    ).toThrow();
+  });
+});
+
+describe('deliverEventJobDataSchema', () => {
+  const baseEvent = {
+    id: 'evt-1',
+    type: 'alert.triggered',
+    orgId: 'org-1',
+    source: 'unit-test',
+    priority: 'high' as const,
+    payload: { alertId: 'a-1' },
+    metadata: { timestamp: '2026-08-26T00:00:00.000Z' },
+  };
+
+  it('accepts a valid deliver-event job for a known subscriber', () => {
+    const payload = { v: 1 as const, subscriberId: 'webhook-delivery' as const, event: baseEvent };
+    expect(deliverEventJobDataSchema.parse(payload)).toEqual(payload);
+  });
+
+  it('rejects an unknown subscriberId', () => {
+    expect(() =>
+      deliverEventJobDataSchema.parse({ v: 1, subscriberId: 'bogus-subscriber', event: baseEvent }),
+    ).toThrow();
+  });
+
+  it('rejects an unknown top-level key (.strict())', () => {
+    expect(() =>
+      deliverEventJobDataSchema.parse({
+        v: 1,
+        subscriberId: 'webhook-delivery',
+        event: baseEvent,
+        unexpected: true,
+      }),
+    ).toThrow();
+  });
+});
+
+describe('backupProcessResultSchema snapshot files (D12)', () => {
+  it('accepts the originalPath a VSS-backed Windows agent sends alongside the shadow sourcePath', async () => {
+    const { backupProcessResultSchema } = await import('./queueSchemas');
+    const parsed = backupProcessResultSchema.safeParse({
+      status: 'completed',
+      snapshot: {
+        id: 'snapshot-20260909T191123Z-4faf7e45',
+        timestamp: '2026-09-09T19:11:23.000Z',
+        size: 10,
+        files: [{
+          sourcePath: '\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy1\\assure\\src\\x',
+          originalPath: 'C:\\assure\\src\\x',
+          backupPath: 'snapshots/snapshot-20260909T191123Z-4faf7e45/files/path_0/assure/src/x.gz',
+          size: 10,
+          modTime: '2026-09-09T19:11:23.000Z',
+        }],
+      },
+    });
+    // originalPath (D12) must not be rejected by the strict queue schema — a
+    // rejection here silently leaves the job running forever.
+    expect(parsed.success, JSON.stringify(parsed.success ? null : parsed.error.issues)).toBe(true);
+  });
+});
+

@@ -12,8 +12,28 @@ vi.mock('./invoiceEvents', () => ({ emitInvoiceEvent: vi.fn().mockResolvedValue(
 // can hang under NOAUTH). The render itself is covered by invoicePdf.integration.test.ts.
 vi.mock('../jobs/invoiceWorker', () => ({ enqueueInvoicePdfRender: vi.fn().mockResolvedValue(undefined) }));
 
+// issueInvoice/voidInvoice also enqueue QuickBooks push/void jobs (Phase C,
+// Task 4). Same reason as the PDF-render mock above — the worker/coordinator
+// wiring is covered by accountingSyncWorker.test.ts; here we only assert the
+// hook fires with the right args.
+const { enqueueAccountingInvoicePushMock, enqueueAccountingInvoiceVoidMock } = vi.hoisted(() => ({
+  enqueueAccountingInvoicePushMock: vi.fn().mockResolvedValue(undefined),
+  enqueueAccountingInvoiceVoidMock: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock('../jobs/accountingSyncWorker', () => ({
+  enqueueAccountingInvoicePush: enqueueAccountingInvoicePushMock,
+  enqueueAccountingInvoiceVoid: enqueueAccountingInvoiceVoidMock,
+  enqueueAccountingPaymentPush: vi.fn().mockResolvedValue(true),
+  enqueueAccountingPaymentDelete: vi.fn().mockResolvedValue(true),
+}));
+
+// Catalog writes (used by the addBundleLine allocation test) emit BullMQ
+// lifecycle events the same way — stub them for the same reason.
+vi.mock('./catalogEvents', () => ({ emitCatalogEvent: vi.fn().mockResolvedValue(undefined) }));
+
 import { db, withSystemDbAccessContext, withDbAccessContext, type DbAccessContext } from '../db';
 import { partners, organizations, users, timeEntries, invoices, invoiceLines } from '../db/schema';
+import { createCatalogItem, setBundleComponents } from './catalogService';
 import { eq } from 'drizzle-orm';
 import * as svc from './invoiceService';
 import type { InvoiceActor } from './invoiceTypes';
@@ -46,6 +66,7 @@ async function seedFixture(opts?: {
     }).returning({ id: partners.id });
     const partnerId = p!.id;
     const [o] = await db.insert(organizations).values({
+      currencyCode: 'USD',
       partnerId, name: `Org ${suffix}`, slug: `inv-org-${suffix}`
     }).returning({ id: organizations.id });
     const orgId = o!.id;
@@ -60,7 +81,8 @@ async function seedFixture(opts?: {
         partnerId, orgId, userId, startedAt: now, endedAt: now,
         durationMinutes: e.durationMinutes, description: 'Work', isBillable: true,
         hourlyRate: e.hourlyRate, billingStatus: e.billed ? 'billed' : 'not_billed',
-        isApproved: e.isApproved ?? true
+        isApproved: e.isApproved ?? true,
+        currencyCode: 'USD'
       }).returning({ id: timeEntries.id });
       timeEntryIds.push(te!.id);
     }
@@ -123,7 +145,7 @@ describe.runIf(RUN)('issueInvoice', () => {
     // Forge a second draft that references the SAME (now-billed) source rows by
     // cloning inv1's lines into a fresh draft, then attempt to issue it.
     const forgedId = await withSystemDbAccessContext(async () => {
-      const [draft] = await db.insert(invoices).values({ partnerId: f.partnerId, orgId: f.orgId, status: 'draft' }).returning({ id: invoices.id });
+      const [draft] = await db.insert(invoices).values({ partnerId: f.partnerId, orgId: f.orgId, status: 'draft', currencyCode: 'USD' }).returning({ id: invoices.id });
       const srcLines = await db.select().from(invoiceLines).where(eq(invoiceLines.invoiceId, inv1.id));
       await db.insert(invoiceLines).values(srcLines.map((l) => ({
         invoiceId: draft!.id, orgId: l.orgId, sourceType: l.sourceType, sourceId: l.sourceId, catalogItemId: l.catalogItemId,
@@ -172,8 +194,10 @@ describe.runIf(RUN)('voidInvoice + runOverdueSweep', () => {
     const { invoice } = await withDbAccessContext(ctx(f), () =>
       svc.assembleDraftFromOrg({ orgId: f.orgId, from: dayBefore(), to: dayAfter() }, actor(f)));
     const issued = await withDbAccessContext(ctx(f), () => svc.issueInvoice(invoice.id, actor(f)));
+    expect(enqueueAccountingInvoicePushMock).toHaveBeenCalledWith(issued.id, f.partnerId);
 
     const result = await withDbAccessContext(ctx(f), () => svc.voidInvoice(issued.id, 'wrong amounts', { reissue: true }, actor(f)));
+    expect(enqueueAccountingInvoiceVoidMock).toHaveBeenCalledWith(issued.id, f.partnerId);
     // returned object is the fresh draft (getInvoice shape)
     expect(result.invoice.status).toBe('draft');
     expect(result.invoice.replacesInvoiceId).toBe(issued.id);
@@ -249,5 +273,44 @@ describe.runIf(RUN)('voidInvoice + runOverdueSweep', () => {
     const cur = await withDbAccessContext(ctx(f), () => svc.getInvoice(issued.id, actor(f)));
     expect(cur.invoice.status).toBe('overdue');
     expect(cur.invoice.markedOverdueAt).not.toBeNull();
+  });
+});
+
+describe.runIf(RUN)('addBundleLine allocation currency (#3775 review #7)', () => {
+  it('copies a component revenueAllocation onto the invoice line ONLY when authored in the invoice currency', async () => {
+    const f = await seedFixture({ entries: [] });
+    const catActor = { userId: f.userId, partnerId: f.partnerId, accessibleOrgIds: null };
+    const mk = (name: string, isBundle: boolean) => withDbAccessContext(ctx(f), () =>
+      createCatalogItem(
+        { itemType: 'service', name, billingType: 'one_time', prices: [{ currencyCode: 'USD', unitPrice: 100 }, { currencyCode: 'EUR', unitPrice: 100 }], unitOfMeasure: 'each', taxable: true, isBundle, attributes: {} },
+        catActor
+      ));
+    const bundle = await mk('Alloc bundle', true);
+    const compA = await mk('Alloc A', false);
+    const compB = await mk('Alloc B', false);
+    await withDbAccessContext(ctx(f), () =>
+      setBundleComponents(bundle.id, [
+        { componentItemId: compA.id, quantity: 1, showOnInvoice: true, revenueAllocation: 60 },
+        { componentItemId: compB.id, quantity: 1, showOnInvoice: true, revenueAllocation: 40 },
+      ], catActor, 'USD'));
+
+    const draft = async (currencyCode: string) => withSystemDbAccessContext(async () => {
+      const [d] = await db.insert(invoices).values({ partnerId: f.partnerId, orgId: f.orgId, status: 'draft', currencyCode }).returning({ id: invoices.id });
+      return d!.id;
+    });
+    const childAllocations = async (invoiceId: string) => {
+      const lines = await withSystemDbAccessContext(() => db.select().from(invoiceLines).where(eq(invoiceLines.invoiceId, invoiceId)));
+      return lines.filter((l) => l.parentLineId !== null).map((l) => l.revenueAllocation).sort();
+    };
+
+    const usdInvoice = await draft('USD');
+    await withDbAccessContext(ctx(f), () => svc.addBundleLine(usdInvoice, bundle.id, 1, actor(f)));
+    expect(await childAllocations(usdInvoice)).toEqual(['40.00', '60.00']);
+
+    // Same bundle on an EUR invoice: the USD split is unavailable — null on every
+    // child line, never EUR 60.00 / EUR 40.00.
+    const eurInvoice = await draft('EUR');
+    await withDbAccessContext(ctx(f), () => svc.addBundleLine(eurInvoice, bundle.id, 1, actor(f)));
+    expect(await childAllocations(eurInvoice)).toEqual([null, null]);
   });
 });

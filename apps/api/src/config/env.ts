@@ -1,3 +1,5 @@
+import { EVENT_SUBSCRIBER_IDS, isSubscriberId, type SubscriberId } from '../services/eventSubscriberIds';
+
 // The single truthy/falsey vocabulary for boolean-ish env vars. Kept as two
 // named sets rather than inline literals so a reader that must distinguish
 // "explicitly off" from "unrecognized" (abuseSignalsEnabled below) can never
@@ -92,6 +94,50 @@ export const PARTNER_API_CURSOR_SIGNING_KEY =
 // Gates tool registration (aiAgentSdkTools.ts) and the connect routes.
 export const GOOGLE_WORKSPACE_ENABLED = envFlag('GOOGLE_WORKSPACE_ENABLED', false);
 
+// AI operator (spec docs/superpowers/specs/ai-mcp/2026-08-22-ai-agents-program-and-wave1-design.md §5.1).
+// Platform kill switch: false forces every effective agent to enabled=false.
+// Default OFF until the wave-3 runner ships.
+export const AI_AGENTS_ENABLED = envFlag('BREEZE_AI_AGENTS_ENABLED', false);
+
+// Wave 5 Part B (#3827). Sub-flag of BREEZE_AI_AGENTS_ENABLED: gates
+// attemptPolicyDecision (policyDecide.ts) — an agent-originated, supervised-
+// scope action-intent whose operation is in the operator's per-agent
+// actAssets.supervisedActionKeys ⊆ POLICY_DECIDABLE_TIER3 is authorized by
+// policy instead of human fanout. Default OFF (dark-ship): when false,
+// resolvePolicyDecisionState returns 'human_required' exactly as Part A —
+// byte-identical to the merged behavior before this wave (Global
+// Constraints, plan header). Read at CALL time, like isHosted()/breezeRole()
+// above, so a test can flip it per-case without vi.resetModules().
+export function policyDecideEnabled(): boolean {
+  return envFlag('BREEZE_AI_AGENTS_POLICY_DECIDE_ENABLED', false);
+}
+
+// AI Operator durable tasks (#5205 W06, spec §11.2 "Feature controls").
+//
+// Two INDEPENDENT flags, both default OFF, both read at CALL time so a test
+// (and an operator) can flip one without a module reload:
+//
+//  - `AI_OPERATOR_TASKS_ENABLED` gates task ADMISSION and continuation-run
+//    admission. It does NOT gate the reconciler: spec §11.2 is explicit that
+//    turning admission off must still let late results land and in-flight
+//    effects settle, otherwise disabling the feature would strand every live
+//    task with an unobserved external side effect. "Off" means "start nothing
+//    new", never "stop watching what already happened".
+//  - `AI_OPERATOR_RECIPE_SERVICE_RECOVERY_ENABLED` gates the one recipe, per
+//    spec §13's "each recipe ships behind its own flag". Task infrastructure
+//    and each executable recipe are separately controlled on purpose.
+//
+// The pre-existing AI kill switches (`AI_AGENTS_ENABLED` and the DB kill
+// switch) remain OVERRIDING gates above both of these — they fence admission
+// AND dispatch claims, and they too leave the reconciler running.
+export function aiOperatorTasksEnabled(): boolean {
+  return envFlag('AI_OPERATOR_TASKS_ENABLED', false);
+}
+
+export function aiOperatorServiceRecoveryEnabled(): boolean {
+  return envFlag('AI_OPERATOR_RECIPE_SERVICE_RECOVERY_ENABLED', false);
+}
+
 // Microsoft 365 identity tools. Defaults OFF everywhere; an org must also have
 // an explicit m365_connections row before any tool is usable. Gates tool
 // registration (aiAgentSdkTools.ts) and the connect routes.
@@ -122,10 +168,51 @@ export const QBO_CLIENT_ID = process.env.QBO_CLIENT_ID?.trim() ?? '';
 export const QBO_CLIENT_SECRET = process.env.QBO_CLIENT_SECRET?.trim() ?? '';
 export const QBO_REDIRECT_URI = process.env.QBO_REDIRECT_URI?.trim() ?? '';
 export const QBO_ENVIRONMENT = process.env.QBO_ENVIRONMENT?.trim() ?? '';
+// Intuit's shared-secret used to verify inbound CDC webhook signatures
+// (Phase D). '' when unset — a region without the Intuit webhook configured
+// relies entirely on the 15-minute reconcile sweep instead.
+export const QBO_WEBHOOK_VERIFIER_TOKEN = process.env.QBO_WEBHOOK_VERIFIER_TOKEN?.trim() ?? '';
 
 // Read at call time so tests can flip `IS_HOSTED` per-test without `vi.resetModules()`.
 export function isHosted(): boolean {
   return envFlag('IS_HOSTED');
+}
+
+export type IpClassifyProvider = 'ipinfo' | 'ipdata' | 'none';
+
+let warnedAboutIpClassifyConfig = false;
+
+/**
+ * Optional IP-classification provider configuration. Invalid or incomplete
+ * configuration deliberately degrades to the offline classifier: trust
+ * classification must never prevent API boot or block a request.
+ */
+export function ipClassifyProvider(
+  source: NodeJS.ProcessEnv = process.env,
+): IpClassifyProvider {
+  const raw = (source.IP_CLASSIFY_PROVIDER ?? '').trim().toLowerCase();
+  const key = (source.IP_CLASSIFY_API_KEY ?? '').trim();
+
+  if (raw === '' || raw === 'none') return 'none';
+  if (raw !== 'ipinfo' && raw !== 'ipdata') {
+    if (!warnedAboutIpClassifyConfig) {
+      warnedAboutIpClassifyConfig = true;
+      console.warn(`[IPClassify] Unknown provider ${JSON.stringify(raw)}; using offline fallback`);
+    }
+    return 'none';
+  }
+  if (!key) {
+    if (!warnedAboutIpClassifyConfig) {
+      warnedAboutIpClassifyConfig = true;
+      console.warn(`[IPClassify] ${raw} is configured without IP_CLASSIFY_API_KEY; using offline fallback`);
+    }
+    return 'none';
+  }
+  return raw;
+}
+
+export function ipClassifyApiKey(source: NodeJS.ProcessEnv = process.env): string {
+  return (source.IP_CLASSIFY_API_KEY ?? '').trim();
 }
 
 // Signup-abuse detection (services/abuseSignals) is a HOSTED-operator concern:
@@ -198,6 +285,48 @@ export function abuseSignalsExplicitlyDisabled(): boolean {
   return RECOGNIZED_FALSE_FLAG_VALUES.has(
     (process.env.ABUSE_SIGNALS_ENABLED ?? '').trim().toLowerCase(),
   );
+}
+
+export type EventDispatchMode = 'off' | 'shadow' | 'enforce';
+
+/** Wave 3.5c (#4085). off = today's in-process delivery only. shadow = mirror
+ * routing plans into receipts, execute nothing via the queue. enforce = the
+ * subscribers listed in EVENT_DISPATCH_QUEUE_SUBSCRIBERS deliver via BullMQ
+ * ONLY (skipped locally); everyone else stays local. Unrecognized values fall
+ * back to 'off' with a warning — a typo must never silently change delivery. */
+export function eventDispatchMode(): EventDispatchMode {
+  const raw = (process.env.EVENT_DISPATCH_MODE ?? '').trim().toLowerCase();
+  if (raw === '' || raw === 'off') return 'off';
+  if (raw === 'shadow' || raw === 'enforce') return raw;
+  console.warn(`[config] EVENT_DISPATCH_MODE="${raw}" is not off|shadow|enforce — treating as off`);
+  return 'off';
+}
+
+export function eventDispatchQueueSubscribers(): ReadonlySet<SubscriberId> {
+  const raw = (process.env.EVENT_DISPATCH_QUEUE_SUBSCRIBERS ?? '').trim();
+  const out = new Set<SubscriberId>();
+  if (raw === '') return out;
+  for (const part of raw.split(',').map((p) => p.trim()).filter(Boolean)) {
+    if (isSubscriberId(part)) out.add(part);
+    else console.warn(`[config] EVENT_DISPATCH_QUEUE_SUBSCRIBERS contains unknown id "${part}" (known: ${EVENT_SUBSCRIBER_IDS.join(', ')}) — ignoring`);
+  }
+  return out;
+}
+
+export type BreezeRole = 'all' | 'api' | 'worker';
+
+/**
+ * Process role for the 3.5d split (#4086). `all` (default) = today's
+ * all-in-one process. Introduced in 3.5b (#4084) so socket-local dispatch can
+ * fail LOUDLY in a worker-role process instead of silently reporting every
+ * agent offline.
+ */
+export function breezeRole(): BreezeRole {
+  const raw = (process.env.BREEZE_ROLE ?? '').trim().toLowerCase();
+  if (raw === '' || raw === 'all') return 'all';
+  if (raw === 'api' || raw === 'worker') return raw;
+  console.warn(`[config] BREEZE_ROLE="${raw}" is not all|api|worker — treating as all`);
+  return 'all';
 }
 
 // Recognizes an AFFIRMATIVE self-host declaration: IS_HOSTED explicitly set to
@@ -367,12 +496,97 @@ export const OAUTH_JWKS_PUBLIC_JWK = process.env.OAUTH_JWKS_PUBLIC_JWK ?? '';
 export const OAUTH_COOKIE_SECRET = process.env.OAUTH_COOKIE_SECRET ?? '';
 
 // Kill-switch for the role-level MFA gate (Task 8 of the launch-readiness
-// sprint). Defaults ON so the secure-by-default posture holds; ops can
-// flip it OFF without a code change to relieve an enrollment outage that
-// locks legitimate partner-admins out. Read at call time so tests and
-// runtime overrides don't need module re-evaluation.
+// sprint). Defaults OFF for this release (#4491): the reconcile migration
+// (2026-10-11-170000-partner-admin-force-mfa-reconcile.sql) flips
+// force_mfa on every EXISTING Partner Admin role, and enforcing on upgrade
+// with no warning would lock those admins into enrolment unexpectedly.
+// Enforcement returns to default ON once the notification-period feature
+// (#5306 — grace window, banner, deadline before force_mfa takes effect)
+// ships. Set MFA_FORCE_FOR_PARTNER_ADMIN=true to opt in and enforce now.
+// Read at call time so tests and runtime overrides don't need module
+// re-evaluation.
 export function mfaForcePartnerAdmin(): boolean {
-  return envFlag('MFA_FORCE_FOR_PARTNER_ADMIN', true);
+  return envFlag('MFA_FORCE_FOR_PARTNER_ADMIN', false);
+}
+
+/**
+ * #1374 — when true (the DEFAULT), an L4 (critical-tier) approval requires the
+ * approver device's `platform_bound_basis` to be in
+ * `L4_TRUSTED_PLATFORM_BOUND_BASES` (services/authenticatorAssurance.ts), not
+ * merely `is_platform_bound = true`.
+ *
+ * DEFAULT TRUE, deliberately: pre-#1374 mobile registrations forced
+ * is_platform_bound = true with NO attestation of any kind, so leaving this off
+ * leaves a critical-tier bypass open. Set to `false` ONLY as a break-glass
+ * revert — it re-opens that bypass for every legacy mobile key, and the
+ * `breeze_authenticator_l4_basis_total{outcome="would_deny"}` series is what
+ * makes the resulting blast radius visible.
+ *
+ * Read at CALL time (like mfaForcePartnerAdmin / policyDecideEnabled above) so
+ * ops can flip it without a code change and tests need no module reload.
+ *
+ * Unlike a plain `envFlag(name, true)` this distinguishes "explicitly off" from
+ * "unrecognized" — same treatment as abuseSignalsEnabled() — because on a
+ * default-TRUE security gate, `envFlag`'s "anything not in the true-vocabulary
+ * is false" rule would let a typo (`=flase`) silently DISABLE enforcement.
+ * config/validate.ts additionally refuses boot on such a value.
+ */
+export function authenticatorAttestationEnforced(): boolean {
+  const raw = (process.env.BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED ?? '').trim();
+  if (raw === '') return true;
+  const normalized = raw.toLowerCase();
+  if (RECOGNIZED_TRUE_FLAG_VALUES.has(normalized)) return true;
+  if (RECOGNIZED_FALSE_FLAG_VALUES.has(normalized)) return false;
+  console.warn(
+    `[Authenticator] Ignoring unrecognized BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED value ${JSON.stringify(raw)} ` +
+      '— expected true/false, 1/0, yes/no or on/off. Keeping L4 attestation enforcement ON.',
+  );
+  return true;
+}
+
+/**
+ * Apple App Attest configuration (#1374 W03).
+ *
+ * `appId` is Apple's "<TeamID>.<bundle id>" form and is hashed into the
+ * attestation's rpIdHash, so a wrong value here rejects every genuine
+ * attestation rather than accepting a foreign one — fail-closed either way.
+ * Default matches the committed identifiers (apps/mobile/eas.json team
+ * D8W6N2JYMA, apps/mobile/app.json bundle com.breeze.rmm).
+ */
+export const APPLE_APP_ATTEST_APP_ID =
+  process.env.APPLE_APP_ATTEST_APP_ID?.trim() || 'D8W6N2JYMA.com.breeze.rmm';
+
+/**
+ * Which App Attest environment's aaguid sentinel is accepted.
+ *
+ * DEFAULTS TO `production`, and only the exact string `development` opts out.
+ * A typo, an empty value, or a missing variable must NOT silently accept
+ * development attestations: those come from any developer-signed build of the
+ * app, which would hand an attacker the very L4 basis this wave exists to
+ * protect. Read at call time so ops can flip it without a rebuild and tests
+ * need no module reload.
+ *
+ * Unlike a plain equality test this WARNS on an unrecognized value — same
+ * treatment as authenticatorAttestationEnforced() above, and for the same
+ * reason. The failure mode is asymmetric and nasty: a typo (`Development`,
+ * `dev`, a trailing space) resolves to production, and then EVERY genuine
+ * attestation from a development build fails check 8 forever, fleet-wide, in a
+ * way that is indistinguishable request-by-request from a forged blob. Failing
+ * safe is right; failing safe *silently* is what makes a misconfiguration take
+ * weeks to find. It stays a warning rather than a boot refusal because the
+ * wrong value can only ever reject, never admit.
+ */
+export function appleAppAttestEnvironment(): 'production' | 'development' {
+  const raw = process.env.APPLE_APP_ATTEST_ENVIRONMENT?.trim() ?? '';
+  if (raw === 'development') return 'development';
+  if (raw !== '' && raw !== 'production') {
+    console.warn(
+      `[Authenticator] Ignoring unrecognized APPLE_APP_ATTEST_ENVIRONMENT value ${JSON.stringify(raw)} ` +
+        '— expected exactly "production" or "development". Treating it as production, which will reject ' +
+        'every development-build App Attest attestation.',
+    );
+  }
+  return 'production';
 }
 
 // Delegant service configuration for M365 helpdesk agent capability.
@@ -387,14 +601,49 @@ export const DELEGANT_PRINCIPAL_KID = process.env.DELEGANT_PRINCIPAL_KID ?? '';
 export function cfAccessTrustEnabled(): boolean {
   return envFlag('CF_ACCESS_TRUST_ENABLED');
 }
+
+const CF_ACCESS_TEAM_DOMAIN_PATTERN =
+  /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.cloudflareaccess\.com$/;
+
+/** Accept only the canonical bare hostname Cloudflare assigns to one team. */
+export function canonicalCfAccessTeamDomain(raw: string): string | null {
+  if (!raw || raw !== raw.trim() || !CF_ACCESS_TEAM_DOMAIN_PATTERN.test(raw)) return null;
+  try {
+    const parsed = new URL(`https://${raw}`);
+    if (
+      parsed.username
+      || parsed.password
+      || parsed.port
+      || parsed.pathname !== '/'
+      || parsed.search
+      || parsed.hash
+      || parsed.hostname !== raw
+    ) return null;
+    return parsed.hostname;
+  } catch {
+    return null;
+  }
+}
+
 export function cfAccessTeamDomain(): string {
-  return (process.env.CF_ACCESS_TEAM_DOMAIN ?? '').trim();
+  return canonicalCfAccessTeamDomain(process.env.CF_ACCESS_TEAM_DOMAIN ?? '') ?? '';
 }
 export function cfAccessAud(): string {
   return (process.env.CF_ACCESS_AUD ?? '').trim();
 }
 export function cfAccessTrustsMfa(): boolean {
   return envFlag('CF_ACCESS_TRUSTS_MFA');
+}
+
+// Browser authentication transition rollout. Both switches are deliberately
+// read at call time and default off; validation prevents terminal preparation
+// from being enabled before transition enforcement.
+export function authBrowserTransitionsEnforced(): boolean {
+  return envFlag('AUTH_BROWSER_TRANSITIONS_ENFORCED', false);
+}
+
+export function authBrowserTerminalPreparationEnabled(): boolean {
+  return envFlag('AUTH_BROWSER_TERMINAL_PREPARATION_ENABLED', false);
 }
 
 // Emergency kill switches for ML/AI producers. These are intentionally read at

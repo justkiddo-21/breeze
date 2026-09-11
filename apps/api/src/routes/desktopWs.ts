@@ -58,10 +58,25 @@ import {
   requireRemoteWsUpgrade,
   type RemoteWsUpgradeContext,
 } from '../services/remoteWsUpgrade';
+import { partnerTrustMode } from '../config/partnerTrustMode';
+import {
+  evaluateCapability,
+  partnerIdForDevice,
+  trustDenyBody,
+  unresolvedPartnerDecision,
+} from '../services/partnerTrust';
 
-// Zod validation for desktop user messages
-const desktopInputEvent = z.object({
-  type: z.enum(['mousemove', 'mousedown', 'mouseup', 'keydown', 'keyup', 'wheel', 'click', 'dblclick', 'mouse_move', 'mouse_down', 'mouse_up', 'key_down', 'key_up']),
+// Zod validation for desktop user messages.
+// Exported for desktopWs_inputSchema.test.ts, which asserts this enum covers
+// every input kind the Viewer's sendInputFn (apps/viewer/src/components/
+// DesktopViewer.tsx) can emit. Note WebRTC sessions inject input via the
+// user helper's data channel and never reach this schema at all (this route
+// only carries the WebSocket *fallback* transport) — but the agent's own
+// command-relay handler for that fallback path, handleDesktopInput /
+// desktopInputTypes in agent/internal/heartbeat/handlers_desktop.go, accepts
+// the same event kinds, so this enum should stay a superset of that map.
+export const desktopInputEvent = z.object({
+  type: z.enum(['mousemove', 'mousedown', 'mouseup', 'keydown', 'keyup', 'wheel', 'click', 'dblclick', 'mouse_move', 'mouse_down', 'mouse_up', 'mouse_scroll', 'key_down', 'key_up', 'key_press']),
   x: z.number().min(-10000).max(100000).optional(),
   y: z.number().min(-10000).max(100000).optional(),
   button: z.union([z.string().max(20), z.number().int().min(0).max(4)]).optional(),
@@ -79,6 +94,13 @@ const desktopInputEvent = z.object({
   deltaX: z.number().optional(),
   deltaY: z.number().optional(),
   code: z.string().max(50).optional(),
+  // Viewer's Caps Lock state at the moment the event was produced (issue
+  // #3595). Zod strips undeclared keys, so omitting this would silently drop
+  // the field on the WebSocket fallback transport and leave those sessions
+  // with the desynced-AlphaShift bug that WebRTC sessions no longer have.
+  // Optional, never defaulted: an older Viewer sends nothing and the agent
+  // keeps its previous behaviour.
+  capsLock: z.boolean().optional(),
 });
 
 const desktopMessageSchema = z.discriminatedUnion('type', [
@@ -188,6 +210,7 @@ async function validateViewerSessionAccess(
   authorizationHeader: string | undefined,
   sessionId: string,
   prevalidatedViewerToken?: ViewerTokenPayload,
+  accessMode: 'live' | 'failure-diagnostics' = 'live',
 ): Promise<ViewerAccessResult> {
   if (!authorizationHeader?.startsWith('Bearer ')) {
     return { valid: false, status: 401, error: 'Missing viewer token' };
@@ -203,7 +226,8 @@ async function validateViewerSessionAccess(
     return { valid: false, status: 401, error: 'Viewer token revoked' };
   }
 
-  if (await isViewerSessionRevoked(payload.sessionId)) {
+  const sessionRevoked = await isViewerSessionRevoked(payload.sessionId);
+  if (sessionRevoked && accessMode === 'live') {
     return { valid: false, status: 401, error: 'Session closed' };
   }
 
@@ -253,7 +277,33 @@ async function validateViewerSessionAccess(
     // session to reconnect; otherwise a lingering viewer token (valid for up to
     // the viewer-token TTL, see getViewerAccessTokenExpirySeconds()) resurrects
     // a session the operator believes is over. Finding #5.
-    if (session.status === 'disconnected' || session.status === 'failed') {
+    // The status poll may read a terminal failure after agentWs revokes the
+    // session so the viewer can explain why capture failed. This exception
+    // never grants live access, and individual token revocation still wins.
+    //
+    // #5300: a 'disconnected' session can also carry a real reason now — the
+    // no-video watchdog's swallowed capture error, relayed through the
+    // peer-disconnect command_result as `stopReason` and written to
+    // errorMessage (agentWs.ts, agentWs.desktop.peerDisconnected). Extend the
+    // same diagnostics-only exception #5295 introduced for 'failed' so the
+    // viewer can read that reason back too.
+    //
+    // The gate is "any recorded errorMessage on a disconnected row", not
+    // "a #5300 reason specifically" — staleCommandReaper.ts's
+    // reapStaleRemoteSessions also writes errorMessage on a 'disconnected'
+    // transition for its own routine timeouts ("connection was never
+    // established", "exceeded maximum session duration"), and those become
+    // readable here too. That's accepted as a side effect: the reaper's text
+    // is benign/user-safe and arguably useful to show instead of the bare
+    // generic message, and this still never grants live access — a routine
+    // disconnect with NO errorMessage at all still 401s exactly as before,
+    // so this never widens access beyond a read-only diagnostic string.
+    const readingFailure = accessMode === 'failure-diagnostics' &&
+      (session.status === 'failed' || (session.status === 'disconnected' && !!session.errorMessage));
+    if (sessionRevoked && !readingFailure) {
+      return { valid: false as const, status: 401 as const, error: 'Session closed' };
+    }
+    if ((session.status === 'disconnected' || session.status === 'failed') && !readingFailure) {
       return { valid: false as const, status: 401 as const, error: 'Session ended' };
     }
 
@@ -1333,6 +1383,26 @@ export function createDesktopWsRoutes(
         return c.json({ error: 'Session is not available for connection' }, 400);
       }
 
+      if (partnerTrustMode() !== 'off') {
+        const partnerId = await partnerIdForDevice(session.deviceId);
+        const decision = partnerId
+          ? await evaluateCapability('remote_control', {
+            partnerId,
+            deviceId: session.deviceId,
+            userId: codeRecord.userId,
+            detail: { stage: 'ticket', kind: 'desktop' },
+          })
+          : await unresolvedPartnerDecision('remote_control');
+        if (!decision.allow) {
+          return c.json(trustDenyBody({
+            allow: false,
+            code: decision.code,
+            capability: 'remote_control',
+            reason: decision.reason,
+          }, false), 403);
+        }
+      }
+
       const accessToken = await createViewerAccessToken({
         sub: codeRecord.userId,
         email: codeRecord.email,
@@ -1532,7 +1602,9 @@ export function createDesktopWsRoutes(
     zValidator('param', desktopSessionIdParamSchema),
     async (c) => {
       const { id: sessionId } = c.req.valid('param');
-      const access = await validateViewerSessionAccess(c.req.header('Authorization'), sessionId);
+      const access = await validateViewerSessionAccess(
+        c.req.header('Authorization'), sessionId, undefined, 'failure-diagnostics',
+      );
       if (!access.valid) {
         return c.json({ error: access.error }, access.status);
       }
@@ -1540,7 +1612,7 @@ export function createDesktopWsRoutes(
       return c.json({
         id: access.session.id,
         status: access.session.status,
-        webrtcAnswer: access.session.webrtcAnswer,
+        webrtcAnswer: access.session.status === 'failed' ? null : access.session.webrtcAnswer,
         errorMessage: access.session.errorMessage,
         startedAt: access.session.startedAt,
         endedAt: access.session.endedAt,

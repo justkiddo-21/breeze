@@ -1,4 +1,5 @@
-import { pgTable, uuid, varchar, text, timestamp, boolean, jsonb, pgEnum, integer, real, index, uniqueIndex } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, varchar, text, timestamp, boolean, jsonb, pgEnum, integer, real, smallint, index, uniqueIndex } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 import { organizations } from './orgs';
 import { users } from './users';
 import { devices } from './devices';
@@ -32,6 +33,9 @@ export const aiSessions = pgTable('ai_sessions', {
   type: text('type').notNull().default('general'),
   title: varchar('title', { length: 255 }),
   model: varchar('model', { length: 100 }).notNull().default('claude-sonnet-4-5-20250929'),
+  billingSource: text('billing_source', { enum: ['platform', 'partner_key'] }).notNull().default('platform'),
+  catalogEntryId: uuid('catalog_entry_id'),
+  catalogRevisionId: uuid('catalog_revision_id'),
   systemPrompt: text('system_prompt'),
   contextSnapshot: jsonb('context_snapshot'),
   // TOTAL input across the session — uncached + cache-read + cache-creation.
@@ -67,6 +71,12 @@ export const aiSessions = pgTable('ai_sessions', {
   // file. Nullable (older rows, non-Office sessions). Added in
   // 2026-06-13-c-ai-sessions-workbook-name.sql.
   workbookName: varchar('workbook_name', { length: 500 }),
+  // AI agent principal (spec §3.3). CHECK ai_sessions_single_principal_check
+  // (at most one of user_id/client_user_id/agent_id) and
+  // ai_sessions_agent_type_check (type='agent' ⇒ agent_id set) live in
+  // 2026-09-02-ai-agents.sql. FK is declared in SQL to avoid a circular import
+  // (aiAgents.ts imports aiSessions for ai_agent_runs.session_id).
+  agentId: uuid('agent_id'),
 }, (table) => ({
   orgIdIdx: index('ai_sessions_org_id_idx').on(table.orgId),
   userIdIdx: index('ai_sessions_user_id_idx').on(table.userId),
@@ -144,6 +154,8 @@ export const aiCostUsage = pgTable('ai_cost_usage', {
   sessionCount: integer('session_count').notNull().default(0),
   messageCount: integer('message_count').notNull().default(0),
   toolExecutionCount: integer('tool_execution_count').notNull().default(0),
+  // Most-recent-writer label, not a per-source cost split; deductions are decided per turn, never from this column.
+  billingSource: text('billing_source', { enum: ['platform', 'partner_key'] }).notNull().default('platform'),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
 }, (table) => ({
   orgPeriodIdx: uniqueIndex('ai_cost_usage_org_period_idx').on(table.orgId, table.period, table.periodKey)
@@ -164,9 +176,40 @@ export const aiBudgets = pgTable('ai_budgets', {
   messagesPerMinutePerUser: integer('messages_per_minute_per_user').notNull().default(20),
   messagesPerHourPerOrg: integer('messages_per_hour_per_org').notNull().default(200),
   approvalMode: aiApprovalModeEnum('approval_mode').notNull().default('per_step'),
+  // #4388 — pre-cap alert ladder. NULL = inherit default [50,80,95]; [] = off.
+  // Property name must equal the partner-JSONB key so the AI_BUDGET_FIELDS
+  // merge loop in effectiveSettings.ts reads both sides with one name.
+  alertThresholdPercents: integer('alert_threshold_pcts').array(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
 });
+
+// ============================================
+// AI Budget Alert Events (#4388) — durable outbox, one row per threshold
+// crossing per (org, period, period_key). RLS shape 1.
+// ============================================
+
+export const aiBudgetAlertEvents = pgTable('ai_budget_alert_events', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  orgId: uuid('org_id').notNull().references(() => organizations.id, { onDelete: 'cascade' }),
+  period: text('period', { enum: ['daily', 'monthly'] }).notNull(),
+  periodKey: varchar('period_key', { length: 10 }).notNull(),
+  thresholdPct: smallint('threshold_pct').notNull(),
+  capCents: integer('cap_cents').notNull(),
+  usedCents: integer('used_cents').notNull(),
+  billingSource: text('billing_source', { enum: ['platform', 'partner_key'] }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  deliveredAt: timestamp('delivered_at', { withTimezone: true }),
+  deliveryAttempts: integer('delivery_attempts').notNull().default(0),
+  lastDeliveryError: text('last_delivery_error'),
+  recipientCount: integer('recipient_count'),
+}, (table) => ({
+  orgPeriodRungIdx: uniqueIndex('ai_budget_alert_events_org_period_rung_uidx')
+    .on(table.orgId, table.period, table.periodKey, table.thresholdPct),
+  undeliveredIdx: index('ai_budget_alert_events_undelivered_idx')
+    .on(table.createdAt)
+    .where(sql`${table.deliveredAt} IS NULL`),
+}));
 
 // ============================================
 // AI Action Plans (multi-step approval)

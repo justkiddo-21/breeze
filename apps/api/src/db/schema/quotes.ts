@@ -1,6 +1,6 @@
 import { sql, type SQL } from 'drizzle-orm';
 import {
-  pgTable, uuid, text, varchar, integer, boolean, numeric, jsonb, timestamp,
+  pgTable, uuid, text, varchar, integer, smallint, boolean, numeric, jsonb, timestamp,
   char, date, pgEnum, index, uniqueIndex, primaryKey, foreignKey, type AnyPgColumn
 } from 'drizzle-orm/pg-core';
 import { partners, organizations } from './orgs';
@@ -8,9 +8,10 @@ import { partners, organizations } from './orgs';
 // of redefining it locally — same pattern as users.avatarData.
 import { users, bytea } from './users';
 import { catalogItemTypeEnum } from './catalog';
+import { contractLineTypeEnum, contractOverageModeEnum } from './contracts';
 
 export const quoteStatusEnum = pgEnum('quote_status', [
-  'draft', 'sent', 'viewed', 'accepted', 'declined', 'expired', 'converted'
+  'draft', 'sent', 'viewed', 'accepted', 'declined', 'expired', 'converted', 'superseded'
 ]);
 export const quoteLineSourceTypeEnum = pgEnum('quote_line_source_type', ['catalog', 'bundle', 'manual']);
 export const quoteLineRecurrenceEnum = pgEnum('quote_line_recurrence', ['one_time', 'monthly', 'annual']);
@@ -38,7 +39,11 @@ export const quotes = pgTable('quotes', {
   quoteNumber: varchar('quote_number', { length: 40 }),
   title: varchar('title', { length: 200 }),
   status: quoteStatusEnum('status').notNull().default('draft'),
-  currencyCode: char('currency_code', { length: 3 }).notNull().default('USD'),
+  // Multi-currency (spec §5): stamped from the org (or copied from the source
+  // document) at creation and immutable once monetary lines exist. Deliberately
+  // NO .default() — every creation path must stamp it explicitly, so a missed
+  // path is a loud insert failure, never a silent USD document.
+  currencyCode: char('currency_code', { length: 3 }).notNull(),
   issueDate: date('issue_date'),
   expiryDate: date('expiry_date'),
   acceptedAt: timestamp('accepted_at'),
@@ -71,6 +76,8 @@ export const quotes = pgTable('quotes', {
   // Frozen { theme, pageSize } captured at send so sent quotes never restyle
   // when the partner later changes theme (sellerSnapshot pattern).
   presentationSnapshot: jsonb('presentation_snapshot'),
+  // Render-locale snapshot, stamped once at issue/send (#3777). NULL = resolve from partner at render.
+  documentLocale: varchar('document_locale', { length: 16 }),
   termsAndConditions: text('terms_and_conditions'),
   declineReason: text('decline_reason'),
   convertedInvoiceId: uuid('converted_invoice_id'),
@@ -105,6 +112,17 @@ export const quotes = pgTable('quotes', {
   publicResponseConsumedAt: timestamp('public_response_consumed_at', { withTimezone: true }),
   publicResponseOutcome: varchar('public_response_outcome', { length: 16 }),
   publicLinkRevokedAt: timestamp('public_link_revoked_at', { withTimezone: true }),
+  // Quote revisions: immediate-parent link + 1-based position in the lineage.
+  // cloneLineagePair writes the parent link and correlated revision number.
+  // Enforced TODAY: linearity via quotes_revision_of_uq (one successor ever),
+  // root-vs-revision via quotes_revision_number_chk, and same-tenant lineage
+  // via the composite FK to (id, org_id).
+  // Revisions keep the root's number with an -R<n> suffix. Sending one will
+  // flip its parent to 'superseded' in a later wave (see
+  // docs/superpowers/plans/2026-08-17-quote-revisions.md); that behavior does
+  // not exist in sendQuote yet.
+  revisionOfQuoteId: uuid('revision_of_quote_id'),
+  revisionNumber: integer('revision_number').notNull().default(1),
   createdBy: uuid('created_by').references(() => users.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
@@ -114,7 +132,13 @@ export const quotes = pgTable('quotes', {
   index('quotes_org_issue_date_idx').on(t.orgId, t.issueDate),
   index('quotes_expiry_idx').on(t.expiryDate).where(sqlOpenForExpiry(t)),
   uniqueIndex('quotes_partner_number_uq').on(t.partnerId, t.quoteNumber).where(sqlNumberPresent(t)),
-  uniqueIndex('quotes_id_org_uq').on(t.id, t.orgId)
+  uniqueIndex('quotes_id_org_uq').on(t.id, t.orgId),
+  uniqueIndex('quotes_revision_of_uq').on(t.revisionOfQuoteId).where(sql`${t.revisionOfQuoteId} IS NOT NULL`),
+  foreignKey({
+    columns: [t.revisionOfQuoteId, t.orgId],
+    foreignColumns: [t.id, t.orgId],
+    name: 'quotes_revision_of_fk',
+  }),
 ]);
 
 export const quoteBlocks = pgTable('quote_blocks', {
@@ -151,6 +175,21 @@ export const quoteLines = pgTable('quote_lines', {
   recurrence: quoteLineRecurrenceEnum('recurrence').notNull().default('one_time'),
   termMonths: integer('term_months'),
   billingFrequency: varchar('billing_frequency', { length: 20 }),
+  // #3205 W05: device-set descriptor. All NULL together on an ordinary line —
+  // contract_line_type IS NULL is the whole feature switch. The invariants live
+  // in quote_lines_device_set_chk (SQL-only, like contract_lines_device_roles_chk)
+  // and in quoteLineDeviceSetIssues.
+  contractLineType: contractLineTypeEnum('contract_line_type'),
+  deviceRoles: text('device_roles').array(),
+  deviceGroupId: uuid('device_group_id'),
+  // Stamped at write; outlives the id (the FK is ON DELETE SET NULL on the id
+  // only), which is how a deleted reference is detected.
+  deviceGroupName: varchar('device_group_name', { length: 255 }),
+  siteId: uuid('site_id'),
+  siteName: varchar('site_name', { length: 255 }),
+  includedQuantity: numeric('included_quantity', { precision: 12, scale: 2 }),
+  overageMode: contractOverageModeEnum('overage_mode'),
+  overageUnitPrice: numeric('overage_unit_price', { precision: 12, scale: 2 }),
   // Internal builder economics — never serialized to the customer document.
   unitCost: numeric('unit_cost', { precision: 12, scale: 2 }),
   // Counts toward a 'selected_lines' deposit. Catalog hardware defaults it on.
@@ -176,7 +215,11 @@ export const quoteLines = pgTable('quote_lines', {
   index('quote_lines_block_idx').on(t.blockId),
   index('quote_lines_org_idx').on(t.orgId),
   index('quote_lines_image_idx').on(t.imageId),
-  uniqueIndex('quote_lines_id_quote_uq').on(t.id, t.quoteId)
+  uniqueIndex('quote_lines_id_quote_uq').on(t.id, t.quoteId),
+  index('quote_lines_device_group_id_idx').on(t.deviceGroupId).where(sql`${t.deviceGroupId} IS NOT NULL`),
+  // The CHECK and all three composite FKs are SQL-only (2026-10-08-101500-quote-lines-device-set.sql) —
+  // the W01/W02 pattern. Drizzle cannot express ON DELETE SET NULL (col) or
+  // DEFERRABLE, and drift detection compares columns/indexes, not constraints.
 ]);
 
 export const quoteImages = pgTable('quote_images', {
@@ -203,7 +246,15 @@ export const quoteAcceptances = pgTable('quote_acceptances', {
   ipAddress: varchar('ip_address', { length: 64 }),
   userAgent: text('user_agent'),
   quoteSha256: char('quote_sha256', { length: 64 }).notNull(),
+  // #3205 W05: which computeQuoteSha256 algorithm produced quoteSha256.
+  // Existing rows default to 1 because that is what hashed them.
+  hashVersion: smallint('hash_version').notNull().default(1),
   acceptanceTokenJti: varchar('acceptance_token_jti', { length: 128 }),
+  // Render locale the acceptance hash + executed contract PDF were computed
+  // with (#3777 follow-up): the quote's send-time document_locale, or 'en'
+  // for a pre-stamp quote. NULL only on rows older than the backfill
+  // (2026-09-01-b) — read through acceptanceRenderLocale(), never directly.
+  renderLocale: varchar('render_locale', { length: 16 }),
   createdAt: timestamp('created_at').defaultNow().notNull()
 }, (t) => [
   index('quote_acceptances_quote_idx').on(t.quoteId),

@@ -17,9 +17,11 @@ import { getBullMQConnection } from '../services/redis';
 import { captureException } from '../services/sentry';
 import { renderInvoicePdf } from '../services/invoicePdf';
 import { runOverdueSweep } from '../services/invoiceService';
+import { jobSchedule } from './scheduleRegistry';
+import { attachWorkerObservability } from './workerObservability';
 
 const INVOICE_QUEUE = 'invoice-jobs';
-const OVERDUE_SWEEP_CRON = '0 6 * * *'; // daily at 06:00
+const OVERDUE_SWEEP_CRON = jobSchedule('invoice-overdue-sweep');
 
 // Mirror alertWorker.ts: prefer withSystemDbAccessContext (background scope) when
 // present, falling back to bare invocation in the mocked unit-test harness.
@@ -154,6 +156,7 @@ let invoiceWorker: Worker<InvoiceJobData> | null = null;
 export async function initializeInvoiceWorkers(): Promise<void> {
   try {
     invoiceWorker = createInvoiceWorker();
+  attachWorkerObservability(invoiceWorker, 'invoiceWorker');
 
     invoiceWorker.on('error', (error) => {
       console.error('[InvoiceWorker] Worker error:', error);

@@ -72,8 +72,8 @@ async function seedPartner(label: string): Promise<PartnerSeed> {
   `);
 
   const [org] = (await testDb.execute(sql`
-    INSERT INTO organizations (partner_id, name, slug, status, created_at, updated_at)
-    VALUES (${partnerId}, ${`Org ${label}`}, ${`org-${label}-${suffix}`}, 'active', now(), now())
+    INSERT INTO organizations (partner_id, name, slug, status, currency_code, created_at, updated_at)
+    VALUES (${partnerId}, ${`Org ${label}`}, ${`org-${label}-${suffix}`}, 'active', 'USD', now(), now())
     RETURNING id
   `)) as unknown as Array<{ id: string }>;
   const orgId = org!.id;
@@ -93,6 +93,26 @@ async function seedPartner(label: string): Promise<PartnerSeed> {
   await testDb.execute(sql`
     INSERT INTO audit_logs (org_id, actor_type, actor_id, action, resource_type, result, timestamp)
     VALUES (${orgId}, 'user', ${userId}, 'test.seed', 'test', 'success', now())
+  `);
+
+  // Partner-axis catalog item + one price-book row (multi-currency wave 3,
+  // #3775). catalog_item_prices is swept by the dynamic partner_id sweep, not a
+  // cascade list — this is the only functional proof that the purge reaches it.
+  const [item] = (await testDb.execute(sql`
+    INSERT INTO catalog_items (partner_id, item_type, name, unit_price, cost_currency)
+    VALUES (${partnerId}, 'service', ${`Item ${label}`}, 10.00, 'USD')
+    RETURNING id
+  `)) as unknown as Array<{ id: string }>;
+  await testDb.execute(sql`
+    INSERT INTO catalog_item_prices (item_id, partner_id, currency_code, unit_price)
+    VALUES (${item!.id}, ${partnerId}, 'USD', 10.00)
+  `);
+  // Org-axis override that ALSO carries a denormalized partner_id (composite
+  // same-partner FKs). It is reached by BOTH the org cascade and the dynamic
+  // partner_id sweep — assert the purge leaves none behind.
+  await testDb.execute(sql`
+    INSERT INTO catalog_item_org_pricing (catalog_item_id, org_id, partner_id, currency_code, unit_price)
+    VALUES (${item!.id}, ${orgId}, ${partnerId}, 'USD', 9.00)
   `);
 
   return { partnerId, userId, roleId, orgId, siteId };
@@ -131,6 +151,9 @@ describe('cascadeDeletePartner — end-to-end', () => {
     expect(await countById('sites', 'id', purge.siteId)).toBe(0);
     expect(await countById('alert_templates', 'org_id', purge.orgId)).toBe(0);
     expect(await countById('audit_logs', 'org_id', purge.orgId)).toBe(0);
+    expect(await countById('catalog_items', 'partner_id', purge.partnerId)).toBe(0);
+    expect(await countById('catalog_item_prices', 'partner_id', purge.partnerId)).toBe(0);
+    expect(await countById('catalog_item_org_pricing', 'partner_id', purge.partnerId)).toBe(0);
 
     // Control partner: every row untouched (no cross-tenant leak).
     expect(await countById('partners', 'id', control.partnerId)).toBe(1);
@@ -141,6 +164,36 @@ describe('cascadeDeletePartner — end-to-end', () => {
     expect(await countById('sites', 'id', control.siteId)).toBe(1);
     expect(await countById('alert_templates', 'org_id', control.orgId)).toBe(1);
     expect(await countById('audit_logs', 'org_id', control.orgId)).toBe(1);
+    expect(await countById('catalog_items', 'partner_id', control.partnerId)).toBe(1);
+    expect(await countById('catalog_item_prices', 'partner_id', control.partnerId)).toBe(1);
+    expect(await countById('catalog_item_org_pricing', 'partner_id', control.partnerId)).toBe(1);
+  });
+
+  it('purges a partner whose Service Management is bound to a partner-wide PSA connection (#5075 W04)', async () => {
+    // partners.service_management_psa_connection_id -> psa_connections.id is
+    // ON DELETE RESTRICT, and the partner-axis sweep deletes partner-wide
+    // connections BEFORE the final partners DELETE. Without the un-wire
+    // pre-clear this purge aborts with 23503. This is the live shape: PATCH
+    // /orgs/partners/me only ever binds partner-wide (org_id IS NULL) rows.
+    const testDb = getTestDb();
+    const [conn] = (await testDb.execute(sql`
+      INSERT INTO psa_connections (partner_id, org_id, provider, name, credentials, created_at, updated_at)
+      VALUES (${purge.partnerId}, NULL, 'connectwise', 'Canary PSA', '{}'::jsonb, now(), now())
+      RETURNING id
+    `)) as unknown as Array<{ id: string }>;
+    await testDb.execute(sql`
+      UPDATE partners
+      SET service_management_mode = 'external', service_management_psa_connection_id = ${conn!.id}
+      WHERE id = ${purge.partnerId}
+    `);
+
+    const stats = await cascadeDeletePartner(purge.partnerId, SENTINEL);
+
+    expect(stats.tablesDeleted.partners).toBe(1);
+    expect(stats.tablesDeleted['partners.service_management_unwired']).toBe(1);
+    expect(await countById('partners', 'id', purge.partnerId)).toBe(0);
+    expect(await countById('psa_connections', 'id', conn!.id)).toBe(0);
+    expect(await countById('partners', 'id', control.partnerId)).toBe(1);
   });
 
   it('writes purge_started and purged audit rows with org_id = NULL', async () => {

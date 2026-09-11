@@ -1,6 +1,6 @@
 ---
 title: Privileged Access Management
-description: Eliminate standing admin rights with just-in-time elevation -- intercept Windows UAC prompts, route them to an approver, and grant temporary admin access that revokes itself.
+description: "Eliminate standing admin rights with just-in-time elevation: intercept Windows UAC prompts, route them to an approver, and grant self-revoking access."
 sidebar:
   label: "Privileged Access"
 ---
@@ -11,7 +11,7 @@ Privileged Access Management (PAM) lets you take admin rights *away* from everyd
 
 This page is the operator's guide. For the trust model behind PAM -- how credentials are minted on the endpoint and never transmitted, what PAM does and does not defend against -- see the [PAM Security Model](/security/pam/). For the REST endpoints, see the [PAM API](/reference/pam-api/).
 
-Open **Privileged Access** from the Security section of the left sidebar to work the console.
+Open **PAM** from the Security section of the left sidebar to work the console.
 
 PAM covers three kinds of elevation, all of which land in the same queue:
 
@@ -85,7 +85,7 @@ A rule's verdict is one of:
 Criteria identify *what* is being elevated and *who* is asking. A rule must carry at least one identifying criterion -- you can't write a rule that matches everything:
 
 - **Executable rules** match on code-signer (a single publisher or a reusable **signer group**), file hash, file path (glob), parent process, or the launched **command line** (a case-insensitive substring match).
-- **AI tool-action rules** match on the tool name and risk tier.
+- **AI tool-action rules** match on the tool name and risk tier. The risk tier is matched *exactly*, and tool tiers are set by the Breeze release -- so if an upgrade re-classifies a tool, a rule pinned to the old tier stops covering it. Such a rule is flagged with a warning badge on the Rules tab (and rejected outright if the tier it names can no longer occur at all); see [Risk-tier drift](/reference/pam-api/#risk-tier-drift).
 - Both shapes can additionally narrow by **user**, **AD group**, and a **time window** (with day-of-week and time-zone awareness, including windows that wrap past midnight).
 
 Any criterion can be **negated** — turn on "does not match" beneath a field to make the rule fire when that criterion is *not* satisfied (for example, "signer is *not* Microsoft Corporation"). Negation never turns missing data into a match: if the agent didn't report the value a negated criterion checks, the rule simply doesn't match.
@@ -217,7 +217,7 @@ The **Audit** tab is the permanent, immutable record of every elevation decision
 
 <Steps>
 
-1. Open **Privileged Access** and select the **Audit** tab.
+1. Open **PAM** from the sidebar and select the **Audit** tab.
 
 2. Filter by status, flow type, and date range to scope the report (for example, all approvals in the previous quarter).
 

@@ -1,12 +1,15 @@
 // @vitest-environment jsdom
 import { describe, it, expect, afterEach } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
-import type { QuoteBlock } from '@/lib/api';
+import type { PublicApiPath, QuoteBlock } from '@/lib/api';
 import { QuoteBlocks } from './quoteBlocks';
 
 afterEach(() => cleanup());
 
-const buildUrl = (path: string) => `https://portal.example.test${path}`;
+// Tests stamp the brand by hand: the contract the brand enforces (no absolute
+// internal origin in SSR href/src) is covered in basePathCoverage.test.ts.
+const buildUrl = (path: string) => `https://portal.example.test${path}` as PublicApiPath;
+const imageUrl = (imageId: string) => `https://portal.example.test/images/${imageId}` as PublicApiPath;
 
 function renderBlocks(blocks: QuoteBlock[]) {
   return render(
@@ -14,7 +17,7 @@ function renderBlocks(blocks: QuoteBlock[]) {
       blocks={blocks}
       lines={[]}
       currency="USD"
-      imageUrl={(imageId) => `https://portal.example.test/images/${imageId}`}
+      imageUrl={imageUrl}
       buildUrl={buildUrl}
     />
   );
@@ -101,7 +104,7 @@ describe('QuoteBlocks — line rendering (title/blurb + thumbnail)', () => {
         blocks={[lineItemsBlock]}
         lines={lines}
         currency="USD"
-        imageUrl={(imageId) => `https://portal.example.test/images/${imageId}`}
+        imageUrl={imageUrl}
         buildUrl={buildUrl}
       />
     );
@@ -138,6 +141,20 @@ describe('QuoteBlocks — line rendering (title/blurb + thumbnail)', () => {
   it('renders no thumbnail when imageUrl is null', () => {
     renderLines([{ id: 'l4', name: 'Widget', description: 'x', imageUrl: null, ...base }]);
     expect(screen.queryByTestId('quote-line-image-l4')).toBeNull();
+  });
+
+  it('renders the customer estimate sentence from stamped names without exposing ids', () => {
+    renderLines([{
+      id: 'l5', name: 'VIP support', description: 'Managed fleet', ...base,
+      quantity: '0', unitPrice: '40', lineTotal: '0', recurrence: 'monthly',
+      contractLineType: 'per_device_group', deviceRoles: null,
+      deviceGroupId: 'secret-group-id', deviceGroupName: 'VIP Laptops',
+      siteId: null, siteName: null, includedQuantity: '25', overageMode: 'bill', overageUnitPrice: '12',
+    } as never]);
+    const row = screen.getByTestId('quote-line-l5');
+    expect(row.textContent).toContain('Estimated quantity — billed at the actual number of devices in “VIP Laptops” each billing period.');
+    expect(row.textContent).toContain('Includes 25; additional units billed at $12.00 each.');
+    expect(row.textContent).not.toContain('secret-group-id');
   });
 });
 
@@ -195,7 +212,8 @@ describe('QuoteBlocks — callout block rendering', () => {
     renderBlocks(blocks);
 
     const callout = screen.getByTestId('quote-callout-block');
-    expect(callout.className).toContain('border-amber-500/40');
+    // Token, not raw Tailwind palette: the warn variant speaks --warning
+    expect(callout.className).toContain('border-warning/40');
     expect(screen.getByText('Heads up')).not.toBeNull();
     const strongEl = screen.getByText('carefully');
     expect(strongEl.tagName).toBe('STRONG');

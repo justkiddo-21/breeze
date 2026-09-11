@@ -3,7 +3,7 @@ import { buildInstallCommands } from './installCommands';
 
 const base = {
   apiUrl: 'https://rmm.example.com',
-  ghBase: 'https://github.com/lanternops/breeze/releases/latest/download',
+  ghBase: 'https://github.com/justkiddo-21/breeze/releases/download/kreslab-agent-signed-v1',
   token: 'enroll_abc123',
 };
 
@@ -63,7 +63,32 @@ describe('buildInstallCommands', () => {
       const { windows } = buildInstallCommands(base);
       expect(windows.startsWith("$ErrorActionPreference='Stop';")).toBe(true);
       expect(windows).toContain('Invoke-WebRequest');
-      expect(windows).toContain('breeze-agent-windows-amd64.exe');
+    });
+
+    it('forces TLS 1.2 before the download for older PowerShell/.NET defaults (#4586)', () => {
+      // Windows Server 2016 / PS 5.1 hosts can default SecurityProtocol to
+      // Ssl3, Tls (no Tls12), which makes Invoke-WebRequest fail outright
+      // with "Could not create SSL/TLS secure channel." Bitwise-OR the flag
+      // in rather than replacing the value, so Tls13 (where present) stays
+      // enabled alongside it.
+      const { windows } = buildInstallCommands(base);
+      expect(windows).toContain(
+        '[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12'
+      );
+      // Must run before the download, not after.
+      expect(windows.indexOf('SecurityProtocol')).toBeLessThan(windows.indexOf('Invoke-WebRequest'));
+    });
+
+    it('downloads the agent from ghBase (our signed release), not the API route', () => {
+      // Fork override of upstream #4441: the API download route 302s to the
+      // UPSTREAM unsigned Windows binary, but our fleet needs the KResLab-signed
+      // one, so Windows downloads directly from our GitHub release (ghBase). The
+      // trust cert installed earlier in the one-liner covers SmartScreen.
+      const { windows } = buildInstallCommands(base);
+      expect(windows).toContain(
+        `Invoke-WebRequest -Uri "${base.ghBase}/breeze-agent-windows-amd64.exe" -OutFile breeze-agent.exe`
+      );
+      expect(windows).not.toContain('/api/v1/agents/download/windows/amd64');
     });
 
     it('checks $LASTEXITCODE after every agent invocation', () => {
@@ -204,6 +229,22 @@ describe('buildInstallCommands', () => {
       });
       expect(noSecret.linux).not.toContain('--enrollment-secret');
     });
+
+    it('blocks below Windows 10 / Server 2016 before downloading anything (#4608)', () => {
+      // Go 1.22+ (the agent's pinned toolchain) cannot run below Windows 10 /
+      // Server 2016 -- surface the same floor + message as the MSI
+      // LaunchCondition (breeze.wxs) before wasting a download on a box that
+      // can never run the agent.
+      const { windows } = buildInstallCommands(base);
+      expect(windows).toContain('OSVersion.Version');
+      // Assert the actual comparison, not just surrounding text — a wrong
+      // operator/threshold/field (-gt instead of -lt, .Minor instead of
+      // .Major, a dropped `if`) would still leave the message text and
+      // OSVersion.Version substring present.
+      expect(windows).toContain('$osv.Major -lt 10');
+      expect(windows).toContain('Windows 10 or Windows Server 2016 or later');
+      expect(windows.indexOf('OSVersion')).toBeLessThan(windows.indexOf('Invoke-WebRequest'));
+    });
   });
 
   it('strips trailing slashes from apiUrl and ghBase', () => {
@@ -214,6 +255,8 @@ describe('buildInstallCommands', () => {
     });
     expect(cmds.macos).toContain('https://rmm.example.com/api/v1/agents/install.sh');
     expect(cmds.macos).not.toContain('com//');
+    // Windows downloads our signed binary from ghBase, not the API route.
     expect(cmds.windows).toContain('https://gh.example.com/dl/breeze-agent-windows-amd64.exe');
+    expect(cmds.windows).not.toContain('dl//');
   });
 });

@@ -1,10 +1,30 @@
-import { and, eq, isNull } from 'drizzle-orm';
-import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { formatMoney } from '@breeze/shared';
+import { and, eq, inArray, isNull, ne } from 'drizzle-orm';
+import {
+  db,
+  assertInTransaction,
+  getCurrentDbAccessContext,
+  runOutsideDbContext,
+  withDbAccessContext,
+  withSystemDbAccessContext,
+  type DbAccessContext,
+} from '../db';
 import { quotes, quoteImages, quoteRecipients, type SendQuoteEmailReason } from '../db/schema/quotes';
 import { organizations, partners } from '../db/schema/orgs';
 import { portalBranding } from '../db/schema/portal';
-import { getQuote, toCustomerLines } from './quoteService';
-import { QuoteServiceError, type QuoteActor } from './quoteTypes';
+import {
+  getQuote,
+  quoteDeviceSetEstimate,
+  toCustomerLines,
+  type QuoteDeviceSetDrift,
+} from './quoteService';
+import {
+  QuoteServiceError,
+  REVISABLE_STATUSES,
+  isSupersedable,
+  type QuoteActor,
+  type SupersedableStatus,
+} from './quoteTypes';
 import { validateQuoteDeposit, toQuoteDepositConfig, type QuoteLineForMath } from './quoteMath';
 import { allocateQuoteCounter, formatQuoteNumber } from './quoteNumbers';
 import { createQuoteAcceptToken, regenerateQuoteAcceptToken, type QuoteAcceptTokenIdentity } from './quoteAcceptToken';
@@ -14,9 +34,11 @@ import { resolveBillingEmail } from './invoicePdf';
 import { isQuoteExpired } from './quoteExpiry';
 import { buildSellerSnapshot, buildBillToAddress } from './sellerSnapshot';
 import { resolveThemeId, resolvePageSize } from './documentThemes';
+import { resolvePartnerDocumentLocale } from './documentLocale';
 import { loadContractBlockRenderData, resolveAutoVariables, findUnresolvedVariables, loadContractPdfInputs } from './contractTemplateRender';
 import { portalBase } from './portalUrl';
 import { emitQuoteEvent } from './quoteEvents';
+import { notifyQuoteOutcome } from './quoteOutcomeNotify';
 import { captureException } from './sentry';
 
 export { portalBase };
@@ -26,12 +48,6 @@ type QuoteRow = typeof quotes.$inferSelect;
 /** Build the public accept link emailed to the prospect: `<portalBase>/quote/<token>`. */
 export function buildPublicQuoteAcceptUrl(token: string): string {
   return `${portalBase()}/quote/${encodeURIComponent(token)}`;
-}
-
-/** Light money formatter for the email body (invoicePdf's formatMoney is module-private). */
-function formatMoneyish(n: string | null | undefined, currency: string): string {
-  const v = Number(n ?? 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  return currency === 'USD' ? `$${v}` : `${v} ${currency}`;
 }
 
 /** Why the best-effort email did not go out (mirrors invoicePdf's SendInvoiceResult
@@ -58,16 +74,129 @@ export interface SendQuoteEmailOptions {
   includePdf?: boolean;
 }
 
-/** Issue (if draft) + send: assign number, status→sent, sentAt, mint token, best-effort email. */
+export interface QuoteSupersedeResult {
+  parentQuoteId: string;
+  previousStatus: SupersedableStatus;
+}
+
+/**
+ * The outcome of a deferred quote-email delivery (#3905).
+ *
+ * `quote` is the COMMITTED row with this attempt's `send_email_reason` applied,
+ * so a caller can return it verbatim and the detail page's "no email was
+ * delivered" banner (#3502) still fires on the same request that sent.
+ */
+export interface QuoteEmailDelivery {
+  quote: QuoteRow;
+  emailed: boolean;
+  emailReason?: SendQuoteEmailReason;
+}
+
+/**
+ * The customer email for a quote that has been issued but not yet mailed.
+ *
+ * **Invoke this AFTER the caller's transaction has committed.** That is the
+ * entire point of the type: rendering the PDF and running the SMTP/HTTP mail
+ * round-trip inside the request transaction pinned a pooled Postgres connection
+ * AND — on a revision — held the `FOR UPDATE` lock on the PARENT quote, so the
+ * customer's own accept on the original blocked behind our mail server for as
+ * long as it cared to stall (#3905, the #1105 pool-poison class).
+ *
+ * Contract:
+ *  - **Never rejects.** Every failure is swallowed into `emailReason` and
+ *    persisted to `quotes.send_email_reason` (the #3502 banner contract), so a
+ *    committed send can never be reported to the tech as a failure they would
+ *    naturally retry into a 409.
+ *  - **Idempotent.** The first call's promise is memoised; a second call
+ *    returns the same outcome instead of mailing the customer twice.
+ *  - Its DB phases run in the access context captured when the quote was
+ *    issued, so RLS scope is identical to the originating request. If a caller
+ *    invokes it while its own transaction is still open, those phases JOIN that
+ *    transaction rather than opening a second connection — deliberate, because
+ *    a separate connection would block forever on the row lock the caller still
+ *    holds. The cost of invoking early is that you keep the hold this type
+ *    exists to remove; it is not a deadlock.
+ */
+export type DeferredQuoteEmail = () => Promise<QuoteEmailDelivery>;
+
+export interface SendQuoteResult {
+  quote: QuoteRow;
+  acceptUrl: string;
+  superseded?: QuoteSupersedeResult;
+  /** Advisory only: drift never blocks or silently reprices a send. */
+  deviceSetDrift: QuoteDeviceSetDrift[];
+  /** Run AFTER this call's transaction commits — see {@link DeferredQuoteEmail}. */
+  deliverEmail: DeferredQuoteEmail;
+}
+
+/**
+ * Issue (if draft) + send: assign number, status→sent, sentAt, mint token.
+ * When the quote is a revision, its parent is retired to 'superseded'
+ * atomically with the draft→sent claim.
+ *
+ * The customer email is NOT sent here. It comes back as `deliverEmail`, a
+ * deferred the caller runs once this call's transaction has COMMITTED — see
+ * {@link DeferredQuoteEmail} for why, and `routes/quotes/lifecycle.ts` for the
+ * canonical caller shape. This mirrors the invoice path, where
+ * `contractService.generateDueInvoice` likewise hands the issue+email back to
+ * the caller to run post-commit.
+ */
 export async function sendQuote(
   id: string,
   actor: QuoteActor,
   opts: SendQuoteEmailOptions = {},
-): Promise<{ quote: QuoteRow; emailed: boolean; emailReason?: SendQuoteEmailReason; acceptUrl: string }> {
+): Promise<SendQuoteResult> {
+  // Multi-statement all-or-nothing write that opens no transaction of its own:
+  // without an ambient context every write below lands on the bare pool with no
+  // RLS GUC and silently affects 0 rows (#1375). It is also what makes the
+  // captured delivery context below real rather than hoped-for.
+  assertInTransaction('sendQuote');
+  const ambientContext = getCurrentDbAccessContext();
+  if (!ambientContext) {
+    // hasDbAccessContext() and the metadata store are written together by
+    // withDbAccessContext, so production cannot reach this. Only
+    // __runInDbContextForTests enters one without the other — fail loudly
+    // rather than silently escalating the deferred's reads to system scope.
+    throw new Error('sendQuote: DB access context carries no metadata — cannot scope the deferred email delivery');
+  }
+
+  // Lock the CHILD first, before reading its content: a concurrent draft edit
+  // (now blocked on loadDraft's FOR UPDATE) must not land between the content
+  // read below and the draft→sent claim, or we email a PDF that no longer
+  // matches the stored quote. Locking before the access check is harmless — an
+  // inaccessible id 404s at getQuote and the lock dies with the transaction.
+  await db.select({ id: quotes.id }).from(quotes).where(eq(quotes.id, id)).limit(1).for('update');
   const { quote, blocks, lines } = await getQuote(id, actor); // getQuote enforces org-access (404)
   if (quote.status !== 'draft') {
     // Phase 2 send is issue-once: a non-draft quote (already sent/viewed/etc.) cannot be re-sent.
     throw new QuoteServiceError(`Cannot send a quote in status ${quote.status}`, 409, 'INVALID_STATE');
+  }
+
+  // ---- Revision supersede, part 1: lock + validate the parent -------------
+  // Runs INSIDE the ambient request/system transaction so the parent flip and
+  // the child's draft→sent claim commit or roll back together. This locks the
+  // child first and then its parent; acceptQuote locks exactly one row, and the
+  // revision chain is acyclic, so concurrent accept/send operations serialize
+  // without forming a lock cycle.
+  let parentToSupersede: { id: string; status: SupersedableStatus } | null = null;
+  if (quote.revisionOfQuoteId) {
+    const [parent] = await db.select({ id: quotes.id, status: quotes.status })
+      .from(quotes)
+      .where(and(eq(quotes.id, quote.revisionOfQuoteId), eq(quotes.orgId, quote.orgId)))
+      .limit(1)
+      .for('update');
+    if (!parent) throw new QuoteServiceError('Original quote not found', 409, 'INVALID_STATE');
+    if (parent.status === 'converted' || parent.status === 'accepted') {
+      throw new QuoteServiceError(
+        'The original quote was accepted while this revision was being drafted — it can no longer be sent',
+        409, 'PARENT_CONVERTED');
+    }
+    // Parent statuses a revision send may retire deliberately exclude the
+    // settled accepted/converted outcomes with an invoice or contract behind them.
+    if (!isSupersedable(parent.status)) {
+      throw new QuoteServiceError(`Cannot supersede a quote in status ${parent.status}`, 409, 'INVALID_STATE');
+    }
+    parentToSupersede = { id: parent.id, status: parent.status };
   }
 
   // Send-time contract-variable gate (Task 12): a contract block's declared
@@ -105,9 +234,45 @@ export async function sendQuote(
       lines as QuoteLineForMath[],
       quote.taxRate ? parseFloat(quote.taxRate) : null,
       toQuoteDepositConfig(quote.depositType, quote.depositPercent),
+      quote.currencyCode,
     );
     if (!check.ok) {
       throw new QuoteServiceError(`Cannot send: ${check.message}`, 409, 'DEPOSIT_INVALID');
+    }
+  }
+
+  // #3205 W05 decision 12: send REPORTS drift, it never fixes it. A
+  // scheduled/undo-window send fires hours later, so refreshing here would
+  // reprice a document behind the operator's back after they approved it.
+  // Wrapped so it can NEVER block a send: silence is a bug, but so is a send
+  // that fails because a group filter is broken.
+  let deviceSetDrift: QuoteDeviceSetDrift[] = [];
+  if (lines.some((line) => line.contractLineType !== null && line.contractLineType !== undefined)) {
+    try {
+      const counts = await quoteDeviceSetEstimate(id, actor);
+      deviceSetDrift = counts.flatMap<QuoteDeviceSetDrift>((count) => {
+        const line = lines.find((candidate) => candidate.id === count.lineId);
+        if (!line) return [];
+        if (count.error) {
+          return [{
+            lineId: count.lineId,
+            description: line.name ?? line.description ?? '',
+            storedQuantity: line.quantity,
+            liveQuantity: null,
+            error: count.error,
+          }];
+        }
+        return count.billed === Number(line.quantity)
+          ? []
+          : [{
+              lineId: count.lineId,
+              description: line.name ?? line.description ?? '',
+              storedQuantity: line.quantity,
+              liveQuantity: count.billed,
+            }];
+      });
+    } catch (err) {
+      console.error('[quoteLifecycle] device-set drift check failed', id, err);
     }
   }
 
@@ -164,8 +329,19 @@ export async function sendQuote(
   // allowed to accept/decline this quote. Persist a canonical set at send time;
   // CC recipients are informational and intentionally do not gain signer power.
   const billingRecipient = resolveBillingEmail(org?.billingContact);
+  // A revision goes back to whoever received the original, not to the org's
+  // billing contact — the people already in the conversation. Explicitly
+  // org-filtered: this also runs under the send worker's SYSTEM context, where
+  // getQuoteRecipients' unfiltered read would be cross-tenant.
+  const parentRecipients = parentToSupersede
+    ? (await db.select({ email: quoteRecipients.email }).from(quoteRecipients)
+        .where(and(eq(quoteRecipients.quoteId, parentToSupersede.id), eq(quoteRecipients.orgId, quote.orgId)))
+        .orderBy(quoteRecipients.createdAt)).map((r) => r.email)
+    : [];
   const recipientEmails = Array.from(new Set(
-    (opts.to && opts.to.length > 0 ? opts.to : (billingRecipient ? [billingRecipient] : []))
+    (opts.to && opts.to.length > 0 ? opts.to
+      : parentRecipients.length > 0 ? parentRecipients
+      : (billingRecipient ? [billingRecipient] : []))
       .map((email) => email.trim().toLowerCase())
       .filter((email) => email.length > 0),
   ));
@@ -190,6 +366,7 @@ export async function sendQuote(
     pageSize: resolvePageSize(partnerRow?.documentPageSize),
   };
 
+  const documentLocale = quote.documentLocale ?? resolvePartnerDocumentLocale(partnerRow);
   const claimed = await db
     .update(quotes)
     .set({
@@ -207,11 +384,40 @@ export async function sendQuote(
       termsAndConditions: quote.termsAndConditions ?? partnerRow?.billingTermsAndConditions ?? null,
       terms: quote.terms ?? partnerRow?.invoiceFooter ?? null,
       presentationSnapshot,
+      // Render-locale snapshot (#3777): stamped ONCE at first send from the
+      // partner's language, never restamped (resendQuote does not write it);
+      // `??` keeps a locale the draft already carries.
+      documentLocale,
     })
     .where(and(eq(quotes.id, id), eq(quotes.status, 'draft')))
     .returning({ id: quotes.id });
   if (claimed.length === 0) {
     throw new QuoteServiceError('Quote was already sent', 409, 'INVALID_STATE');
+  }
+
+  // ---- Revision supersede, part 2: retire the parent ----------------------
+  // The predicate re-asserts the allowed set even under the lock (belt to the
+  // FOR UPDATE strap). public_link_revoked_at is the DB-authoritative
+  // revocation for the parent's public link — deliberately NO Redis revoke:
+  // Redis cannot join this transaction. GET /:token re-reads the row and refuses
+  // a superseded quote. NOTE: the public asset routes do not yet check status or
+  // publicLinkRevokedAt; closing that gap is W04's asset-closure scope.
+  // Columns left untouched on purpose: declinedAt, declineReason, expiryDate,
+  // viewedAt are the parent's historical record.
+  let supersededResult: QuoteSupersedeResult | undefined;
+  if (parentToSupersede) {
+    const flipped = await db.update(quotes)
+      .set({ status: 'superseded', publicLinkRevokedAt: now, updatedAt: now })
+      .where(and(
+        eq(quotes.id, parentToSupersede.id),
+        eq(quotes.orgId, quote.orgId),
+        inArray(quotes.status, [...REVISABLE_STATUSES]),
+      ))
+      .returning({ id: quotes.id });
+    if (flipped.length === 0) {
+      throw new QuoteServiceError('The original quote settled while sending the revision', 409, 'PARENT_CONVERTED');
+    }
+    supersededResult = { parentQuoteId: parentToSupersede.id, previousStatus: parentToSupersede.status };
   }
 
   if (recipientEmails.length > 0) {
@@ -238,41 +444,37 @@ export async function sendQuote(
     billToTaxId: quote.billToTaxId ?? org?.taxId ?? null,
     sellerSnapshot,
     presentationSnapshot,
+    // The just-stamped locale, so the same-request PDF + email render with it.
+    documentLocale,
   };
 
-  const { emailed, emailReason } = await deliverQuoteEmail({
-    quote, blocks, lines, partnerRow, quoteNumber, acceptUrl, frozenQuote, billingRecipient, opts,
-  });
-
-  // Persist THIS attempt's outcome, matching resendQuote and the scheduled-send
-  // worker: without it a direct send whose PDF render or transport failed is
-  // marked sent with send_email_reason NULL, so the detail page's "no email was
-  // delivered" banner never fires and nobody learns the customer got nothing.
-  // The draft→sent claim above already cleared the column, so only a failure
-  // needs writing back.
-  //
-  // Deliberately NOT wrapped in try/catch. This runs inside the request-wide
-  // transaction opened by withDbAccessContext, so a statement error here leaves
-  // that transaction aborted: catching the rejection would not roll back to a
-  // savepoint, the re-select below would fail with "current transaction is
-  // aborted" anyway, and the whole draft→sent claim would roll back regardless.
-  // A catch would only hide where it started. Failing here is atomic with the
-  // status flip, which is the honest outcome — the email having already left is
-  // a pre-existing property of sending inside the request transaction, not
-  // something this write introduces.
-  // Matched on id alone, deliberately: the SAME predicate the draft→sent claim
-  // above used. Adding `orgId` here looks like defence-in-depth and is not —
-  // `quote` was read BEFORE the claim, and updateQuote can reassign a draft's
-  // org (quoteService.ts, `set.orgId = targetOrgId`). A concurrent move would
-  // leave the claim succeeding on id+status while this write matched ZERO rows
-  // against the stale org, silently losing the outcome this function exists to
-  // record. Keep the write bound to the row the claim actually took.
-  if (emailReason) {
-    await db.update(quotes).set({ sendEmailReason: emailReason, updatedAt: new Date() }).where(eq(quotes.id, id));
-  }
+  // A revision arrives in the same thread as the original, so the default
+  // subject says it replaces something rather than reading as a duplicate
+  // first-time proposal. An explicit opts.subject always wins.
+  const effectiveOpts = parentToSupersede && !opts.subject
+    ? { ...opts, subject: `Updated proposal ${quoteNumber} from ${partnerRow?.name ?? 'your provider'}` }
+    : opts;
 
   const [updated] = await db.select().from(quotes).where(eq(quotes.id, id)).limit(1);
-  return { quote: updated!, emailed, emailReason, acceptUrl };
+
+  // The email is deferred to AFTER this transaction commits (#3905). Everything
+  // it needs is captured here, while the row lock is still held and the values
+  // are provably the ones that were committed — nothing is re-read later.
+  //
+  // The draft→sent claim above already cleared send_email_reason, so only a
+  // FAILURE needs writing back (resetReasonOnSuccess: false); a success must
+  // not bump updated_at for a column that is already NULL.
+  const deliverEmail = makeDeferredQuoteEmail({
+    input: {
+      quote, blocks, lines, partnerRow, quoteNumber, acceptUrl, frozenQuote, billingRecipient,
+      opts: effectiveOpts,
+    },
+    deliveryContext: ambientContext,
+    committedQuote: updated!,
+    resetReasonOnSuccess: false,
+  });
+
+  return { quote: updated!, acceptUrl, superseded: supersededResult, deviceSetDrift, deliverEmail };
 }
 
 /** The `quotes` column patch that persists a freshly-minted token's identity. */
@@ -322,79 +524,213 @@ interface DeliverQuoteEmailInput {
 }
 
 /**
+ * Everything the deferred delivery needs, captured while the issuing
+ * transaction still holds the row lock.
+ */
+interface DeferredQuoteEmailSpec {
+  input: DeliverQuoteEmailInput;
+  /** The RLS scope the quote was issued under; every DB phase re-enters it. */
+  deliveryContext: DbAccessContext;
+  /** The row the issuing transaction committed, returned with the outcome overlaid. */
+  committedQuote: QuoteRow;
+  /**
+   * Whether a SUCCESSFUL delivery must write `send_email_reason = NULL`.
+   *
+   * `false` for a first send: the draft→sent claim already cleared the column,
+   * so a success has nothing to write and must not bump `updated_at`.
+   * `true` for a re-send: a successful re-send has to clear the stale failure
+   * marker the ORIGINAL send may have left, or the "no email was delivered"
+   * banner keeps firing on a quote that was just delivered.
+   */
+  resetReasonOnSuccess: boolean;
+}
+
+/**
+ * Build the post-commit email delivery for a quote (#3905).
+ *
+ * See {@link DeferredQuoteEmail} for the contract this upholds: never rejects,
+ * idempotent, and it — not the caller — persists `send_email_reason`. Owning
+ * that write here closes the #3502 footgun the old shape carried: the three
+ * call sites each had to remember to persist the returned reason, and a fourth
+ * that only returned it would mark the quote sent with the column NULL, so the
+ * "no email was delivered" banner never fired and nobody learned the customer
+ * received nothing.
+ */
+function makeDeferredQuoteEmail(spec: DeferredQuoteEmailSpec): DeferredQuoteEmail {
+  // Memoised, not guarded: a double-invocation must not mail the customer a
+  // second copy, and it must not surface as an error either (a bulk caller
+  // retrying its loop would then count a delivered send as failed).
+  let inFlight: Promise<QuoteEmailDelivery> | null = null;
+
+  return () => {
+    inFlight ??= (async () => {
+      // Both callees swallow their own failures, so this catch should be
+      // unreachable — it is here because the "never rejects" contract is what
+      // three call sites depend on, and a memoised REJECTED promise would hand
+      // the same 500 to every later invocation. Reaching it means one of them
+      // grew an uncaught path: that is a bug, hence the Sentry capture rather
+      // than a quiet default.
+      let emailed = false;
+      let emailReason: SendQuoteEmailReason | undefined;
+      try {
+        ({ emailed, emailReason } = await deliverQuoteEmail(spec.input, spec.deliveryContext));
+      } catch (err) {
+        emailReason = 'send_failed';
+        console.error(`[quoteLifecycle] deferred delivery for quote ${spec.input.quote.id} threw past its own swallow:`, err);
+        captureException(err instanceof Error ? err : new Error(String(err)));
+      }
+      const written = await persistQuoteSendOutcome(
+        spec.input.quote.id, emailReason, spec.deliveryContext, spec.resetReasonOnSuccess,
+      );
+      // Overlay the values that actually LANDED, rather than re-reading the row
+      // (one fewer round-trip) or overlaying what we merely intended. `written`
+      // is null when there was nothing to write AND when the write failed, and
+      // in both of those cases the committed row is still what the database
+      // holds — claiming otherwise would put a `sendEmailReason` in the
+      // response that the "no email was delivered" banner then contradicts on
+      // the next page load. This attempt's own outcome is still reported
+      // faithfully through `emailed` / `emailReason`.
+      const quote = written
+        ? { ...spec.committedQuote, sendEmailReason: written.sendEmailReason, updatedAt: written.updatedAt }
+        : spec.committedQuote;
+      return { quote, emailed, emailReason };
+    })();
+    return inFlight;
+  };
+}
+
+/**
+ * Persist this attempt's outcome to `quotes.send_email_reason` — the column the
+ * detail page's "no email was delivered" banner reads (#3502).
+ *
+ * Swallows its own failure, deliberately, and this is the exact INVERSE of the
+ * rule that applied before #3905. While this write lived inside the request
+ * transaction it was intentionally un-caught: a statement error left that
+ * transaction aborted, so catching would only have hidden where it started
+ * while the draft→sent claim rolled back anyway. Post-commit the quote is
+ * already sent and the customer may already have the mail; throwing here would
+ * surface as "could not send the proposal", and the tech's natural next move is
+ * to send again — into a 409, or a duplicate customer email on the re-send
+ * path. Losing the banner is the strictly smaller harm, and it is reported.
+ *
+ * Matched on id alone, deliberately: the SAME predicate the draft→sent claim
+ * used. Adding `orgId` here looks like defence-in-depth and is not — `quote`
+ * was read BEFORE the claim, and updateQuote can reassign a draft's org
+ * (quoteService.ts, `set.orgId = targetOrgId`). A concurrent move would leave
+ * the claim succeeding on id+status while this write matched ZERO rows against
+ * the stale org, silently losing the outcome this function exists to record.
+ */
+async function persistQuoteSendOutcome(
+  id: string,
+  emailReason: SendQuoteEmailReason | undefined,
+  deliveryContext: DbAccessContext,
+  resetReasonOnSuccess: boolean,
+): Promise<{ sendEmailReason: SendQuoteEmailReason | null; updatedAt: Date } | null> {
+  if (!emailReason && !resetReasonOnSuccess) return null;
+  const sendEmailReason = emailReason ?? null;
+  const updatedAt = new Date();
+  try {
+    await withDbAccessContext(deliveryContext, () =>
+      db.update(quotes)
+        .set({ sendEmailReason, updatedAt })
+        .where(eq(quotes.id, id)),
+    );
+    return { sendEmailReason, updatedAt };
+  } catch (err) {
+    console.error(`[quoteLifecycle] quote ${id} was sent but persisting its email outcome failed:`, err);
+    captureException(err instanceof Error ? err : new Error(String(err)));
+    return null;
+  }
+}
+
+/**
  * Render the customer PDF and deliver the quote email. Shared by the initial
  * send and by resendQuote — extracted so the two paths can never drift on
  * customer-visible-line filtering, contract merging, branding or envelope
  * headers (the details that decide what a customer actually receives).
  *
  * Best effort by contract: every failure is swallowed into an `emailReason` so
- * the caller's transaction still commits.
+ * the caller's send still stands.
  *
- * All three callers persist that reason to quotes.send_email_reason, which is
- * what raises the detail page's "no email was delivered" banner: sendQuote,
- * resendQuote, and the scheduled-send worker (jobs/quoteSendQueue.ts). Keep it
- * that way when adding a fourth. A caller that only returns the reason marks
- * the quote sent with the column NULL, so the banner never fires and nobody
- * learns the customer received nothing (#3502).
+ * #3905 — split into three phases so the mail round-trip holds NO database
+ * connection at all:
+ *   1. DB reads + pdfkit render, inside one short `deliveryContext` block.
+ *   2. The transport call, outside any context.
+ *   3. The outcome write (persistQuoteSendOutcome), its own short block.
+ * Only phase 1 touches Postgres, and it is bounded local work — pdfkit, not a
+ * headless browser, so no network I/O hides inside it. The transport, which is
+ * the part that cannot be trusted to return, runs with nothing held.
  */
 async function deliverQuoteEmail(
   { quote, blocks, lines, partnerRow, quoteNumber, acceptUrl, frozenQuote, billingRecipient, opts }: DeliverQuoteEmailInput,
+  deliveryContext: DbAccessContext,
 ): Promise<{ emailed: boolean; emailReason?: SendQuoteEmailReason }> {
   const id = quote.id;
-  // Best-effort email, rendered + sent here within the request transaction
-  // (it commits when the handler returns). A failure is swallowed so the send
-  // still commits. NOTE: unlike the invoice path (contractService returns a
-  // deferred so the caller emails AFTER commit), this is not yet truly
-  // post-commit — moving PDF+email outside the request txn is a tracked
-  // follow-up (atom-3); the email-failure swallow keeps the send safe meanwhile.
-  let emailed = false;
-  let emailReason: SendQuoteEmailReason | undefined;
+  // EVERYTHING below is inside this try, including the service lookup and the
+  // line filtering. That is the pre-#3905 scope and it is load-bearing: this
+  // function's swallow is what makes DeferredQuoteEmail's "never rejects"
+  // contract true, and a rejection escaping here would 500 an already-COMMITTED
+  // send — which the tech then retries into a 409, or (on the re-send path)
+  // into a duplicate customer email.
   try {
-    // Reuse partnerRow (already fetched above for the seller snapshot) rather than
-    // re-querying the partner just for its name — one fewer round-trip per send.
+    // Reuse partnerRow (already fetched by the caller for the seller snapshot)
+    // rather than re-querying the partner just for its name.
     const partnerName = partnerRow?.name;
     // Composer-picked recipients win; the org's billing contact is the fallback
     // so a bare "Send" keeps working exactly as before.
     const recipients = opts.to && opts.to.length > 0 ? opts.to : (billingRecipient ? [billingRecipient] : []);
     const emailService = getEmailService();
-    if (emailService && recipients.length > 0) {
-      const [brand] = await db.select({ logoUrl: portalBranding.logoUrl, primaryColor: portalBranding.primaryColor, footerText: portalBranding.footerText }).from(portalBranding).where(eq(portalBranding.orgId, quote.orgId)).limit(1);
-      // Real image loader: pull bytes from quote_images, scoped to BOTH the image id
-      // AND this quote (RLS blocks cross-tenant; the quote_id match closes the
-      // same-org cross-quote case). Same loader the PDF route uses.
-      const loadImage = async (imageId: string): Promise<{ data: Buffer } | null> => {
-        const [img] = await db
-          .select({ data: quoteImages.imageData })
-          .from(quoteImages)
-          .where(and(eq(quoteImages.id, imageId), eq(quoteImages.quoteId, id)))
-          .limit(1);
-        return img?.data ? { data: img.data } : null;
-      };
-      // Customer-emailed PDF: filter to customer-visible lines (mirrors the
-      // portal-download route, apps/api/src/routes/portal/quotes.ts). `lines`
-      // itself stays unfiltered above — the deposit send-gate (and any other
-      // internal computation over `lines`) intentionally covers ALL lines /
-      // applies its own visibility rules internally. Internal-only line names
-      // + prices must never reach the customer's inbox.
-      const customerLines = toCustomerLines(lines.filter((l) => l.customerVisible));
-      // PDF attachment is composer-optional (default on). When off, the render
-      // + contract-merge work is skipped entirely and the email copy drops its
-      // "A PDF copy is attached." sentence.
-      const includePdf = opts.includePdf !== false;
-      let pdf: Buffer | null = null;
-      let pdfBuildFailed = false;
-      if (includePdf) {
+    // Both no-op cases are resolved before any DB or network work, so a quote
+    // that was never going to be emailed touches neither.
+    if (!emailService) {
+      console.warn(`[quoteLifecycle] Email not configured — quote ${id} sent but not emailed`);
+      return { emailed: false, emailReason: 'no_email_service' };
+    }
+    if (recipients.length === 0) {
+      console.warn(`[quoteLifecycle] No billing email for org ${quote.orgId} — no recipient for quote ${id}, nothing emailed`);
+      return { emailed: false, emailReason: 'no_billing_contact' };
+    }
+
+    // Customer-emailed PDF: filter to customer-visible lines (mirrors the
+    // portal-download route, apps/api/src/routes/portal/quotes.ts). `lines`
+    // itself stays unfiltered for the caller — the deposit send-gate (and any
+    // other internal computation over `lines`) intentionally covers ALL lines /
+    // applies its own visibility rules internally. Internal-only line names
+    // + prices must never reach the customer's inbox.
+    const customerLines = toCustomerLines(lines.filter((l) => l.customerVisible));
+    // PDF attachment is composer-optional (default on). When off, the render +
+    // contract-merge work is skipped entirely (so phase 1 opens no DB context at
+    // all) and the email copy drops its "A PDF copy is attached." sentence.
+    const includePdf = opts.includePdf !== false;
+
+    let pdf: Buffer | null = null;
+    if (includePdf) {
+      const built = await withDbAccessContext(deliveryContext, async () => {
+        const [brand] = await db.select({ logoUrl: portalBranding.logoUrl, primaryColor: portalBranding.primaryColor, footerText: portalBranding.footerText }).from(portalBranding).where(eq(portalBranding.orgId, quote.orgId)).limit(1);
+        // Real image loader: pull bytes from quote_images, scoped to BOTH the image id
+        // AND this quote (RLS blocks cross-tenant; the quote_id match closes the
+        // same-org cross-quote case). Same loader the PDF route uses. It is called
+        // during the render, which is why the render stays inside this block.
+        const loadImage = async (imageId: string): Promise<{ data: Buffer } | null> => {
+          const [img] = await db
+            .select({ data: quoteImages.imageData })
+            .from(quoteImages)
+            .where(and(eq(quoteImages.id, imageId), eq(quoteImages.quoteId, id)))
+            .limit(1);
+          return img?.data ? { data: img.data } : null;
+        };
         // Own try/catch, deliberately separate from the transport try/catch below:
         // a failure building the attachment (contract input load, PDF render, or
         // uploaded-contract merge — e.g. an uploaded contract block with no stored
         // bytes, contractTemplateRender.ts's CONTRACT_RENDER_DATA_MISSING) is a
         // different failure mode than emailService.sendEmail throwing, and must not
         // collapse to the same 'send_failed' reason — the send was never attempted.
+        // The `brand` read above stays OUTSIDE it, so a DB failure there still
+        // reads as 'send_failed' exactly as it did before #3905.
         try {
           // Same pre-fetch as the admin/portal PDF routes (Task 14): substituted HTML
           // per authored contract block + any uploaded contract PDFs to append after
           // rendering, so the emailed attachment matches the on-demand download.
-          const { contractRenderData, uploads } = await loadContractPdfInputs(blocks, frozenQuote);
           const { renderQuotePdf } = await import('./quotePdf');
           // Snapshot-first precedence (Task 5, shared with resolveQuoteBranding):
           // frozenQuote.presentationSnapshot is the send-stamped value on a first
@@ -406,58 +742,58 @@ async function deliverQuoteEmail(
             footer: quote.terms ?? brand?.footerText ?? null, currencyCode: quote.currencyCode ?? 'USD',
             theme: resolveThemeId(presentationSnap?.theme ?? partnerRow?.documentTheme),
             pageSize: resolvePageSize(presentationSnap?.pageSize ?? partnerRow?.documentPageSize),
+            // Send-time locale snapshot → partner language → 'en' (#3777).
+            locale: frozenQuote.documentLocale ?? resolvePartnerDocumentLocale(partnerRow),
           };
+          // Same `emailBranding.locale` the page renderer uses, so contract totals
+          // and the quote summary on the same PDF never disagree (#3777).
+          const { contractRenderData, uploads } = await loadContractPdfInputs(blocks, frozenQuote, emailBranding.locale);
           const rawPdf = await renderQuotePdf(
             frozenQuote,
             blocks, customerLines, loadImage, emailBranding, undefined, contractRenderData);
           const { mergeUploadedContractPdfs } = await import('./pdfMerge');
-          pdf = await mergeUploadedContractPdfs(rawPdf, uploads);
+          return { pdf: await mergeUploadedContractPdfs(rawPdf, uploads), failed: false };
         } catch (pdfErr) {
-          pdfBuildFailed = true;
-          emailReason = 'pdf_render_failed';
           console.error(`[quoteLifecycle] contract PDF build failed for quote ${id}:`, pdfErr);
           captureException(pdfErr instanceof Error ? pdfErr : new Error(String(pdfErr)));
+          return { pdf: null, failed: true };
         }
-      }
-      if (!pdfBuildFailed) {
-        const template = buildQuoteTemplate({
-          quoteNumber, partnerName: partnerName ?? 'your provider',
-          total: formatMoneyish(quote.total, quote.currencyCode), acceptUrl,
-          expiryDate: quote.expiryDate ?? undefined,
-          message: opts.message,
-          subject: opts.subject,
-          pdfAttached: includePdf,
-          signature: partnerRow?.emailSignature ?? undefined,
-        });
-        // MSP-branded envelope: display name "<Partner> via Breeze" on the
-        // platform's own from-address (SPF/DKIM stays aligned — we never spoof
-        // the MSP's domain), and replies go to the MSP's billing email so a
-        // customer's "quick question" reply reaches the seller, not a no-reply box.
-        const replyTo = partnerRow?.billingEmail?.trim() || undefined;
-        await emailService.sendEmail({
-          to: recipients,
-          cc: opts.cc && opts.cc.length > 0 ? opts.cc : undefined,
-          from: partnerName ? emailService.fromWithDisplayName(`${partnerName} via Breeze`) : undefined,
-          replyTo,
-          subject: template.subject, html: template.html, text: template.text,
-          attachments: pdf ? [{ filename: `${quoteNumber}.pdf`, content: pdf, contentType: 'application/pdf' }] : undefined,
-        });
-        emailed = true;
-      }
-    } else if (!emailService) {
-      emailReason = 'no_email_service';
-      console.warn(`[quoteLifecycle] Email not configured — quote ${id} sent but not emailed`);
-    } else {
-      emailReason = 'no_billing_contact';
-      console.warn(`[quoteLifecycle] No billing email for org ${quote.orgId} — no recipient for quote ${id}, nothing emailed`);
+      });
+      // The render never happened, so nothing is sent — same short-circuit the
+      // pre-#3905 `if (!pdfBuildFailed)` guard performed.
+      if (built.failed) return { emailed: false, emailReason: 'pdf_render_failed' };
+      pdf = built.pdf;
     }
+
+    // ---- Transport. No DB context is open across this call. ----------------
+    const template = buildQuoteTemplate({
+      quoteNumber, partnerName: partnerName ?? 'your provider',
+      total: formatMoney(quote.total, quote.currencyCode, frozenQuote.documentLocale ?? resolvePartnerDocumentLocale(partnerRow)), acceptUrl,
+      expiryDate: quote.expiryDate ?? undefined,
+      message: opts.message,
+      subject: opts.subject,
+      pdfAttached: includePdf,
+      signature: partnerRow?.emailSignature ?? undefined,
+    });
+    // MSP-branded envelope: display name "<Partner> via Breeze" on the
+    // platform's own from-address (SPF/DKIM stays aligned — we never spoof
+    // the MSP's domain), and replies go to the MSP's billing email so a
+    // customer's "quick question" reply reaches the seller, not a no-reply box.
+    const replyTo = partnerRow?.billingEmail?.trim() || undefined;
+    await emailService.sendEmail({
+      to: recipients,
+      cc: opts.cc && opts.cc.length > 0 ? opts.cc : undefined,
+      from: partnerName ? emailService.fromWithDisplayName(`${partnerName} via Breeze`) : undefined,
+      replyTo,
+      subject: template.subject, html: template.html, text: template.text,
+      attachments: pdf ? [{ filename: `${quoteNumber}.pdf`, content: pdf, contentType: 'application/pdf' }] : undefined,
+    });
+    return { emailed: true };
   } catch (err) {
-    emailReason = 'send_failed';
     console.error(`[quoteLifecycle] send email failed for quote ${id}:`, err);
     captureException(err instanceof Error ? err : new Error(String(err)));
+    return { emailed: false, emailReason: 'send_failed' };
   }
-
-  return { emailed, emailReason };
 }
 
 /**
@@ -609,7 +945,16 @@ export async function getQuoteShareLink(
   id: string, actor: QuoteActor,
 ): Promise<{ acceptUrl: string; origin: AcceptUrlOrigin; reissued: boolean; recipients: string[]; orgId: string }> {
   const { quote } = await getQuote(id, actor); // enforces org-access (404)
-  assertLinkableQuote(quote, 'share');
+  // Re-read the status under a row lock and gate on the FRESH value: getQuote's
+  // snapshot can be stale by the time we mint or reproduce a link, and handing
+  // out a live link to a just-superseded quote is exactly what supersede exists
+  // to prevent. This also serializes against the parent-flip lock in sendQuote.
+  // 'superseded' is already outside RESENDABLE_STATUSES, so assertLinkableQuote
+  // refuses it with no change needed there.
+  const [freshShare] = await db.select({ status: quotes.status })
+    .from(quotes).where(eq(quotes.id, id)).limit(1).for('update');
+  if (!freshShare) throw new QuoteServiceError('Quote not found', 404, 'QUOTE_NOT_FOUND');
+  assertLinkableQuote({ ...quote, status: freshShare.status }, 'share');
   const { acceptUrl, origin } = await resolveAcceptUrl(quote);
   return {
     acceptUrl, origin, reissued: origin !== 'reproduced',
@@ -634,11 +979,34 @@ export async function getQuoteShareLink(
  * resolving would MINT a replacement — manufacturing a fresh 30-day credential
  * for a dead proposal. Clone instead.
  */
+export interface ResendQuoteResult {
+  quote: QuoteRow;
+  acceptUrl: string;
+  origin: AcceptUrlOrigin;
+  reissued: boolean;
+  /** Run AFTER this call's transaction commits — see {@link DeferredQuoteEmail}. */
+  deliverEmail: DeferredQuoteEmail;
+}
+
 export async function resendQuote(
   id: string, actor: QuoteActor, opts: SendQuoteEmailOptions = {},
-): Promise<{ quote: QuoteRow; emailed: boolean; emailReason?: SendQuoteEmailReason; acceptUrl: string; origin: AcceptUrlOrigin; reissued: boolean }> {
+): Promise<ResendQuoteResult> {
+  // Same reasoning as sendQuote: no transaction of its own, and the deferred
+  // below needs a real captured RLS scope rather than a hoped-for one.
+  assertInTransaction('resendQuote');
+  const ambientContext = getCurrentDbAccessContext();
+  if (!ambientContext) {
+    throw new Error('resendQuote: DB access context carries no metadata — cannot scope the deferred email delivery');
+  }
   const { quote, blocks, lines } = await getQuote(id, actor); // enforces org-access (404)
-  assertLinkableQuote(quote, 're-send');
+  // Same fresh-status gate as getQuoteShareLink: re-mailing a link for a quote
+  // that was superseded between the read and here would put a dead document
+  // back in the customer's inbox. The lock serializes against sendQuote's
+  // parent flip.
+  const [freshResend] = await db.select({ status: quotes.status })
+    .from(quotes).where(eq(quotes.id, id)).limit(1).for('update');
+  if (!freshResend) throw new QuoteServiceError('Quote not found', 404, 'QUOTE_NOT_FOUND');
+  assertLinkableQuote({ ...quote, status: freshResend.status }, 're-send');
   if (!quote.quoteNumber) {
     // A sent quote always has a number (sendQuote allocates one on the way
     // through). Missing here means the row was tampered with or half-migrated.
@@ -685,36 +1053,23 @@ export async function resendQuote(
     sellerSnapshot: quote.sellerSnapshot ?? buildSellerSnapshot(partnerRow),
   };
 
-  const { emailed, emailReason } = await deliverQuoteEmail({
-    quote, blocks, lines, partnerRow, quoteNumber: quote.quoteNumber, acceptUrl,
-    frozenQuote, billingRecipient,
-    opts: { ...opts, to: effectiveTo },
+  // Deferred to AFTER this transaction commits (#3905): the FOR UPDATE lock
+  // taken above must not be held across the PDF render and the mail
+  // round-trip. resetReasonOnSuccess is TRUE here — a successful re-send has to
+  // clear a stale failure marker left by the ORIGINAL send, or the "no email
+  // was delivered" banner keeps firing on a quote that just went out.
+  const deliverEmail = makeDeferredQuoteEmail({
+    input: {
+      quote, blocks, lines, partnerRow, quoteNumber: quote.quoteNumber, acceptUrl,
+      frozenQuote, billingRecipient,
+      opts: { ...opts, to: effectiveTo },
+    },
+    deliveryContext: ambientContext,
+    committedQuote: quote,
+    resetReasonOnSuccess: true,
   });
 
-  // Refresh the outcome marker so the detail page's "no email was delivered"
-  // banner reflects THIS attempt — a successful re-send must clear a stale
-  // failure from the original send, and vice versa.
-  //
-  // Bookkeeping only, and it runs AFTER the email has left: a throw here (or in
-  // the re-select) would surface as "Could not re-send the proposal" while the
-  // customer already has the message in hand, and the tech's natural next move
-  // is to send it a second time. Swallow it onto the returned row instead.
-  let updated: QuoteRow | undefined;
-  try {
-    await db.update(quotes).set({ sendEmailReason: emailReason ?? null, updatedAt: new Date() }).where(eq(quotes.id, id));
-    [updated] = await db.select().from(quotes).where(eq(quotes.id, id)).limit(1);
-  } catch (err) {
-    console.error(`[quoteLifecycle] re-send delivered for quote ${id} but persisting its outcome failed:`, err);
-    captureException(err instanceof Error ? err : new Error(String(err)));
-  }
-
-  // Fall back to the pre-send row overlaid with this attempt's outcome, so the
-  // caller (and the route's audit record, which reads quote.orgId) always gets
-  // a usable row even when the bookkeeping write failed.
-  return {
-    quote: updated ?? { ...quote, sendEmailReason: emailReason ?? null },
-    emailed, emailReason, acceptUrl, origin, reissued: origin !== 'reproduced',
-  };
+  return { quote, acceptUrl, origin, reissued: origin !== 'reproduced', deliverEmail };
 }
 
 /**
@@ -733,15 +1088,32 @@ export async function markQuoteViewed(quoteId: string, orgId: string): Promise<v
     const set: Record<string, unknown> = { viewedAt: now, updatedAt: now };
     if (!q.firstViewedAt) set.firstViewedAt = now;
     if (q.status === 'sent') set.status = 'viewed';
-    await db.update(quotes).set(set).where(eq(quotes.id, quoteId));
+    // CAS on the status we actually read. `q` is an unlocked snapshot, so a
+    // supersede can commit between that read and this write — an unguarded
+    // `WHERE id = ?` would then resurrect a retired quote to 'viewed' or stamp
+    // a superseded row. Matching zero rows is the correct outcome here, not an
+    // error: someone settled the quote first, and this is a cosmetic stamp, so
+    // the caller still succeeds. The event cannot lose with the write, though:
+    // emitting it without a committed stamp would describe a view that did not happen.
+    const viewed = await db.update(quotes).set(set).where(and(
+      eq(quotes.id, quoteId),
+      q.status === 'sent' ? eq(quotes.status, 'sent') : ne(quotes.status, 'superseded'),
+    )).returning({ id: quotes.id });
     // First view only (invoice.viewed parity): the sales-timing signal a future
     // notification worker cares about. Fire-and-forget — never fails the view.
-    if (!q.firstViewedAt) await emitQuoteEvent({ type: 'quote.viewed', quoteId, orgId: q.orgId, partnerId: q.partnerId });
+    if (viewed.length > 0 && !q.firstViewedAt) await emitQuoteEvent({ type: 'quote.viewed', quoteId, orgId: q.orgId, partnerId: q.partnerId });
   }));
 }
 
 /** Internal/portal decline. */
-export async function declineQuoteByActor(id: string, reason: string | undefined, actor: QuoteActor): Promise<QuoteRow> {
+export async function declineQuoteByActor(
+  id: string, reason: string | undefined, actor: QuoteActor,
+  // Attribution for the outcome notification: 'customer' (portal decline on the
+  // customer's behalf) emails the quote creator; 'msp' (a tech marking their own
+  // quote declined — AI tool / internal route) only emits the bus event, so an
+  // internal action is never misattributed to the customer.
+  source: 'customer' | 'msp' = 'msp',
+): Promise<QuoteRow> {
   const { quote } = await getQuote(id, actor);
   if (quote.status !== 'sent' && quote.status !== 'viewed') {
     throw new QuoteServiceError(`Cannot decline a quote in status ${quote.status}`, 409, 'INVALID_STATE');
@@ -752,7 +1124,21 @@ export async function declineQuoteByActor(id: string, reason: string | undefined
     throw new QuoteServiceError('This quote has expired', 410, 'QUOTE_EXPIRED');
   }
   const now = new Date();
-  await db.update(quotes).set({ status: 'declined', declineReason: reason ?? null, declinedAt: now, updatedAt: now }).where(eq(quotes.id, id));
+  // CAS on the status guard above: `quote` is an unlocked read, so a supersede
+  // (or a concurrent accept/decline) can land in between. Unlike markQuoteViewed
+  // this is NOT cosmetic — declining is a real customer-visible outcome, so zero
+  // rows matched must surface rather than silently pretend to succeed.
+  const declined = await db.update(quotes)
+    .set({ status: 'declined', declineReason: reason ?? null, declinedAt: now, updatedAt: now })
+    .where(and(eq(quotes.id, id), inArray(quotes.status, ['sent', 'viewed'])))
+    .returning({ id: quotes.id });
+  if (declined.length === 0) {
+    throw new QuoteServiceError('This quote can no longer be declined', 409, 'INVALID_STATE');
+  }
   const [updated] = await db.select().from(quotes).where(eq(quotes.id, id)).limit(1);
+  // Tell the tech who sent it (decline-completion spec §A). Deliberately
+  // UNAWAITED: it emails over SMTP and must never add latency to (or fail)
+  // the decline the caller already committed; it swallows its own errors.
+  void notifyQuoteOutcome({ quoteId: id, outcome: 'declined', source });
   return updated!;
 }

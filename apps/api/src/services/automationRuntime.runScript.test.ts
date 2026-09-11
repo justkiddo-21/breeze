@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // #3162: automation `run_script` actions must queue the command against a REAL
 // script_executions row so handleScriptResult can persist the agent's stdout.
@@ -12,9 +12,20 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // pre-check, mapping dispatch results onto action logs, and the caller-side
 // 'queued' status write for the undelivered-but-queued case.
 
-const { updateMock, dispatchMock } = vi.hoisted(() => ({
+const { updateMock, dispatchMock, resolveOwnedAutomationReferencesMock } = vi.hoisted(() => ({
   updateMock: vi.fn(),
   dispatchMock: vi.fn(),
+  resolveOwnedAutomationReferencesMock: vi.fn(),
+}));
+
+vi.mock('./automationReferenceAuthorization', () => ({
+  AutomationReferenceAuthorizationError: class AutomationReferenceAuthorizationError extends Error {
+    readonly code = 'unknown_or_unauthorized_reference';
+    constructor() {
+      super('Unknown or unauthorized automation reference');
+    }
+  },
+  resolveOwnedAutomationReferences: resolveOwnedAutomationReferencesMock,
 }));
 
 vi.mock('../db', () => ({
@@ -26,6 +37,7 @@ vi.mock('../db', () => ({
     insert: vi.fn(),
     update: updateMock,
     delete: vi.fn(),
+    transaction: vi.fn(),
   },
 }));
 
@@ -34,6 +46,7 @@ vi.mock('./sentry', () => ({ captureException: vi.fn() }));
 vi.mock('../db/schema', () => ({
   automationRuns: { id: 'id', automationId: 'automationId', status: 'status' },
   automationRunDeviceResults: { runId: 'runId', deviceId: 'deviceId' },
+  automationResourceBindings: { automationId: 'automationId', state: 'state', resourceKind: 'resourceKind', resourceId: 'resourceId' },
   configPolicyAutomations: { featureLinkId: 'featureLinkId' },
   configurationPolicies: { id: 'id', orgId: 'orgId' },
   devices: { id: 'id', hostname: 'hostname', osType: 'osType', status: 'status', displayName: 'displayName', agentId: 'agentId' },
@@ -57,7 +70,8 @@ vi.mock('./notificationSenders', () => ({
   sendWebhookNotification: vi.fn().mockResolvedValue({ success: false }),
 }));
 
-import { executeRunScriptAction } from './automationRuntime';
+import { db } from '../db';
+import { createAutomationRunRecord, executeRunScriptAction, normalizeAutomationActions } from './automationRuntime';
 
 const EXECUTION_ID = '11111111-2222-4333-8444-555555555555';
 const RUN_ID = '99999999-8888-4777-8666-555555555555';
@@ -98,6 +112,13 @@ function buildContext() {
 beforeEach(() => {
   updatedValues = [];
 
+  // #5128 W4: this suite predates the offline queue and asserts the legacy
+  // reject semantics, which are now only reachable with the flag off. Pin it
+  // explicitly rather than leaning on a default that flipped in W4 — the
+  // queue-arm behaviour has its own suite
+  // (automationRuntime.whenOffline.test.ts).
+  vi.stubEnv('DEVICE_COMMAND_OFFLINE_QUEUE_ENABLED', 'false');
+
   updateMock.mockReset().mockImplementation(() => ({
     set: (vals: Record<string, unknown>) => {
       updatedValues.push(vals);
@@ -112,6 +133,53 @@ beforeEach(() => {
     delivered: true,
     executedAt: new Date('2026-08-14T00:00:00.000Z'),
     ignoredParameters: [],
+  });
+  resolveOwnedAutomationReferencesMock.mockReset().mockResolvedValue({
+    scriptsById: new Map(),
+    softwareCatalogsById: new Map(),
+    softwareVersionsByCatalogId: new Map(),
+    notificationChannelsById: new Map(),
+  });
+  vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn(db as any));
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
+describe('createAutomationRunRecord — ownership admission', () => {
+  it('rejects a moved script before creating a run or any downstream execution state', async () => {
+    vi.mocked(db.select).mockReturnValue({
+      from: vi.fn(() => ({ where: vi.fn().mockResolvedValue([]) })),
+    } as any);
+    vi.mocked(db.insert).mockReturnValue({
+      values: vi.fn(() => ({
+        returning: vi.fn().mockResolvedValue([{ id: RUN_ID, logs: [] }]),
+      })),
+    } as any);
+    resolveOwnedAutomationReferencesMock.mockRejectedValueOnce(
+      Object.assign(new Error('Unknown or unauthorized automation reference'), {
+        code: 'unknown_or_unauthorized_reference',
+      }),
+    );
+
+    await expect(createAutomationRunRecord({
+      automation: {
+        id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        orgId: null,
+        partnerId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+        name: 'Moved reference',
+        trigger: { type: 'manual' },
+        conditions: null,
+        actions: [{ type: 'run_script', scriptId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' }],
+        onFailure: 'stop',
+        notificationTargets: null,
+      } as never,
+      triggeredBy: 'manual:user-1',
+    })).rejects.toMatchObject({ code: 'unknown_or_unauthorized_reference' });
+
+    expect(vi.mocked(db.insert)).toHaveBeenCalledTimes(0);
+    expect(dispatchMock).toHaveBeenCalledTimes(0);
   });
 });
 
@@ -142,7 +210,7 @@ describe('executeRunScriptAction — dispatch via scriptDispatch core (#3409 PR0
       buildContext(),
     );
 
-    expect(result.success).toBe(true);
+    expect(result.outcome.status).toBe('delivered');
     expect(dispatchMock).toHaveBeenCalledTimes(1);
 
     const input = dispatchMock.mock.calls[0]![0] as Record<string, unknown>;
@@ -155,7 +223,7 @@ describe('executeRunScriptAction — dispatch via scriptDispatch core (#3409 PR0
     expect(input.triggeredBy).toBe('user-1');
     expect(input.createdBy).toBe('user-1');
     expect(input.runAs).toBe('system');
-    expect(input.requireOnline).toBe(true);
+    expect(input.offlinePolicy).toEqual({ kind: 'reject' });
   });
 
   it('logs success with the core-assigned commandId and executionId once delivered', async () => {
@@ -165,7 +233,11 @@ describe('executeRunScriptAction — dispatch via scriptDispatch core (#3409 PR0
       buildContext(),
     );
 
-    expect(result.success).toBe(true);
+    expect(result.outcome).toEqual({
+      status: 'delivered',
+      commandId: 'cmd-1',
+      scriptExecutionId: EXECUTION_ID,
+    });
     expect(result.log.commandId).toBe('cmd-1');
     expect(result.log.details).toMatchObject({ scriptId: 'script-1', executionId: EXECUTION_ID });
     // Delivered: the core already wrote 'running' itself, so the caller must
@@ -183,12 +255,19 @@ describe('executeRunScriptAction — dispatch via scriptDispatch core (#3409 PR0
       ignoredParameters: [],
     });
 
-    await executeRunScriptAction(
+    const result = await executeRunScriptAction(
       { type: 'run_script', scriptId: 'script-1' },
       0,
       buildContext(),
     );
 
+    expect(result.outcome).toEqual({
+      status: 'queued',
+      commandId: 'cmd-1',
+      scriptExecutionId: EXECUTION_ID,
+      // #5128 W4 — the operator-facing reason the step has not started.
+      message: 'Queued — device offline',
+    });
     expect(updatedValues).toEqual([{ status: 'queued' }]);
   });
 
@@ -246,7 +325,7 @@ describe('executeRunScriptAction — dispatch via scriptDispatch core (#3409 PR0
     expect(updatedValues).toEqual([]);
   });
 
-  it('logs failure with the core error when the device is offline (requireOnline gate)', async () => {
+  it('logs failure with the core error when the device is offline (reject policy)', async () => {
     dispatchMock.mockResolvedValue({
       ok: false,
       code: 'device_offline',
@@ -259,13 +338,13 @@ describe('executeRunScriptAction — dispatch via scriptDispatch core (#3409 PR0
       buildContext(),
     );
 
-    expect(result.success).toBe(false);
+    expect(result.outcome.status).toBe('failed');
     expect(result.log.details).toMatchObject({
       error: 'Device is offline, cannot execute command',
       scriptId: 'script-1',
     });
     // No status write to make — the core never inserted an execution row for
-    // an offline device (requireOnline is checked before any insert).
+    // an offline device (the reject policy is checked before any insert).
     expect(updatedValues).toEqual([]);
   });
 
@@ -294,7 +373,7 @@ describe('executeRunScriptAction — dispatch via scriptDispatch core (#3409 PR0
       context as never,
     );
 
-    expect(result.success).toBe(false);
+    expect(result.outcome.status).toBe('failed');
     expect(dispatchMock).not.toHaveBeenCalled();
   });
 
@@ -310,7 +389,112 @@ describe('executeRunScriptAction — dispatch via scriptDispatch core (#3409 PR0
       context as never,
     );
 
-    expect(result.success).toBe(false);
+    expect(result.outcome.status).toBe('failed');
     expect(dispatchMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * #4888 — the automation form now EXPOSES the run-as override, so the value
+ * stops being a field only an API caller could set. Two properties matter:
+ * the override actually reaches dispatch (the form's whole point), and
+ * "Script default" — an absent `runAs` — still resolves to the script row.
+ */
+describe('run_script run-context override (#4888)', () => {
+  it('forwards an action-level runAs to dispatch instead of the script default', async () => {
+    // SCRIPT.runAs is 'system'; the action asks for 'user'.
+    await executeRunScriptAction(
+      { type: 'run_script', scriptId: 'script-1', runAs: 'user' },
+      0,
+      buildContext(),
+    );
+
+    const input = dispatchMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect(input.runAs).toBe('user');
+  });
+
+  /**
+   * `normalizeAutomationActions` is the READ path as well as the write
+   * validator (routes/automations.ts and services/configurationPolicy.ts both
+   * run it over rows loaded from the DB), so an unrecognised stored value must
+   * degrade to "script default" rather than throw and take a live automation
+   * offline.
+   */
+  it('narrows a stored runAs to the enum, dropping anything else to the script default', () => {
+    const [kept] = normalizeAutomationActions([
+      { type: 'run_script', scriptId: 'script-1', runAs: 'elevated' },
+    ]);
+    expect(kept).toMatchObject({ runAs: 'elevated' });
+
+    const [dropped] = normalizeAutomationActions([
+      { type: 'run_script', scriptId: 'script-1', runAs: 'root' },
+    ]);
+    expect((dropped as Record<string, unknown>).runAs).toBeUndefined();
+  });
+});
+
+/**
+ * #4919 — the dispatch seam now refuses a device inside a maintenance window
+ * that suppresses scripts. The automation runtime must record that as a SKIP,
+ * not a failure: a failure would mark the run red, fire on-failure
+ * notifications, and skip every trailing action for that device — all on the
+ * strength of the operator's own maintenance schedule.
+ */
+describe('run_script honours a device maintenance window (#4919)', () => {
+  it('records a skip (not a failure) when dispatch reports maintenance_suppressed', async () => {
+    dispatchMock.mockResolvedValueOnce({
+      ok: false,
+      code: 'maintenance_suppressed',
+      error: 'Device is in a maintenance window that suppresses script execution',
+    });
+
+    const result = await executeRunScriptAction(
+      { type: 'run_script', scriptId: 'script-1' },
+      0,
+      buildContext(),
+    );
+
+    expect(result.outcome.status).toBe('skipped');
+    expect((result.outcome as { message?: string }).message).toContain('maintenance window');
+    expect(result.log.message).toContain('maintenance window');
+  });
+
+  /**
+   * The whole reason `maintenance_check_failed` is a separate code: a fault in
+   * the safety check is NOT the operator's schedule. It must keep the failure
+   * treatment (run reddened, on-failure notifications, `onFailure: 'stop'`
+   * honoured), or a fleet-wide maintenance-config outage renders as green runs.
+   */
+  it('treats an UNEVALUATABLE maintenance check as a failure, not a skip', async () => {
+    dispatchMock.mockResolvedValueOnce({
+      ok: false,
+      code: 'maintenance_check_failed',
+      error: 'Maintenance window could not be evaluated for this device; refusing to run the script (fail-closed)',
+    });
+
+    const result = await executeRunScriptAction(
+      { type: 'run_script', scriptId: 'script-1' },
+      0,
+      buildContext(),
+    );
+
+    expect(result.outcome.status).toBe('failed');
+    expect(result.outcome.status).not.toBe('skipped');
+  });
+
+  it('still reports an ordinary dispatch refusal as a failure', async () => {
+    dispatchMock.mockResolvedValueOnce({
+      ok: false,
+      code: 'device_offline',
+      error: 'Device is offline, cannot execute command',
+    });
+
+    const result = await executeRunScriptAction(
+      { type: 'run_script', scriptId: 'script-1' },
+      0,
+      buildContext(),
+    );
+
+    expect(result.outcome.status).toBe('failed');
   });
 });

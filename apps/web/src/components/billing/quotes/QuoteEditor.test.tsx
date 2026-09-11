@@ -1,10 +1,13 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { useLayoutEffect } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import QuoteEditor from './QuoteEditor';
 import { QuoteHeaderMeta } from './QuoteHeaderMeta';
 import type { QuoteDetail as QuoteDetailData } from './quoteTypes';
 import { fetchWithAuth } from '../../../stores/auth';
+import { listCatalog } from '../../../lib/api/catalog';
+import { addCatalogLine } from '../../../lib/api/quotes';
 
 vi.mock('../../../stores/auth', () => ({
   // orgStore (imported by QuoteEditor for the customer select) registers an
@@ -21,7 +24,8 @@ vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
 const showToast = vi.fn();
 vi.mock('../../shared/Toast', () => ({ showToast: (a: unknown) => showToast(a) }));
 
-vi.mock('../../../lib/api/catalog', () => ({
+vi.mock('../../../lib/api/catalog', async (orig) => ({
+  ...(await orig<typeof import('../../../lib/api/catalog')>()),
   listCatalog: vi.fn().mockResolvedValue(
     { ok: true, status: 200, statusText: 'OK', json: vi.fn().mockResolvedValue({ data: [] }) } as unknown as Response,
   ),
@@ -42,6 +46,27 @@ vi.mock('../../../lib/api/quotes', () => ({
 const fetchMock = vi.mocked(fetchWithAuth);
 const json = (payload: unknown, ok = true, status = ok ? 200 : 500): Response =>
   ({ ok, status, statusText: ok ? 'OK' : 'ERR', json: vi.fn().mockResolvedValue(payload) }) as unknown as Response;
+
+/**
+ * Records a probed element's committed DOM value. Layout effects run
+ * synchronously in the mutation phase of the very commit that produced the
+ * DOM, so this reads what the field actually showed at that commit without
+ * depending on when React's scheduler gets around to passive effects — the
+ * same technique used to pin down #4659 (AiBudgetThresholdsInput). It only
+ * appends when THIS probe re-renders (a sibling of the field under test), so
+ * an unconditional passive `useEffect` prop-sync — which re-seeds one commit
+ * AFTER the render that already delivered the new prop — shows up as the
+ * probe's commit still holding the STALE value; the render-phase reseed this
+ * fix uses shows the new value already, in that same commit.
+ */
+function CommitProbe({ testId, seen }: { testId: string; seen: string[] }) {
+  useLayoutEffect(() => {
+    const el = document.querySelector(`[data-testid="${testId}"]`) as HTMLInputElement | HTMLTextAreaElement | null;
+    if (!el) throw new Error(`CommitProbe: no element matching [data-testid="${testId}"]`);
+    seen.push(el.value);
+  });
+  return null;
+}
 
 function draftDetail(extra: Partial<QuoteDetailData['quote']> = {}): QuoteDetailData {
   return {
@@ -176,5 +201,141 @@ describe('QuoteEditor', () => {
 
     const textarea = screen.getByTestId('quote-terms') as HTMLTextAreaElement;
     expect(textarea.value).toBe('Payment due in 30 days');
+  });
+
+  // #4807 (mirrors #4659/#4033): `terms` used to re-seed from
+  // `quote.termsAndConditions` in a `useEffect`, i.e. in a commit AFTER the
+  // one that delivered the new prop. Because a passive effect is deferred, a
+  // keystroke landing in that window was silently reverted by the stale
+  // string the effect had captured. Re-seeding during render (this fix)
+  // leaves no such commit — assert exactly that.
+  it('re-seeds a changed termsAndConditions prop within the same commit, not a later one (#4807)', async () => {
+    const seen: string[] = [];
+    const view = (terms: string | null) => (
+      <>
+        <QuoteEditor detail={draftDetail({ termsAndConditions: terms })} onChanged={vi.fn()} />
+        <CommitProbe testId="quote-terms" seen={seen} />
+      </>
+    );
+
+    const { rerender } = render(view('Net 30'));
+    await waitFor(() => expect(screen.getByTestId('quote-editor')).toBeInTheDocument());
+    seen.length = 0;
+
+    rerender(view('Net 45'));
+
+    // One commit, already showing the new terms. An earlier entry still
+    // reading 'Net 30' is the old effect-driven seed — the window that made
+    // the field clobberable mid-keystroke.
+    expect(seen).toEqual(['Net 45']);
+  });
+
+  // The deposit-percent draft has the identical shape: a live-typed numeric
+  // field re-seeded from `quote.depositPercent` in a passive effect (#4807).
+  it('re-seeds a changed depositPercent prop within the same commit, not a later one (#4807)', async () => {
+    const seen: string[] = [];
+    const view = (depositPercent: string | null) => (
+      <>
+        <QuoteEditor detail={draftDetail({ depositType: 'percent', depositPercent })} onChanged={vi.fn()} />
+        <CommitProbe testId="deposit-percent-input" seen={seen} />
+      </>
+    );
+
+    const { rerender } = render(view('10'));
+    await waitFor(() => expect(screen.getByTestId('deposit-percent-input')).toBeInTheDocument());
+    seen.length = 0;
+
+    rerender(view('25'));
+
+    expect(seen).toEqual(['25']);
+  });
+
+  // Discriminating test per the issue's required pattern: type a draft, then
+  // let an unrelated (equal-valued) prop refetch land — the draft must
+  // survive rather than being discarded by a resync that changed nothing.
+  it('keeps a typed terms draft when an unrelated refetch hands back the same termsAndConditions', async () => {
+    const detail = draftDetail({ termsAndConditions: 'Net 30' });
+    const { rerender } = render(<QuoteEditor detail={detail} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('quote-editor')).toBeInTheDocument());
+
+    const textarea = screen.getByTestId('quote-terms') as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: 'Net 30 — draft in progress' } });
+
+    // A fresh detail object, same persisted terms — an unrelated resync.
+    rerender(<QuoteEditor detail={draftDetail({ termsAndConditions: 'Net 30' })} onChanged={vi.fn()} />);
+
+    expect(textarea.value).toBe('Net 30 — draft in progress');
+  });
+
+  // Review finding: the reseed must also reset `termsDirty` when the prop
+  // GENUINELY changes mid-edit (not just an equal-value refetch) — matching
+  // what the old effect did — otherwise a stale "Unsaved" badge would linger
+  // over text that was just replaced with the (already-persisted) new value.
+  it('clears the Unsaved badge when a genuinely different termsAndConditions prop lands mid-edit', async () => {
+    const { rerender } = render(<QuoteEditor detail={draftDetail({ termsAndConditions: 'Net 30' })} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('quote-editor')).toBeInTheDocument());
+
+    const textarea = screen.getByTestId('quote-terms') as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: 'Net 30 draft' } });
+    expect(screen.getByTestId('unsaved-badge')).toBeInTheDocument();
+
+    // A genuinely different persisted value lands (e.g. another session's edit).
+    rerender(<QuoteEditor detail={draftDetail({ termsAndConditions: 'Net 60' })} onChanged={vi.fn()} />);
+
+    expect(textarea.value).toBe('Net 60');
+    expect(screen.queryByTestId('unsaved-badge')).not.toBeInTheDocument();
+  });
+
+  // Review finding: the deposit-percent reseed clears `depositPctError` too
+  // (new behavior vs. the old effect, which never touched it) — a stale
+  // "out of range" message must not linger once the field has been replaced
+  // with a fresh, valid, server-confirmed value.
+  it('clears the inline deposit-percent range error when a genuinely different depositPercent prop lands', async () => {
+    const { rerender } = render(
+      <QuoteEditor detail={draftDetail({ depositType: 'percent', depositPercent: '10' })} onChanged={vi.fn()} />,
+    );
+    await waitFor(() => expect(screen.getByTestId('deposit-percent-input')).toBeInTheDocument());
+
+    const input = screen.getByTestId('deposit-percent-input') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '150' } });
+    fireEvent.blur(input);
+    expect(screen.getByTestId('deposit-percent-error')).toBeInTheDocument();
+
+    rerender(<QuoteEditor detail={draftDetail({ depositType: 'percent', depositPercent: '30' })} onChanged={vi.fn()} />);
+
+    expect(input.value).toBe('30');
+    expect(screen.queryByTestId('deposit-percent-error')).not.toBeInTheDocument();
+  });
+
+  it('toasts the currency-gap message when the catalog add answers NO_PRICE_FOR_CURRENCY (#3775)', async () => {
+    const catItem = {
+      id: 'cat-1', partnerId: 'p-1', itemType: 'hardware', name: 'NVMe 1TB', sku: 'NV-1', description: null,
+      billingType: 'one_time', unitPrice: '150.00', costBasis: null, costCurrency: 'USD', markupPercent: null,
+      unitOfMeasure: 'each', taxable: false, taxCategory: null, isBundle: false, isActive: true, createdAt: '', updatedAt: '',
+      prices: [{ currencyCode: 'USD', unitPrice: '150.00' }],
+    };
+    vi.mocked(listCatalog).mockResolvedValueOnce(json({ data: [catItem] }));
+    vi.mocked(addCatalogLine).mockResolvedValueOnce(
+      json({ error: 'No price in EUR', code: 'NO_PRICE_FOR_CURRENCY' }, false, 409),
+    );
+    const detail = draftDetail({ currencyCode: 'EUR' });
+    detail.blocks = [
+      { id: 'b-1', quoteId: 'q-1', orgId: 'org-1', blockType: 'line_items', content: {}, sortOrder: 0, createdAt: '2026-06-01T00:00:00Z' },
+    ];
+    render(<QuoteEditor detail={detail} onChanged={vi.fn()} />);
+    await waitFor(() => screen.getByTestId('quote-block-add-catalog-b-1'));
+    fireEvent.click(screen.getByTestId('quote-block-add-catalog-b-1'));
+
+    // The picker renders the EUR gap (not the USD row, not the unitPrice mirror)…
+    fireEvent.change(await screen.findByTestId('quote-catalog-picker-b-1-input'), { target: { value: 'NV' } });
+    expect(await screen.findByTestId('quote-catalog-picker-b-1-noprice-cat-1')).toHaveTextContent('No EUR price');
+    // …but the item stays selectable; the server answers the gap and the editor names the currency.
+    fireEvent.click(screen.getByTestId('quote-catalog-picker-b-1-option-cat-1'));
+
+    await waitFor(() => expect(addCatalogLine).toHaveBeenCalledWith('q-1', expect.objectContaining({ catalogItemId: 'cat-1', blockId: 'b-1' })));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'error',
+      message: 'No EUR price for this item. Add one in the catalog or enter a manual line.',
+    })));
   });
 });

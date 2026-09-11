@@ -70,6 +70,9 @@ import { registerAuditTools } from './aiToolsAudit';
 import { registerDocsTools } from './aiToolsDocs';
 import { registerRemoteTools } from './aiToolsRemote';
 import { registerAgentMgmtTools } from './aiToolsAgentMgmt';
+// AI-agent GOVERNANCE (P2-5, #4192) — distinct from aiToolsAgentMgmt above,
+// which manages the Go endpoint agent. See that module's header.
+import { registerAiAgentGovernanceTools } from './aiToolsAiAgentGovernance';
 import { registerUITools } from './aiToolsUI';
 import { registerTicketingTools } from './aiToolsTicketing';
 import { registerCatalogTools } from './aiToolsCatalog';
@@ -144,6 +147,11 @@ export async function verifyDeviceAccess(
   if (auth.helperDeviceId && deviceId !== auth.helperDeviceId) {
     return { error: 'Device not found or access denied' };
   }
+  // Device-exact axis (device-bound agent runs): tighter than canAccessSite
+  // below, which admits every sibling device in the same site.
+  if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) {
+    return { error: 'Device not found or access denied' };
+  }
   const conditions: SQL[] = [eq(devices.id, deviceId)];
   const orgCond = auth.orgCondition(devices.orgId);
   if (orgCond) conditions.push(orgCond);
@@ -153,7 +161,10 @@ export async function verifyDeviceAccess(
   if (auth.canAccessSite && !auth.canAccessSite(device.siteId)) {
     return { error: 'Device not found or access denied' };
   }
-  if (requireOnline && device.status !== 'online') return { error: `Device ${device.hostname} is not online (status: ${device.status})` };
+  if (requireOnline && device.status !== 'online')
+    return {
+      error: `Device ${device.hostname} is not online (status: ${device.status}). This tool needs a live connection; to run when the device reconnects use the Run Script / deployment tools instead.`,
+    };
   return { device };
 }
 
@@ -240,7 +251,12 @@ export function resolveWritableToolOrgId(
 // Tool Registry
 // ============================================
 
-export const aiTools: Map<string, AiTool> = new Map();
+// The map instance and the reserved-name predicate/registration live in
+// aiToolNames.ts now (a leaf module with no domain-tool imports) — see that
+// file's header for why. Re-exported below for the many domain/consumer
+// modules that still import `aiTools/hasCoreAiToolName` from here.
+export { aiTools, hasCoreAiToolName } from './aiToolNames';
+import { aiTools, hasCoreAiToolName, registerReservedAiToolNamePredicate } from './aiToolNames';
 
 // Register all domain modules
 registerAgentLogTools(aiTools);
@@ -288,6 +304,7 @@ registerAuditTools(aiTools);
 registerDocsTools(aiTools);
 registerRemoteTools(aiTools);
 registerAgentMgmtTools(aiTools);
+registerAiAgentGovernanceTools(aiTools);
 registerUITools(aiTools);
 registerPamTools(aiTools);
 registerVulnerabilityTools(aiTools);
@@ -297,13 +314,15 @@ registerM365Tools(aiTools);
 // Exports
 // ============================================
 
-export function hasCoreAiToolName(toolName: string): boolean {
-  return aiTools.has(toolName)
-    || m365ToolTiers[toolName] !== undefined
-    || googleToolTiers[toolName] !== undefined;
-}
-
-extensionContributionRegistry.configureReservedAiToolNames(hasCoreAiToolName);
+// M365/Google tools are session-aware and never added to the `aiTools` map
+// (see the comment above the `registerM365Tools` import), so their tier
+// tables are registered as an additional reserved-name source. This — plus
+// the map population above — is what makes hasCoreAiToolName's actual
+// behavior identical to the pre-extraction version; see aiToolNames.ts's
+// header and aiToolNames.test.ts.
+registerReservedAiToolNamePredicate(
+  (toolName) => m365ToolTiers[toolName] !== undefined || googleToolTiers[toolName] !== undefined,
+);
 
 /** The state-store surface the extension AI-tool gate needs (injectable for tests). */
 export type AiToolEnabledStore = Pick<ExtensionStateStore, 'isEnabled'>;
