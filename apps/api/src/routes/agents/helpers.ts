@@ -24,6 +24,7 @@ import {
   deviceGroupMemberships,
   configPolicyAssignments,
   configurationPolicies,
+  fileEgressPolicies,
   configPolicyEffectiveFeatureLinks,
   configPolicyEventLogSettings,
   configPolicyMonitoringSettings,
@@ -2031,6 +2032,79 @@ export interface MonitoringWatchConfig {
 export interface MonitoringConfigUpdate {
   check_interval_seconds: number;
   watches: MonitoringWatchConfig[];
+}
+
+export interface FileEgressConfigUpdate {
+  enabled: boolean;
+  watch_removable: boolean;
+  watch_network_shares: boolean;
+  watch_uploads: boolean;
+  /** null => agent uses its built-in default process list. */
+  upload_process_watchlist: string[] | null;
+  ignore_globs: string[];
+  min_file_size_bytes: number;
+}
+
+// Resolve the file-egress (DLP) policy that applies to a device.
+// file_egress_policies is a STANDALONE dual-axis (org XOR partner) table with no
+// assignment hierarchy, so the most-specific ACTIVE policy wins: an org-owned
+// policy (org_id = device.orgId) takes precedence over a partner-wide one
+// (org_id NULL, partner_id = the device org's partner). Read in the caller's own
+// context — the file_egress_policies_partner_wide_select RLS branch plus the
+// agent context's breeze_current_partner_id() make partner-wide rows visible
+// without escaping to a system context (mirrors the monitoring W03 pattern; the
+// deprecated runOutsideDbContext escape is deliberately NOT used).
+export async function buildFileEgressConfigUpdate(deviceId: string): Promise<FileEgressConfigUpdate | null> {
+  const [device] = await db
+    .select({ orgId: devices.orgId })
+    .from(devices)
+    .where(eq(devices.id, deviceId))
+    .limit(1);
+  if (!device) return null;
+
+  const [org] = await db
+    .select({ partnerId: organizations.partnerId })
+    .from(organizations)
+    .where(eq(organizations.id, device.orgId))
+    .limit(1);
+
+  const ownershipCondition = org?.partnerId
+    ? or(
+        eq(fileEgressPolicies.orgId, device.orgId),
+        and(isNull(fileEgressPolicies.orgId), eq(fileEgressPolicies.partnerId, org.partnerId))
+      )
+    : eq(fileEgressPolicies.orgId, device.orgId);
+
+  const rows = await db
+    .select({
+      orgId: fileEgressPolicies.orgId,
+      enabled: fileEgressPolicies.enabled,
+      watchRemovable: fileEgressPolicies.watchRemovable,
+      watchNetworkShares: fileEgressPolicies.watchNetworkShares,
+      watchUploads: fileEgressPolicies.watchUploads,
+      uploadProcessWatchlist: fileEgressPolicies.uploadProcessWatchlist,
+      ignoreGlobs: fileEgressPolicies.ignoreGlobs,
+      minFileSizeBytes: fileEgressPolicies.minFileSizeBytes,
+    })
+    .from(fileEgressPolicies)
+    .where(and(eq(fileEgressPolicies.isActive, true), ownershipCondition));
+
+  if (rows.length === 0) return null;
+
+  // Org-owned (org_id NOT NULL) wins over partner-wide (org_id NULL).
+  rows.sort((a, b) => (a.orgId ? 0 : 1) - (b.orgId ? 0 : 1));
+  const winner = rows[0];
+  if (!winner) return null;
+
+  return {
+    enabled: winner.enabled,
+    watch_removable: winner.watchRemovable,
+    watch_network_shares: winner.watchNetworkShares,
+    watch_uploads: winner.watchUploads,
+    upload_process_watchlist: winner.uploadProcessWatchlist ?? null,
+    ignore_globs: winner.ignoreGlobs ?? [],
+    min_file_size_bytes: winner.minFileSizeBytes,
+  };
 }
 
 async function resolveDeviceMonitoringSettings(deviceId: string): Promise<MonitoringConfigUpdate | null> {
