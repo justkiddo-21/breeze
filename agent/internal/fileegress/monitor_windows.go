@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/0xrawsec/golang-etw/etw"
-	log "github.com/breeze-rmm/agent/internal/logging"
 )
 
 // Microsoft-Windows-Kernel-File provider. The CREATE keyword (0x80) scopes the
@@ -48,8 +47,12 @@ func NewSubscriber(poster Poster) (Subscriber, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fileegress: parse Kernel-File provider: %w", err)
 	}
-	provider.EnableLevel = traceLevelVerbose
-	provider.MatchAnyKeyword = kernelFileKeywordCreate
+	// TODO(windows-spike): scope the session to the CREATE keyword
+	// (kernelFileKeywordCreate) via the golang-etw Provider keyword field to cut
+	// event volume — Kernel-File is extremely high-throughput system-wide.
+	// Enabling with defaults (like etwlua does for the LUA provider) delivers all
+	// Kernel-File events and we filter to EventID==12 in the callback; correct
+	// but heavier. Confirm the exact Provider field name on a Windows box first.
 
 	if err := session.EnableProvider(provider); err != nil {
 		_ = session.Stop()
