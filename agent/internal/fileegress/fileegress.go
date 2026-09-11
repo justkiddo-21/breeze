@@ -19,9 +19,11 @@ import (
 	"strings"
 	"time"
 
-	log "github.com/breeze-rmm/agent/internal/logging"
+	"github.com/breeze-rmm/agent/internal/logging"
 	"github.com/breeze-rmm/agent/internal/privilege"
 )
+
+var log = logging.L("fileegress")
 
 // Egress surface classifications. These MUST match the server's
 // file_egress_type enum (apps/api migration 2026-10-15-140006) and the agent
