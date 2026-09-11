@@ -637,6 +637,8 @@ const REPOINT_TABLES: readonly string[] = [
   // against the surviving org instead of a dead shell.
   "event_delivery_receipts",
   "executive_summaries",
+  "file_egress_events",
+  "file_egress_policies",
   "fleet_finding_devices",
   "fleet_remediation_run_targets",
   "fleet_remediation_runs",
