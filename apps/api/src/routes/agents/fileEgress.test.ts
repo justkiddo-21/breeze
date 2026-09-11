@@ -92,7 +92,7 @@ describe('agent file-egress ingest', () => {
     // resolved behavior so it doesn't leak into unrelated tests (fileEgress
     // publishes for EVERY event, unlike peripherals which only publishes for
     // 'blocked' events, so a leaked rejection is visible here).
-    vi.mocked(publishEvent).mockResolvedValue(undefined);
+    vi.mocked(publishEvent).mockResolvedValue('evt-published');
     app = new Hono();
     app.use('*', async (c: any, next: any) => {
       c.set('agent', { orgId: 'org-1', agentId: 'agent-1', role: 'agent' });
