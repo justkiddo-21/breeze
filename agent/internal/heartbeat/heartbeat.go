@@ -36,6 +36,7 @@ import (
 	"github.com/breeze-rmm/agent/internal/ipc"
 	"github.com/breeze-rmm/agent/internal/logging"
 	"github.com/breeze-rmm/agent/internal/mgmtdetect"
+	"github.com/breeze-rmm/agent/internal/fileegress"
 	"github.com/breeze-rmm/agent/internal/monitoring"
 	"github.com/breeze-rmm/agent/internal/mtls"
 	"github.com/breeze-rmm/agent/internal/netcache"
@@ -545,6 +546,13 @@ type Heartbeat struct {
 	// device with no PAM policy — or one talking to a server that never sends
 	// the field — never prompts the user before the first heartbeat says so.
 	uacInterceptionEnabled atomic.Bool
+
+	// File-egress (DLP) policy, delivered on the heartbeat under
+	// configUpdate["file_egress_settings"]. nil pointer = disabled, so a device
+	// with no policy (or a server that never sends the field) never monitors.
+	// Read by the fileegress monitor via FileEgressConfig() (implements
+	// fileegress.Poster).
+	fileEgressConfig atomic.Pointer[fileegress.Config]
 
 	// Service & process monitoring
 	monitor *monitoring.Monitor
@@ -2238,6 +2246,49 @@ func (h *Heartbeat) submitPeripheralEvents(events []peripheral.PeripheralEvent) 
 	return nil
 }
 
+// FileEgressConfig returns the currently active file-egress policy (implements
+// fileegress.Poster). A nil stored pointer means no policy has been delivered,
+// which the zero-value Config correctly represents as disabled.
+func (h *Heartbeat) FileEgressConfig() fileegress.Config {
+	if cfg := h.fileEgressConfig.Load(); cfg != nil {
+		return *cfg
+	}
+	return fileegress.Config{}
+}
+
+// SubmitFileEgressEvents PUTs a batch of detected egress events (implements
+// fileegress.Poster). Mirrors submitPeripheralEvents: bearer auth, 30s timeout,
+// retryCfg, non-2xx is an error so the monitor re-queues the batch.
+func (h *Heartbeat) SubmitFileEgressEvents(events []fileegress.Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+	body, err := json.Marshal(fileegress.EventSubmission{Events: events})
+	if err != nil {
+		return fmt.Errorf("marshal file-egress events: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/api/v1/agents/%s/file-egress/events", h.serverURL(), h.config.AgentID)
+	headers := http.Header{
+		"Content-Type":  {"application/json"},
+		"Authorization": {h.authHeader()},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resp, err := httputil.Do(ctx, h.httpClient(), "PUT", url, body, headers, h.retryCfg)
+	if err != nil {
+		return fmt.Errorf("PUT file-egress events: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("file-egress events submission failed: HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (h *Heartbeat) sendHardwareInventory() {
 	// Launched as a bare goroutine; without this a panic takes down the process.
 	defer observability.Recoverer("heartbeat.hardwareInventory")
@@ -2719,6 +2770,21 @@ func (h *Heartbeat) applyConfigUpdate(update map[string]any) {
 	if hasMon && h.monitor != nil {
 		if cfg, ok := monitoring.ParseMonitorConfig(monRaw); ok {
 			h.monitor.ApplyConfig(cfg)
+		}
+	}
+
+	// Apply file_egress_settings if present (DLP monitor). snake/camel dual-key,
+	// same as monitoring. A missing block leaves the previous config in place
+	// (the server sends the block on every heartbeat when a policy applies, and
+	// omits it otherwise); an omitted block does NOT disable the monitor here —
+	// disable is expressed by the block itself with enabled=false.
+	feRaw, hasFE := update["file_egress_settings"]
+	if !hasFE {
+		feRaw, hasFE = update["fileEgressSettings"]
+	}
+	if hasFE {
+		if cfg, ok := fileegress.ParseFileEgressConfig(feRaw); ok {
+			h.fileEgressConfig.Store(&cfg)
 		}
 	}
 
