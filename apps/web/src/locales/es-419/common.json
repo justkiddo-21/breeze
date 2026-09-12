@@ -27,6 +27,7 @@
     "userRisk": "Riesgo del usuario",
     "sensitiveData": "Datos confidenciales",
     "peripherals": "Periféricos",
+    "fileEgress": "Salida de Archivos",
     "cisBenchmarks": "CIS Benchmarks",
     "complianceBaselines": "Líneas base de cumplimiento",
     "quotes": "Cotizaciones",

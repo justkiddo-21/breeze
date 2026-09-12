@@ -1,0 +1,96 @@
+{
+  "fileEgressPage": {
+    "title": "Salida de Archivos (DLP)",
+    "subtitle": "Supervisa los archivos que salen de los dispositivos: copiados a USB o recursos compartidos de red, y subidos mediante aplicaciones o el navegador.",
+    "tabs": {
+      "policies": "Políticas",
+      "activity": "Actividad"
+    }
+  },
+  "policiesList": {
+    "new": "Nueva política",
+    "empty": "Aún no hay políticas de salida de archivos. Crea una para empezar a monitorear.",
+    "allOrgs": "Todas las organizaciones",
+    "partnerWideTitle": "Política a nivel de partner — se aplica a todas tus organizaciones",
+    "loadError": "Error al cargar las políticas.",
+    "status": {
+      "enabled": "Habilitada",
+      "disabled": "Deshabilitada"
+    },
+    "columns": {
+      "name": "Nombre",
+      "scope": "Alcance",
+      "surfaces": "Superficies",
+      "status": "Estado"
+    },
+    "surfaces": {
+      "removable": "USB",
+      "network": "Red",
+      "uploads": "Subidas"
+    }
+  },
+  "policyForm": {
+    "newTitle": "Nueva política de salida de archivos",
+    "editTitle": "Editar política de salida de archivos",
+    "name": "Nombre",
+    "enabled": "Monitoreo habilitado",
+    "enabledHint": "Cuando está desactivado, los agentes con esta política asignada no monitorean.",
+    "surfacesLegend": "Superficies a vigilar",
+    "watchRemovable": "USB / unidades extraíbles",
+    "watchNetworkShares": "Recursos compartidos de red",
+    "watchUploads": "Subidas por aplicación / navegador",
+    "watchUploadsHint": "Detecta un proceso que lee un archivo y luego lo sube (Messenger, Zalo, navegador). Esta es una heurística de correlación: identifica el archivo, la aplicación y el destino, no es prueba del contenido exacto enviado.",
+    "uploadWatchlist": "Lista de procesos vigilados para subidas",
+    "uploadWatchlistHint": "Nombres de procesos a vigilar para subidas. Déjalo vacío para usar el valor predeterminado (navegadores y apps de chat comunes).",
+    "uploadWatchlistPlaceholder": "p. ej. Zalo.exe",
+    "ignoreGlobs": "Patrones a ignorar",
+    "ignoreGlobsHint": "Rutas o patrones glob a omitir, por ejemplo *.tmp o el nombre de una carpeta temporal.",
+    "ignoreGlobsPlaceholder": "p. ej. *.tmp",
+    "minFileSize": "Tamaño mínimo de archivo (bytes)",
+    "minFileSizeHint": "Ignorar archivos menores que esto. 0 = reportar todos.",
+    "scope": "Alcance",
+    "allOrganizations": "Todas las organizaciones",
+    "partnerWide": "a nivel de partner",
+    "thisOrganization": "Esta organización",
+    "add": "Agregar",
+    "remove": "Quitar",
+    "save": "Guardar política",
+    "cancel": "Cancelar",
+    "delete": "Eliminar",
+    "deleteConfirm": "¿Eliminar esta política? Esto no se puede deshacer.",
+    "saved": "Política guardada.",
+    "deleted": "Política eliminada.",
+    "errors": {
+      "nameRequired": "El nombre es obligatorio.",
+      "save": "Error al guardar la política.",
+      "delete": "Error al eliminar la política."
+    }
+  },
+  "eventsTable": {
+    "empty": "No hay eventos de salida en este rango.",
+    "loadError": "Error al cargar los eventos.",
+    "columns": {
+      "time": "Hora",
+      "device": "Dispositivo",
+      "type": "Tipo",
+      "file": "Archivo",
+      "destination": "Destino",
+      "process": "Proceso"
+    },
+    "types": {
+      "removable": "USB / extraíble",
+      "network_share": "Recurso compartido de red",
+      "app_upload": "Subida por aplicación"
+    },
+    "filters": {
+      "type": "Tipo",
+      "allTypes": "Todos los tipos",
+      "from": "Desde",
+      "to": "Hasta"
+    },
+    "prev": "Anterior",
+    "next": "Siguiente",
+    "showing": "Mostrando {{from}}–{{to}} de {{total}}",
+    "none": "—"
+  }
+}
