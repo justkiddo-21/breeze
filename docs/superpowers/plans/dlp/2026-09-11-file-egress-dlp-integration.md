@@ -47,7 +47,14 @@ handoff `internal/ops/handoff/16-file-egress-dlp.md`; agent-shipped code lives i
   (commit `85cf719e9`): page + policy form + policies list + events table +
   per-device Egress tab + nav + i18n (8 locales). 10 component tests pass, web
   tsc clean, i18n contract tests pass. Unmerged.
-- **Deploy, wave 2b (upload correlation), alerting, Linux:** not started.
+- **Wave 2b — read→upload correlation (Zalo/Messenger):** CODE WRITTEN on the
+  wave-2 branch (connect-driven, review-refined): correlator core unit-tested,
+  Windows Kernel-Network + DNS-Client wiring done. Pending `GOOS=windows` build
+  validation + a Windows runtime spike for the ETW event-ID/property specifics.
+- **Wave-1 deployed to an isolated test stack** (wt-stack, podman) and validated
+  live (migrations, routes, auth, create/list policy); a realistic demo dataset
+  (4 karaoke PCs + 10 violations) was seeded there.
+- **Prod deploy, alerting, Linux fanotify:** not started.
 
 ## File map
 
@@ -112,26 +119,40 @@ To create (remaining):
 - [x] 10 component tests (Vitest + jsdom); web typecheck clean; i18n contract
       tests pass (94).
 
-## Phase 2 — Ship wave 2a end-to-end
+## Phase 2 — Wave 2a agent (file→USB/network) — CODE WRITTEN, pending build+spike
 
-- [ ] Build + KResLab-sign the Windows agent including the module; publish via the
-      signed release flow.
-- [ ] Pilot rollout to one karaoke PC; create an enabled `file_egress_policies`
-      row; validate USB copy + network-share copy appear in the UI.
-- [ ] Tune volume/dedupe from pilot data; document operator runbook.
+- [x] ETW Kernel-File Create capture + NT-path→drive classifier + wiring +
+      heartbeat plumbing (`agent/internal/fileegress/`, branch
+      `feature/file-egress-dlp/wave-2-agent-windows`). Compiles `GOOS=windows`;
+      core unit-tested.
+- [ ] `go test ./internal/fileegress/...` + `GOOS=windows go build ./...` (user;
+      no Go on the ops box).
+- [ ] **Windows runtime spike**: Create fires on a USB copy, drive classified,
+      PID→process resolves. Then add CREATE keyword scoping (TODO in
+      `monitor_windows.go`) to cut volume.
+- [ ] Build + KResLab-sign the agent; pilot on one karaoke PC; enable a policy;
+      confirm USB + network-share copies appear in the UI.
 
-## Phase 3 — Wave 2b: read→upload correlation (Messenger/Zalo/browser)
+## Phase 3 — Wave 2b: read→upload correlation (Messenger/Zalo) — CODE WRITTEN, pending build+spike
 
-- [ ] **Advisor quorum** on the correlation contract (new cross-module surface).
-- [ ] Add Kernel-Network provider to the `Breeze-FileEgress` session; enable
-      Kernel-File READ keyword.
-- [ ] FileObject→path map (Create→Read/Write correlation), bounded + evicted.
-- [ ] Per-process recent-read ring buffer keyed by PID; on an outbound connection
-      from a watchlisted process (browsers + Zalo/Messenger/chat apps), emit an
-      `app_upload` event with file + process + dest host/domain/IP + confidence.
-- [ ] Resolve dest IP→domain best-effort; confidence scoring; extend
-      `FileEgressEventDetails` + the UI to render the upload case.
-- [ ] Go tests for the correlation map + ring buffer; spike validation.
+Design REVISED after an independent review to **connect-driven** (the original
+Read+FileObject-map approach was dropped — high volume + FileObject-reuse bug).
+
+- [x] **Advisor quorum** done (independent review; adopted its refinements).
+- [x] Correlator core (`correlate.go`): per-PID recent-open buffer fed by
+      Kernel-File **Create** (watchlist-gated), per-PID DNS→domain cache,
+      connect-triggered correlation, hard FP gates (user-doc path + extension +
+      external-IP + tight window), chat-clients-first watchlist, mutex-safe, gc.
+      **Unit-tested** (`correlate_test.go`).
+- [x] Windows wiring (`upload_windows.go` + `monitor_windows.go`): SEPARATE
+      Kernel-Network + DNS-Client session (avoid file-event starvation),
+      Create→noteOpen, process-name cache.
+- [ ] `go test` + `GOOS=windows go build` validation (user).
+- [ ] **Windows spike** for the `TODO(windows-spike)` runtime unknowns:
+      Kernel-Network connect event IDs, `daddr`/`dport` (big-endian) +
+      DNS `QueryResults` property names/encodings.
+- [ ] Tune FP gates / confidence / watchlist from spike data; consider browsers
+      (policy-opt-in) once doc-path gating is proven.
 
 ## Phase 4 — Alerting & workflow
 
