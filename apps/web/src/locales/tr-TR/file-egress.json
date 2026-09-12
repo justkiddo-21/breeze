@@ -1,0 +1,96 @@
+{
+  "fileEgressPage": {
+    "title": "Dosya Sızıntısı (DLP)",
+    "subtitle": "Cihazlardan çıkan dosyaları izleyin — USB'ye veya ağ paylaşımlarına kopyalanan ve uygulamalar ya da tarayıcı üzerinden yüklenen dosyalar.",
+    "tabs": {
+      "policies": "Politikalar",
+      "activity": "Etkinlik"
+    }
+  },
+  "policiesList": {
+    "new": "Yeni politika",
+    "empty": "Henüz dosya sızıntısı politikası yok. İzlemeye başlamak için bir tane oluşturun.",
+    "allOrgs": "Tüm organizasyonlar",
+    "partnerWideTitle": "İş ortağı geneli politika — tüm organizasyonlarınıza uygulanır",
+    "loadError": "Politikalar yüklenemedi.",
+    "status": {
+      "enabled": "Etkin",
+      "disabled": "Devre dışı"
+    },
+    "columns": {
+      "name": "Ad",
+      "scope": "Kapsam",
+      "surfaces": "Yüzeyler",
+      "status": "Durum"
+    },
+    "surfaces": {
+      "removable": "USB",
+      "network": "Ağ",
+      "uploads": "Yüklemeler"
+    }
+  },
+  "policyForm": {
+    "newTitle": "Yeni dosya sızıntısı politikası",
+    "editTitle": "Dosya sızıntısı politikasını düzenle",
+    "name": "Ad",
+    "enabled": "İzleme etkin",
+    "enabledHint": "Kapalıyken, bu politika atanmış aracılar izleme yapmaz.",
+    "surfacesLegend": "İzlenecek yüzeyler",
+    "watchRemovable": "USB / çıkarılabilir sürücüler",
+    "watchNetworkShares": "Ağ paylaşımları",
+    "watchUploads": "Uygulama / tarayıcı yüklemeleri",
+    "watchUploadsHint": "Bir dosyayı okuyup ardından yükleyen bir süreci algılar (Messenger, Zalo, tarayıcı). Bu bir korelasyon sezgiselidir — dosyayı, uygulamayı ve hedefi belirtir, gönderilen tam içeriğin kanıtı değildir.",
+    "uploadWatchlist": "Yükleme için izlenen süreç listesi",
+    "uploadWatchlistHint": "Yüklemeler için izlenecek süreç adları. Yerleşik varsayılanı (tarayıcılar ve yaygın sohbet uygulamaları) kullanmak için boş bırakın.",
+    "uploadWatchlistPlaceholder": "örn. Zalo.exe",
+    "ignoreGlobs": "Yoksayılacak desenler",
+    "ignoreGlobsHint": "Atlanacak yollar veya glob desenleri, örneğin *.tmp veya bir geçici klasör adı.",
+    "ignoreGlobsPlaceholder": "örn. *.tmp",
+    "minFileSize": "Minimum dosya boyutu (bayt)",
+    "minFileSizeHint": "Bundan küçük dosyaları yoksay. 0 = tümünü bildir.",
+    "scope": "Kapsam",
+    "allOrganizations": "Tüm organizasyonlar",
+    "partnerWide": "iş ortağı geneli",
+    "thisOrganization": "Bu organizasyon",
+    "add": "Ekle",
+    "remove": "Kaldır",
+    "save": "Politikayı kaydet",
+    "cancel": "İptal",
+    "delete": "Sil",
+    "deleteConfirm": "Bu politika silinsin mi? Bu işlem geri alınamaz.",
+    "saved": "Politika kaydedildi.",
+    "deleted": "Politika silindi.",
+    "errors": {
+      "nameRequired": "Ad zorunludur.",
+      "save": "Politika kaydedilemedi.",
+      "delete": "Politika silinemedi."
+    }
+  },
+  "eventsTable": {
+    "empty": "Bu aralıkta sızıntı olayı yok.",
+    "loadError": "Olaylar yüklenemedi.",
+    "columns": {
+      "time": "Saat",
+      "device": "Cihaz",
+      "type": "Tür",
+      "file": "Dosya",
+      "destination": "Hedef",
+      "process": "Süreç"
+    },
+    "types": {
+      "removable": "USB / çıkarılabilir",
+      "network_share": "Ağ paylaşımı",
+      "app_upload": "Uygulama yüklemesi"
+    },
+    "filters": {
+      "type": "Tür",
+      "allTypes": "Tüm türler",
+      "from": "Başlangıç",
+      "to": "Bitiş"
+    },
+    "prev": "Önceki",
+    "next": "Sonraki",
+    "showing": "{{total}} içinden {{from}}–{{to}} gösteriliyor",
+    "none": "—"
+  }
+}

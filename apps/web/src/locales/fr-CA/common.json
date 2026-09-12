@@ -27,6 +27,7 @@
     "userRisk": "Risque utilisateur",
     "sensitiveData": "Données sensibles",
     "peripherals": "Périphériques",
+    "fileEgress": "Fuite de fichiers",
     "cisBenchmarks": "CIS Benchmarks",
     "complianceBaselines": "Références de conformité",
     "quotes": "Citations",

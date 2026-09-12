@@ -1,0 +1,96 @@
+{
+  "fileEgressPage": {
+    "title": "File Egress (DLP)",
+    "subtitle": "Monitor files leaving devices — copied to USB or network shares, and uploaded via apps or the browser.",
+    "tabs": {
+      "policies": "Policies",
+      "activity": "Activity"
+    }
+  },
+  "policiesList": {
+    "new": "New policy",
+    "empty": "No file-egress policies yet. Create one to start monitoring.",
+    "allOrgs": "All orgs",
+    "partnerWideTitle": "Partner-wide policy — applies to all your organizations",
+    "loadError": "Failed to load policies.",
+    "status": {
+      "enabled": "Enabled",
+      "disabled": "Disabled"
+    },
+    "columns": {
+      "name": "Name",
+      "scope": "Scope",
+      "surfaces": "Surfaces",
+      "status": "Status"
+    },
+    "surfaces": {
+      "removable": "USB",
+      "network": "Network",
+      "uploads": "Uploads"
+    }
+  },
+  "policyForm": {
+    "newTitle": "New file-egress policy",
+    "editTitle": "Edit file-egress policy",
+    "name": "Name",
+    "enabled": "Monitoring enabled",
+    "enabledHint": "When off, agents assigned this policy do not monitor.",
+    "surfacesLegend": "Surfaces to watch",
+    "watchRemovable": "USB / removable drives",
+    "watchNetworkShares": "Network shares",
+    "watchUploads": "App / browser uploads",
+    "watchUploadsHint": "Detect a process reading a file then uploading it (Messenger, Zalo, browser). This is a correlation heuristic — it names the file, app, and destination, not proof of the exact content sent.",
+    "uploadWatchlist": "Upload process watchlist",
+    "uploadWatchlistHint": "Process names to watch for uploads. Leave empty to use the built-in default (browsers and common chat apps).",
+    "uploadWatchlistPlaceholder": "e.g. Zalo.exe",
+    "ignoreGlobs": "Ignore patterns",
+    "ignoreGlobsHint": "Paths or globs to skip, e.g. *.tmp or a temp folder name.",
+    "ignoreGlobsPlaceholder": "e.g. *.tmp",
+    "minFileSize": "Minimum file size (bytes)",
+    "minFileSizeHint": "Ignore files smaller than this. 0 = report all.",
+    "scope": "Scope",
+    "allOrganizations": "All organizations",
+    "partnerWide": "partner-wide",
+    "thisOrganization": "This organization",
+    "add": "Add",
+    "remove": "Remove",
+    "save": "Save policy",
+    "cancel": "Cancel",
+    "delete": "Delete",
+    "deleteConfirm": "Delete this policy? This cannot be undone.",
+    "saved": "Policy saved.",
+    "deleted": "Policy deleted.",
+    "errors": {
+      "nameRequired": "Name is required.",
+      "save": "Failed to save policy.",
+      "delete": "Failed to delete policy."
+    }
+  },
+  "eventsTable": {
+    "empty": "No egress events in this range.",
+    "loadError": "Failed to load events.",
+    "columns": {
+      "time": "Time",
+      "device": "Device",
+      "type": "Type",
+      "file": "File",
+      "destination": "Destination",
+      "process": "Process"
+    },
+    "types": {
+      "removable": "USB / removable",
+      "network_share": "Network share",
+      "app_upload": "App upload"
+    },
+    "filters": {
+      "type": "Type",
+      "allTypes": "All types",
+      "from": "From",
+      "to": "To"
+    },
+    "prev": "Previous",
+    "next": "Next",
+    "showing": "Showing {{from}}–{{to}} of {{total}}",
+    "none": "—"
+  }
+}

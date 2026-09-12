@@ -1,0 +1,96 @@
+{
+  "fileEgressPage": {
+    "title": "Fuite de fichiers (DLP)",
+    "subtitle": "Surveillez les fichiers qui quittent les appareils — copiés vers une clé USB ou des partages réseau, et envoyés via des applications ou le navigateur.",
+    "tabs": {
+      "policies": "Politiques",
+      "activity": "Activité"
+    }
+  },
+  "policiesList": {
+    "new": "Nouvelle politique",
+    "empty": "Aucune politique de fuite de fichiers pour l'instant. Créez-en une pour commencer la surveillance.",
+    "allOrgs": "Toutes les organisations",
+    "partnerWideTitle": "Politique à l'échelle du partenaire — s'applique à toutes vos organisations",
+    "loadError": "Échec du chargement des politiques.",
+    "status": {
+      "enabled": "Activée",
+      "disabled": "Désactivée"
+    },
+    "columns": {
+      "name": "Nom",
+      "scope": "Portée",
+      "surfaces": "Surfaces",
+      "status": "Statut"
+    },
+    "surfaces": {
+      "removable": "USB",
+      "network": "Réseau",
+      "uploads": "Envois"
+    }
+  },
+  "policyForm": {
+    "newTitle": "Nouvelle politique de fuite de fichiers",
+    "editTitle": "Modifier la politique de fuite de fichiers",
+    "name": "Nom",
+    "enabled": "Surveillance activée",
+    "enabledHint": "Lorsque c'est désactivé, les agents auxquels cette politique est assignée n'effectuent aucune surveillance.",
+    "surfacesLegend": "Surfaces à surveiller",
+    "watchRemovable": "USB / lecteurs amovibles",
+    "watchNetworkShares": "Partages réseau",
+    "watchUploads": "Envois via application / navigateur",
+    "watchUploadsHint": "Détecte un processus qui lit un fichier puis l'envoie (Messenger, Zalo, navigateur). Il s'agit d'une heuristique de corrélation — elle indique le fichier, l'application et la destination, ce n'est pas une preuve du contenu exact envoyé.",
+    "uploadWatchlist": "Liste des processus surveillés pour les envois",
+    "uploadWatchlistHint": "Noms de processus à surveiller pour les envois. Laissez vide pour utiliser la valeur par défaut intégrée (navigateurs et applications de messagerie courantes).",
+    "uploadWatchlistPlaceholder": "p. ex. Zalo.exe",
+    "ignoreGlobs": "Motifs à ignorer",
+    "ignoreGlobsHint": "Chemins ou motifs glob à ignorer, par exemple *.tmp ou le nom d'un dossier temporaire.",
+    "ignoreGlobsPlaceholder": "p. ex. *.tmp",
+    "minFileSize": "Taille de fichier minimale (octets)",
+    "minFileSizeHint": "Ignorer les fichiers plus petits que ceci. 0 = tout signaler.",
+    "scope": "Portée",
+    "allOrganizations": "Toutes les organisations",
+    "partnerWide": "à l'échelle du partenaire",
+    "thisOrganization": "Cette organisation",
+    "add": "Ajouter",
+    "remove": "Supprimer",
+    "save": "Enregistrer la politique",
+    "cancel": "Annuler",
+    "delete": "Supprimer",
+    "deleteConfirm": "Supprimer cette politique ? Cette action est irréversible.",
+    "saved": "Politique enregistrée.",
+    "deleted": "Politique supprimée.",
+    "errors": {
+      "nameRequired": "Le nom est requis.",
+      "save": "Échec de l'enregistrement de la politique.",
+      "delete": "Échec de la suppression de la politique."
+    }
+  },
+  "eventsTable": {
+    "empty": "Aucun événement de fuite dans cette période.",
+    "loadError": "Échec du chargement des événements.",
+    "columns": {
+      "time": "Heure",
+      "device": "Appareil",
+      "type": "Type",
+      "file": "Fichier",
+      "destination": "Destination",
+      "process": "Processus"
+    },
+    "types": {
+      "removable": "USB / amovible",
+      "network_share": "Partage réseau",
+      "app_upload": "Envoi par application"
+    },
+    "filters": {
+      "type": "Type",
+      "allTypes": "Tous les types",
+      "from": "De",
+      "to": "À"
+    },
+    "prev": "Précédent",
+    "next": "Suivant",
+    "showing": "Affichage de {{from}} à {{to}} sur {{total}}",
+    "none": "—"
+  }
+}

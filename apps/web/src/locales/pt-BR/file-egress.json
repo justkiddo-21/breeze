@@ -1,0 +1,96 @@
+{
+  "fileEgressPage": {
+    "title": "Saída de Arquivos (DLP)",
+    "subtitle": "Monitore arquivos saindo dos dispositivos — copiados para USB ou compartilhamentos de rede, e enviados por aplicativos ou pelo navegador.",
+    "tabs": {
+      "policies": "Políticas",
+      "activity": "Atividade"
+    }
+  },
+  "policiesList": {
+    "new": "Nova política",
+    "empty": "Ainda não há políticas de saída de arquivos. Crie uma para começar a monitorar.",
+    "allOrgs": "Todas as organizações",
+    "partnerWideTitle": "Política em todo o parceiro — aplica-se a todas as suas organizações",
+    "loadError": "Falha ao carregar as políticas.",
+    "status": {
+      "enabled": "Ativada",
+      "disabled": "Desativada"
+    },
+    "columns": {
+      "name": "Nome",
+      "scope": "Escopo",
+      "surfaces": "Superfícies",
+      "status": "Status"
+    },
+    "surfaces": {
+      "removable": "USB",
+      "network": "Rede",
+      "uploads": "Envios"
+    }
+  },
+  "policyForm": {
+    "newTitle": "Nova política de saída de arquivos",
+    "editTitle": "Editar política de saída de arquivos",
+    "name": "Nome",
+    "enabled": "Monitoramento ativado",
+    "enabledHint": "Quando desativado, os agentes com esta política atribuída não monitoram.",
+    "surfacesLegend": "Superfícies a monitorar",
+    "watchRemovable": "USB / unidades removíveis",
+    "watchNetworkShares": "Compartilhamentos de rede",
+    "watchUploads": "Envios por aplicativo / navegador",
+    "watchUploadsHint": "Detecta um processo lendo um arquivo e depois enviando-o (Messenger, Zalo, navegador). Esta é uma heurística de correlação — ela identifica o arquivo, o aplicativo e o destino, não é prova do conteúdo exato enviado.",
+    "uploadWatchlist": "Lista de processos monitorados para envios",
+    "uploadWatchlistHint": "Nomes de processos a monitorar para envios. Deixe em branco para usar o padrão embutido (navegadores e aplicativos de chat comuns).",
+    "uploadWatchlistPlaceholder": "ex.: Zalo.exe",
+    "ignoreGlobs": "Padrões a ignorar",
+    "ignoreGlobsHint": "Caminhos ou padrões glob a pular, por exemplo *.tmp ou o nome de uma pasta temporária.",
+    "ignoreGlobsPlaceholder": "ex.: *.tmp",
+    "minFileSize": "Tamanho mínimo do arquivo (bytes)",
+    "minFileSizeHint": "Ignorar arquivos menores que isto. 0 = reportar todos.",
+    "scope": "Escopo",
+    "allOrganizations": "Todas as organizações",
+    "partnerWide": "em todo o parceiro",
+    "thisOrganization": "Esta organização",
+    "add": "Adicionar",
+    "remove": "Remover",
+    "save": "Salvar política",
+    "cancel": "Cancelar",
+    "delete": "Excluir",
+    "deleteConfirm": "Excluir esta política? Isso não pode ser desfeito.",
+    "saved": "Política salva.",
+    "deleted": "Política excluída.",
+    "errors": {
+      "nameRequired": "O nome é obrigatório.",
+      "save": "Falha ao salvar a política.",
+      "delete": "Falha ao excluir a política."
+    }
+  },
+  "eventsTable": {
+    "empty": "Nenhum evento de saída neste período.",
+    "loadError": "Falha ao carregar os eventos.",
+    "columns": {
+      "time": "Hora",
+      "device": "Dispositivo",
+      "type": "Tipo",
+      "file": "Arquivo",
+      "destination": "Destino",
+      "process": "Processo"
+    },
+    "types": {
+      "removable": "USB / removível",
+      "network_share": "Compartilhamento de rede",
+      "app_upload": "Envio por aplicativo"
+    },
+    "filters": {
+      "type": "Tipo",
+      "allTypes": "Todos os tipos",
+      "from": "De",
+      "to": "Até"
+    },
+    "prev": "Anterior",
+    "next": "Próximo",
+    "showing": "Mostrando {{from}}–{{to}} de {{total}}",
+    "none": "—"
+  }
+}
