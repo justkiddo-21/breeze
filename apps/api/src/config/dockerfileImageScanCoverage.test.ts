@@ -590,6 +590,7 @@ describe('Trivy image scan covers the images we publish', () => {
     }
 
     expect(coverage).toEqual({
+      '.github/workflows/edge-image-api.yml:publish-edge': 'has a trivy-action step',
       '.github/workflows/edge-image-web.yml:publish-edge': 'has a trivy-action step',
       '.github/workflows/hosted-images.yml:build-m365-executor-image': 'has a trivy-action step',
       '.github/workflows/hosted-images.yml:build-server-image': 'NO trivy-action step',
