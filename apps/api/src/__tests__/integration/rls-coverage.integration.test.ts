@@ -467,6 +467,13 @@ const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
   // axis. Functional cross-partner forge + distribution fan-out proof:
   // peripheralPoliciesPartnerRls.integration.test.ts.
   'peripheral_policies',
+  // file_egress_policies (Task 2, file-egress DLP): org-scoped OR partner-wide
+  // file-egress monitoring config. file_egress_events stay org-owned by the
+  // reporting DEVICE's org. CHECK file_egress_policies_one_owner_chk enforces
+  // exactly one axis. Ships the real *_partner_wide_select branch (migration
+  // 2026-10-15-140005). Cross-partner forge + fan-out proof:
+  // fileEgressPoliciesPartnerRls.integration.test.ts.
+  'file_egress_policies',
   // maintenance_windows (#2131, epic #2135): org-scoped OR partner-wide
   // maintenance window. maintenance_occurrences stay window-join (their
   // EXISTS policies gained the partner branch in the same migration).
@@ -599,6 +606,7 @@ const XOR_OWNERSHIP_DUAL_AXIS_TABLES: ReadonlySet<string> = new Set<string>([
   'automations',
   'sensitive_data_policies',
   'peripheral_policies',
+  'file_egress_policies',
   'maintenance_windows',
   'notification_channels',
   'notification_routing_rules',

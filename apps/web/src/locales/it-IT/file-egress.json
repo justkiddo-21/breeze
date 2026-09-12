@@ -1,0 +1,96 @@
+{
+  "fileEgressPage": {
+    "title": "Uscita di file (DLP)",
+    "subtitle": "Monitora i file che escono dai dispositivi: copiati su USB o condivisioni di rete, e caricati tramite app o browser.",
+    "tabs": {
+      "policies": "Criteri",
+      "activity": "Attività"
+    }
+  },
+  "policiesList": {
+    "new": "Nuovo criterio",
+    "empty": "Nessun criterio di uscita file ancora. Creane uno per iniziare il monitoraggio.",
+    "allOrgs": "Tutte le organizzazioni",
+    "partnerWideTitle": "Criterio a livello di partner — si applica a tutte le tue organizzazioni",
+    "loadError": "Impossibile caricare i criteri.",
+    "status": {
+      "enabled": "Abilitato",
+      "disabled": "Disabilitato"
+    },
+    "columns": {
+      "name": "Nome",
+      "scope": "Ambito",
+      "surfaces": "Superfici",
+      "status": "Stato"
+    },
+    "surfaces": {
+      "removable": "USB",
+      "network": "Rete",
+      "uploads": "Caricamenti"
+    }
+  },
+  "policyForm": {
+    "newTitle": "Nuovo criterio di uscita file",
+    "editTitle": "Modifica criterio di uscita file",
+    "name": "Nome",
+    "enabled": "Monitoraggio abilitato",
+    "enabledHint": "Se disattivato, gli agenti a cui è assegnato questo criterio non eseguono il monitoraggio.",
+    "surfacesLegend": "Superfici da monitorare",
+    "watchRemovable": "USB / unità rimovibili",
+    "watchNetworkShares": "Condivisioni di rete",
+    "watchUploads": "Caricamenti da app / browser",
+    "watchUploadsHint": "Rileva un processo che legge un file e poi lo carica (Messenger, Zalo, browser). Si tratta di un'euristica di correlazione: indica il file, l'app e la destinazione, non è una prova del contenuto esatto inviato.",
+    "uploadWatchlist": "Elenco processi monitorati per i caricamenti",
+    "uploadWatchlistHint": "Nomi di processi da monitorare per i caricamenti. Lascia vuoto per usare il valore predefinito integrato (browser e app di chat comuni).",
+    "uploadWatchlistPlaceholder": "es. Zalo.exe",
+    "ignoreGlobs": "Pattern da ignorare",
+    "ignoreGlobsHint": "Percorsi o pattern glob da saltare, ad esempio *.tmp o il nome di una cartella temporanea.",
+    "ignoreGlobsPlaceholder": "es. *.tmp",
+    "minFileSize": "Dimensione minima del file (byte)",
+    "minFileSizeHint": "Ignora i file più piccoli di questo valore. 0 = segnala tutti.",
+    "scope": "Ambito",
+    "allOrganizations": "Tutte le organizzazioni",
+    "partnerWide": "a livello di partner",
+    "thisOrganization": "Questa organizzazione",
+    "add": "Aggiungi",
+    "remove": "Rimuovi",
+    "save": "Salva criterio",
+    "cancel": "Annulla",
+    "delete": "Elimina",
+    "deleteConfirm": "Eliminare questo criterio? Questa azione non può essere annullata.",
+    "saved": "Criterio salvato.",
+    "deleted": "Criterio eliminato.",
+    "errors": {
+      "nameRequired": "Il nome è obbligatorio.",
+      "save": "Impossibile salvare il criterio.",
+      "delete": "Impossibile eliminare il criterio."
+    }
+  },
+  "eventsTable": {
+    "empty": "Nessun evento di uscita in questo intervallo.",
+    "loadError": "Impossibile caricare gli eventi.",
+    "columns": {
+      "time": "Ora",
+      "device": "Dispositivo",
+      "type": "Tipo",
+      "file": "File",
+      "destination": "Destinazione",
+      "process": "Processo"
+    },
+    "types": {
+      "removable": "USB / rimovibile",
+      "network_share": "Condivisione di rete",
+      "app_upload": "Caricamento da app"
+    },
+    "filters": {
+      "type": "Tipo",
+      "allTypes": "Tutti i tipi",
+      "from": "Da",
+      "to": "A"
+    },
+    "prev": "Precedente",
+    "next": "Successivo",
+    "showing": "Visualizzazione di {{from}}–{{to}} su {{total}}",
+    "none": "—"
+  }
+}

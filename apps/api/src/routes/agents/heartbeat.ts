@@ -25,6 +25,7 @@ import {
   compareAgentVersions,
   buildEventLogConfigUpdate,
   buildMonitoringConfigUpdate,
+  buildFileEgressConfigUpdate,
   buildHelperConfigUpdate,
   buildPamConfigUpdate,
   buildOnedriveHelperConfigUpdate,
@@ -1905,12 +1906,14 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   type PolicyConfigUpdates = {
     eventLogSettings: Record<string, unknown> | null;
     monitoringSettings: Record<string, unknown> | null;
+    fileEgressSettings: Record<string, unknown> | null;
     pamSettings: { uacInterceptionEnabled: boolean } | null;
     patchSourceSettings: { exclusiveWindowsUpdate: boolean } | null;
   };
   let policyConfigs: PolicyConfigUpdates = {
     eventLogSettings: null,
     monitoringSettings: null,
+    fileEgressSettings: null,
     pamSettings: null,
     patchSourceSettings: null,
   };
@@ -1918,6 +1921,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     policyConfigs = await withSystemDbAccessContext(async (): Promise<PolicyConfigUpdates> => {
       let eventLogSettings: Record<string, unknown> | null = null;
       let monitoringSettings: Record<string, unknown> | null = null;
+      let fileEgressSettings: Record<string, unknown> | null = null;
       let pamSettings: { uacInterceptionEnabled: boolean } | null = null;
       let patchSourceSettings: { exclusiveWindowsUpdate: boolean } | null = null;
 
@@ -1936,6 +1940,13 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
         monitoringSettings = await buildMonitoringConfigUpdate(scoped.deviceId) as Record<string, unknown> | null;
       } catch (err) {
         console.error(`[agents] failed to build monitoring config update for ${agentId}:`, err);
+        captureException(err);
+      }
+
+      try {
+        fileEgressSettings = await buildFileEgressConfigUpdate(scoped.deviceId) as Record<string, unknown> | null;
+      } catch (err) {
+        console.error(`[agents] failed to build file-egress config update for ${agentId}:`, err);
         captureException(err);
       }
 
@@ -1965,7 +1976,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
         captureException(err);
       }
 
-      return { eventLogSettings, monitoringSettings, pamSettings, patchSourceSettings };
+      return { eventLogSettings, monitoringSettings, fileEgressSettings, pamSettings, patchSourceSettings };
     });
   } catch (err) {
     // Transaction setup/commit failure — see the note above. Every resolver's
@@ -1974,7 +1985,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     console.error(`[agents] policy config context failed for ${agentId} — omitting config updates this heartbeat:`, err);
     captureException(err);
   }
-  const { eventLogSettings, monitoringSettings, pamSettings, patchSourceSettings } = policyConfigs;
+  const { eventLogSettings, monitoringSettings, fileEgressSettings, pamSettings, patchSourceSettings } = policyConfigs;
 
   const policyConfigUpdate: Record<string, unknown> = {};
   if (eventLogSettings) {
@@ -1982,6 +1993,9 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   }
   if (monitoringSettings) {
     policyConfigUpdate.monitoring_settings = monitoringSettings;
+  }
+  if (fileEgressSettings) {
+    policyConfigUpdate.file_egress_settings = fileEgressSettings;
   }
   if (patchSourceSettings) {
     policyConfigUpdate.patch_source_settings = patchSourceSettings;

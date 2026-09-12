@@ -599,6 +599,8 @@
     "cvesDetectedOnThisDevice": "CVE detectados en este dispositivo",
     "peripherals": "Periféricos",
     "usbBluetoothAndConnectedDevices": "USB, Bluetooth y dispositivos conectados",
+    "egress": "Salida",
+    "fileEgressDlp": "Salida de archivos (DLP)",
     "scripts": "Scripts",
     "scriptExecutionHistory": "Historial de ejecución de scripts",
     "management": "Gestión",

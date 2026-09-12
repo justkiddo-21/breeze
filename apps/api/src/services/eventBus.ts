@@ -143,6 +143,8 @@ export type EventType =
   | 'peripheral.unauthorized_device'
   | 'peripheral.blocked'
   | 'peripheral.policy_changed'
+  // File-egress (DLP) events
+  | 'file_egress.detected'
   // Remote events
   | 'remote.session.started'
   | 'remote.session.ended'
@@ -658,6 +660,8 @@ export const EVENT_TYPES = {
   PERIPHERAL_UNAUTHORIZED_DEVICE: 'peripheral.unauthorized_device' as const,
   PERIPHERAL_BLOCKED: 'peripheral.blocked' as const,
   PERIPHERAL_POLICY_CHANGED: 'peripheral.policy_changed' as const,
+  // File-egress (DLP)
+  FILE_EGRESS_DETECTED: 'file_egress.detected' as const,
   // Service and process monitoring
   MONITORING_CHECK_FAILED: 'monitoring.check_failed' as const,
   MONITORING_CHECK_RECOVERED: 'monitoring.check_recovered' as const,
