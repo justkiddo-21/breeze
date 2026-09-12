@@ -347,6 +347,13 @@ func isExternalIP(ipStr string) bool {
 	return true
 }
 
+// isAnyIP reports whether s parses as any valid IP address (used to extract
+// resolved addresses from a DNS results string; the connect path applies the
+// external-only filter separately).
+func isAnyIP(s string) bool {
+	return net.ParseIP(strings.TrimSpace(s)) != nil
+}
+
 // egressUploadID is a stable idempotency key bucketed to the minute so a retried
 // correlation collapses server-side while a later genuine upload gets a new id.
 func egressUploadID(pid uint32, path, destIP string, t time.Time) string {

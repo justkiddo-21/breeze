@@ -65,12 +65,23 @@ func NewSubscriber(poster Poster) (Subscriber, error) {
 		classifier: newDriveClassifier(),
 		events:     make(chan Event, eventChanDepth),
 		doneCh:     make(chan struct{}),
+		correlator: newCorrelator(poster.FileEgressConfig()),
+		nameCache:  newProcNameCache(),
+		gcStop:     make(chan struct{}),
 	}
 	// NewRealTimeConsumer panics on a nil parent context (see etwlua).
 	s.consumer = etw.NewRealTimeConsumer(context.Background()).FromSessions(session)
 	s.consumer.EventRecordHelperCallback = s.onEvent
 
 	go s.run()
+
+	// wave 2b: a SEPARATE low-volume session for outbound connects + DNS, so the
+	// high-volume Kernel-File session can't starve/drop network events (design
+	// review Q4). Non-fatal on failure: file-copy detection still works.
+	if err := s.startNetworkSession(); err != nil {
+		log.Warn("fileegress: network/DNS session init failed; app-upload detection disabled", "error", err.Error())
+	}
+	go s.gcLoop()
 	return s, nil
 }
 
@@ -82,6 +93,16 @@ type etwSubscriber struct {
 	events     chan Event
 	doneCh     chan struct{}
 	stopOnce   sync.Once
+
+	// wave 2b: read->upload correlation. The correlator is fed by this
+	// (Kernel-File) consumer's Create events AND the separate network/DNS
+	// consumer below; it is mutex-safe for those two threads.
+	correlator *correlator
+	nameCache  *procNameCache
+	netSession *etw.RealTimeSession
+	netConsumer *etw.Consumer
+	netDoneCh  chan struct{}
+	gcStop     chan struct{}
 }
 
 func (s *etwSubscriber) Events() <-chan Event { return s.events }
@@ -99,6 +120,21 @@ func (s *etwSubscriber) run() {
 
 func (s *etwSubscriber) Stop() {
 	s.stopOnce.Do(func() {
+		close(s.gcStop)
+		// Network/DNS session first (wave 2b), then the file session.
+		if s.netConsumer != nil {
+			if err := s.netConsumer.Stop(); err != nil {
+				log.Warn("fileegress: net ETW consumer stop", "error", err.Error())
+			}
+		}
+		if s.netSession != nil {
+			if err := s.netSession.Stop(); err != nil {
+				log.Warn("fileegress: net ETW session stop", "error", err.Error())
+			}
+		}
+		if s.netDoneCh != nil {
+			<-s.netDoneCh
+		}
 		if err := s.consumer.Stop(); err != nil {
 			log.Warn("fileegress: ETW consumer stop", "error", err.Error())
 		}
@@ -107,6 +143,24 @@ func (s *etwSubscriber) Stop() {
 		}
 		<-s.doneCh
 	})
+}
+
+// gcLoop periodically prunes stale correlator state so PIDs that open files but
+// never connect don't leak memory.
+func (s *etwSubscriber) gcLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.gcStop:
+			return
+		case <-ticker.C:
+			if s.correlator != nil {
+				s.correlator.gc()
+			}
+			s.nameCache.gc()
+		}
+	}
 }
 
 // onEvent is the per-event callback. It must be cheap: Kernel-File is a
@@ -124,6 +178,17 @@ func (s *etwSubscriber) onEvent(h *etw.EventRecordHelper) error {
 		return nil
 	}
 
+	pid := h.EventRec.EventHeader.ProcessId
+	procPath := s.nameCache.get(pid)
+
+	// wave 2b: feed the upload correlator on EVERY create. It gates internally to
+	// watchlisted processes opening interesting user-doc files, so most creates
+	// return immediately. Size is unknown at create time (0 skips the size gate).
+	if s.correlator != nil {
+		s.correlator.noteOpen(pid, procPath, ntPath, 0)
+	}
+
+	// wave 2a: file-copy to a removable/network surface.
 	egressType, destVolume := s.classifier.classify(ntPath)
 	if egressType == "" {
 		h.Skip()
@@ -136,9 +201,6 @@ func (s *etwSubscriber) onEvent(h *etw.EventRecordHelper) error {
 		h.Skip()
 		return nil
 	}
-
-	pid := h.EventRec.EventHeader.ProcessId
-	procPath := processImageName(pid)
 
 	now := time.Now().UTC()
 	ev := Event{
