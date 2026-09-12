@@ -43,7 +43,11 @@ handoff `internal/ops/handoff/16-file-egress-dlp.md`; agent-shipped code lives i
 - **Wave 2a — Windows agent (file→removable/network):** DONE on
   `feature/file-egress-dlp/wave-2-agent-windows` (compiles `GOOS=windows`, core
   unit-tested). **Runtime unvalidated.** Unmerged.
-- **UI, deploy, wave 2b (upload correlation), alerting, Linux:** not started.
+- **Phase 1 — dashboard UI:** DONE on `feature/file-egress-dlp/wave-1-server`
+  (commit `85cf719e9`): page + policy form + policies list + events table +
+  per-device Egress tab + nav + i18n (8 locales). 10 component tests pass, web
+  tsc clean, i18n contract tests pass. Unmerged.
+- **Deploy, wave 2b (upload correlation), alerting, Linux:** not started.
 
 ## File map
 
@@ -91,18 +95,22 @@ To create (remaining):
       scope the session to the CREATE keyword (remove the TODO in
       `monitor_windows.go`) to cut event volume.
 
-## Phase 1 — Dashboard UI (make it visible)
+## Phase 1 — Dashboard UI (make it visible) — DONE (commit `85cf719e9`, branch `feature/file-egress-dlp/wave-1-server`)
 
-- [ ] `FileEgressPolicyForm` — enable toggle, per-surface toggles
-      (removable/network/uploads), `ownerScope` selector + "All orgs" badge
-      (pattern: `components/software/PolicyForm.tsx`), process watchlist + ignore
-      globs editors, min-file-size. `runAction`-wrapped mutations.
-- [ ] `FileEgressEventsTable` — device, egress type, file/app/destination (read
-      from `details`), time; org/site/device/type filters + 90-day window
-      (pattern: peripheral activity view).
-- [ ] Route + nav entry (`/file-egress` or under Security), RLS-aware fetch.
-- [ ] Per-device **Egress** tab on `DeviceDetails`.
-- [ ] Web unit tests (Vitest + jsdom), `no-silent-mutations` compliance.
+- [x] `FileEgressPage` — Policies / Activity tabs.
+- [x] `FileEgressPolicyForm` — enable toggle, per-surface toggles
+      (removable/network/uploads), `ownerScope` selector + partner-wide badge
+      (via `useDefaultOwnerScope`), process watchlist + ignore-globs editors,
+      min-file-size. `runAction`-wrapped create/update/delete.
+- [x] `FileEgressPoliciesList` — dual-axis list, "All orgs" partner-wide badge.
+- [x] `FileEgressEventsTable` — egress type, file/app/destination/process (read
+      from `details`), type + date filters, pagination. Reused as the per-device
+      **Egress** tab (`DeviceFileEgressTab` on `DeviceDetails`).
+- [x] Astro route `/file-egress` + Sidebar nav entry (under Security).
+- [x] i18n: `file-egress.json` across all 8 locales + nav/device-detail keys;
+      `translationCoverage` baselines updated.
+- [x] 10 component tests (Vitest + jsdom); web typecheck clean; i18n contract
+      tests pass (94).
 
 ## Phase 2 — Ship wave 2a end-to-end
 
