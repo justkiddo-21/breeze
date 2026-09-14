@@ -45,7 +45,8 @@ jobs:
             type=raw,value=edge
             type=sha,format=long,prefix=sha-
 
-      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+      - id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: apps/web/Dockerfile
@@ -62,3 +63,14 @@ jobs:
             PUBLIC_AGENT_OPENH264_URL=https://github.com/justkiddo-21/breeze/releases/download/kreslab-agent-signed-v1/libopenh264-2.4.1-linux64.7.so
           cache-from: type=gha,scope=edge-web
           cache-to: type=gha,scope=edge-web,mode=max
+
+      # Scan the exact pushed manifest for HIGH/CRITICAL CVEs. This edge image
+      # is deployed to self-host production, so it gets the same blocking Trivy
+      # gate as the other published images (dockerfileImageScanCoverage.test.ts).
+      - name: Scan pushed edge Web image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/web@${{ steps.build.outputs.digest }}
+          severity: 'HIGH,CRITICAL'
+          format: 'table'
+          exit-code: '1'
