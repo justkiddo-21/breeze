@@ -1086,8 +1086,13 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
     </aside>
   );
 
-  // --- Mobile overlay sidebar ----------------------------------------------
-  const mobileOverlay = isMobile && isMobileMenuOpen && (
+  // --- Mobile/tablet overlay sidebar ---------------------------------------
+  // Also used on tablet (< lg): there the persistent aside is force-collapsed
+  // to an icon rail with no in-rail expand control, so the header hamburger
+  // (now visible < lg) opens this full labeled slide-out. The overlay always
+  // renders labels (forMobileOverlay), so it works for touch too — unlike
+  // hover mode, which needs a real pointer.
+  const mobileOverlay = (isMobile || isTablet) && isMobileMenuOpen && (
     <>
       {/* Backdrop */}
       <div
@@ -1141,6 +1146,18 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
       <div className="relative w-16 shrink-0">
         {sidebarContent}
       </div>
+    );
+  }
+
+  // Tablet (< lg): the icon rail is force-collapsed with no in-rail expand
+  // control, so also render the hamburger-driven slide-out overlay as the
+  // escape hatch to the full labeled nav.
+  if (isTablet) {
+    return (
+      <>
+        {sidebarContent}
+        {mobileOverlay}
+      </>
     );
   }
 

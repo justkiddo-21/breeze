@@ -376,9 +376,12 @@ export default function Header() {
   return (
     <header className="flex h-16 items-center justify-between gap-2 border-b bg-card px-2 sm:px-4 md:px-6">
       <div className={`flex min-w-0 flex-1 items-center gap-2 transition-opacity duration-150 sm:gap-4 ${mounted ? 'opacity-100' : 'opacity-0'}`}>
-        {/* Hamburger menu — visible only on mobile (< 768px) */}
+        {/* Hamburger menu — visible below lg (< 1024px): mobile AND tablet. On
+            tablet the sidebar is force-collapsed to an icon rail with no
+            in-rail expand control, so this is the only way to reach the full
+            labeled nav (opens the same slide-out overlay as mobile). */}
         <button
-          className="rounded-md p-2 hover:bg-muted transition-colors md:hidden"
+          className="rounded-md p-2 hover:bg-muted transition-colors lg:hidden"
           onClick={toggleMobileMenu}
           title={t('layout.header.menu')}
           aria-label={t('layout.header.openMenu')}
