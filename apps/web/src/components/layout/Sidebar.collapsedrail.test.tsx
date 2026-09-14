@@ -1,4 +1,4 @@
-import { render, waitFor } from '@testing-library/react';
+import { fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Collapsed icon rail alignment. The desktop `<nav>` is 64px wide (`w-16`)
@@ -85,6 +85,24 @@ describe('Sidebar collapsed icon rail', () => {
     // Active item still gets its highlight — only its horizontal layout changed.
     const active = links.find((l) => l.getAttribute('href') === '/devices');
     expect(active?.className).toContain('bg-primary');
+  });
+
+  it('expands to open mode when a collapsed rail section icon is clicked', async () => {
+    const { container } = await renderWithMode('collapsed');
+    const nav = getNav(container);
+
+    // Collapsed rail sections render as icon buttons (not dead <div>s), so a
+    // click is the escape hatch back to the full labelled nav.
+    const sectionButtons = Array.from(nav.querySelectorAll('button')).filter((b) =>
+      b.className.includes('justify-center'),
+    );
+    expect(sectionButtons.length).toBeGreaterThan(0);
+
+    fireEvent.click(sectionButtons[0]);
+
+    await waitFor(() => expect(getNav(container).style.scrollbarGutter).toBe('stable'));
+    const links = Array.from(getNav(container).querySelectorAll('a'));
+    expect(links.some((l) => l.className.includes('px-3'))).toBe(true);
   });
 
   it('keeps the labelled layout and stable gutter in open mode', async () => {
