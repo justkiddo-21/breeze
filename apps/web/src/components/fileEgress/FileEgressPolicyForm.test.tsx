@@ -7,9 +7,19 @@ const { fetchWithAuthMock } = vi.hoisted(() => ({
 const { ownerScopeMock } = vi.hoisted(() => ({
   ownerScopeMock: vi.fn(),
 }));
+const { orgScopeMock } = vi.hoisted(() => ({
+  orgScopeMock: vi.fn(),
+}));
 
 vi.mock("../../stores/auth", () => ({ fetchWithAuth: fetchWithAuthMock }));
 vi.mock("../../hooks/useDefaultOwnerScope", () => ({ useDefaultOwnerScope: ownerScopeMock }));
+vi.mock("../../hooks/useOrgScope", () => ({ useOrgScope: orgScopeMock }));
+// Mock the store directly so importing the form doesn't pull in orgStore's
+// module-load registerOrgIdProvider side effect.
+vi.mock("../../stores/orgStore", () => ({
+  useOrgStore: (selector: (s: { organizations: { id: string; name: string }[] }) => unknown) =>
+    selector({ organizations: [{ id: "o1", name: "Org One" }, { id: "o2", name: "Org Two" }] }),
+}));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (k: string) => k }) }));
 // runAction executes the request thunk so we can assert the fetchWithAuth call,
 // and mirrors its throw-on-non-2xx contract.
@@ -35,6 +45,8 @@ describe("FileEgressPolicyForm", () => {
     vi.clearAllMocks();
     fetchWithAuthMock.mockResolvedValue({ ok: true, json: async () => ({ data: {} }) } as never);
     ownerScopeMock.mockReturnValue({ isPartnerScope: false, defaultOwnerScope: "organization" });
+    // Default: no org selected in the switcher (the "All organizations" state).
+    orgScopeMock.mockReturnValue({ ready: false, status: "loading", scope: null, orgId: null, org: null, error: null });
   });
 
   it("requires a name before saving", async () => {
@@ -68,6 +80,28 @@ describe("FileEgressPolicyForm", () => {
     await waitFor(() => expect(onClose).toHaveBeenCalledWith(true));
     const body = JSON.parse((fetchWithAuthMock.mock.calls[0][1] as { body: string }).body);
     expect(body.ownerScope).toBe("partner");
+  });
+
+  it("partner scope + organization: requires an org pick, then sends orgId", async () => {
+    ownerScopeMock.mockReturnValue({ isPartnerScope: true, defaultOwnerScope: "partner" });
+    const onClose = vi.fn();
+    render(<FileEgressPolicyForm policy={null} onClose={onClose} />);
+    fireEvent.change(screen.getByTestId("file-egress-policy-name"), { target: { value: "Org DLP" } });
+    // Switch to org-owned — the org picker appears.
+    fireEvent.click(screen.getByTestId("file-egress-policy-owner-org"));
+    // Saving with no org chosen is blocked (no request fired).
+    fireEvent.click(screen.getByTestId("file-egress-policy-save"));
+    await waitFor(() =>
+      expect(screen.getByText("policyForm.errors.orgRequired")).toBeInTheDocument(),
+    );
+    expect(fetchWithAuthMock).not.toHaveBeenCalled();
+    // Pick an org, then it sends ownerScope + orgId.
+    fireEvent.change(screen.getByTestId("file-egress-policy-org-select"), { target: { value: "o2" } });
+    fireEvent.click(screen.getByTestId("file-egress-policy-save"));
+    await waitFor(() => expect(onClose).toHaveBeenCalledWith(true));
+    const body = JSON.parse((fetchWithAuthMock.mock.calls[0][1] as { body: string }).body);
+    expect(body.ownerScope).toBe("organization");
+    expect(body.orgId).toBe("o2");
   });
 
   it("edits an existing policy: sends id, never ownerScope", async () => {
