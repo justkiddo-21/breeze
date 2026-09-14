@@ -18,10 +18,29 @@ import {
   consumeWsTicket,
   getViewerAccessTokenExpirySeconds,
 } from '../services/remoteSessionAuth';
-import { getIceServers, logSessionAudit, buildRemoteSessionPromptPayload } from './remote/helpers';
+import {
+  getIceServers,
+  logSessionAudit,
+  buildRemoteSessionPromptPayload,
+  createDesktopStartCommandId,
+} from './remote/helpers';
+import {
+  assertDesktopStartIntentCurrent,
+  commitDesktopStartIntent,
+  commitDesktopStreamStartIntent,
+  formatDesktopGeneration,
+  startIntentDenialCode,
+  startIntentDenialMessage,
+} from '../services/remoteDesktopStartIntent';
 import { webrtcOfferSchema } from './remote/schemas';
 import { sendCommandToAgent, isAgentConnected } from './agentWs';
 import { checkRemoteAccess, resolveDesktopSessionPolicy } from '../services/remoteAccessPolicy';
+import {
+  AGENT_UPGRADE_REQUIRED_CODE,
+  AGENT_UPGRADE_REQUIRED_MESSAGE,
+  prepareRevocationLeaseForStart,
+  renewRevocationLease,
+} from '../services/remoteRevocationLease';
 import { getRedis } from '../services/redis';
 import { rateLimiter } from '../services/rate-limit';
 import { getTrustedClientIp } from '../services/clientIp';
@@ -51,7 +70,12 @@ import {
 } from '../services/desktopSessionFinalization';
 import { enqueueDesktopSessionFinalization } from '../jobs/desktopSessionFinalizationWorker';
 import { ensureDesktopStreamStopped } from '../services/desktopSessionStop';
-import { authorizeConsumedRemoteWsTicket } from '../services/remoteWsAuthorization';
+import {
+  authorizeConsumedRemoteWsTicket,
+  revalidateRemoteWsAuthorityBounded,
+  authorizeLiveRemoteSessionAccess,
+  type LiveRemoteSessionAuthorizationResult,
+} from '../services/remoteWsAuthorization';
 import {
   assertRemoteWsUpgradeRuntimeReady,
   getRemoteWsUpgradeConnection,
@@ -134,6 +158,8 @@ interface DesktopSession extends RemoteConnectionLease {
   // E2: audit summary counters
   inputEvents: number;
   frameBytes: number;
+  continuationAuthorized: boolean;
+  liveAuthorizationInFlight: boolean;
   detachComplete: boolean;
   stopCommandId?: string;
   stopConfirmed: boolean;
@@ -202,9 +228,55 @@ type ViewerAccessResult =
     }
   | {
       valid: false;
-      status: 400 | 401 | 403 | 404;
+      status: 400 | 401 | 403 | 404 | 503;
       error: string;
     };
+
+function viewerAuthorizationDenial(
+  denied: Extract<LiveRemoteSessionAuthorizationResult, { ok: false }>,
+): Extract<ViewerAccessResult, { valid: false }> {
+  switch (denied.reason) {
+    case 'user_inactive':
+      return { valid: false, status: 403, error: 'User not found or inactive' };
+    case 'session_missing':
+      return { valid: false, status: 404, error: 'Session not found' };
+    case 'session_inactive':
+      return { valid: false, status: 401, error: 'Session ended' };
+    case 'session_not_owned':
+      return { valid: false, status: 403, error: 'Viewer token does not match session owner' };
+    case 'site_denied':
+      return { valid: false, status: 403, error: 'Access to this site denied' };
+    case 'permission_denied':
+      return { valid: false, status: 403, error: 'Remote access permission denied' };
+    case 'device_offline':
+      return { valid: false, status: 503, error: 'Device is not online' };
+    case 'policy_denied':
+      return { valid: false, status: 403, error: 'Remote desktop is disabled by policy' };
+    default:
+      return { valid: false, status: 503, error: 'Unable to verify current remote access' };
+  }
+}
+
+function connectExchangeAuthorizationDenial(
+  denied: Extract<LiveRemoteSessionAuthorizationResult, { ok: false }>,
+): { status: 400 | 401 | 403 | 503; error: string } {
+  switch (denied.reason) {
+    case 'session_missing':
+    case 'session_not_owned':
+    case 'user_inactive':
+      return { status: 401, error: 'Invalid or expired connect code' };
+    case 'session_inactive':
+      return { status: 400, error: 'Session is not available for connection' };
+    case 'site_denied':
+      return { status: 403, error: 'Access to this site denied' };
+    case 'permission_denied':
+      return { status: 403, error: 'Remote access permission denied' };
+    case 'policy_denied':
+      return { status: 403, error: 'Remote desktop is disabled by policy' };
+    default:
+      return { status: 503, error: 'Unable to verify current remote access' };
+  }
+}
 
 async function validateViewerSessionAccess(
   authorizationHeader: string | undefined,
@@ -235,92 +307,36 @@ async function validateViewerSessionAccess(
     return { valid: false, status: 403, error: 'Viewer token does not match session' };
   }
 
-  // Viewer auth bypasses JWT middleware so no RLS context is set.
-  // Use system scope — the viewer token already verified ownership.
-  return withSystemDbAccessContext(async () => {
-    const [result] = await db
-      .select({
-        session: remoteSessions,
-        device: devices,
-        user: {
-          id: users.id,
-          email: users.email,
-          status: users.status,
-        },
-      })
-      .from(remoteSessions)
-      .innerJoin(devices, eq(remoteSessions.deviceId, devices.id))
-      .innerJoin(users, eq(remoteSessions.userId, users.id))
-      .where(eq(remoteSessions.id, sessionId))
-      .limit(1);
-
-    if (!result) {
-      return { valid: false as const, status: 404 as const, error: 'Session not found' };
+  // Viewer auth bypasses JWT middleware. Reuse the same live authorization
+  // primitive as direct WebSocket admission so membership, selected-org reach,
+  // site scope, role grants, device state and remote policy are all refreshed.
+  const live = await authorizeLiveRemoteSessionAccess({
+    sessionId,
+    sessionType: 'desktop',
+    userId: payload.sub,
+  }, accessMode);
+  if (!live.ok) {
+    if (sessionRevoked && live.reason === 'session_inactive') {
+      return { valid: false, status: 401, error: 'Session closed' };
     }
-
-    const { session, device, user } = result;
-
-    if (session.type !== 'desktop') {
-      return { valid: false as const, status: 400 as const, error: 'Session is not a desktop session' };
-    }
-
-    if (session.userId !== payload.sub || user.id !== payload.sub || user.email !== payload.email) {
-      return { valid: false as const, status: 403 as const, error: 'Viewer token does not match session owner' };
-    }
-
-    if (user.status !== 'active') {
-      return { valid: false as const, status: 403 as const, error: 'User not found or inactive' };
-    }
-
-    // Do not let a still-valid viewer token re-attach to a session that has
-    // already ended. A 'disconnected'/'failed' row requires a freshly created
-    // session to reconnect; otherwise a lingering viewer token (valid for up to
-    // the viewer-token TTL, see getViewerAccessTokenExpirySeconds()) resurrects
-    // a session the operator believes is over. Finding #5.
-    // The status poll may read a terminal failure after agentWs revokes the
-    // session so the viewer can explain why capture failed. This exception
-    // never grants live access, and individual token revocation still wins.
-    //
-    // #5300: a 'disconnected' session can also carry a real reason now — the
-    // no-video watchdog's swallowed capture error, relayed through the
-    // peer-disconnect command_result as `stopReason` and written to
-    // errorMessage (agentWs.ts, agentWs.desktop.peerDisconnected). Extend the
-    // same diagnostics-only exception #5295 introduced for 'failed' so the
-    // viewer can read that reason back too.
-    //
-    // The gate is "any recorded errorMessage on a disconnected row", not
-    // "a #5300 reason specifically" — staleCommandReaper.ts's
-    // reapStaleRemoteSessions also writes errorMessage on a 'disconnected'
-    // transition for its own routine timeouts ("connection was never
-    // established", "exceeded maximum session duration"), and those become
-    // readable here too. That's accepted as a side effect: the reaper's text
-    // is benign/user-safe and arguably useful to show instead of the bare
-    // generic message, and this still never grants live access — a routine
-    // disconnect with NO errorMessage at all still 401s exactly as before,
-    // so this never widens access beyond a read-only diagnostic string.
-    const readingFailure = accessMode === 'failure-diagnostics' &&
-      (session.status === 'failed' || (session.status === 'disconnected' && !!session.errorMessage));
-    if (sessionRevoked && !readingFailure) {
-      return { valid: false as const, status: 401 as const, error: 'Session closed' };
-    }
-    if ((session.status === 'disconnected' || session.status === 'failed') && !readingFailure) {
-      return { valid: false as const, status: 401 as const, error: 'Session ended' };
-    }
-
-    // Re-enforce the remote-access policy on every viewer entry point, not just
-    // at session creation: disabling webrtcDesktop mid-session must stop a
-    // holder of an existing viewer token from (re)starting a stream. Finding #1.
-    const policyCheck = await checkRemoteAccess(device.id, 'webrtcDesktop');
-    if (!policyCheck.allowed) {
-      return {
-        valid: false as const,
-        status: 403 as const,
-        error: policyCheck.reason ?? 'Remote desktop is disabled by policy',
-      };
-    }
-
-    return { valid: true as const, session, device, user, viewerToken: payload };
-  });
+    return viewerAuthorizationDenial(live);
+  }
+  const readingFailure = accessMode === 'failure-diagnostics' &&
+    (live.session.status === 'failed' ||
+      (live.session.status === 'disconnected' && !!live.session.errorMessage));
+  if (sessionRevoked && !readingFailure) {
+    return { valid: false, status: 401, error: 'Session closed' };
+  }
+  if (live.user.email !== payload.email) {
+    return { valid: false, status: 403, error: 'Viewer token does not match session owner' };
+  }
+  return {
+    valid: true,
+    session: live.session as typeof remoteSessions.$inferSelect,
+    device: live.device,
+    user: live.user,
+    viewerToken: payload,
+  };
 }
 
 /**
@@ -774,6 +790,8 @@ function createDesktopWsHandlers(
             orgId: device.orgId,
             startedAt: new Date(),
             lastPongAt: now,
+            continuationAuthorized: true,
+            liveAuthorizationInFlight: false,
           });
         }
         const installed = upgradeContext
@@ -807,6 +825,8 @@ function createDesktopWsHandlers(
                 inputOverageLogged: false,
                 inputEvents: 0,
                 frameBytes: 0,
+                continuationAuthorized: true,
+                liveAuthorizationInFlight: false,
                 detachComplete: false,
                 stopConfirmed: false,
                 intentAcknowledged: false,
@@ -871,6 +891,7 @@ function createDesktopWsHandlers(
             const sess = activeDesktopSessions.get(sessionId);
             if (
               sess
+              && sess.continuationAuthorized
               && connectionIdentity
               && ownsSafeRemoteConnection(
                 activeDesktopSessions,
@@ -904,26 +925,40 @@ function createDesktopWsHandlers(
           return;
         }
 
-        // Update only a still-open row. A prior owner may have made the row
-        // terminal after validation but before this exact lease was bound.
-        const [activated] = await withSystemDbAccessContext(() =>
-          db.update(remoteSessions)
-            .set({ status: 'active', startedAt: new Date() })
-            .where(and(
-              eq(remoteSessions.id, sessionId),
-              inArray(remoteSessions.status, ['pending', 'connecting']),
-            ))
-            .returning({ id: remoteSessions.id })
+        // Update only a still-open row, under the same row-locked start-intent
+        // commit the WebRTC paths use (SEC-038 W02). A prior owner may have made
+        // the row terminal after validation but before this exact lease was
+        // bound, and the generation orders this start against that decision.
+        const streamIntent = await withSystemDbAccessContext(() =>
+          commitDesktopStreamStartIntent(sessionId)
         );
-        if (
-          !activated
-          || !ownsSafeRemoteConnection(
-            activeDesktopSessions,
-            sessionId,
-            boundIdentity,
-            ws,
-          )
-        ) {
+        // A denial is told to the viewer, with the reason, exactly as the lease
+        // and re-read failures below are. Dropping the socket without a frame
+        // is indistinguishable from a network blip, and the viewer then has
+        // nothing to render and nothing to branch on.
+        if (!streamIntent.ok) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            code: startIntentDenialCode(streamIntent.reason),
+            message: startIntentDenialMessage(streamIntent.reason),
+          }));
+          await closeDesktopSessionLifecycle(sessionId, {
+            expectedWs: ws,
+            connection: boundIdentity,
+            reason: 'setup_failed',
+            terminalStatus: 'failed',
+            notifyAgent: true,
+          });
+          ws.close(4003, 'Session not startable');
+          return;
+        }
+
+        if (!ownsSafeRemoteConnection(
+          activeDesktopSessions,
+          sessionId,
+          boundIdentity,
+          ws,
+        )) {
           await closeDesktopSessionLifecycle(sessionId, {
             expectedWs: ws,
             connection: boundIdentity,
@@ -934,17 +969,67 @@ function createDesktopWsHandlers(
           return;
         }
 
+        // Fail-closed revocation lease, exactly as on the two WebRTC start
+        // paths. The WebSocket fallback transport streams frames and injects
+        // input just as a WebRTC session does, so it must be just as revokable.
+        const streamLease = await prepareRevocationLeaseForStart(sessionId);
+        if (!streamLease.ok) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            code: streamLease.reason === 'agent_upgrade_required'
+              ? 'AGENT_UPGRADE_REQUIRED'
+              : 'LEASE_UNAVAILABLE',
+            message: streamLease.reason === 'agent_upgrade_required'
+              ? AGENT_UPGRADE_REQUIRED_MESSAGE
+              : 'Unable to authorize this remote session right now. Please try again.',
+          }));
+          await closeDesktopSessionLifecycle(sessionId, {
+            expectedWs: ws,
+            connection: boundIdentity,
+            reason: 'setup_failed',
+            terminalStatus: 'failed',
+            notifyAgent: true,
+          });
+          ws.close(4003, streamLease.reason === 'agent_upgrade_required'
+            ? 'Agent update required'
+            : 'Lease unavailable');
+          return;
+        }
+
         // Send desktop_stream_start command to agent
         const startCommand = {
           id: `desk-start-${sessionId}`,
           type: 'desktop_stream_start',
           payload: {
             sessionId,
+            startGeneration: formatDesktopGeneration(streamIntent.generation),
             quality: 60,
             scaleFactor: 1.0,
-            maxFps: 15
+            maxFps: 15,
+            revocationLease: streamLease.lease
           }
         };
+
+        // Pre-publication re-read — the twin of the check on both /offer routes.
+        const streamStillCurrent = await withSystemDbAccessContext(() =>
+          assertDesktopStartIntentCurrent(sessionId, streamIntent.generation)
+        );
+        if (!streamStillCurrent.ok) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            code: startIntentDenialCode(streamStillCurrent.reason),
+            message: startIntentDenialMessage(streamStillCurrent.reason),
+          }));
+          await closeDesktopSessionLifecycle(sessionId, {
+            expectedWs: ws,
+            connection: boundIdentity,
+            reason: 'setup_failed',
+            terminalStatus: 'failed',
+            notifyAgent: true,
+          });
+          ws.close(4003, 'Session superseded');
+          return;
+        }
 
         if (!ownsSafeRemoteConnection(
           activeDesktopSessions,
@@ -1046,10 +1131,39 @@ function createDesktopWsHandlers(
           // A revoked socket closes within at most one ping interval
           // (`PING_INTERVAL_MS`, ~30s). Finding #4.
           // (isViewerSessionRevoked fails closed, matching the connect gate.)
-          void isViewerSessionRevoked(sessionId)
-            .then((revoked) => {
+          if (deskSess.liveAuthorizationInFlight || !deskSess.continuationAuthorized) return;
+          deskSess.liveAuthorizationInFlight = true;
+          void Promise.all([
+            isViewerSessionRevoked(sessionId),
+            revalidateRemoteWsAuthorityBounded({ sessionId, sessionType: 'desktop', userId: deskSess.userId }),
+            // Revocation-lease recheck on the same tick, inside the SAME
+            // in-flight guard. `isViewerSessionRevoked` only sees an EXPLICIT
+            // revoke flag; this is the live authorization recheck (membership,
+            // role, site ceiling, epoch, MFA, hard deadline) that nothing else
+            // performs for a streaming Flow-A socket.
+            //
+            // Only a definitive `revoked` closes. An `unavailable` (DB/Redis
+            // blip) resolves inertly so an infrastructure hiccup cannot
+            // disconnect the fleet — the agent's own grace window covers a
+            // control plane that really is gone. That is also why a THROW is
+            // mapped to `unavailable` here rather than falling through to the
+            // fail-closed .catch() below: renewRevocationLease already converts
+            // its own failures, so an escaping throw is an unknown, and an
+            // unknown must not be stronger evidence than a known outage.
+            renewRevocationLease(sessionId).catch((leaseErr) => {
+              console.error(
+                `[DesktopWs] Revocation-lease renew threw for session ${sessionId}:`,
+                leaseErr
+              );
+              return { status: 'unavailable' as const };
+            }),
+          ])
+            .then(([revoked, authority, lease]) => {
+              const current = activeDesktopSessions.get(sessionId);
+              const leaseRevoked = lease.status === 'revoked';
               if (
-                revoked
+                (revoked || !authority.ok || leaseRevoked)
+                && current
                 && connectionIdentity
                 && ownsSafeRemoteConnection(
                   activeDesktopSessions,
@@ -1058,7 +1172,11 @@ function createDesktopWsHandlers(
                   ws,
                 )
               ) {
-                console.warn(`[DesktopWs] Session ${sessionId} revoked mid-session, closing socket`);
+                current.continuationAuthorized = false;
+                console.warn(
+                  `[DesktopWs] Session ${sessionId} revoked mid-session, closing socket`
+                  + (leaseRevoked ? ` (lease: ${lease.reason})` : '')
+                );
                 if (pingInterval) clearInterval(pingInterval);
                 void closeDesktopSessionLifecycle(sessionId, {
                   expectedWs: ws,
@@ -1090,6 +1208,8 @@ function createDesktopWsHandlers(
                   ws,
                 )
               ) {
+                const current = activeDesktopSessions.get(sessionId);
+                if (current) current.continuationAuthorized = false;
                 void closeDesktopSessionLifecycle(sessionId, {
                   expectedWs: ws,
                   connection: connectionIdentity,
@@ -1109,13 +1229,18 @@ function createDesktopWsHandlers(
                   );
                 });
               }
+            })
+            .finally(() => {
+              const current = activeDesktopSessions.get(sessionId);
+              if (!current || !connectionIdentity || !ownsSafeRemoteConnection(activeDesktopSessions, sessionId, connectionIdentity, ws)) return;
+              current.liveAuthorizationInFlight = false;
+              if (!current.continuationAuthorized) return;
+              try { ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() })); }
+              catch (err) {
+                console.warn(`[DesktopWs] Ping send failed for session ${sessionId}, cleaning up`, err);
+                if (pingInterval) clearInterval(pingInterval);
+              }
             });
-          try {
-            ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
-          } catch (err) {
-            console.warn(`[DesktopWs] Ping send failed for session ${sessionId}, cleaning up`, err);
-            if (pingInterval) clearInterval(pingInterval);
-          }
         }, PING_INTERVAL_MS);
 
         const currentSession = activeDesktopSessions.get(sessionId);
@@ -1171,6 +1296,8 @@ function createDesktopWsHandlers(
         return;
       }
       if (
+        !desktopSession.continuationAuthorized
+        ||
         !connectionIdentity
         || !ownsSafeRemoteConnection(
           activeDesktopSessions,
@@ -1339,49 +1466,21 @@ export function createDesktopWsRoutes(
         return c.json({ error: 'Invalid or expired connect code' }, 401); // Reject pre-deployment codes missing email field
       }
 
-      // Connect-code exchange bypasses JWT middleware so no RLS context is set.
-      // Use system scope — the one-time code already verified ownership.
-      const dbResult = await withSystemDbAccessContext(async () => {
-        const [session] = await db
-          .select({
-            id: remoteSessions.id,
-            userId: remoteSessions.userId,
-            type: remoteSessions.type,
-            status: remoteSessions.status,
-            deviceId: remoteSessions.deviceId,
-          })
-          .from(remoteSessions)
-          .where(eq(remoteSessions.id, sessionId))
-          .limit(1);
-
-        let hostname: string | undefined;
-        let osType: string | undefined;
-        if (session?.deviceId) {
-          try {
-            const [device] = await db
-              .select({ hostname: devices.hostname, osType: devices.osType })
-              .from(devices)
-              .where(eq(devices.id, session.deviceId))
-              .limit(1);
-            hostname = device?.hostname ?? undefined;
-            osType = device?.osType ?? undefined;
-          } catch (err) {
-            console.error('Failed to look up device hostname for viewer title:', err);
-          }
-        }
-
-        return { session, hostname, osType };
+      // The code proves possession, not continuing authority. Rebuild the live
+      // user/membership/site/permission/policy decision before minting a bearer.
+      const live = await authorizeLiveRemoteSessionAccess({
+        sessionId,
+        sessionType: 'desktop',
+        userId: codeRecord.userId,
       });
-
-      const { session, hostname, osType } = dbResult;
-
-      if (!session || session.type !== 'desktop' || session.userId !== codeRecord.userId) {
+      if (!live.ok) {
+        const denial = connectExchangeAuthorizationDenial(live);
+        return c.json({ error: denial.error }, denial.status);
+      }
+      if (live.user.email !== codeRecord.email) {
         return c.json({ error: 'Invalid or expired connect code' }, 401);
       }
-
-      if (!['pending', 'connecting', 'active'].includes(session.status)) {
-        return c.json({ error: 'Session is not available for connection' }, 400);
-      }
+      const session = live.session as typeof remoteSessions.$inferSelect;
 
       if (partnerTrustMode() !== 'off') {
         const partnerId = await partnerIdForDevice(session.deviceId);
@@ -1412,8 +1511,8 @@ export function createDesktopWsRoutes(
       const result = {
         accessToken,
         expiresInSeconds: getViewerAccessTokenExpirySeconds(),
-        hostname: hostname ?? null,
-        osType: osType ?? null,
+        hostname: live.device.hostname ?? null,
+        osType: live.device.osType ?? null,
       };
 
       return c.json(result);
@@ -1524,30 +1623,6 @@ export function createDesktopWsRoutes(
         }, 400);
       }
 
-      const [updated] = await withSystemDbAccessContext(() =>
-        db.update(remoteSessions)
-          .set({
-            webrtcOffer: data.offer,
-            webrtcAnswer: null,
-            status: 'connecting',
-            ...(access.session.status === 'active' ? { endedAt: null } : {}),
-          })
-          .where(eq(remoteSessions.id, sessionId))
-          .returning()
-      );
-
-      if (!updated) {
-        return c.json({ error: 'Failed to update session' }, 500);
-      }
-
-      await logSessionAudit(
-        'session_offer_submitted',
-        access.user.id,
-        access.device.orgId,
-        { sessionId, type: access.session.type, via: 'viewer_token' },
-        getTrustedClientIp(c, 'unknown')
-      );
-
       if (!access.device.agentId) {
         console.error(`[desktop-ws] Device ${access.device.id} has no agentId, cannot send start_desktop for session ${sessionId}`);
         return c.json({ error: 'Device has no agent connection identifier' }, 502);
@@ -1564,11 +1639,82 @@ export function createDesktopWsRoutes(
         access.device,
         access.session.userId
       );
+      // Fail-closed revocation lease (same gate as the JWT offer route).
+      const offerLease = await prepareRevocationLeaseForStart(sessionId);
+      if (!offerLease.ok) {
+        if (offerLease.reason === 'agent_upgrade_required') {
+          return c.json({
+            error: AGENT_UPGRADE_REQUIRED_MESSAGE,
+            code: AGENT_UPGRADE_REQUIRED_CODE,
+          }, 503);
+        }
+        return c.json({
+          error: 'Unable to authorize this remote session right now. Please try again.',
+          code: 'lease_unavailable',
+        }, 503);
+      }
+
+      const promptMode = prompt?.mode === 'consent' || prompt?.mode === 'notify' ? prompt.mode : 'off';
+      const startCommandId = createDesktopStartCommandId(sessionId);
+      // Row-locked start decision (SEC-038 W02): refuses a session whose
+      // terminal intent has already committed, and bumps the generation the
+      // agent fences on.
+      const startIntent = await withSystemDbAccessContext(() =>
+        commitDesktopStartIntent({
+          sessionId,
+          startCommandId,
+          promptMode,
+          offer: data.offer,
+        })
+      );
+
+      if (!startIntent.ok) {
+        if (startIntent.reason === 'not_found') {
+          return c.json({ error: 'Session not found' }, 404);
+        }
+        if (startIntent.reason === 'terminal') {
+          return c.json({
+            error: 'This session has already been ended',
+            code: 'SESSION_TERMINAL',
+          }, 409);
+        }
+        return c.json({ error: 'Session state changed while submitting offer' }, 409);
+      }
+
+      const startGeneration = startIntent.generation;
+
+      await logSessionAudit(
+        'session_offer_submitted',
+        access.user.id,
+        access.device.orgId,
+        {
+          sessionId,
+          type: access.session.type,
+          via: 'viewer_token',
+          startCommandId,
+          promptMode,
+          startGeneration: formatDesktopGeneration(startGeneration),
+        },
+        getTrustedClientIp(c, 'unknown')
+      );
+
+      // Pre-publication re-read — see the twin check on the JWT offer route.
+      const stillCurrent = await withSystemDbAccessContext(() =>
+        assertDesktopStartIntentCurrent(sessionId, startGeneration)
+      );
+      if (!stillCurrent.ok) {
+        return c.json({
+          error: 'This session was ended while the stream was starting',
+          code: startIntentDenialCode(stillCurrent.reason),
+        }, 409);
+      }
+
       const agentReachable = sendCommandToAgent(access.device.agentId, {
-        id: `desk-start-${sessionId}`,
+        id: startCommandId,
         type: 'start_desktop',
         payload: {
           sessionId,
+          startGeneration: formatDesktopGeneration(startGeneration),
           offer: data.offer,
           iceServers: getIceServers({
             sessionId,
@@ -1578,6 +1724,7 @@ export function createDesktopWsRoutes(
           clipboard: desktopPolicy.clipboard,
           idleTimeoutMinutes: desktopPolicy.idleTimeoutMinutes,
           maxSessionDurationHours: desktopPolicy.maxSessionDurationHours,
+          revocationLease: offerLease.lease,
           ...(data.displayIndex != null ? { displayIndex: data.displayIndex } : {}),
           ...(data.targetSessionId != null ? { targetSessionId: data.targetSessionId } : {}),
           ...(prompt ? { prompt } : {})
@@ -1590,10 +1737,55 @@ export function createDesktopWsRoutes(
       }
 
       return c.json({
-        id: updated.id,
-        status: updated.status,
-        webrtcOffer: updated.webrtcOffer,
+        id: sessionId,
+        status: 'connecting',
+        webrtcOffer: data.offer,
       });
+    }
+  );
+
+  // POST /desktop-ws/:id/viewer/lease/renew
+  //
+  // The viewer-token twin of POST /remote/sessions/:id/lease/renew. apps/viewer
+  // authenticates with a single-session VIEWER token (minted by the connect-code
+  // exchange), not a user JWT, so it cannot reach the JWT route — but it is the
+  // client that holds the live peer connection and must stop streaming the
+  // instant authorization is withdrawn. Same recheck, same answers.
+  app.post(
+    '/:id/viewer/lease/renew',
+    zValidator('param', desktopSessionIdParamSchema),
+    async (c) => {
+      const { id: sessionId } = c.req.valid('param');
+      const payload = await verifyViewerAccessToken(
+        (c.req.header('Authorization') ?? '').replace(/^Bearer /, '')
+      );
+      if (!payload || payload.sessionId !== sessionId) {
+        return c.json({ error: 'Invalid or expired viewer token' }, 401);
+      }
+      if (await isViewerJtiRevoked(payload.jti)) {
+        return c.json({ error: 'Viewer token revoked' }, 401);
+      }
+
+      const result = await renewRevocationLease(sessionId, { expectUserId: payload.sub });
+      switch (result.status) {
+        case 'renewed':
+          return c.json({
+            status: 'renewed',
+            expiresAt: result.expiresAt,
+            hardDeadline: result.hardDeadline,
+            renewEverySec: result.renewEverySec,
+            graceSec: result.graceSec,
+          });
+        case 'revoked':
+          return c.json({ status: 'revoked', reason: result.reason }, 403);
+        case 'forbidden':
+          return c.json({ error: 'Viewer token does not match session owner' }, 403);
+        default:
+          return c.json({
+            error: 'Unable to verify session authorization right now.',
+            code: 'lease_unavailable',
+          }, 503);
+      }
     }
   );
 
@@ -1612,7 +1804,7 @@ export function createDesktopWsRoutes(
       return c.json({
         id: access.session.id,
         status: access.session.status,
-        webrtcAnswer: access.session.status === 'failed' ? null : access.session.webrtcAnswer,
+        webrtcAnswer: access.session.status === 'failed' || access.session.status === 'disconnected' ? null : access.session.webrtcAnswer,
         errorMessage: access.session.errorMessage,
         startedAt: access.session.startedAt,
         endedAt: access.session.endedAt,
@@ -1655,6 +1847,8 @@ export function createDesktopWsRoutes(
               inputOverageLogged: false,
               inputEvents: 0,
               frameBytes: 0,
+              continuationAuthorized: true,
+              liveAuthorizationInFlight: false,
               detachComplete: false,
               stopConfirmed: false,
               intentAcknowledged: false,
@@ -1749,6 +1943,7 @@ export function __createDesktopSharedLeasesForTest(): RemoteWsSharedLeaseManager
     releaseDesktopFinalizationIntent: async () => true,
     observeDesktopFinalization: async () => ({
       ownerPresent: false,
+      everOwned: false,
       finalizationId: null,
       canonicalPayload: null,
       consistent: true,

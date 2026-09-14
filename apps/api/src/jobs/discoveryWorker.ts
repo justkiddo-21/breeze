@@ -35,7 +35,7 @@ import {
 } from '../services/discoveredAssetClassification';
 import type { discoveredAssetTypeEnum } from '../db/schema';
 import type { PgUpdateSetSource } from 'drizzle-orm/pg-core';
-import { buildEventFingerprint } from '../services/networkBaseline';
+import { buildEventFingerprint, normalizeBaselineScanSchedule } from '../services/networkBaseline';
 import { createDiscoveryJobIfIdle } from '../services/discoveryJobCreation';
 import { assertQueueJobName, parseQueueJobData } from '../services/bullmqValidation';
 import { decryptSnmpCommunities, decryptSnmpCredentials } from '../services/snmpSecrets';
@@ -889,6 +889,16 @@ export async function processResults(data: ProcessResultsJobData): Promise<{
           orgId: data.orgId,
           siteId: data.siteId,
           subnet,
+          // SEC-2026-09-05-146: this baseline is created by the system on the
+          // back of a scan, so there is no principal whose revocation could ever
+          // stop a recurring schedule on it. Leaving scan_schedule NULL was not
+          // neutral: normalizeBaselineScanSchedule reads NULL back as
+          // `enabled: true` and compareBaselineScan then PERSISTS that, turning
+          // the row into an enabled recurring schedule with no envelope —
+          // permanently blocked by the dispatch gate and invisible to the
+          // migration's quarantine sweep. Start it explicitly disabled; an
+          // operator arms it (and becomes its authority) by saving the schedule.
+          scanSchedule: normalizeBaselineScanSchedule({ enabled: false }),
         })
         .onConflictDoNothing()
         .returning({ id: networkBaselines.id });
@@ -1115,7 +1125,10 @@ export async function processResults(data: ProcessResultsJobData): Promise<{
                 })
                 .where(and(
                   eq(devices.id, match.deviceId),
-                  sql`${devices.deviceRoleSource} is distinct from 'manual'`,
+                  // Neither a technician's ('manual') nor a Fleet Design
+                  // correction the technician approved ('ai', W03 #5653) is
+                  // overwritten by a discovery guess.
+                  sql`coalesce(${devices.deviceRoleSource}, 'auto') not in ('manual', 'ai')`,
                   sql`exists (select 1 from ${discoveredAssets} where ${discoveredAssets.id} = ${upsertedAssetId} and ${discoveredAssets.typeSource} <> 'manual' and ${discoveredAssets.assetType} <> 'unknown')`,
                 ));
             }

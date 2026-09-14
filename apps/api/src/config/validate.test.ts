@@ -49,6 +49,11 @@ const validEnv = {
   // never guesses its compatibility posture. Tests that assert the
   // missing/invalid throw override this.
   EVENT_PERMISSION_EPOCH_MODE: 'compat',
+  // Production-required (SEC-065): integration provider credentials are sealed
+  // with AAD-bound enc:v3 ciphertext and fail closed without an active key id.
+  // Supplied here so the suite's production happy-path tests don't trip it; the
+  // test that asserts the throw overrides it explicitly.
+  APP_ENCRYPTION_KEY_ID: 'app-test-key-1',
 };
 
 describe('validateConfig', () => {
@@ -83,25 +88,12 @@ describe('validateConfig', () => {
     }
   });
 
-  it('accepts terminal preparation only when browser transitions are enforced', () => {
+  it('accepts terminal preparation because guarded issuance is unconditional', () => {
     withEnv({
       ...validEnv,
-      AUTH_BROWSER_TRANSITIONS_ENFORCED: 'true',
       AUTH_BROWSER_TERMINAL_PREPARATION_ENABLED: 'true',
     }, () => {
       expect(() => validateConfig()).not.toThrow();
-    });
-  });
-
-  it('rejects terminal preparation when browser transitions are not enforced', () => {
-    withEnv({
-      ...validEnv,
-      AUTH_BROWSER_TRANSITIONS_ENFORCED: 'false',
-      AUTH_BROWSER_TERMINAL_PREPARATION_ENABLED: 'true',
-    }, () => {
-      expect(() => validateConfig()).toThrow(
-        /AUTH_BROWSER_TERMINAL_PREPARATION_ENABLED.*AUTH_BROWSER_TRANSITIONS_ENFORCED/,
-      );
     });
   });
 
@@ -138,7 +130,6 @@ describe('validateConfig', () => {
   });
 
   it.each([
-    ['AUTH_BROWSER_TRANSITIONS_ENFORCED', 'enabled'],
     ['AUTH_BROWSER_TERMINAL_PREPARATION_ENABLED', 'enabled'],
   ])('rejects an invalid boolean rollout value for %s', (key, value) => {
     withEnv({ ...validEnv, [key]: value }, () => {
@@ -294,6 +285,64 @@ describe('validateConfig', () => {
       }, () => {
         expect(() => validateConfig()).toThrow(/M365_CUSTOMER_GRAPH_ACTIONS_CLIENT_ID/);
       });
+    });
+
+    it('warns (but does not refuse boot) when APP_ENCRYPTION_KEY_ID is unset in production', () => {
+      // No feature flag gates /integrations/{communication,monitoring,ticketing,psa}
+      // — they are mounted unconditionally under the default BREEZE_ROLE 'all' —
+      // but this is deliberately a WARNING, not a hard error: guided-setup.sh
+      // has never generated APP_ENCRYPTION_KEY_ID, so refusing boot would brick
+      // every existing self-hosted upgrade and every fresh guided install. The
+      // failure lands at the point of use instead (503 from the seal site).
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      withEnv({
+        ...validEnv,
+        NODE_ENV: 'production',
+        CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
+        TRUST_PROXY_HEADERS: 'false',
+        APP_ENCRYPTION_KEY_ID: '',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining('APP_ENCRYPTION_KEY_ID'),
+        );
+        const sealWarnings = warnSpy.mock.calls
+          .flat()
+          .filter((m) => typeof m === 'string' && m.includes('APP_ENCRYPTION_KEY_ID'));
+        expect(sealWarnings.join('\n')).toContain('503');
+      });
+      warnSpy.mockRestore();
+    });
+
+    it('does not warn about APP_ENCRYPTION_KEY_ID outside production, or when it is set', () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      withEnv({
+        ...validEnv,
+        NODE_ENV: 'development',
+        APP_ENCRYPTION_KEY_ID: '',
+      }, () => {
+        expect(() => validateConfig()).not.toThrow();
+        expect(
+          warnSpy.mock.calls
+            .flat()
+            .filter((m) => typeof m === 'string' && m.includes('APP_ENCRYPTION_KEY_ID')),
+        ).toHaveLength(0);
+      });
+      warnSpy.mockClear();
+      withEnv({
+        ...validEnv,
+        NODE_ENV: 'production',
+        CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
+        TRUST_PROXY_HEADERS: 'false',
+      }, () => {
+        validateConfig();
+        expect(
+          warnSpy.mock.calls
+            .flat()
+            .filter((m) => typeof m === 'string' && m.includes('APP_ENCRYPTION_KEY_ID')),
+        ).toHaveLength(0);
+      });
+      warnSpy.mockRestore();
     });
 
     it('requires APP_ENCRYPTION_KEY_ID when write-action tools are enabled', () => {
@@ -2445,6 +2494,126 @@ describe('validateConfig', () => {
       });
     });
   });
+
+  // Execution plane W02 (spec §8 "Hosted only", §2.2 D-I). The workspace flag
+  // spends LanternOps' own money in LanternOps' own Vercel tenant, so a
+  // production deploy that turns it on without a backend and credentials must
+  // die at boot, not at the first analysis run.
+  const workspaceProdEnv = {
+    ...validEnv,
+    NODE_ENV: 'production',
+    CORS_ALLOWED_ORIGINS: 'https://app.breeze.io',
+    TRUST_PROXY_HEADERS: 'true',
+    IS_HOSTED: 'true',
+  };
+
+  it('boots in production when the workspace flag is off, whatever else is unset', () => {
+    withEnv({
+      ...workspaceProdEnv,
+      BREEZE_AI_WORKSPACE_ENABLED: 'false',
+      AI_WORKSPACE_BACKEND: '',
+      VERCEL_SANDBOX_TOKEN: '',
+      VERCEL_TEAM_ID: '',
+      VERCEL_PROJECT_ID: '',
+    }, () => {
+      expect(() => validateConfig()).not.toThrow();
+    });
+  });
+
+  it('refuses BREEZE_AI_WORKSPACE_ENABLED in production without AI_WORKSPACE_BACKEND', () => {
+    withEnv({
+      ...workspaceProdEnv,
+      BREEZE_AI_WORKSPACE_ENABLED: 'true',
+      AI_WORKSPACE_BACKEND: '',
+      VERCEL_SANDBOX_TOKEN: 'prod-test-vercel-sandbox-token',
+      VERCEL_TEAM_ID: 'team_xxx',
+      VERCEL_PROJECT_ID: 'prj_xxx',
+    }, () => {
+      expect(() => validateConfig()).toThrow(/AI_WORKSPACE_BACKEND/);
+    });
+  });
+
+  it('refuses the fake backend in production with the workspace flag on', () => {
+    withEnv({
+      ...workspaceProdEnv,
+      BREEZE_AI_WORKSPACE_ENABLED: 'true',
+      AI_WORKSPACE_BACKEND: 'fake',
+      VERCEL_SANDBOX_TOKEN: 'prod-test-vercel-sandbox-token',
+      VERCEL_TEAM_ID: 'team_xxx',
+      VERCEL_PROJECT_ID: 'prj_xxx',
+    }, () => {
+      expect(() => validateConfig()).toThrow(/AI_WORKSPACE_BACKEND/);
+    });
+  });
+
+  it('refuses the workspace flag without IS_HOSTED=true', () => {
+    withEnv({
+      ...workspaceProdEnv,
+      IS_HOSTED: 'false',
+      BREEZE_AI_WORKSPACE_ENABLED: 'true',
+      AI_WORKSPACE_BACKEND: 'vercel',
+      VERCEL_SANDBOX_TOKEN: 'prod-test-vercel-sandbox-token',
+      VERCEL_TEAM_ID: 'team_xxx',
+      VERCEL_PROJECT_ID: 'prj_xxx',
+    }, () => {
+      expect(() => validateConfig()).toThrow(/IS_HOSTED/);
+    });
+  });
+
+  it.each(['VERCEL_SANDBOX_TOKEN', 'VERCEL_TEAM_ID', 'VERCEL_PROJECT_ID'])(
+    'refuses the workspace flag without %s',
+    (missing) => {
+      withEnv({
+        ...workspaceProdEnv,
+        BREEZE_AI_WORKSPACE_ENABLED: 'true',
+        AI_WORKSPACE_BACKEND: 'vercel',
+        VERCEL_SANDBOX_TOKEN: 'prod-test-vercel-sandbox-token',
+        VERCEL_TEAM_ID: 'team_xxx',
+        VERCEL_PROJECT_ID: 'prj_xxx',
+        [missing]: '',
+      }, () => {
+        expect(() => validateConfig()).toThrow(new RegExp(missing));
+      });
+    },
+  );
+
+  it('accepts a fully configured hosted deployment', () => {
+    withEnv({
+      ...workspaceProdEnv,
+      BREEZE_AI_WORKSPACE_ENABLED: 'true',
+      AI_WORKSPACE_BACKEND: 'vercel',
+      VERCEL_SANDBOX_TOKEN: 'prod-test-vercel-sandbox-token',
+      VERCEL_TEAM_ID: 'team_xxx',
+      VERCEL_PROJECT_ID: 'prj_xxx',
+    }, () => {
+      const config = validateConfig();
+      expect(config.NODE_ENV).toBe('production');
+    });
+  });
+
+  // computePriceMultiplier() falls back to 1 for anything unparseable, silently.
+  // Without a boot-time refusal a typo runs at 1x forever and only ever surfaces
+  // as a margin discrepancy nobody traces back to an env var.
+  it.each(['1.5x', 'abc', '0', '-2', 'NaN'])(
+    'refuses a malformed AI_COMPUTE_PRICE_MULTIPLIER (%s) at boot',
+    (bad) => {
+      withEnv({ ...workspaceProdEnv, AI_COMPUTE_PRICE_MULTIPLIER: bad }, () => {
+        expect(() => validateConfig()).toThrow(/AI_COMPUTE_PRICE_MULTIPLIER/);
+      });
+    },
+  );
+
+  it.each(['1', '1.25', '2.5'])('accepts a valid AI_COMPUTE_PRICE_MULTIPLIER (%s)', (good) => {
+    withEnv({ ...workspaceProdEnv, AI_COMPUTE_PRICE_MULTIPLIER: good }, () => {
+      expect(() => validateConfig()).not.toThrow();
+    });
+  });
+
+  it('leaves AI_COMPUTE_PRICE_MULTIPLIER optional — unset means 1x', () => {
+    withEnv({ ...workspaceProdEnv }, () => {
+      expect(() => validateConfig()).not.toThrow();
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3088,4 +3257,33 @@ describe('BREEZE_AI_AGENTS_POLICY_DECIDE_ENABLED boolean guard', () => {
       });
     },
   );
+});
+
+describe('M365_TENANT_SYNC_ENABLED + sync knobs (wave 04)', () => {
+  it('declares every sync key in the schema so buildEnvParseInput sees it', () => {
+    expect(ENV_SCHEMA_KEYS).toContain('M365_TENANT_SYNC_ENABLED');
+    expect(ENV_SCHEMA_KEYS).toContain('M365_SYNC_CONCURRENCY');
+    expect(ENV_SCHEMA_KEYS).toContain('M365_SYNC_MAX_BACKLOG');
+    expect(ENV_SCHEMA_KEYS).toContain('M365_SYNC_TICK_BATCH');
+  });
+
+  it('refuses boot on a non-boolean M365_TENANT_SYNC_ENABLED (a typo must not read as OFF)', () => {
+    withEnv({ ...validEnv, M365_TENANT_SYNC_ENABLED: 'tru' }, () => {
+      expect(() => validateConfig()).toThrow(/M365_TENANT_SYNC_ENABLED must be a boolean/);
+    });
+  });
+
+  it('accepts every recognised boolean spelling', () => {
+    for (const raw of ['true', 'false', '1', '0', 'yes', 'no', 'on', 'off']) {
+      withEnv({ ...validEnv, M365_TENANT_SYNC_ENABLED: raw }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    }
+  });
+
+  it('refuses boot on a non-integer sync knob', () => {
+    withEnv({ ...validEnv, M365_SYNC_TICK_BATCH: 'lots' }, () => {
+      expect(() => validateConfig()).toThrow(/M365_SYNC_TICK_BATCH/);
+    });
+  });
 });

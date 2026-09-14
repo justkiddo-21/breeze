@@ -278,7 +278,8 @@
     "loadMore": "Daha fazlasını yükle",
     "couldnTLoadMore": "Daha fazlası yüklenemedi.",
     "viewAllActivity2": "Tüm etkinlikleri görüntüle",
-    "text": "→"
+    "text": "→",
+    "viewProposal": "Öneriyi görüntüle"
   },
   "deviceAlertHistory": {
     "failedToFetchAlertHistory": "Uyarı geçmişi getirilemedi",
@@ -932,6 +933,23 @@
     "role": "Rol",
     "changeRole": "Rolü değiştir",
     "source": "Kaynak",
+    "function": "İşlev",
+    "changeFunction": "İşlevi değiştir",
+    "functionNone": "Değerlendirilmedi",
+    "functionSource": {
+      "ai": "Yapay Zeka",
+      "manual": "Manuel"
+    },
+    "functionConfidence": "{{pct}}% güven",
+    "functionEvidence": "Tasarımcı neden böyle düşünüyor",
+    "functionEvidenceUnavailable": "Değerlendirme ayrıntıları yüklenemedi.",
+    "functionCustom": "Özel…",
+    "functionCustomSlug": "özel anahtar (a-z, 0-9, -)",
+    "functionCustomLabel": "Etiket",
+    "functionClear": "Temizle",
+    "functionSaved": "Cihaz işlevi kaydedildi",
+    "functionCleared": "Cihaz işlevi temizlendi",
+    "functionSaveFailed": "Cihaz işlevi kaydedilemedi",
     "operatingSystem": "İşletim Sistemi",
     "osType": "İşletim Sistemi Türü",
     "osVersion": "İşletim Sistemi Sürümü",
@@ -1879,9 +1897,10 @@
       "disablingMaintenance": "Bakım modunun devre dışı bırakılması",
       "enablingMaintenance": "Bakım modunu etkinleştirme"
     },
+    "refresh": "Yenile",
     "selectedOrganization": "seçilen kuruluş",
     "subtitle": "Filonuzu yönetin ve izleyin.",
-    "title": "Cihazlar",
+    "title": "Cihazlar ve Varlıklar",
     "toasts": {
       "actionFailed": "{{action}}, {{hostname}} üzerinde başarısız oldu",
       "advancedFilterFailed": "Gelişmiş filtre yüklenemedi — hiçbir cihaz gösterilmiyor. Yeniden denemek için filtreyi düzenleyin veya temizleyin.",
@@ -1933,6 +1952,7 @@
       "permanentDeleteCancelled": "Kalıcı Silme İptal Edildi",
       "permanentDeleting": "{{hostname}} kalıcı olarak siliniyor…",
       "permanentlyDeleted": "{{hostname}} kalıcı olarak silindi",
+      "refreshFailed": "Cihazlar yenilenemedi. Gösterilen liste güncel olmayabilir.",
       "restored": "Yenilendi",
       "scriptQueueFailed": "Komut Dosyası Sırası Başarısız",
       "scriptQueuedMany": "Komut Dosyası Çok Sayıda Sıraya Alındı",

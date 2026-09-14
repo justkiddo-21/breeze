@@ -10,6 +10,7 @@ export default defineConfig({
     environment: 'node',
     include: [
       'src/__tests__/integration/**/*.test.ts',
+      'src/routes/integrationConnectionScope.integration.test.ts',
       'src/db/auditRetentionDefault.integration.test.ts',
       // Co-located real-driver integration test for the inbound email pipeline
       // (placed alongside the code it exercises, per the repo's test-placement
@@ -161,6 +162,8 @@ export default defineConfig({
       // roll back as ONE system-scoped transaction, and probes that an org-B
       // context still cannot read org A's system-scoped intent (RLS unchanged).
       'src/services/actionIntents/createIntentAtomicity.integration.test.ts',
+      // #5612 W04: live-DB race proving the lane hourly cap reserves under the advisory lock.
+      'src/services/actionIntents/scriptLaneHourlyCap.integration.test.ts',
       // Co-located real-DB integration test for headless Google Tier-3 dispatch
       // (Phase 2): drives an approved google_suspend_user intent through the real
       // release worker with only the Google SDK client mocked, proving it
@@ -199,6 +202,10 @@ export default defineConfig({
       // mocked route suite can only assert the predicate's shape and cannot
       // see the ON DELETE CASCADE at all.
       'src/routes/enrollmentKeysPurgeExpired.integration.test.ts',
+      // Real-Postgres rotation/redeem revocation boundary.
+      'src/routes/installerRotationRevocation.integration.test.ts',
+      // One-time legacy token/child cutover and replay proof.
+      'src/db/installerBootstrapCredentialGeneration.migration.integration.test.ts',
       // Co-located real-DB end-to-end coverage for the tier3-supervised-four-eyes
       // split (Task 10): four_eyes fan-out ownership (both admins, never the
       // requester), a t+30min approve/release proving the new 60-minute
@@ -239,6 +246,7 @@ export default defineConfig({
       // The mocked list suite returns whatever rows it is handed regardless
       // of the predicate and cannot test this at all.
       'src/routes/enrollmentKeysExpiredFilter.integration.test.ts',
+      'src/routes/enrollmentKeysSiteScope.integration.test.ts',
       // Co-located real-DB integration test for the fleet posture report
       // (#3244): the mixed never-scanned/stale/clean/detected fixture that
       // guards the two-query split — a mocked unit test cannot catch the
@@ -318,6 +326,13 @@ export default defineConfig({
       // see vitest.config.integration-suite-coverage.ts for its
       // dedicated runner.
       'src/__tests__/integration/integration-suite-coverage.integration.test.ts',
+      // workspace.vercel.e2e.test.ts is the NIGHTLY real-Vercel suite: it needs
+      // live VERCEL_* credentials, spends real sandbox-minutes, and every case
+      // waits out a deliberate deny-all network failure. It must never run in
+      // the PR-blocking Integration Tests job, and it needs no Postgres/Redis
+      // setup at all — see vitest.config.workspace-e2e.ts
+      // (`pnpm test:workspace-e2e`) and .github/workflows/workspace-nightly.yml.
+      'src/__tests__/integration/workspace.vercel.e2e.test.ts',
     ],
     // Migrations run ONCE per invocation here (not in setup.ts's per-file
     // beforeAll): re-verifying 400+ migration checksums for every test file

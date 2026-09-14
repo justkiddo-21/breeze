@@ -24,6 +24,7 @@ import {
 } from './tenantExportPolicy';
 import {
   CORE_TENANT_EXPORT_POLICY,
+  getTenantExportPolicyRegistry,
   tablePolicy,
 } from './tenantExportPolicyRegistry';
 
@@ -116,6 +117,54 @@ describe('buildTenantExportPlan', () => {
       /access_token_hash.*reviewedSensitiveName/i,
     );
   });
+
+  const enrollmentEpochs = [
+    ['enrollment_keys', 'credential_generation', ['key', 'key_secret_hash', 'short_code']],
+    ['installer_bootstrap_tokens', 'parent_credential_generation', ['token']],
+  ] as const;
+
+  it.each(enrollmentEpochs)(
+    'exports the reviewed integer epoch for %s while excluding credentials',
+    async (tableName, epoch, secrets) => {
+      const table = CORE_TENANT_EXPORT_POLICY[tableName]!;
+      mockState.columns = Object.keys(table.columns).map((name, index) =>
+        column(tableName, name, name === epoch ? 'integer' : 'text', index + 1),
+      );
+
+      expect(table.columns[epoch]).toMatchObject({
+        decision: 'include', reviewedSensitiveName: true,
+      });
+      expect(table.columns[epoch]!.rationale).toMatch(/positive integer/i);
+      const [plan] = await buildTenantExportPlan([tableName], CORE_TENANT_EXPORT_POLICY);
+      expect(plan!.includedColumns).toContain(epoch);
+      for (const secret of secrets) {
+        expect(table.columns[secret]!.decision).toBe('exclude');
+        expect(plan!.includedColumns).not.toContain(secret);
+      }
+    },
+  );
+
+  it.each(enrollmentEpochs)(
+    'rejects an unreviewed integer epoch for %s without relaxing the name guard',
+    async (tableName, epoch) => {
+      const table = CORE_TENANT_EXPORT_POLICY[tableName]!;
+      mockState.columns = Object.keys(table.columns).map((name, index) =>
+        column(tableName, name, name === epoch ? 'integer' : 'text', index + 1),
+      );
+      const registry: TenantExportPolicyRegistry = {
+        [tableName]: {
+          ...table,
+          columns: {
+            ...table.columns,
+            [epoch]: { decision: 'include', rationale: 'Unreviewed integer epoch.' },
+          },
+        },
+      };
+      await expect(buildTenantExportPlan([tableName], registry)).rejects.toThrow(
+        new RegExp(`${epoch}.*reviewedSensitiveName`),
+      );
+    },
+  );
 
   it.each([
     ['jsonb type', column('widgets', 'preferences', 'jsonb', 2, 'jsonb')],
@@ -269,6 +318,34 @@ describe('buildTenantExportPlan', () => {
 });
 
 describe('CORE_TENANT_EXPORT_POLICY migration-era columns', () => {
+  it('exports deployment dependency fingerprints as reviewed integrity provenance', () => {
+    expect(
+      CORE_TENANT_EXPORT_POLICY.software_deployments!.columns.dependency_fingerprint,
+    ).toMatchObject({
+      decision: 'include',
+      reviewedSensitiveName: true,
+    });
+  });
+
+  it('classifies the portal auth epoch but omits it from the export plan', async () => {
+    const portalPolicy = CORE_TENANT_EXPORT_POLICY.portal_users!;
+    mockState.columns = Object.keys(portalPolicy.columns).map((columnName, index) =>
+      column('portal_users', columnName, 'text', index + 1),
+    );
+
+    const [plan] = await buildTenantExportPlan(
+      ['portal_users'],
+      CORE_TENANT_EXPORT_POLICY,
+    );
+
+    expect(portalPolicy.columns.auth_epoch).toMatchObject({
+      decision: 'exclude',
+      reviewedSensitiveName: true,
+    });
+    expect(plan?.includedColumns).not.toContain('auth_epoch');
+    expect(plan?.includedColumns).toContain('status');
+  });
+
   it('exports portal report definitions and contact-bound recipients', () => {
     expect(
       CORE_TENANT_EXPORT_POLICY.reports!.columns.portal_self_service!.decision,
@@ -372,5 +449,52 @@ describe('CORE_TENANT_EXPORT_POLICY migration-era columns', () => {
     ).toEqual([
       'device_event_logs.future_derived_projection: unclassified',
     ]);
+  });
+});
+describe('m365 tenant sync export classifications', () => {
+  const registry = getTenantExportPolicyRegistry();
+
+  it('classifies every m365 sync table', () => {
+    for (const table of [
+      'm365_sync_state', 'm365_users', 'm365_intune_devices', 'm365_ca_policies',
+      'm365_license_skus', 'm365_secure_score_snapshots', 'm365_posture_rollups',
+    ]) {
+      expect(registry[table], `${table} unclassified`).toBeDefined();
+      expect(registry[table]!.organizationKey).toBe('org_id');
+    }
+  });
+
+  it('excludes every open container and the executor continuation', () => {
+    const excluded = (table: string, column: string) =>
+      registry[table]!.columns[column]?.decision;
+    expect(excluded('m365_sync_state', 'sources')).toBe('exclude');
+    expect(excluded('m365_sync_state', 'last_counts')).toBe('exclude');
+    expect(excluded('m365_sync_state', 'continuation')).toBe('exclude');
+    expect(excluded('m365_users', 'assigned_sku_ids')).toBe('exclude');
+    expect(excluded('m365_users', 'admin_roles')).toBe('exclude');
+    expect(excluded('m365_ca_policies', 'conditions')).toBe('exclude');
+    expect(excluded('m365_ca_policies', 'grant_controls')).toBe('exclude');
+    expect(excluded('m365_ca_policies', 'session_controls')).toBe('exclude');
+    expect(excluded('m365_secure_score_snapshots', 'control_scores')).toBe('exclude');
+    expect(excluded('m365_posture_rollups', 'domains_fresh')).toBe('exclude');
+  });
+
+  it('marks every mfa/hash column reviewed rather than plain-included', () => {
+    for (const [table, column] of [
+      ['m365_users', 'core_hash'],
+      ['m365_users', 'mfa_registered'],
+      ['m365_users', 'mfa_capable'],
+      ['m365_users', 'default_mfa_method'],
+      ['m365_ca_policies', 'definition_hash'],
+      ['m365_posture_rollups', 'users_mfa_registered'],
+      ['m365_posture_rollups', 'users_mfa_unknown'],
+      ['m365_posture_rollups', 'admins_without_mfa'],
+      ['m365_posture_rollups', 'admins_mfa_unknown'],
+    ] as const) {
+      const decision = registry[table]!.columns[column];
+      expect(decision, `${table}.${column} unclassified`).toBeDefined();
+      expect(decision!.decision).toBe('include');
+      expect(decision!.reviewedSensitiveName, `${table}.${column} needs review`).toBe(true);
+    }
   });
 });

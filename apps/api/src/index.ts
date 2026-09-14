@@ -26,6 +26,7 @@ import { pamRoutes } from './routes/pam';
 import { scriptRoutes } from './routes/scripts';
 import { scriptLibraryRoutes } from './routes/scriptLibrary';
 import { automationRoutes, automationWebhookRoutes } from './routes/automations';
+import { monitorDefinitionRoutes } from './routes/monitorDefinitions';
 import { alertRoutes } from './routes/alerts';
 import { alertTemplateRoutes } from './routes/alertTemplates';
 import { ticketsRoutes } from './routes/tickets';
@@ -52,6 +53,11 @@ import { orgRoutes } from './routes/orgs';
 import { orgMergeRoutes } from './routes/orgMerge';
 import { orgArchiveRoutes } from './routes/orgArchive';
 import { orgSummaryRoutes } from './routes/orgSummary';
+import { orgAccountReadinessRoutes } from './routes/orgAccountReadiness';
+import { serviceDeliverableRoutes } from './routes/serviceDeliverables';
+import { deliverableTemplateRoutes } from './routes/deliverableTemplates';
+import { orgDocumentRoutes } from './routes/orgDocuments';
+import { orgKeyDateRoutes } from './routes/orgKeyDates';
 import { oauthRoutes } from './routes/oauth';
 import { wellKnownRoutes } from './routes/oauthWellKnown';
 import { oauthInteractionRoutes } from './routes/oauthInteraction';
@@ -136,9 +142,13 @@ import { tunnelRoutes, vncExchangeRoutes, vncViewerRoutes } from './routes/tunne
 import { agentVersionRoutes } from './routes/agentVersions';
 import { viewerRoutes } from './routes/viewers';
 import { aiRoutes } from './routes/ai';
+import { aiScriptProposalRoutes } from './routes/ai/scriptProposals';
+import { aiScriptPolicyRoutes } from './routes/ai/scriptPolicy';
+import { partnerAiScriptPolicyRoutes } from './routes/partnerAiScriptPolicy';
 import { aiProviderRoutes } from './routes/aiProvider';
 import { aiAgentsRoutes } from './routes/aiAgents';
 import { aiAgentSchedulesRoutes } from './routes/aiAgentSchedules';
+import { fleetDesignRoutes } from './routes/fleetDesign';
 import { aiOperatorTasksRoutes } from './routes/aiOperatorTasks';
 import { scriptAiRoutes } from './routes/scriptAi';
 import { mcpServerRoutes, initMcpBootstrapForStartup } from './routes/mcpServer';
@@ -149,6 +159,7 @@ import { playbookRoutes } from './routes/playbooks';
 import { remediationSuggestionRoutes } from './routes/remediationSuggestions';
 import { seedBuiltInPlaybooks } from './services/builtInPlaybooks';
 import { ensureSystemLibraryScripts } from './services/systemScriptLibrary';
+import { ensureBuiltInMonitorsForAllPartners } from './services/monitors/builtInMonitors';
 import { seedDefaultAuditBaselines } from './services/auditBaselineService';
 import { changesRoutes } from './routes/changes';
 import { dnsSecurityRoutes } from './routes/dnsSecurity';
@@ -794,6 +805,10 @@ api.route('/script-library', scriptLibraryRoutes);
 api.route('/automations/webhooks', automationWebhookRoutes);
 api.route('/automations', automationRoutes);
 api.route('/alerts', alertRoutes);
+// #5289 — monitor DEFINITIONS (the authored object the alert rules above get
+// compiled from). Deliberately NOT '/monitors': that path is already the
+// network-monitor API (routes/monitors.ts).
+api.route('/monitor-definitions', monitorDefinitionRoutes);
 api.route('/alert-templates', alertTemplateRoutes);
 // M365 mailbox OAuth + connection routes. Mounted as its OWN top-level router
 // (NOT under ticketsRoutes) and BEFORE /tickets so its literal /tickets/mailbox/*
@@ -836,6 +851,11 @@ api.route('/orgs', orgRoutes);
 api.route('/orgs', orgMergeRoutes);
 api.route('/orgs', orgArchiveRoutes);
 api.route('/orgs', orgSummaryRoutes);
+api.route('/orgs', orgAccountReadinessRoutes); // GET /orgs/account-readiness — Organizations board bulk read (#5721 W01)
+api.route('/orgs', serviceDeliverableRoutes); // /orgs/:orgId/deliverables/* (#5573 W01)
+api.route('/deliverable-templates', deliverableTemplateRoutes); // (#5573 W05)
+api.route('/orgs', orgDocumentRoutes); // /orgs/:orgId/documents/* (#5573 W03)
+api.route('/orgs', orgKeyDateRoutes);         // /orgs/:orgId/key-dates/* (#5573 W01)
 api.route('/users', userRoutes);
 api.route('/roles', roleRoutes);
 api.route('/permissions', permissionsCatalogRoutes);
@@ -959,6 +979,8 @@ api.route('/groups', groupRoutes);
 api.route('/device-groups', groupRoutes);
 api.route('/integrations', integrationRoutes);
 api.route('/partner/trust', partnerTrustRoutes);
+// W04 (#5612): the partner CEILING for the unattended script lane.
+api.route('/partner/ai/script-policy', partnerAiScriptPolicyRoutes);
 api.route('/partner', partnerRoutes);
 api.route('/internal/synthetic', internalSyntheticRoutes);
 api.route('/partner/known-guests', networkKnownGuestsRoutes);
@@ -981,9 +1003,21 @@ api.route('/ai/provider', aiProviderRoutes);
 // '/schedules' as an agent id (#4189).
 api.route('/ai/agents/schedules', aiAgentSchedulesRoutes);
 api.route('/ai/agents', aiAgentsRoutes);
+// Fleet Designer (W01, #5651) — trigger/list/detail for `designer`-kind runs.
+// Distinct path prefix from '/ai/agents', so registration order relative to
+// it doesn't matter the way '/ai/agents/schedules' does.
+api.route('/ai/fleet-design', fleetDesignRoutes);
 // Read-only Operator task surface (W07 of #5205, P3-1e) — a separate route
 // module from the already-large aiAgentsRoutes per spec §12.
 api.route('/ai/operator', aiOperatorTasksRoutes);
+// W03 (#5612): more specific than '/ai', so it must be registered first — same
+// reason '/ai/agents/schedules' sits above '/ai/agents'. Hono matches in
+// registration order.
+api.route('/ai/script-proposals', aiScriptProposalRoutes);
+// W04 (#5612): GET/PUT /ai/script-policy + POST /ai/script-lane/reset —
+// registered ahead of '/ai' so the literal paths never fall into a sibling
+// param route.
+api.route('/ai', aiScriptPolicyRoutes);
 api.route('/ai', aiRoutes);
 api.route('/ai/script-builder', scriptAiRoutes);
 api.route('/mcp', mcpServerRoutes);
@@ -1048,10 +1082,16 @@ app.notFound((c) => {
 app.onError((err, c) => {
   // Handle HTTPException properly (e.g., 401, 403, etc.)
   if (err instanceof HTTPException) {
+    // A typed HTTPException may carry a machine-readable `code` (e.g.
+    // `lease_unavailable`) that callers switch on. This handler builds the body
+    // itself instead of delegating to `err.getResponse()`, so the code has to
+    // be copied across explicitly or it is silently dropped.
+    const typedCode = (err as { code?: unknown }).code;
     return c.json(
       {
         error: err.message || 'Request failed',
-        message: err.message
+        message: err.message,
+        ...(typeof typedCode === 'string' && typedCode ? { code: typedCode } : {})
       },
       err.status
     );
@@ -1634,6 +1674,7 @@ async function bootstrap(): Promise<void> {
     console.error('[startup] Failed to ensure system script library:', err);
   }
 
+
   try {
     await runWithSystemDbAccess(async () => {
       const seeded = await seedDefaultAuditBaselines();
@@ -1707,6 +1748,23 @@ async function bootstrap(): Promise<void> {
 
   console.log(`Breeze API running at http://localhost:${port}`);
   console.log(`WebSocket endpoint available at ws://localhost:${port}/api/v1/agent-ws/:id/ws`);
+
+  // Built-in CPU / memory / disk monitors for partners created before the
+  // feature shipped. Detached and AFTER the listener is up: hundreds of
+  // partners × ~40 queries each must never delay /health. One-time per partner
+  // (partners.settings marker), each partner its own transaction; opt out with
+  // BREEZE_BUILTIN_MONITORS_AUTOSEED=false.
+  void ensureBuiltInMonitorsForAllPartners()
+    .then((result) => {
+      if (result.provisioned > 0 || result.failed > 0) {
+        console.log(
+          `[startup] Built-in monitors provisioned for ${result.provisioned} partner(s), ${result.failed} failed`
+        );
+      }
+    })
+    .catch((err) => {
+      console.error('[startup] Failed to provision built-in monitors:', err);
+    });
 
   // Explicit registration (wave 3.5d-b, #4086): the lazy worker registry only
   // loads `jobs/aiAgentRunner` for a process that runs global workers, so an

@@ -33,6 +33,15 @@ vi.mock('../services/auditEvents', () => ({
 vi.mock('../services/tenantStatus', () => ({
   getActiveOrgTenant: vi.fn(async () => ({ orgId: 'org-active', partnerId: 'partner-active' })),
 }));
+vi.mock('../services/partnerDeviceCapacity', () => ({
+  admitPartnerDeviceCapacity: vi.fn(async (_tx: unknown, input: { expectedPartnerId: string }) => ({
+    allowed: true,
+    partnerId: input.expectedPartnerId,
+    maxDevices: null,
+    activeCount: null,
+  })),
+  PartnerDeviceCapacityError: class PartnerDeviceCapacityError extends Error {},
+}));
 vi.mock('../services/filesystemAnalysis', () => ({
   parseFilesystemAnalysisStdout: vi.fn(() => ({ summary: { filesScanned: 1 } })),
   saveFilesystemSnapshot: vi.fn(() => Promise.resolve({ id: 'snapshot-1' })),
@@ -74,6 +83,16 @@ const defaultUpdateChain = () => ({
     }))
   }))
 });
+
+function mockResolvedEnrollmentPartner(partnerId = 'partner-123') {
+  vi.mocked(db.select).mockReturnValueOnce({
+    from: vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({
+        limit: vi.fn().mockResolvedValue([{ partnerId }]),
+      }),
+    }),
+  } as any);
+}
 
 vi.mock('../db', () => ({
   db: {
@@ -360,6 +379,8 @@ describe('agent routes', () => {
         })
       } as any);
 
+      mockResolvedEnrollmentPartner();
+
       // Then checks for colliding devices:
       // db.select().from(devices).where(...).orderBy(devices.createdAt) — every
       // match, oldest first, no `.limit` (#2764).
@@ -490,6 +511,8 @@ describe('agent routes', () => {
         })
       } as any);
 
+      mockResolvedEnrollmentPartner();
+
       // Colliding-device lookup: `.orderBy(devices.createdAt)`, no `.limit` (#2764).
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
@@ -602,6 +625,8 @@ describe('agent routes', () => {
           })
         })
       } as any);
+
+      mockResolvedEnrollmentPartner();
 
       const tx = {
         insert: vi.fn().mockReturnValue({
@@ -938,6 +963,9 @@ describe('agent routes', () => {
           { file_path: '/etc/ssh/sshd_config', config_key: 'PermitRootLogin' }
         ],
         patch_source_settings: { exclusiveWindowsUpdate: false },
+        // #5511 W02: a resolved absent warranty policy delivers an explicit
+        // false (the revoke-on-unassign contract), exactly like patch_source.
+        warranty_settings: { hp_cmsl_enabled: false },
         // Security remediation Wave 6, Task 9 — always sent (true or false),
         // mirroring AGENT_REQUIRE_MANIFEST_SIGNING_KEY_ID. Sending the explicit
         // false is what makes the switch reversible: an omitted key is a no-op
@@ -1057,6 +1085,7 @@ describe('agent routes', () => {
         policy_registry_state_probes: [],
         policy_config_state_probes: [],
         patch_source_settings: { exclusiveWindowsUpdate: false },
+        warranty_settings: { hp_cmsl_enabled: false },
         require_manifest_signing_key_id: false
       });
       expect(insertValues).toHaveBeenCalledWith(

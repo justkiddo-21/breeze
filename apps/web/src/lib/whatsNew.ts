@@ -18,6 +18,32 @@ export interface WhatsNewEntry {
  */
 export const WHATS_NEW_ENTRIES: WhatsNewEntry[] = [
   {
+    version: '0.113.0',
+    date: '2026-09-13',
+    title: 'Remote desktop sessions that stay up, AI-authored scripts you approve on a card, and service deliverables in the customer portal',
+    highlights: [
+      'Remote desktop sessions no longer drop after about a minute. Since early August every peer-to-peer session was ended by the server as an orphan; the fix is server-side, so no agent update is needed. Secondary monitors also get correct input and cursor placement on Windows with the updated helper.',
+      'The AI assistant can now write a script as a proposal: it is scanned, independently reviewed, and shown to you on an approval card with the goal, risk tier, findings, target devices and the code. Approved runs are verified with an independent device read before the script can be saved to the library, where its origin and reviewer stay visible.',
+      'Service deliverables: define deliverable templates, apply them to an organization or contract, track key dates and evidence, and let customers see Service and Documents in the portal. Organizations also get a document library with evidence attachments.',
+      'Faster navigation: a Devices & Assets section, recent devices, a jump-back palette and keyboard shortcuts. Consecutive Tier-3 approvals need one step-up ceremony instead of one per decision.',
+      'Fixes: AI credit calls reach billing again, the approval mode is kept on the first AI budget save, chat sessions bind to the device you are looking at, UniFi lowercase status values count as online, and decommissioned devices stop being reconciled for peripheral policy.',
+    ],
+    learnMoreUrl: 'https://breezermm.com/release-notes',
+  },
+  {
+    version: '0.112.0',
+    date: '2026-09-10',
+    title: 'Windows MSI installs again, bound authority for automation, and bare-metal recovery that restores the whole machine',
+    highlights: [
+      'The Windows agent MSI installs on Windows 10 and 11 again. Since v0.110.0 it refused every fresh install with "requires Windows 10 or Server 2016 or later"; existing agents were never affected.',
+      'Some automation now waits for a human after this upgrade: PAM auto-approve rules are suspended until an admin re-approves them, and recurring sensitive-data and network-baseline scans pause until re-saved. QuickBooks, Workspace, connected apps and PAM approval use new dedicated permissions; custom roles need them granted in Settings → Roles.',
+      'Remote desktop sessions are capped at 12 hours and end within seconds when a technician loses membership, role, site scope or MFA standing. Devices need the updated agent first.',
+      'Bare-metal recovery restores system state (packages, services, firewall, crontabs, /etc) with checksum verification, file backups keep symlinks and ownership, and each system-image snapshot shows whether it is bare-metal restorable.',
+      'Lenovo warranty lookup works, approval headlines name the device, and on mobile you can acknowledge or dismiss findings, set a requester contact on new tickets, and land in the note composer when you stop a timer.',
+    ],
+    learnMoreUrl: 'https://breezermm.com/release-notes',
+  },
+  {
     version: '0.111.0',
     date: '2026-09-09',
     title: 'Work that queues for offline devices, a customer record page, and Stop for running scripts',

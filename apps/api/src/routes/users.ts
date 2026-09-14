@@ -46,6 +46,7 @@ import { resetAllFactorsAndInvalidate, sweepPendingFactorArtifacts } from '../se
 import { neutralizeUserIfOrphaned } from '../services/userNeutralization';
 import { getEffectiveMfaPolicy } from '../services/mfaPolicy';
 import { requestPendingEmailChange } from '../services/pendingEmail';
+import { resolveDelegatedSiteIds } from '../services/organizationMembershipDelegation';
 
 export const userRoutes = new Hono();
 const supportedLocales = SUPPORTED_LOCALES;
@@ -644,7 +645,14 @@ userRoutes.patch('/me', zValidator('json', updateMeSchema), async (c) => {
         orgId: auth.orgId,
         partnerId: auth.partnerId,
       });
-      if (policy.required && !(await userIsMfaProtected(auth.user.id))) {
+      // #5306: an OPEN enrolment grace window counts as "MFA is owed" here, even
+      // though it makes policy.required false everywhere else. The window's whole
+      // point is to keep an unenrolled user working while they are nudged — but
+      // repointing the recovery address is the one thing this gate exists to deny
+      // to a pre-enrollment session, and a 14-day window would otherwise hand a
+      // stolen session exactly that. Enrol first, then change the address.
+      const mfaOwed = policy.required || policy.source.graceWindow === 'active';
+      if (mfaOwed && !(await userIsMfaProtected(auth.user.id))) {
         return c.json({ error: 'mfa_enrollment_required', enrollUrl: '/auth/mfa/setup' }, 403);
       }
 
@@ -1228,6 +1236,19 @@ userRoutes.post(
     }
 
     const result = await db.transaction(async (tx) => {
+      // The membership row is the authoritative live site ceiling. Lock and
+      // re-read it inside the SAME transaction that creates the invitee link:
+      // a request snapshot alone would let a concurrent scope reduction race
+      // an unrestricted invitation. Partner invitations use their independent
+      // full-partner gate above and do not carry an organization site axis.
+      const delegatedSiteIds = scopeContext.scope === 'organization'
+        ? await resolveDelegatedSiteIds(tx, {
+            inviterUserId: auth.user.id,
+            orgId: scopeContext.orgId,
+            requestedSiteIds: data.siteIds,
+          })
+        : undefined;
+
       const [existingUser] = await tx
         .select()
         .from(users)
@@ -1315,7 +1336,7 @@ userRoutes.post(
           .limit(1);
 
         if (existingLink) {
-          return { user, linkCreated: false };
+          return { user, linkCreated: false, delegatedSiteIds };
         }
 
         const orgAccess = data.orgAccess ?? 'none';
@@ -1332,7 +1353,7 @@ userRoutes.post(
           })
           .returning();
 
-        return { user, linkCreated: true, link };
+        return { user, linkCreated: true, link, delegatedSiteIds };
       }
 
       const [existingLink] = await tx
@@ -1342,7 +1363,7 @@ userRoutes.post(
         .limit(1);
 
       if (existingLink) {
-        return { user, linkCreated: false };
+        return { user, linkCreated: false, delegatedSiteIds };
       }
 
       const [link] = await tx
@@ -1351,12 +1372,12 @@ userRoutes.post(
           orgId: scopeContext.orgId,
           userId: user.id,
           roleId: data.roleId,
-          siteIds: data.siteIds ?? null,
+          siteIds: delegatedSiteIds,
           deviceGroupIds: data.deviceGroupIds ?? null
         })
         .returning();
 
-      return { user, linkCreated: true, link };
+      return { user, linkCreated: true, link, delegatedSiteIds };
     });
 
     if (!result.linkCreated) {
@@ -1381,7 +1402,7 @@ userRoutes.post(
         scope: scopeContext.scope,
         orgAccess: scopeContext.scope === 'partner' ? data.orgAccess ?? 'none' : undefined,
         orgIds: scopeContext.scope === 'partner' ? data.orgIds ?? [] : undefined,
-        siteIds: scopeContext.scope === 'organization' ? data.siteIds ?? [] : undefined,
+        siteIds: scopeContext.scope === 'organization' ? result.delegatedSiteIds : undefined,
         deviceGroupIds: scopeContext.scope === 'organization' ? data.deviceGroupIds ?? [] : undefined,
         inviteEmailSent: invite.inviteEmailSent
       }
@@ -1667,7 +1688,23 @@ async function removeMembershipForScope(
         return { deleted: true };
       })
     )
-  );
+  ).then(async (result) => {
+    if (result.deleted) {
+      // Belt, to the epoch advance's braces. The epoch bump above makes the
+      // next revocation-lease renew fail (within ~25s), but that still leaves a
+      // window where a removed member keeps live screen and keyboard control —
+      // so tear their remote sessions down NOW as well. Post-commit: the
+      // membership delete must be durable before the sessions are ended.
+      const torn = await terminateUserRemoteSessions(userId);
+      if (torn === TEARDOWN_FAILED) {
+        console.error(
+          `[users] Remote-session teardown FAILED after membership removal for user ${userId}; ` +
+          'the permissions-epoch recheck remains the only cutoff.'
+        );
+      }
+    }
+    return result;
+  });
 }
 
 userRoutes.delete(
@@ -1863,6 +1900,7 @@ userRoutes.post(
         }
       });
       await clearPermissionCache(userId);
+      await terminateRemoteSessionsAfterRoleChange(userId);
 
       return c.json({ success: true });
     }
@@ -1887,7 +1925,35 @@ userRoutes.post(
       }
     });
     await clearPermissionCache(userId);
+    await terminateRemoteSessionsAfterRoleChange(userId);
 
     return c.json({ success: true });
   }
 );
+
+/**
+ * Belt for a role change, matching the one in `removeMembershipForScope`.
+ *
+ * The `organization_users` / `partner_users` UPDATE already advances the
+ * target's `permissions_epoch` by trigger, so the next revocation-lease renew
+ * (within ~25s) ends any live remote session. Ending it immediately closes that
+ * window: a role change is often exactly the moment somebody's remote-control
+ * rights were meant to stop.
+ *
+ * Best-effort by design — a teardown failure is logged (and reported to Sentry
+ * inside the service) but never fails the role assignment, which has already
+ * committed.
+ */
+async function terminateRemoteSessionsAfterRoleChange(userId: string): Promise<void> {
+  try {
+    const torn = await terminateUserRemoteSessions(userId);
+    if (torn === TEARDOWN_FAILED) {
+      console.error(
+        `[users] Remote-session teardown FAILED after role change for user ${userId}; ` +
+        'the permissions-epoch recheck remains the only cutoff.'
+      );
+    }
+  } catch (err) {
+    console.error(`[users] Remote-session teardown threw after role change for user ${userId}:`, err);
+  }
+}

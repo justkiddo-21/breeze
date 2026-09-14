@@ -72,7 +72,8 @@ const {
   getEffectiveMfaPolicyMock: vi.fn().mockResolvedValue({
     required: false,
     allowedMethods: { totp: true, sms: true, passkey: true },
-    source: { roleForceMfa: false, settingsRequireMfa: false, killSwitchOff: true }
+    pendingEnrollment: null,
+    source: { roleForceMfa: false, settingsRequireMfa: false, killSwitchOff: true, graceWindow: 'none' as const }
   }),
   // SR2-17: default the pending-email service succeeds and returns a raw token.
   requestPendingEmailChangeMock: vi.fn().mockResolvedValue({ rawToken: 'raw-token-mock', emailEpoch: 5 }),
@@ -161,7 +162,15 @@ vi.mock('../db/schema', () => ({
     disabledAt: { __column: 'user_passkeys.disabled_at' },
   },
   partnerUsers: {},
-  organizationUsers: {},
+  organizationUsers: {
+    userId: { __column: 'organization_users.user_id' },
+    orgId: { __column: 'organization_users.org_id' },
+    siteIds: { __column: 'organization_users.site_ids' },
+  },
+  sites: {
+    id: { __column: 'sites.id' },
+    orgId: { __column: 'sites.org_id' },
+  },
   roles: {},
   permissions: {},
   rolePermissions: {},
@@ -355,7 +364,8 @@ describe('user routes', () => {
     getEffectiveMfaPolicyMock.mockResolvedValue({
       required: false,
       allowedMethods: { totp: true, sms: true, passkey: true },
-      source: { roleForceMfa: false, settingsRequireMfa: false, killSwitchOff: true }
+      pendingEnrollment: null,
+      source: { roleForceMfa: false, settingsRequireMfa: false, killSwitchOff: true, graceWindow: 'none' as const }
     });
     requestPendingEmailChangeMock.mockResolvedValue({ rawToken: 'raw-token-mock', emailEpoch: 5 });
     isPasswordAuthDisabledBySsoMock.mockResolvedValue(false);
@@ -461,6 +471,109 @@ describe('user routes', () => {
   });
 
   describe('POST /users/invite', () => {
+    it('does not let a site-restricted org inviter create an unrestricted sibling by omitting siteIds', async () => {
+      const SITE_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+      const ROLE_ID = '22222222-2222-4222-8222-222222222222';
+      const USER_ID = '11111111-1111-4111-8111-111111111111';
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          scope: 'organization',
+          partnerId: 'partner-123',
+          orgId: '33333333-3333-4333-8333-333333333333',
+          allowedSiteIds: [SITE_A],
+          canAccessSite: (siteId: string | null | undefined) => siteId === SITE_A,
+          user: { id: 'user-123', email: 'restricted@example.com' },
+        });
+        return next();
+      });
+
+      // Role, effective-role parent, effective permissions, tombstone preflight.
+      vi.mocked(db.select)
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([{ id: ROLE_ID, scope: 'organization', name: 'Technician', description: null, isSystem: true, partnerId: null, orgId: null }]) }) }) } as any)
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([{ parentRoleId: null }]) }) }) } as any)
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ innerJoin: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([]) }) }) } as any)
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([]) }) }) } as any)
+        // Post-commit organization-name lookup for the invite email.
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([{ name: 'Org A' }]) }) }) } as any);
+
+      const insertedMemberships: Array<Record<string, unknown>> = [];
+      const txSelect = vi.fn()
+        // Locked live inviter membership.
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockReturnValue({ for: vi.fn().mockResolvedValue([{ siteIds: [SITE_A] }]) }) }) }) })
+        // Same-org validation of the normalized site set.
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ for: vi.fn().mockResolvedValue([{ id: SITE_A }]) }) }) })
+        // Existing user, organization tenancy, existing membership.
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([]) }) }) })
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([{ partnerId: 'partner-123' }]) }) }) })
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([]) }) }) });
+      const txInsert = vi.fn()
+        .mockReturnValueOnce({ values: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([{ id: USER_ID, email: 'invitee@example.com', name: 'Invitee', status: 'invited' }]) }) })
+        .mockReturnValueOnce({ values: vi.fn((values: Record<string, unknown>) => {
+          insertedMemberships.push(values);
+          return { returning: vi.fn().mockResolvedValue([{ id: 'link-1' }]) };
+        }) });
+      vi.mocked(db.transaction).mockImplementation(async (fn) => fn({ select: txSelect, insert: txInsert } as any));
+
+      const res = await app.request('/users/invite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'invitee@example.com', name: 'Invitee', roleId: ROLE_ID }),
+      });
+
+      expect(res.status).toBe(201);
+      expect(insertedMemberships).toHaveLength(1);
+      expect(insertedMemberships[0]).toMatchObject({ siteIds: [SITE_A] });
+    });
+
+    it('rejects an explicit site outside the live inviter scope before creating the invitee', async () => {
+      const SITE_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+      const SITE_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+      const ROLE_ID = '22222222-2222-4222-8222-222222222222';
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          scope: 'organization',
+          partnerId: 'partner-123',
+          orgId: '33333333-3333-4333-8333-333333333333',
+          allowedSiteIds: [SITE_A],
+          canAccessSite: (siteId: string | null | undefined) => siteId === SITE_A,
+          user: { id: 'user-123', email: 'restricted@example.com' },
+        });
+        return next();
+      });
+
+      vi.mocked(db.select)
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([{ id: ROLE_ID, scope: 'organization', name: 'Technician', description: null, isSystem: true, partnerId: null, orgId: null }]) }) }) } as any)
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([{ parentRoleId: null }]) }) }) } as any)
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ innerJoin: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([]) }) }) } as any)
+        .mockReturnValueOnce({ from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([]) }) }) } as any);
+
+      const txInsert = vi.fn();
+      const txSelect = vi.fn().mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockReturnValue({
+              for: vi.fn().mockResolvedValue([{ siteIds: [SITE_A] }]),
+            }),
+          }),
+        }),
+      });
+      vi.mocked(db.transaction).mockImplementation(async (fn) => fn({ select: txSelect, insert: txInsert } as any));
+
+      const res = await app.request('/users/invite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'invitee@example.com',
+          name: 'Invitee',
+          roleId: ROLE_ID,
+          siteIds: [SITE_B],
+        }),
+      });
+
+      expect(res.status).toBe(403);
+      expect(txInsert).not.toHaveBeenCalled();
+    });
+
     it('should invite a partner user with selected orgs', async () => {
       vi.mocked(db.select).mockReturnValueOnce({
         from: vi.fn().mockReturnValue({
@@ -1530,6 +1643,29 @@ describe('user routes', () => {
       );
     });
 
+    // #5306 — an OPEN grace window makes policy.required false everywhere else,
+    // but this gate must still refuse: a session stolen before enrollment would
+    // otherwise get 14 days in which to repoint the recovery address.
+    it('SR2-18 + #5306: an unenrolled user inside the MFA grace window still cannot move the recovery address', async () => {
+      orgScopeAuth();
+      mockSelf({ email: 'old@example.com', passwordHash: 'hash' });
+      mockUpdate(updatedRow());
+      getEffectiveMfaPolicyMock.mockResolvedValue({
+        required: false,
+        allowedMethods: { totp: true, sms: true, passkey: true },
+        pendingEnrollment: { deadline: new Date(Date.now() + 10 * 86_400_000).toISOString() },
+        source: { roleForceMfa: true, settingsRequireMfa: false, killSwitchOff: false, graceWindow: 'active' as const }
+      });
+      userIsMfaProtectedMock.mockResolvedValue(false);
+
+      const res = await patchMe({ email: 'new@example.com', currentPassword: 'pw' });
+
+      expect(res.status).toBe(403);
+      expect(await res.json()).toMatchObject({ error: 'mfa_enrollment_required' });
+      expect(requestPendingEmailChangeMock).not.toHaveBeenCalled();
+      expect(vi.mocked(db.update)).not.toHaveBeenCalled();
+    });
+
     it('SR2-18: a forced-enrollment user (policy required, unenrolled) cannot move the recovery address', async () => {
       orgScopeAuth();
       mockSelf({ email: 'old@example.com', passwordHash: 'hash' });
@@ -1537,7 +1673,8 @@ describe('user routes', () => {
       getEffectiveMfaPolicyMock.mockResolvedValue({
         required: true,
         allowedMethods: { totp: true, sms: true, passkey: true },
-        source: { roleForceMfa: true, settingsRequireMfa: false, killSwitchOff: true }
+        pendingEnrollment: null,
+        source: { roleForceMfa: true, settingsRequireMfa: false, killSwitchOff: true, graceWindow: 'none' as const }
       });
       userIsMfaProtectedMock.mockResolvedValue(false);
 
@@ -1557,7 +1694,8 @@ describe('user routes', () => {
       getEffectiveMfaPolicyMock.mockResolvedValue({
         required: false,
         allowedMethods: { totp: true, sms: true, passkey: true },
-        source: { roleForceMfa: false, settingsRequireMfa: false, killSwitchOff: true }
+        pendingEnrollment: null,
+        source: { roleForceMfa: false, settingsRequireMfa: false, killSwitchOff: true, graceWindow: 'none' as const }
       });
 
       const res = await patchMe({ email: 'new@example.com' });
@@ -2024,6 +2162,22 @@ describe('user routes', () => {
       const body = await res.json();
       expect(body.success).toBe(true);
       expect(clearPermissionCache).toHaveBeenCalledWith('11111111-1111-1111-1111-111111111111');
+      // Belt to the permissions-epoch braces: a role change must also END any
+      // live remote session the target holds, not merely make the NEXT
+      // revocation-lease renew fail ~25s later.
+      expect(vi.mocked(terminateUserRemoteSessions)).toHaveBeenCalledWith(
+        '11111111-1111-1111-1111-111111111111',
+      );
+    });
+
+    it('does not tear down remote sessions when the role assignment is refused', async () => {
+      const res = await app.request('/users/user-123/role', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roleId: '44444444-4444-4444-4444-444444444444' }),
+      });
+      expect(res.status).toBe(403);
+      expect(vi.mocked(terminateUserRemoteSessions)).not.toHaveBeenCalled();
     });
 
     it('rejects self role assignment', async () => {
@@ -2179,6 +2333,24 @@ describe('user routes', () => {
       expect(capturedUpdates.some((v) => 'revokedReason' in v)).toBe(true);
       expect(runPostCommitCleanup).toHaveBeenCalledWith('11111111-1111-1111-1111-111111111111');
       expect(runPostCommitCleanup).toHaveBeenCalledTimes(1);
+      // Belt: membership removal must also END any live remote session the
+      // removed member holds, not only advance the permissions epoch that the
+      // next revocation-lease renew will notice.
+      expect(vi.mocked(terminateUserRemoteSessions)).toHaveBeenCalledWith(
+        '11111111-1111-1111-1111-111111111111',
+      );
+    });
+
+    it('does not tear down remote sessions when no membership row was deleted', async () => {
+      mockRemoveMembershipTx({ deletedRows: [] });
+
+      const res = await app.request('/users/11111111-1111-1111-1111-111111111111', {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(404);
+      expect(vi.mocked(terminateUserRemoteSessions)).not.toHaveBeenCalled();
     });
 
     it('does not run post-commit cleanup when no row was deleted (404)', async () => {
@@ -2307,7 +2479,17 @@ describe('user routes', () => {
       const txUpdate = vi.fn((_table: any) => ({
         set: (values: Record<string, unknown>) => {
           capturedUpdates.push(values);
-          calls.push('mfaEpoch' in values ? 'epochs' : 'revokedReason' in values ? 'families' : 'mfaSecret' in values ? 'clear-factors' : 'update');
+          calls.push(
+            'mfaEpoch' in values
+              ? 'epochs'
+              : 'revokedReason' in values
+                ? 'families'
+                : 'revokedAt' in values && 'revokedBy' in values
+                  ? 'office-binding'
+                  : 'mfaSecret' in values
+                    ? 'clear-factors'
+                    : 'update'
+          );
           return {
             where: () => {
               const ret: any = Promise.resolve(undefined);
@@ -2345,8 +2527,9 @@ describe('user routes', () => {
       // Cross-user write went through the system-context escape.
       expect(runOutsideDbContext).toHaveBeenCalled();
       expect(withSystemDbAccessContext).toHaveBeenCalled();
-      // One transaction: mfa_epoch bump → families → users clear → passkey delete.
-      expect(calls).toEqual(['epochs', 'families', 'clear-factors', 'delete-passkeys']);
+      // One transaction: mfa_epoch bump → families → Office binding revoke →
+      // users clear → passkey delete.
+      expect(calls).toEqual(['epochs', 'families', 'office-binding', 'clear-factors', 'delete-passkeys']);
       expect(capturedUpdates.some((v) => v.mfaEnabled === false && v.mfaSecret === null && v.phoneNumber === null && v.phoneVerified === false)).toBe(true);
       expect(capturedUpdates.some((v) => 'mfaEpoch' in v)).toBe(true);
       expect(capturedUpdates.some((v) => 'revokedReason' in v)).toBe(true);

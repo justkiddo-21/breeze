@@ -12,6 +12,18 @@ type RecoveryConfig struct {
 	SnapshotID    string            `json:"snapshotId"`
 	DeviceID      string            `json:"deviceId"`
 	TargetPaths   map[string]string `json:"targetPaths,omitempty"` // original -> target path overrides
+
+	// ExpectSystemState is derived from the recovery bootstrap payload (see
+	// session.go, RunRecoveryWithTokenContext) rather than set by a caller:
+	// it is true when bootstrap.Snapshot.SystemStateManifest is present and
+	// non-null, i.e. the snapshot's producer captured system state for this
+	// run. applySystemState (bmr.go) uses it to distinguish "this snapshot
+	// never had system state" (fine — the existing soft-skip path) from
+	// "state was advertised but couldn't be downloaded/applied" (fatal).
+	// Before this field existed, both cases looked identical to bmr.go, so a
+	// snapshot advertising system state that failed to download it still
+	// reported StateApplied=false with status "completed" (D15/O10).
+	ExpectSystemState bool `json:"expectSystemState,omitempty"`
 }
 
 type AuthenticatedProviderConfig struct {
@@ -61,6 +73,24 @@ type BootstrapResponse struct {
 	BackupConfig     *AuthenticatedProviderConfig     `json:"backupConfig"`
 	Download         *AuthenticatedDownloadDescriptor `json:"download"`
 	AuthenticatedAt  string                           `json:"authenticatedAt"`
+	// Recovery (W04a) is present when this token is bound to a bare-metal
+	// recovery (created via POST /backup/bmr/recoveries, exchanged for this
+	// token via POST /bmr/recover/exchange). Nonce is populated ONLY on the
+	// exchange response that minted this token — it is never persisted
+	// server-side (only its hash is), so it cannot appear here again on a
+	// later /bmr/recover/authenticate call with the same token.
+	Recovery *RecoveryBinding `json:"recovery,omitempty"`
+}
+
+// RecoveryBinding is the bare-metal recovery a recovery token is bound to
+// (W04a). See apps/api/src/services/recoveryBootstrap.ts
+// AuthenticatedBootstrapRecovery, which this mirrors field-for-field.
+type RecoveryBinding struct {
+	ID         string `json:"id"`
+	Identity   string `json:"identity"` // "original" | "new"
+	DeviceID   string `json:"deviceId"`
+	SnapshotID string `json:"snapshotId"`
+	Nonce      string `json:"nonce,omitempty"`
 }
 
 // AuthenticateResponse is the legacy flat bootstrap payload. It remains for

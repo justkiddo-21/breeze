@@ -62,6 +62,12 @@ export const devices = pgTable('devices', {
   osType: osTypeEnum('os_type').notNull(),
   deviceRole: varchar('device_role', { length: 30 }).notNull().default('unknown'),
   deviceRoleSource: varchar('device_role_source', { length: 20 }).notNull().default('auto'),
+  // Fleet Designer W02 (#5652) — projection of the ACTIVE
+  // device_function_assessments row ("what is this device for"), written ONLY
+  // by services/deviceFunction.ts in the same transaction as the assessment.
+  // Both NULL, or both set, pinned by devices_device_function_source_chk.
+  deviceFunction: text('device_function'),
+  deviceFunctionSource: text('device_function_source').$type<'ai' | 'manual'>(),
   // Orthogonal virtualization attribute (issue #1387): is this box running on a
   // hypervisor, and which one. Set by the agent from SMBIOS hardware identity
   // strings. Distinct from device_role — a virtual workstation is still a
@@ -98,6 +104,14 @@ export const devices = pgTable('devices', {
   maintenanceStartedBy: uuid('maintenance_started_by').references(() => users.id, { onDelete: 'set null' }),
   lastSeenAt: timestamp('last_seen_at'),
   enrolledAt: timestamp('enrolled_at').defaultNow().notNull(),
+  // Bare-metal recovery W04a: stamped by the heartbeat check-in that completes
+  // a recovery. recoveredFromSnapshotId is a soft reference to
+  // backup_snapshots.id (no FK, like possibleReplacementOfDeviceId above) —
+  // a real FK would create a devices <-> backup_snapshots cascade cycle
+  // (backup_snapshots.device_id already points the other way), which
+  // topologicalCascadeOrder() in tenantCascade.ts rejects outright.
+  recoveredAt: timestamp('recovered_at', { withTimezone: true }),
+  recoveredFromSnapshotId: uuid('recovered_from_snapshot_id'),
   enrolledBy: uuid('enrolled_by').references(() => users.id),
   // Linked device profiles for multi-boot systems (#2138). NULL => unlinked.
   // When set, the device is one boot profile of a physical machine grouped in
@@ -206,6 +220,15 @@ export const devices = pgTable('devices', {
   peripheralPolicyProtocolVersion: integer('peripheral_policy_protocol_version').notNull().default(0),
   rollbackProtocolVersion: integer('rollback_protocol_version').notNull().default(0),
   pamLifetimeProtocolVersion: integer('pam_lifetime_protocol_version').notNull().default(0),
+  // Revocation-lease capability. 1 = this agent build renews a per-session
+  // revocation lease over the command WebSocket and stops the desktop stream
+  // when the lease is revoked or expires past its grace window. 0 (default,
+  // and every agent that omits the field) means the API has no way to end a
+  // live desktop session it can no longer authorize, so all three
+  // desktop-start dispatch sites refuse with 503 agent_upgrade_required.
+  // Non-sticky, same contract as the versions above: rewritten every beat so a
+  // downgrade clears the claim.
+  revocationLeaseProtocolVersion: integer('revocation_lease_protocol_version').notNull().default(0),
   rollbackComponentVersions: jsonb('rollback_component_versions').$type<Record<string, string> | null>(),
   // Agent-reported build edition + migration-needed flag (heartbeat telemetry).
   // Non-sensitive; drives the self-hosted migration banner. Written unconditionally

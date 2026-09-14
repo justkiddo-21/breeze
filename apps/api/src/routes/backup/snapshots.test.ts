@@ -200,6 +200,22 @@ describe('snapshot routes', () => {
     expect(selectMock).toHaveBeenCalledTimes(2);
   });
 
+  it('filters to bare-metal-restorable snapshots when requested (W04a)', async () => {
+    const chain = chainMock([makeSnapshot({ bareMetalRestorable: true })]);
+    selectMock.mockReturnValueOnce(chain);
+
+    const res = await app.request('/backup/snapshots?bareMetalRestorable=true', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toHaveLength(1);
+    // and(...conditions) is called once with every pushed condition — the
+    // bare-metal filter must be among them, not silently dropped.
+    expect(chain.where).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps unrestricted snapshot list behavior unchanged', async () => {
     selectMock.mockReturnValueOnce(chainMock([
       makeSnapshot({ deviceId: 'device-in' }),
@@ -368,6 +384,45 @@ describe('snapshot routes', () => {
       requestedImmutabilityEnforcement: null,
       immutabilityFallbackReason: null,
       retentionBlockedReason: 'legal_hold',
+    });
+  });
+
+  it('returns the bare-metal restorability verdict on snapshot responses', async () => {
+    selectMock.mockReturnValueOnce(chainMock([
+      makeSnapshot({
+        bareMetalRestorable: false,
+        bareMetalReasons: ['LVM volumes are not supported'],
+      }),
+    ]));
+
+    const res = await app.request('/backup/snapshots', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data[0]).toMatchObject({
+      bareMetalRestorable: false,
+      bareMetalReasons: ['LVM volumes are not supported'],
+    });
+  });
+
+  it('returns a null bare-metal verdict (never assessed) as null + empty reasons, not false', async () => {
+    selectMock.mockReturnValueOnce(chainMock([
+      makeSnapshot({ bareMetalRestorable: null, bareMetalReasons: null }),
+    ]));
+
+    const res = await app.request('/backup/snapshots', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data[0]).toMatchObject({
+      bareMetalRestorable: null,
+      bareMetalReasons: [],
     });
   });
 

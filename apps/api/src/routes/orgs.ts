@@ -1,4 +1,5 @@
 import { lockMfaPolicySettings, countMfaPolicyLockouts, mfaPolicyLockoutResponse } from '../services/mfaPolicyActivation';
+import { MFA_ENROLLMENT_GRACE_DAYS_MAX } from '../services/mfaEnrollmentGrace';
 import { isDeepStrictEqual } from 'node:util';
 import { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
@@ -60,8 +61,12 @@ import { getEnrollmentDefaultsForOrg } from '../services/enrollmentDefaults';
 import { isValidIpOrCidr } from '../services/ipMatch';
 import { applyNewPartnerDefaultSettings } from '../services/partnerDefaultSettings';
 import { seedSystemTicketStatuses } from '../services/ticketConfigService';
+import { ensureBuiltInMonitorsForPartner } from '../services/monitors/builtInMonitors';
 import { getTrustedClientIpOrUndefined } from '../services/clientIp';
-import { canManagePartnerWidePolicies } from '../services/partnerWideAccess';
+import {
+  canManagePartnerWidePolicies,
+  PARTNER_WIDE_WRITE_DENIED_MESSAGE,
+} from '../services/partnerWideAccess';
 import { clearPartnerAllowlistCache, ipAllowlistMode, readPartnerAllowlist } from '../services/ipAllowlist';
 import { commitOrgImport, previewOrgImport, MAX_IMPORT_ROWS } from '../services/orgImport';
 import { writeOrgImportAudits } from '../services/orgImport/audit';
@@ -529,6 +534,9 @@ orgRoutes.post('/partners', requireScope('system'), requireOrgWrite, requireMfa(
       .returning(partnerPublicColumns());
     if (newPartner) {
       await seedSystemTicketStatuses(tx, newPartner.id);
+      // createdBy stays NULL: the platform admin creating this partner is a
+      // foreign tenant identifier here, and users.id has no ON DELETE on this FK.
+      await ensureBuiltInMonitorsForPartner(newPartner.id, { createdBy: null, exec: tx });
     }
     return [newPartner];
   });
@@ -623,6 +631,19 @@ const partnerSettingsSchema = z.object({
     complexity: z.enum(['standard', 'strict', 'passphrase']).optional(),
     expirationDays: z.number().int().min(0).optional(),
     requireMfa: z.boolean().optional(),
+    // #5306 — how long a user whose ROLE forces MFA (roles.force_mfa) may keep
+    // working before enrolment is enforced. Optional on purpose: a PATCH that
+    // omits it must not overwrite a configured window with the default. 0 means
+    // enforce immediately; the 30-day ceiling is deliberate — a longer standing
+    // exception is a policy decision, not a grace period. Lowering it SHORTENS
+    // windows already granted (services/mfaEnrollmentGrace.ts takes the min);
+    // raising it only affects grants made afterwards.
+    mfaEnrollmentGraceDays: z
+      .number()
+      .int()
+      .min(0)
+      .max(MFA_ENROLLMENT_GRACE_DAYS_MAX)
+      .optional(),
     allowedMethods: z.object({ totp: z.boolean().optional(), sms: z.boolean().optional() }).optional(),
     // Legacy input alias. Accepted so older clients don't 400, folded into
     // `allowedMethods` at write time (foldAllowedMfaMethodsAlias) and never
@@ -883,6 +904,12 @@ orgRoutes.patch(
   requirePartner,
   requireOrgWrite,
   requireMfa(),
+  async (c, next) => {
+    if (!canManagePartnerWidePolicies(c.get('auth'))) {
+      return c.json({ error: 'Full partner access required' }, 403);
+    }
+    await next();
+  },
   zValidator('json', updatePartnerSettingsSchema, (result, c) => {
     if (!result.success && result.error.issues.some((issue) => issue.path[0] === 'inboundLocalPart')) {
       return c.json({ error: 'Use lowercase letters, numbers, and hyphens only' }, 422);
@@ -1822,8 +1849,18 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
 //
 // Preview → commit pipeline over services/orgImport. CSV is parsed client-side;
 // the API takes JSON only, so the migration-toolkit scripts can call these
-// directly. Gating matches the single-record write routes this composes
-// (POST /organizations, POST /sites): partner/system scope + orgs:write + MFA.
+// directly. Unlike the single-record routes this composes, the import seam
+// enumerates and can mutate ANY organization in the resolved partner while
+// running under system DB context. Selected/none partner members therefore
+// need an additional full-partner capability gate on both preview and commit.
+
+const requireFullPartnerOrgImportAccess = async (c: Context, next: Next) => {
+  const auth = c.get('auth') as AuthContext;
+  if (!canManagePartnerWidePolicies(auth)) {
+    return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+  }
+  return next();
+};
 
 // Row shape lives in services/orgImport/schemas.ts so the PSA company-import
 // route (#3246) accepts the byte-identical row contract.
@@ -1842,7 +1879,7 @@ const commitOrgImportSchema = z.object({
 // The import creates SITES as well as orgs, so it is gated on sites:write in
 // addition to orgs:write (#3242). Preview carries the same gate for an early,
 // honest failure — a preview a caller could never commit is a trap.
-orgRoutes.post('/import/preview', requireScope('partner', 'system'), requireOrgWrite, requireSiteWrite, requireMfa(), zValidator('json', previewOrgImportSchema), async (c) => {
+orgRoutes.post('/import/preview', requireScope('partner', 'system'), requireOrgWrite, requireSiteWrite, requireMfa(), requireFullPartnerOrgImportAccess, zValidator('json', previewOrgImportSchema), async (c) => {
   const auth = c.get('auth') as AuthContext;
   const { rows, partnerId: bodyPartnerId } = c.req.valid('json');
 
@@ -1855,7 +1892,7 @@ orgRoutes.post('/import/preview', requireScope('partner', 'system'), requireOrgW
   return c.json({ rows: annotated });
 });
 
-orgRoutes.post('/import', requireScope('partner', 'system'), requireOrgWrite, requireSiteWrite, requireMfa(), zValidator('json', commitOrgImportSchema), async (c) => {
+orgRoutes.post('/import', requireScope('partner', 'system'), requireOrgWrite, requireSiteWrite, requireMfa(), requireFullPartnerOrgImportAccess, zValidator('json', commitOrgImportSchema), async (c) => {
   const auth = c.get('auth') as AuthContext;
   const { rows, mode, partnerId: bodyPartnerId } = c.req.valid('json');
 

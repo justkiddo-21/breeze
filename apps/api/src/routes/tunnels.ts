@@ -19,7 +19,7 @@ import {
   type ViewerTokenPayload,
 } from '../services/jwt';
 import { getTrustedClientIp, rateLimitIpKey } from '../services/clientIp';
-import { getActiveAllowlistPatterns } from '../services/tunnelAllowlist';
+import { getActiveAllowlistPatterns, tunnelAllowlistRuleAppliesToSite } from '../services/tunnelAllowlist';
 import { getRedis } from '../services/redis';
 import { rateLimiter } from '../services/rate-limit';
 import { isViewerJtiRevoked, isViewerSessionRevoked, revokeViewerSession } from '../services/viewerTokenRevocation';
@@ -28,6 +28,14 @@ import { canAccessSite, PERMISSIONS, type UserPermissions } from '../services/pe
 import { createRemoteSession, RemoteSessionDeniedError } from '../services/remoteSessionCreate';
 import { evaluateCapability, partnerIdForDevice, trustDenyBody, unresolvedPartnerDecision } from '../services/partnerTrust';
 import { partnerTrustMode } from '../config/partnerTrustMode';
+import { authorizeRemoteSessionContinuation } from '../services/remoteWsAuthorization';
+import { teardownDisconnectedSessions } from '../services/remoteSessionTeardown';
+import {
+  terminalIntentSet,
+  terminalSessionReturning,
+  toTerminalSessionRow,
+  type TerminalSessionRow,
+} from '../services/remoteDesktopTerminalIntent';
 
 export const tunnelRoutes = new Hono();
 
@@ -42,6 +50,18 @@ const allowlistIdParamSchema = idParamSchema;
 const CONNECTABLE_TUNNEL_STATUSES = ['pending', 'connecting', 'active'] as const;
 const VNC_EXCHANGE_RATE_LIMIT = 20;
 const VNC_EXCHANGE_RATE_WINDOW_SECONDS = 60;
+const TUNNEL_CONTINUATION_PERMISSIONS = [PERMISSIONS.REMOTE_ACCESS, PERMISSIONS.DEVICES_EXECUTE];
+
+async function authorizeTunnelContinuation(sessionId: string, userId: string) {
+  return authorizeRemoteSessionContinuation(
+    { sessionId, sessionType: 'tunnel', userId },
+    TUNNEL_CONTINUATION_PERMISSIONS,
+  );
+}
+
+function liveAuthorizationResponse(c: Context, denial: { status: 403 | 404 | 429 | 503; reason: string }) {
+  return c.json({ error: 'Remote session access denied', reason: denial.reason }, denial.status);
+}
 
 // Proxy tunnels get no agent-side reaper once `tunnel_open` is skipped for them
 // (see POST /tunnels below) — GET /tunnels lazily expires stale rows on every
@@ -190,7 +210,7 @@ function isTargetBlocked(host: string, port: number, isVNC: boolean): { blocked:
   return { blocked: false };
 }
 
-async function isTargetAllowed(host: string, port: number, orgId: string): Promise<boolean> {
+async function isTargetAllowed(host: string, port: number, orgId: string, bridgeSiteId: string | null): Promise<boolean> {
   const rules = await db
     .select()
     .from(tunnelAllowlists)
@@ -203,6 +223,7 @@ async function isTargetAllowed(host: string, port: number, orgId: string): Promi
   if (rules.length === 0) return false; // Default deny
 
   for (const rule of rules) {
+    if (!tunnelAllowlistRuleAppliesToSite(rule.siteId ?? null, bridgeSiteId)) continue;
     const parts = rule.pattern.split(':');
     if (parts.length !== 2) continue;
     const [cidr, portRange] = parts;
@@ -221,7 +242,7 @@ async function isTargetAllowed(host: string, port: number, orgId: string): Promi
   return false;
 }
 
-async function isSourceIpAllowed(sourceIp: string, orgId: string): Promise<boolean> {
+async function isSourceIpAllowed(sourceIp: string, orgId: string, bridgeSiteId: string | null): Promise<boolean> {
   const rules = await db
     .select()
     .from(tunnelAllowlists)
@@ -231,10 +252,14 @@ async function isSourceIpAllowed(sourceIp: string, orgId: string): Promise<boole
       eq(tunnelAllowlists.enabled, true),
     ));
 
-  // No source rules = no restriction
-  if (rules.length === 0) return true;
+  const effectiveRules = rules.filter((rule) =>
+    tunnelAllowlistRuleAppliesToSite(rule.siteId ?? null, bridgeSiteId)
+  );
 
-  for (const rule of rules) {
+  // No source rules effective for this bridge site = no restriction.
+  if (effectiveRules.length === 0) return true;
+
+  for (const rule of effectiveRules) {
     if (ipInCidr(sourceIp, rule.pattern)) return true;
   }
 
@@ -301,6 +326,11 @@ async function siteBelongsToOrg(siteId: string, orgId: string): Promise<boolean>
   return !!site;
 }
 
+function canManageAllowlistAtSite(perms: UserPermissions | undefined, siteId: string | null): boolean {
+  if (!perms?.allowedSiteIds) return true;
+  return siteId !== null && canAccessSite(perms, siteId);
+}
+
 // Write an audit_logs row for a mutating tunnel action. Mirrors the
 // logSessionAudit helper in remote/helpers.ts:
 //   1. Runs OUTSIDE the caller's request transaction (runOutsideDbContext →
@@ -347,6 +377,7 @@ tunnelRoutes.post(
   '/',
   requireScope('organization', 'partner', 'system'),
   requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
+  requirePermission(PERMISSIONS.REMOTE_ACCESS.resource, PERMISSIONS.REMOTE_ACCESS.action),
   requireMfa(),
   zValidator('json', createTunnelSchema),
   async (c) => {
@@ -395,7 +426,7 @@ tunnelRoutes.post(
       !isVNC && scheme === 'https' ? (body.skipTlsVerify ?? false) : false;
 
     // Source IP check
-    if (!(await isSourceIpAllowed(sourceIp, device.orgId))) {
+    if (!(await isSourceIpAllowed(sourceIp, device.orgId, device.siteId ?? null))) {
       return c.json({ error: 'Source IP not permitted' }, 403);
     }
 
@@ -406,7 +437,7 @@ tunnelRoutes.post(
         return c.json({ error: `Target blocked: ${blockResult.reason}` }, 403);
       }
 
-      if (!(await isTargetAllowed(targetHost, targetPort, device.orgId))) {
+      if (!(await isTargetAllowed(targetHost, targetPort, device.orgId, device.siteId ?? null))) {
         return c.json({ error: 'Target not permitted by allowlist. Add a destination rule first.' }, 403);
       }
     }
@@ -440,7 +471,7 @@ tunnelRoutes.post(
     // that killed proxy sessions early (the other was the cookie TTL, now
     // owned by tunnelHttp.ts's sliding refresh + 12h absolute cap).
     if (body.type !== 'proxy') {
-      const allowlistPatterns = isVNC ? [] : await getActiveAllowlistPatterns(device.orgId);
+      const allowlistPatterns = isVNC ? [] : await getActiveAllowlistPatterns(device.orgId, device.siteId ?? null);
       const sent = sendCommandToAgent(device.agentId!, {
         id: `tun-open-${session!.id}`,
         type: 'tunnel_open',
@@ -487,10 +518,12 @@ tunnelRoutes.post(
   '/proxy-connect',
   requireScope('organization', 'partner', 'system'),
   requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
+  requirePermission(PERMISSIONS.REMOTE_ACCESS.resource, PERMISSIONS.REMOTE_ACCESS.action),
   requireMfa(),
   zValidator('json', proxyConnectSchema),
   async (c) => {
     const auth = c.get('auth') as AuthContext;
+    const perms = c.get('permissions') as UserPermissions | undefined;
     const body = c.req.valid('json');
     const sourceIp = getClientIp(c);
 
@@ -532,6 +565,13 @@ tunnelRoutes.post(
       return c.json({ error: 'Discovered asset not found or access denied' }, 404);
     }
 
+    if (!canManageAllowlistAtSite(perms, asset.siteId ?? null)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+    if ((asset.siteId ?? null) !== (device.siteId ?? null)) {
+      return c.json({ error: 'Discovered asset is not at the bridge device site' }, 403);
+    }
+
     // #5213: ip_address is nullable now (manual website / DNS-only assets).
     // String(null) is the literal "null", which would sail past isTargetBlocked
     // below and reach the agent as a garbage target rather than failing loudly.
@@ -542,7 +582,7 @@ tunnelRoutes.post(
     const siteId = asset.siteId;
 
     // Source IP + blocked-CIDR checks mirror POST /tunnels' non-VNC path.
-    if (!(await isSourceIpAllowed(sourceIp, device.orgId))) {
+    if (!(await isSourceIpAllowed(sourceIp, device.orgId, device.siteId ?? null))) {
       return c.json({ error: 'Source IP not permitted' }, 403);
     }
 
@@ -805,11 +845,16 @@ tunnelRoutes.post(
   zValidator('json', allowlistRuleSchema),
   async (c) => {
     const auth = c.get('auth') as AuthContext;
+    const perms = c.get('permissions') as UserPermissions | undefined;
     const orgResult = resolveOrgId(auth, c.req.query('orgId'));
     if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
     const orgId = orgResult.orgId;
 
     const body = c.req.valid('json');
+
+    if (!canManageAllowlistAtSite(perms, body.siteId ?? null)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
 
     // A body.siteId is an arbitrary uuid until proven to belong to the resolved
     // org — RLS does not defend the site axis. Reject cross-org site ids.
@@ -866,6 +911,7 @@ tunnelRoutes.put(
   zValidator('json', updateAllowlistSchema),
   async (c) => {
     const auth = c.get('auth') as AuthContext;
+    const perms = c.get('permissions') as UserPermissions | undefined;
     const { id } = c.req.valid('param');
     const orgResult = resolveOrgId(auth, c.req.query('orgId'));
     if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
@@ -881,6 +927,9 @@ tunnelRoutes.put(
 
     if (!existing) {
       return c.json({ error: 'Rule not found' }, 404);
+    }
+    if (!canManageAllowlistAtSite(perms, existing.siteId ?? null)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
     }
 
     const updates: Record<string, any> = { updatedAt: new Date() };
@@ -922,6 +971,7 @@ tunnelRoutes.delete(
   zValidator('param', allowlistIdParamSchema),
   async (c) => {
     const auth = c.get('auth') as AuthContext;
+    const perms = c.get('permissions') as UserPermissions | undefined;
     const { id } = c.req.valid('param');
     const orgResult = resolveOrgId(auth, c.req.query('orgId'));
     if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
@@ -935,6 +985,9 @@ tunnelRoutes.delete(
 
     if (!existing) {
       return c.json({ error: 'Rule not found' }, 404);
+    }
+    if (!canManageAllowlistAtSite(perms, existing.siteId ?? null)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
     }
 
     await db
@@ -1134,6 +1187,9 @@ tunnelRoutes.post(
       }, 400);
     }
 
+    const liveAuthority = await authorizeTunnelContinuation(id, auth.user.id);
+    if (!liveAuthority.ok) return liveAuthorizationResponse(c, liveAuthority);
+
     const trustDenial = await tunnelTicketTrustDenyBody(session.deviceId, auth.user.id);
     if (trustDenial) return c.json(trustDenial, 403);
 
@@ -1205,6 +1261,9 @@ tunnelRoutes.post(
       }, 400);
     }
 
+    const liveAuthority = await authorizeTunnelContinuation(id, auth.user.id);
+    if (!liveAuthority.ok) return liveAuthorizationResponse(c, liveAuthority);
+
     const trustDenial = await tunnelTicketTrustDenyBody(session.deviceId, auth.user.id);
     if (trustDenial) return c.json(trustDenial, 403);
 
@@ -1274,6 +1333,9 @@ tunnelRoutes.post(
         status: session.status,
       }, 400);
     }
+
+    const liveAuthority = await authorizeTunnelContinuation(id, auth.user.id);
+    if (!liveAuthority.ok) return liveAuthorizationResponse(c, liveAuthority);
 
     const trustDenial = await tunnelTicketTrustDenyBody(session.deviceId, auth.user.id);
     if (trustDenial) return c.json(trustDenial, 403);
@@ -1365,6 +1427,10 @@ vncExchangeRoutes.post(
       }, 400);
     }
 
+
+    const liveAuthority = await authorizeTunnelContinuation(record.tunnelId, record.userId);
+    if (!liveAuthority.ok) return liveAuthorizationResponse(c, liveAuthority);
+
     // Build the WebSocket URL from the canonical external base URL. Using
     // c.req.url would yield an internal http://api:3001 in Caddy-fronted
     // deployments; honoring X-Forwarded-Proto doesn't help when Caddy itself
@@ -1429,9 +1495,8 @@ async function requireViewerToken(
   c: Context,
   options: {
     requireAssuredTransition?: boolean;
-    descendantSessionId?: string;
   } = {},
-): Promise<(ViewerTokenPayload & { descendantAccessToken?: string }) | Response> {
+): Promise<ViewerTokenPayload | Response> {
   const authHeader = c.req.header('Authorization');
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return c.json({ error: 'Missing or invalid authorization header' }, 401);
@@ -1444,16 +1509,6 @@ async function requireViewerToken(
   if (options.requireAssuredTransition && payload.mfaSatisfied !== true) {
     return c.json({ error: 'legacy_viewer_transition_forbidden' }, 403);
   }
-  let descendantAccessToken: string | undefined;
-  if (options.descendantSessionId) {
-    try {
-      descendantAccessToken = await createViewerDescendantAccessToken(payload, {
-        sessionId: options.descendantSessionId,
-      });
-    } catch {
-      return c.json({ error: 'Invalid or expired token' }, 401);
-    }
-  }
   // Check jti-level revocation (belt — individual token invalidation)
   if (await isViewerJtiRevoked(payload.jti)) {
     return c.json({ error: 'Token revoked' }, 401);
@@ -1464,10 +1519,7 @@ async function requireViewerToken(
   if (await isViewerSessionRevoked(payload.sessionId)) {
     return c.json({ error: 'Session closed' }, 401);
   }
-  return {
-    ...payload,
-    ...(descendantAccessToken ? { descendantAccessToken } : {}),
-  };
+  return payload;
 }
 
 // GET /vnc-viewer/desktop-access
@@ -1477,6 +1529,9 @@ async function requireViewerToken(
 vncViewerRoutes.get('/desktop-access', async (c) => {
   const result = await requireViewerToken(c);
   if (result instanceof Response) return result;
+
+  const liveAuthority = await authorizeTunnelContinuation(result.sessionId, result.sub);
+  if (!liveAuthority.ok) return liveAuthorizationResponse(c, liveAuthority);
 
   const device = await withSystemDbAccessContext(async () => {
     const [row] = await db
@@ -1512,9 +1567,19 @@ vncViewerRoutes.post('/upgrade-to-webrtc', async (c) => {
   const transitionSessionId = randomUUID();
   const auth = await requireViewerToken(c, {
     requireAssuredTransition: true,
-    descendantSessionId: transitionSessionId,
   });
   if (auth instanceof Response) return auth;
+
+  const liveAuthority = await authorizeTunnelContinuation(auth.sessionId, auth.sub);
+  if (!liveAuthority.ok) return liveAuthorizationResponse(c, liveAuthority);
+  let accessToken: string;
+  try {
+    accessToken = await createViewerDescendantAccessToken(auth, {
+      sessionId: transitionSessionId,
+    });
+  } catch {
+    return c.json({ error: 'Invalid or expired token' }, 401);
+  }
 
   const bound = await withSystemDbAccessContext(async () => {
     const [row] = await db
@@ -1560,26 +1625,33 @@ vncViewerRoutes.post('/upgrade-to-webrtc', async (c) => {
   // Reuse the same pattern as /sessions: terminate stragglers first, insert
   // new pending row via the partner-trust-gated service, return its id.
   let session: typeof remoteSessions.$inferSelect;
+  let stragglers: TerminalSessionRow[] = [];
   try {
-    session = await withSystemDbAccessContext(async () => {
-      await db
+    ({ session, stragglers } = await withSystemDbAccessContext(async () => {
+      // Through the terminal-intent contract (SEC-038 W03), returning the rows
+      // so each straggler's stop can name its terminal generation. The stop
+      // itself is dispatched AFTER this context commits — the relay's ack wait
+      // must not pin this connection idle-in-transaction.
+      const swept = (await db
         .update(remoteSessions)
-        .set({ status: 'disconnected', endedAt: new Date() })
+        .set(terminalIntentSet({ status: 'disconnected', endedAt: new Date() }, 'pending'))
         .where(
           and(
             eq(remoteSessions.deviceId, bound.deviceId),
             eq(remoteSessions.type, 'desktop'),
             inArray(remoteSessions.status, ['pending', 'connecting', 'active'])
           )
-        );
-      return createRemoteSession('remote', {
+        )
+        .returning(terminalSessionReturning())).map(toTerminalSessionRow);
+      const created = await createRemoteSession('remote', {
         id: transitionSessionId,
         deviceId: bound.deviceId,
         orgId: bound.tunnelOrgId,
         userId: bound.tunnelUserId,
         type: 'desktop',
       });
-    }) as typeof remoteSessions.$inferSelect;
+      return { session: created as typeof remoteSessions.$inferSelect, stragglers: swept };
+    }));
   } catch (e) {
     if (e instanceof RemoteSessionDeniedError) {
       return c.json(trustDenyBody({ allow: false, code: e.code, capability: 'remote_control', reason: e.reason }, false), 403);
@@ -1591,7 +1663,9 @@ vncViewerRoutes.post('/upgrade-to-webrtc', async (c) => {
     return c.json({ error: 'Failed to create desktop session' }, 500);
   }
 
-  const accessToken = auth.descendantAccessToken!;
+  // Same as POST /remote/sessions: a straggler may still be a live WebRTC
+  // stream, so revoke its viewer token and push the generation-bound stop.
+  await teardownDisconnectedSessions(stragglers);
 
   // Viewer-token auth — no JWT actor. Attribute the upgrade to the tunnel-bound
   // owner (the user who opened the originating VNC tunnel) so the credential
@@ -1625,9 +1699,22 @@ vncViewerRoutes.post('/downgrade-to-vnc', async (c) => {
   const transitionTunnelId = randomUUID();
   const auth = await requireViewerToken(c, {
     requireAssuredTransition: true,
-    descendantSessionId: transitionTunnelId,
   });
   if (auth instanceof Response) return auth;
+
+  const liveAuthority = await authorizeRemoteSessionContinuation(
+    { sessionId: auth.sessionId, sessionType: 'desktop', userId: auth.sub },
+    TUNNEL_CONTINUATION_PERMISSIONS,
+  );
+  if (!liveAuthority.ok) return liveAuthorizationResponse(c, liveAuthority);
+  let accessToken: string;
+  try {
+    accessToken = await createViewerDescendantAccessToken(auth, {
+      sessionId: transitionTunnelId,
+    });
+  } catch {
+    return c.json({ error: 'Invalid or expired token' }, 401);
+  }
 
   const bound = await withSystemDbAccessContext(async () => {
     const [row] = await db
@@ -1721,8 +1808,6 @@ vncViewerRoutes.post('/downgrade-to-vnc', async (c) => {
   const baseUrl = publicBase ? new URL(publicBase) : new URL(c.req.url);
   const wsProtocol = baseUrl.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = `${wsProtocol}//${baseUrl.host}/api/v1/tunnel-ws/${transitionTunnelId}/ws?ticket=${ticket.ticket}`;
-  const accessToken = auth.descendantAccessToken!;
-
   // This path creates a brand-new tunnel session under viewer-token auth (no
   // JWT actor), mirroring POST /tunnels — so emit the same tunnel.open audit,
   // attributed to the session-bound owner. Without this the downgrade opens a

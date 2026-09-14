@@ -23,13 +23,17 @@ const (
 	maxDesktopModifierBytes = 16
 	maxDesktopModifiers     = 8
 
-	// Caps for caller-supplied session-lifetime limits in the direct-mode
-	// (map-payload) decoder. Same maxima as the IPC path (userhelper), but note
-	// the enforcement DIFFERS: this decoder has no error channel so it CLAMPS to
-	// these bounds, whereas the IPC path REJECTS out-of-range input with an
-	// error. Either way the agent can't be pushed past these. 0 = disabled.
-	maxIdleTimeoutMinutes   = 1440 // 24h
-	maxSessionDurationHours = 168  // 7d
+	// Cap for the caller-supplied idle timeout in the direct-mode (map-payload)
+	// decoder. Same maximum as the IPC path (userhelper), but note the
+	// enforcement DIFFERS: this decoder has no error channel so it CLAMPS,
+	// whereas the IPC path REJECTS out-of-range input with an error. Either way
+	// the agent can't be pushed past it. 0 = disabled.
+	maxIdleTimeoutMinutes = 1440 // 24h
+
+	// Fallback grace window when the server omits graceSec. The 12h max-session
+	// ceiling is NOT duplicated here: desktop.ClampMaxDuration owns it for both
+	// decoders.
+	defaultRevocationLeaseGrace = desktop.DefaultRevocationLeaseGrace
 )
 
 var desktopInputTypes = map[string]struct{}{
@@ -133,6 +137,33 @@ func handleStartDesktop(h *Heartbeat, cmd Command) tools.CommandResult {
 		}
 	}
 
+	// SEC-038 start fence. Checked before ANY side effect — before leases,
+	// before the consent prompt, before capture — so a superseded or
+	// post-terminal start cannot spawn a helper, show a banner, or take a
+	// lease on its way to being refused.
+	fenceInput, genErr := parseDesktopStartGeneration(cmd.Payload)
+	if genErr != nil {
+		// Fail closed: a generation we cannot compare is one we cannot honour.
+		log.Warn("refusing start_desktop with a malformed start generation",
+			"sessionId", sessionID, "commandId", cmd.ID, "error", genErr.Error())
+		return tools.NewErrorResult(
+			desktopStartFenceError(desktopFenceReasonMalformed, genErr.Error()),
+			time.Since(start).Milliseconds())
+	}
+	fenceInput.CommandID = cmd.ID
+	if decision := h.desktopStartFence.admitStart(sessionID, fenceInput); !decision.Admitted {
+		log.Warn("refusing start_desktop at the desktop start fence",
+			"sessionId", sessionID,
+			"commandId", cmd.ID,
+			"reason", string(decision.Reason),
+			"generation", fenceInput.Generation,
+			"highWater", decision.HighWater,
+		)
+		return tools.NewErrorResult(
+			desktopStartFenceError(decision.Reason, ""),
+			time.Since(start).Milliseconds())
+	}
+
 	// Parse optional ICE servers from payload
 	var iceServers []desktop.ICEServerConfig
 	if raw, ok := cmd.Payload["iceServers"].([]interface{}); ok {
@@ -164,6 +195,13 @@ func handleStartDesktop(h *Heartbeat, cmd Command) tools.CommandResult {
 	}
 
 	policy := parseDesktopSessionPolicy(cmd.Payload)
+	if policy.RevocationLease == nil {
+		// Fail closed. Without a lease the control plane has no way to end this
+		// session once the operator's authorization changes, and the API refuses
+		// to dispatch a start to an agent that has not declared the capability —
+		// so reaching here means a malformed or downgraded payload.
+		return tools.NewErrorResult(desktop.ErrRevocationLeaseRequired, time.Since(start).Milliseconds())
+	}
 
 	// Explicit per-session target (multi-session hosts): the Windows session
 	// this connect is shadowing, if any. Recorded before the consent gate so
@@ -315,19 +353,65 @@ func parseDesktopSessionPolicy(payload map[string]any) desktop.SessionPolicy {
 	}
 	// Clamp the lifetime fields defensively. The server already clamps these
 	// (remoteAccessPolicy.ts), but this direct-mode decoder must never trust a
-	// hostile/buggy value verbatim: a <=0 value means "disabled" (matching the
-	// IPC decoder ResolveSessionPolicyFromIPC), and an over-cap value is clamped
-	// to the same maxima the IPC path rejects at — so it can't push the agent
-	// into never-idle-out / never-expire territory. NOTE the mechanism differs:
-	// the IPC path (userhelper.validateDesktopStartRequest) returns an error on
-	// out-of-range input; this map decoder has no error channel, so it clamps.
+	// hostile/buggy value verbatim.
+	//
+	// idleTimeoutMinutes: <=0 still means "disabled"; over-cap clamps down.
+	// maxSessionDurationHours: 0 no longer means "unlimited" — it, and anything
+	// over the 12h cap, resolves to the cap. Both decoders funnel through
+	// desktop.clampMaxDuration (via DefaultSessionPolicy + the assignment
+	// below) so they cannot drift apart the way they did while "0" meant two
+	// different things on the two paths.
 	if v, ok := payload["idleTimeoutMinutes"].(float64); ok && v > 0 {
 		policy.IdleTimeout = time.Duration(math.Min(v, maxIdleTimeoutMinutes)) * time.Minute
 	}
-	if v, ok := payload["maxSessionDurationHours"].(float64); ok && v > 0 {
-		policy.MaxDuration = time.Duration(math.Min(v, maxSessionDurationHours)) * time.Hour
+	if v, ok := payload["maxSessionDurationHours"].(float64); ok {
+		// desktop.ClampMaxDuration is the SHARED clamp both decoders use, so 0
+		// (formerly "unlimited"), a negative value and anything over 12h all
+		// resolve identically here and on the IPC path.
+		policy.MaxDuration = desktop.ClampMaxDuration(time.Duration(v * float64(time.Hour)))
 	}
+	policy.RevocationLease = parseRevocationLease(payload)
 	return policy
+}
+
+// parseRevocationLease extracts the server-issued revocation lease from a
+// direct-mode start_desktop payload. Returns nil when the block is absent or
+// unusable — the caller refuses the start rather than running unrevokable.
+//
+// This decoder only reshapes the loose JSON map into the wire struct; every
+// validation and back-fill rule (usable expiry, usable renew cadence, 12h
+// hard-deadline fallback, 90s grace fallback, monotonic deadlines) lives in
+// desktop.NormalizeRevocationLease, which the IPC decoder and the helper's
+// validator also call. Keeping the rules in one place is what stops the two
+// paths from disagreeing about what a valid lease is — they already did once,
+// and the looser side accepted an all-zero block, i.e. an unrevokable session.
+func parseRevocationLease(payload map[string]any) *desktop.RevocationLease {
+	raw, ok := payload["revocationLease"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	var wire ipc.RevocationLease
+	if v, ok := raw["token"].(string); ok {
+		wire.Token = v
+	}
+	if v, ok := raw["expiresAt"].(float64); ok {
+		wire.ExpiresAtUnixMs = int64(v)
+	}
+	if v, ok := raw["hardDeadline"].(float64); ok {
+		wire.HardDeadlineUnixMs = int64(v)
+	}
+	if v, ok := raw["renewEverySec"].(float64); ok {
+		wire.RenewEverySec = int64(v)
+	}
+	if v, ok := raw["graceSec"].(float64); ok {
+		wire.GraceSec = int64(v)
+	}
+	lease, err := desktop.NormalizeRevocationLease(&wire)
+	if err != nil {
+		log.Warn("dropping unusable revocationLease block from start_desktop", "error", err.Error())
+		return nil
+	}
+	return lease
 }
 
 func handleStopDesktop(h *Heartbeat, cmd Command) tools.CommandResult {
@@ -337,6 +421,28 @@ func handleStopDesktop(h *Heartbeat, cmd Command) tools.CommandResult {
 		errResult.DurationMs = time.Since(start).Milliseconds()
 		return *errResult
 	}
+
+	// SEC-038 terminal tombstone. Installed FIRST, and unconditionally —
+	// including when no session is running under this id. A stop can overtake
+	// the start it was meant to cancel, and before this the unknown-session
+	// stop was a silent no-op that let the late start run. A malformed
+	// terminalGeneration does not block the tombstone: the stop is still an
+	// unambiguous terminal decision, only its generation is unusable.
+	stopInput, genErr := parseDesktopTerminalGeneration(cmd.Payload)
+	if genErr != nil {
+		// Log-only, deliberately. The defect cannot be reported in the command
+		// result: desktopCommandResultSchema (apps/api/src/routes/agentWs.ts)
+		// is .strict(), so an extra key would make the API drop the whole stop
+		// confirmation as malformed — and W03's pending -> confirmed phase
+		// transition is driven by exactly that confirmation. Surfacing it needs
+		// an allowed field on the server side first; tracked with W03/W05.
+		// A malformed generation is in any case only reachable from a buggy or
+		// tampered server, and it never weakens the fence: the tombstone below
+		// is installed regardless.
+		log.Warn("stop_desktop carried a malformed terminal generation; tombstoning anyway",
+			"sessionId", sessionID, "commandId", cmd.ID, "error", genErr.Error())
+	}
+	h.desktopStartFence.noteStop(sessionID, stopInput)
 
 	// Drop any on-demand helper leases first: the lease is what keeps the
 	// helper alive, and it must be released even if the stop below fails.
@@ -394,6 +500,16 @@ func handleListSessions(h *Heartbeat, cmd Command) tools.CommandResult {
 	}, time.Since(start).Milliseconds())
 }
 
+// handleDesktopStreamStart is the WS-relay fallback path: frames are pushed to
+// the API over the agent's own WebSocket instead of peer-to-peer WebRTC.
+//
+// It deliberately carries NO revocation lease and runs no lease watchdog. It
+// does not need one: unlike a WebRTC session, every frame passes through the
+// server, so the server can (and does) cut it — the ~30s desktop_stream loop in
+// routes/desktopWs.ts revalidates and drops the relay. The lease exists
+// precisely because the API is NOT in the WebRTC media path; here it is.
+// Follow-up: fold this path into the same revalidation function the lease renew
+// uses, so the two revocation deadlines are provably the same policy.
 func handleDesktopStreamStart(h *Heartbeat, cmd Command) tools.CommandResult {
 	start := time.Now()
 

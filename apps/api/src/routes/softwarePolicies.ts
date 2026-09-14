@@ -17,6 +17,8 @@ import {
   recordSoftwarePolicyAudit,
 } from '../services/softwarePolicyService';
 import { canManagePartnerWidePolicies, PARTNER_WIDE_WRITE_DENIED_MESSAGE } from '../services/partnerWideAccess';
+import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../services/siteCeilingAccess';
+import { assertMayArmInstall } from '../services/softwarePolicyAuthorization';
 import { captureException } from '../services/sentry';
 import { PERMISSIONS, canAccessSite, type UserPermissions } from '../services/permissions';
 import { requestPamCleanup } from '../services/pamActuationLifecycle';
@@ -75,8 +77,13 @@ export const softwareRulesSchema = z.object({
   { message: 'rules must include at least one software[] or executable[] entry' }
 );
 
-const remediationOptionsSchema = z.object({
+// NOTE: a non-strict z.object STRIPS unknown keys silently rather than
+// rejecting them, so a field is invisible to the API until it is declared
+// here. Both createPolicySchema and updatePolicySchema reference this one
+// object, so a field added here covers the create and update surfaces alike.
+export const remediationOptionsSchema = z.object({
   autoUninstall: z.boolean().optional(),
+  autoInstall: z.boolean().optional(), // #5505 — see SoftwarePolicyRemediationOptions
   notifyUser: z.boolean().optional(),
   gracePeriod: z.number().int().min(0).max(24 * 90).optional(), // hours; max 90 days
   cooldownMinutes: z.number().int().min(1).max(24 * 90 * 60).optional(),
@@ -294,7 +301,22 @@ softwarePoliciesRoutes.post(
   zValidator('json', createPolicySchema),
   async (c) => {
     const auth = c.get('auth');
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
     const payload = c.req.valid('json');
+
+    // #5505 D3: arming remediationOptions.autoInstall installs software on
+    // managed devices, so it needs deployment-grade authorization
+    // (devices.execute + MFA) on top of the devices:write + requireMfa() this
+    // route already carries. `stored` is null — nothing exists yet — so the
+    // merged state is the body alone.
+    const armDenied = await assertMayArmInstall(c, null, {
+      mode: payload.mode,
+      enforceMode: payload.enforceMode,
+      remediationOptions: payload.remediationOptions,
+    });
+    if (armDenied) return armDenied;
 
     // Ownership axis (#2126). Partner-wide templates push rules to devices in
     // ALL orgs under the partner (including orgs created later), so creation is
@@ -518,6 +540,9 @@ softwarePoliciesRoutes.patch(
   zValidator('json', updatePolicySchema),
   async (c) => {
     const auth = c.get('auth');
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
     const { id } = c.req.valid('param');
     const payload = c.req.valid('json');
 
@@ -533,8 +558,23 @@ softwarePoliciesRoutes.patch(
       return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
     }
 
-    const updates: Partial<typeof softwarePolicies.$inferInsert> = {
+    // #5505 D3: evaluated over the POST-WRITE merged state — the stored row
+    // overlaid with this body — so editing an ALREADY-armed policy is gated
+    // too. Adding a catalogId to an armed policy installs new software, and
+    // that must not be reachable with a weaker credential than arming was.
+    const armDenied = await assertMayArmInstall(c, policy, {
+      mode: payload.mode,
+      enforceMode: payload.enforceMode,
+      remediationOptions: payload.remediationOptions,
+    });
+    if (armDenied) return armDenied;
+
+    const updates: Omit<Partial<typeof softwarePolicies.$inferInsert>, 'approvalGeneration'> & { approvalGeneration?: SQL } = {
       updatedAt: new Date(),
+      // Site-ceiling gate contract §3: bump on every PATCH so a queued
+      // compliance/remediation job carrying the OLD generation can tell it
+      // has been superseded and skip acting on stale config.
+      approvalGeneration: sql`${softwarePolicies.approvalGeneration} + 1`,
     };
 
     if (payload.name !== undefined) updates.name = payload.name;
@@ -573,7 +613,7 @@ softwarePoliciesRoutes.patch(
 
     let scheduleWarning: string | undefined;
     try {
-      await scheduleSoftwareComplianceCheck(policy.id);
+      await scheduleSoftwareComplianceCheck(policy.id, undefined, updated?.approvalGeneration);
     } catch (error) {
       scheduleWarning = error instanceof Error ? error.message : 'Failed to schedule compliance check';
       console.error(`[softwarePolicies] Failed to schedule compliance check for policy ${policy.id}:`, error);
@@ -618,6 +658,9 @@ softwarePoliciesRoutes.delete(
   zValidator('param', policyIdParamSchema),
   async (c) => {
     const auth = c.get('auth');
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
     const { id } = c.req.valid('param');
 
     const policy = await getPolicyWithAccess(id, auth);

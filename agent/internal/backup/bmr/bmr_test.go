@@ -862,6 +862,136 @@ func TestRestoreFiles_ReappliesModeAndModTime(t *testing.T) {
 	}
 }
 
+// TestRestoreFiles_ReplacesReadOnlyDestination covers D19b: restoring onto a
+// machine where the target file already exists carrying the Windows
+// ReadOnly attribute (mapped by Go to a 0444-style mode with the owner-write
+// bit cleared) must succeed, mirroring restore.go's D19 fix for the ordinary
+// restore path (TestMoveFile_ReadOnlyDestination_CopyFallbackPath). BMR's
+// destination-creation happens inside whichever providers.BackupProvider is
+// in use (the HTTP recoveryDownloadProvider in production,
+// providers.LocalProvider here in tests) — restoreFiles itself must clear
+// the read-only bit and retry the download once, since neither provider
+// implementation is something this package may edit. Before the fix, a
+// non-root user cannot open a 0444 file for writing on any OS, so this test
+// is RED prior to the fix.
+func TestRestoreFiles_ReplacesReadOnlyDestination(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file mode bits; this test requires a non-root user")
+	}
+
+	baseDir := t.TempDir()
+	provider := providers.NewLocalProvider(baseDir)
+
+	snapshotID := "bmr-readonly-dest"
+	backupPath := filepath.ToSlash(path.Join("snapshots", snapshotID, "files", "readonly.gz"))
+
+	srcDir := t.TempDir()
+	srcPath := filepath.Join(srcDir, "readonly")
+	content := []byte("new-bytes")
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatalf("write source file: %v", err)
+	}
+	if err := provider.Upload(srcPath, backupPath); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+
+	restoreRoot := t.TempDir()
+	targetPath := filepath.Join(restoreRoot, "readonly.txt")
+	if err := os.WriteFile(targetPath, []byte("old"), 0o644); err != nil {
+		t.Fatalf("pre-create destination: %v", err)
+	}
+	if err := os.Chmod(targetPath, 0o444); err != nil {
+		t.Fatalf("chmod destination read-only: %v", err)
+	}
+
+	manifest := &snapshotManifest{
+		ID:    snapshotID,
+		Files: []manifestFile{{SourcePath: targetPath, BackupPath: backupPath, Size: int64(len(content))}},
+		Size:  int64(len(content)),
+	}
+
+	filesRestored, _, warnings, failedFiles, err := restoreFiles(context.Background(), manifest, RecoveryConfig{}, provider)
+	if err != nil {
+		t.Fatalf("restoreFiles failed: %v (warnings: %v)", err, warnings)
+	}
+	if filesRestored != 1 || failedFiles != 0 {
+		t.Fatalf("filesRestored=%d failedFiles=%d, want 1/0 (warnings: %v)", filesRestored, failedFiles, warnings)
+	}
+
+	got, readErr := os.ReadFile(targetPath)
+	if readErr != nil {
+		t.Fatalf("read restored destination: %v", readErr)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("destination content = %q, want %q", got, content)
+	}
+}
+
+// TestRestoreFiles_ReadOnlySourceModeReappliedOverReadOnlyDestination proves
+// that once D19b's create-retry lets the download land, the existing
+// mode-reapply step (~restoreFiles:408, O20) still puts the read-only bit
+// BACK: a source file captured as read-only in the manifest must end up
+// read-only again at the destination, not merely writable because the fix
+// had to clear that bit to get the bytes down. Uses the same pre-existing
+// read-only destination as TestRestoreFiles_ReplacesReadOnlyDestination.
+func TestRestoreFiles_ReadOnlySourceModeReappliedOverReadOnlyDestination(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file mode bits; this test requires a non-root user")
+	}
+
+	baseDir := t.TempDir()
+	provider := providers.NewLocalProvider(baseDir)
+
+	snapshotID := "bmr-readonly-src-and-dest"
+	backupPath := filepath.ToSlash(path.Join("snapshots", snapshotID, "files", "readonly.gz"))
+
+	srcDir := t.TempDir()
+	srcPath := filepath.Join(srcDir, "readonly")
+	content := []byte("new-bytes")
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatalf("write source file: %v", err)
+	}
+	if err := provider.Upload(srcPath, backupPath); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+
+	restoreRoot := t.TempDir()
+	targetPath := filepath.Join(restoreRoot, "readonly.txt")
+	if err := os.WriteFile(targetPath, []byte("old"), 0o644); err != nil {
+		t.Fatalf("pre-create destination: %v", err)
+	}
+	if err := os.Chmod(targetPath, 0o444); err != nil {
+		t.Fatalf("chmod destination read-only: %v", err)
+	}
+
+	manifest := &snapshotManifest{
+		ID:    snapshotID,
+		Files: []manifestFile{{SourcePath: targetPath, BackupPath: backupPath, Size: int64(len(content)), Mode: 0o444}},
+		Size:  int64(len(content)),
+	}
+
+	filesRestored, _, warnings, failedFiles, err := restoreFiles(context.Background(), manifest, RecoveryConfig{}, provider)
+	if err != nil {
+		t.Fatalf("restoreFiles failed: %v (warnings: %v)", err, warnings)
+	}
+	if filesRestored != 1 || failedFiles != 0 {
+		t.Fatalf("filesRestored=%d failedFiles=%d, want 1/0 (warnings: %v)", filesRestored, failedFiles, warnings)
+	}
+
+	info, statErr := os.Stat(targetPath)
+	if statErr != nil {
+		t.Fatalf("stat restored destination: %v", statErr)
+	}
+	if info.Mode().Perm()&0o200 != 0 {
+		t.Fatalf("destination mode = %o, want owner-write bit cleared (read-only) after restore", info.Mode().Perm())
+	}
+	if runtime.GOOS != "windows" {
+		if info.Mode().Perm() != 0o444 {
+			t.Errorf("mode = %o, want 0444", info.Mode().Perm())
+		}
+	}
+}
+
 // TestRestoreFiles_CapsFidelityWarningsWithoutCountingAsFailedFiles proves
 // the silent-failure review's item 2 fix: the chmod/chtimes post-restore
 // fidelity warnings (added alongside O20's mode/mtime reapply) bypassed
@@ -975,5 +1105,130 @@ func TestRestoreFiles_FidelityFailureThenSuccessBothWarnUncapped(t *testing.T) {
 	}
 	if len(warnings) != 1 || !strings.Contains(warnings[0], "could not reapply mtime") {
 		t.Fatalf("warnings = %v, want exactly one mtime-reapply warning", warnings)
+	}
+}
+
+// W02: restoreFiles must recreate a symlink/directory manifest entry
+// directly (no download attempted for its empty BackupPath) — mirrors
+// backup.RestoreContentlessEntry's contract (agent/internal/backup/restore.go)
+// for BMR's independent manifestFile mirror.
+func TestRestoreFiles_RecreatesSymlinkWithoutDownload(t *testing.T) {
+	baseDir := t.TempDir()
+	provider := providers.NewLocalProvider(baseDir)
+
+	snapshotID := "bmr-symlink"
+	backupPath := filepath.ToSlash(path.Join("snapshots", snapshotID, "files", "real.gz"))
+	srcDir := t.TempDir()
+	srcPath := filepath.Join(srcDir, "real")
+	content := []byte("real file content")
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatalf("write source file: %v", err)
+	}
+	if err := provider.Upload(srcPath, backupPath); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+
+	restoreRoot := t.TempDir()
+	realTarget := filepath.Join(restoreRoot, "assure", "real")
+	linkTarget := filepath.Join(restoreRoot, "assure", "link")
+	dirTarget := filepath.Join(restoreRoot, "assure", "empty")
+
+	manifest := &snapshotManifest{
+		ID: snapshotID,
+		Files: []manifestFile{
+			{SourcePath: realTarget, BackupPath: backupPath, Size: int64(len(content))},
+			{SourcePath: linkTarget, Kind: "symlink", LinkTarget: "real"},
+			{SourcePath: dirTarget, Kind: "dir", ModeBits: 0o700},
+		},
+		Size: int64(len(content)),
+	}
+
+	filesRestored, _, warnings, failedFiles, err := restoreFiles(context.Background(), manifest, RecoveryConfig{}, provider)
+	if err != nil {
+		t.Fatalf("restoreFiles failed: %v (warnings: %v)", err, warnings)
+	}
+	if failedFiles != 0 {
+		t.Fatalf("failedFiles = %d, warnings: %v", failedFiles, warnings)
+	}
+	if filesRestored != 3 {
+		t.Fatalf("filesRestored = %d, want 3 (1 file + 1 link + 1 dir)", filesRestored)
+	}
+	got, err := os.Readlink(linkTarget)
+	if err != nil || got != "real" {
+		t.Fatalf("symlink = %q, err = %v", got, err)
+	}
+	if fi, statErr := os.Stat(dirTarget); statErr != nil || !fi.IsDir() {
+		t.Fatalf("dir missing: %v", statErr)
+	}
+	// failedFiles==0 above already proves no download was attempted (and
+	// failed) for the content-less entries' empty BackupPath — LocalProvider
+	// errors on a download of a nonexistent/empty key.
+}
+
+// Review finding #1 (PR #5520): restoreFiles must never write THROUGH an
+// ancestor that is a symlink — a prior (possibly interrupted) run may have
+// already recreated a directory-shaped manifest entry as a symlink pointing
+// outside the intended restore root. Uses a TargetPaths override so the
+// "override base" half of the guard is exercised (see
+// symlinkAncestorBase): the override is built the way a real caller (the
+// rebuild engine) builds one — stagingRoot + the original relative path —
+// so the guard can recover stagingRoot as the trusted root to walk from.
+func TestRestoreFiles_ResumedRunDoesNotWriteThroughRestoredSymlink(t *testing.T) {
+	baseDir := t.TempDir()
+	provider := providers.NewLocalProvider(baseDir)
+
+	snapshotID := "bmr-escape"
+	backupPath := filepath.ToSlash(path.Join("snapshots", snapshotID, "files", "pwned.gz"))
+	srcDir := t.TempDir()
+	srcPath := filepath.Join(srcDir, "pwned")
+	content := []byte("pwned content")
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatalf("write source file: %v", err)
+	}
+	if err := provider.Upload(srcPath, backupPath); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+
+	stagingRoot := t.TempDir()
+	outside := t.TempDir()
+	// Exactly what a resumed run sees: a prior run already recreated
+	// /escape as a symlink pointing OUTSIDE the staging root.
+	if err := os.Symlink(outside, filepath.Join(stagingRoot, "escape")); err != nil {
+		t.Fatal(err)
+	}
+
+	origPath := filepath.Join(string(filepath.Separator), "escape", "pwned")
+	manifest := &snapshotManifest{
+		ID: snapshotID,
+		Files: []manifestFile{
+			{SourcePath: origPath, BackupPath: backupPath, Size: int64(len(content))},
+		},
+		Size: int64(len(content)),
+	}
+	cfg := RecoveryConfig{
+		TargetPaths: map[string]string{
+			origPath: filepath.Join(stagingRoot, "escape", "pwned"),
+		},
+	}
+
+	filesRestored, _, warnings, failedFiles, _ := restoreFiles(context.Background(), manifest, cfg, provider)
+
+	if _, statErr := os.Stat(filepath.Join(outside, "pwned")); statErr == nil {
+		t.Fatal("restoreFiles wrote through the symlink into the outside directory")
+	}
+	if failedFiles != 1 {
+		t.Fatalf("failedFiles = %d, want 1 (warnings: %v)", failedFiles, warnings)
+	}
+	if filesRestored != 0 {
+		t.Fatalf("filesRestored = %d, want 0", filesRestored)
+	}
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "symlink") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("warnings = %v, want one mentioning symlink", warnings)
 	}
 }

@@ -8,8 +8,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/breeze-rmm/agent/internal/backup/systemstate"
 )
 
 // TestDecideFile is the decision-table unit test: table-driven coverage of
@@ -93,14 +91,6 @@ func TestDecideFile(t *testing.T) {
 			file: backupFile{sourcePath: missingPath, size: 5, modTime: laterTime},
 			prev: map[string]SnapshotFile{
 				missingPath: {SourcePath: missingPath, BackupPath: "snapshots/old/files/missing.gz", Size: 5, ModTime: baseTime, Checksum: "whatever"},
-			},
-			wantResult: decideUpload,
-		},
-		{
-			name: "system-state staging file never referenced, even with a matching entry",
-			file: backupFile{sourcePath: unchangedPath, size: int64(len("same content")), modTime: baseTime, systemState: true},
-			prev: map[string]SnapshotFile{
-				unchangedPath: {SourcePath: unchangedPath, BackupPath: "snapshots/old/files/unchanged.txt.gz", Size: int64(len("same content")), ModTime: baseTime, Checksum: unchangedSum},
 			},
 			wantResult: decideUpload,
 		},
@@ -361,7 +351,7 @@ func TestIncrementalDedupeBase_ScopedToBackupIdentity(t *testing.T) {
 	}
 	run1Files := []backupFile{{sourcePath: f1, snapshotPath: "path_0/f1.txt", size: 3, modTime: modTime}}
 
-	snapshot1, err := createSnapshotWithProgress(context.Background(), provider, run1Files, nil, nil, nil, nil, identityA)
+	snapshot1, err := createSnapshotWithProgress(context.Background(), provider, run1Files, nil, nil, nil, nil, withRunIdentity(identityA))
 	if err != nil {
 		t.Fatalf("run 1 (identity A) failed: %v", err)
 	}
@@ -373,7 +363,7 @@ func TestIncrementalDedupeBase_ScopedToBackupIdentity(t *testing.T) {
 	// reports it as the newest snapshot in the whole bucket.
 	fB := createTempFile(t, tmpDir, "fb.txt", "foreign-device-file")
 	runBFiles := []backupFile{{sourcePath: fB, snapshotPath: "path_0/fb.txt", size: int64(len("foreign-device-file")), modTime: modTime}}
-	snapshotB, err := createSnapshotWithProgress(context.Background(), provider, runBFiles, nil, nil, nil, nil, identityB)
+	snapshotB, err := createSnapshotWithProgress(context.Background(), provider, runBFiles, nil, nil, nil, nil, withRunIdentity(identityB))
 	if err != nil {
 		t.Fatalf("foreign run (identity B) failed: %v", err)
 	}
@@ -387,7 +377,7 @@ func TestIncrementalDedupeBase_ScopedToBackupIdentity(t *testing.T) {
 	}
 
 	run2Files := []backupFile{{sourcePath: f1, snapshotPath: "path_0/f1.txt", size: 3, modTime: modTime}} // unchanged
-	snapshot2, err := createSnapshotWithProgress(context.Background(), provider, run2Files, nil, nil, prev, nil, identityA)
+	snapshot2, err := createSnapshotWithProgress(context.Background(), provider, run2Files, nil, nil, prev, nil, withRunIdentity(identityA))
 	if err != nil {
 		t.Fatalf("run 2 (identity A) failed: %v", err)
 	}
@@ -419,6 +409,12 @@ func TestIsReferenceEntry(t *testing.T) {
 		{"own prefix -> not a reference", "snapshots/snap-A/files/f.txt.gz", "snap-A", false},
 		{"older prefix -> reference", "snapshots/snap-OLD/files/f.txt.gz", "snap-A", true},
 		{"unrelated prefix -> reference", "snapshots/snap-B/files/f.txt.gz", "snap-A", true},
+		// Review finding #3 (PR #5520): a content-less entry (symlink/dir)
+		// always has an empty BackupPath — "" trivially fails a HasPrefix
+		// check against ANY non-empty own-prefix, which used to make it
+		// look like a reference into some other snapshot. It never is one:
+		// it's rebuilt fresh every run (see decideFile's kind!="" branch).
+		{"empty backupPath (content-less entry) -> never a reference", "", "snap-A", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -430,109 +426,85 @@ func TestIsReferenceEntry(t *testing.T) {
 	}
 }
 
-// TestMarkSystemStateFiles proves the staging-dir exclusion flags exactly
-// the files under stagingDir, leaving everything else untouched.
-func TestMarkSystemStateFiles(t *testing.T) {
-	tmpDir := t.TempDir()
-	stagingDir := pathpkg.Join(tmpDir, "staging")
-	files := []backupFile{
-		{sourcePath: pathpkg.Join(stagingDir, "registry.dat")},
-		{sourcePath: pathpkg.Join(stagingDir, "sub", "boot.cfg")},
-		{sourcePath: pathpkg.Join(tmpDir, "unrelated", "doc.txt")},
-		// A sibling directory that merely shares stagingDir as a string
-		// prefix must NOT match (path-boundary correctness).
-		{sourcePath: stagingDir + "-not-actually-inside" + string(pathpkg.Separator) + "f.txt"},
-	}
+// NOTE: TestMarkSystemStateFiles/TestMarkSystemStateFiles_EmptyStagingDirNoOp/
+// TestSystemStateArtifactsMissing used to live here, covering
+// markSystemStateFiles/isUnderDir/systemStateArtifactsMissing — all removed
+// in incremental.go (see the NOTE there) now that system-state artifacts are
+// published directly from the manifest (snapshot.go's publishSystemState)
+// rather than discovered via the ordinary file walk.
 
-	if marked := markSystemStateFiles(files, stagingDir); marked != 2 {
-		t.Errorf("markSystemStateFiles marked %d files, want 2 — the count is what "+
-			"systemStateArtifactsMissing uses to detect an uncaptured manifest", marked)
-	}
+func TestFetchServerOwnedBase(t *testing.T) {
+	const myIdentity = "s3|bucket-1|device-a|file"
 
-	if !files[0].systemState {
-		t.Error("file directly under stagingDir should be marked systemState")
-	}
-	if !files[1].systemState {
-		t.Error("file nested under stagingDir should be marked systemState")
-	}
-	if files[2].systemState {
-		t.Error("file outside stagingDir must not be marked systemState")
-	}
-	if files[3].systemState {
-		t.Error("a path that merely shares stagingDir as a string prefix must not be marked systemState")
-	}
+	t.Run("valid base with matching identity", func(t *testing.T) {
+		provider := newMockProvider()
+		base := &Snapshot{
+			ID:             "snap-base",
+			Timestamp:      time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+			BackupIdentity: myIdentity,
+			Files:          []SnapshotFile{{SourcePath: "/data/a.txt", BackupPath: "snapshots/snap-base/files/a.txt.gz", Size: 1}},
+		}
+		storeManifest(t, provider, base)
+
+		snap, reason := fetchServerOwnedBase(context.Background(), provider, "snap-base", myIdentity)
+		if snap == nil {
+			t.Fatalf("expected a matching snapshot, got nil (reason: %s)", reason)
+		}
+		if snap.ID != "snap-base" {
+			t.Fatalf("fetchServerOwnedBase picked %q, want %q", snap.ID, "snap-base")
+		}
+	})
+
+	t.Run("identity mismatch falls back to full run", func(t *testing.T) {
+		provider := newMockProvider()
+		base := &Snapshot{
+			ID:             "snap-base",
+			Timestamp:      time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+			BackupIdentity: "s3|bucket-1|device-b|file",
+			Files:          []SnapshotFile{{SourcePath: "/data/a.txt", BackupPath: "snapshots/snap-base/files/a.txt.gz", Size: 1}},
+		}
+		storeManifest(t, provider, base)
+
+		snap, reason := fetchServerOwnedBase(context.Background(), provider, "snap-base", myIdentity)
+		if snap != nil {
+			t.Fatalf("expected nil on identity mismatch, got %+v", snap)
+		}
+		if reason == "" {
+			t.Error("expected a non-empty reason")
+		}
+	})
+
+	t.Run("empty baseSnapshotId means full run", func(t *testing.T) {
+		provider := newMockProvider()
+		snap, reason := fetchServerOwnedBase(context.Background(), provider, "", myIdentity)
+		if snap != nil {
+			t.Fatalf("expected nil for empty baseSnapshotId, got %+v", snap)
+		}
+		if reason == "" {
+			t.Error("expected a non-empty reason")
+		}
+	})
+
+	t.Run("404 (manifest never uploaded) falls back to full run", func(t *testing.T) {
+		provider := newMockProvider()
+		snap, reason := fetchServerOwnedBase(context.Background(), provider, "snap-missing", myIdentity)
+		if snap != nil {
+			t.Fatalf("expected nil on download failure, got %+v", snap)
+		}
+		if reason == "" {
+			t.Error("expected a non-empty reason")
+		}
+	})
 }
 
-// TestMarkSystemStateFiles_EmptyStagingDirNoOp proves the common case (no
-// system-state collection this run) leaves every file untouched.
-func TestMarkSystemStateFiles_EmptyStagingDirNoOp(t *testing.T) {
-	files := []backupFile{{sourcePath: "/data/a.txt"}}
-	if marked := markSystemStateFiles(files, ""); marked != 0 {
-		t.Errorf("markSystemStateFiles with an empty stagingDir marked %d files, want 0", marked)
-	}
-	if files[0].systemState {
-		t.Error("markSystemStateFiles with an empty stagingDir must not mark anything")
-	}
-}
-
-// TestSystemStateArtifactsMissing is the backstop for #3026's SYMPTOM rather
-// than its cause: a job that reports success while the restore point is missing
-// the system state its manifest advertises. #3026 was one route there; the
-// detector has to fire for any of them, and stay silent otherwise.
-func TestSystemStateArtifactsMissing(t *testing.T) {
-	withArtifacts := &systemstate.SystemStateManifest{
-		Artifacts: []systemstate.Artifact{{Name: "registry"}, {Name: "boot"}},
-	}
-
-	tests := []struct {
-		name        string
-		manifest    *systemstate.SystemStateManifest
-		markedFiles int
-		want        bool
-	}{
-		{
-			// The #3026 signature: manifest recorded, staging walk produced
-			// nothing that matched it.
-			name:        "manifest with artifacts but nothing captured is reported",
-			manifest:    withArtifacts,
-			markedFiles: 0,
-			want:        true,
-		},
-		{
-			name:        "manifest with artifacts and files captured is healthy",
-			manifest:    withArtifacts,
-			markedFiles: 2,
-			want:        false,
-		},
-		{
-			// Partial capture is a different problem and deliberately out of
-			// scope here — this detector only claims "none at all".
-			name:        "a single captured file is enough to clear the check",
-			manifest:    withArtifacts,
-			markedFiles: 1,
-			want:        false,
-		},
-		{
-			name:        "no system state collected this run is not a divergence",
-			manifest:    nil,
-			markedFiles: 0,
-			want:        false,
-		},
-		{
-			// Nothing to match, so reporting would fire on every such run and
-			// train operators to ignore the warning.
-			name:        "a manifest describing no artifacts is not a divergence",
-			manifest:    &systemstate.SystemStateManifest{},
-			markedFiles: 0,
-			want:        false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := systemStateArtifactsMissing(tt.manifest, tt.markedFiles); got != tt.want {
-				t.Errorf("systemStateArtifactsMissing = %v, want %v", got, tt.want)
-			}
-		})
+// W02: content-less entries (symlinks/directories) are rebuilt from the live
+// filesystem on every run — decideFile must never reference them, even when
+// an entry with the same key exists in the previous manifest.
+func TestDecideFile_ContentlessAlwaysUploadPath(t *testing.T) {
+	link := backupFile{sourcePath: "/bin", snapshotPath: "path_0/bin", kind: KindSymlink, linkTarget: "usr/bin"}
+	prev := map[string]SnapshotFile{"/bin": {SourcePath: "/bin", Kind: KindSymlink, LinkTarget: "usr/lib"}}
+	decision, entry := decideFile(link, prev)
+	if decision != decideUpload || entry.BackupPath != "" {
+		t.Fatalf("decision=%v entry=%+v; content-less entries never dedupe by reference", decision, entry)
 	}
 }
