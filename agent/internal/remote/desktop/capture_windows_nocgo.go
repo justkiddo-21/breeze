@@ -18,9 +18,10 @@ var (
 	// user32 is already declared in input_windows.go (same package)
 	gdi32 = syscall.NewLazyDLL("gdi32.dll")
 
-	procGetDC            = user32.NewProc("GetDC")
-	procReleaseDC        = user32.NewProc("ReleaseDC")
-	procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
+	procGetDC              = user32.NewProc("GetDC")
+	procReleaseDC          = user32.NewProc("ReleaseDC")
+	procGetSystemMetrics   = user32.NewProc("GetSystemMetrics")
+	procSetProcessDPIAware = user32.NewProc("SetProcessDPIAware")
 
 	procCreateDCW              = gdi32.NewProc("CreateDCW")
 	procCreateCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
