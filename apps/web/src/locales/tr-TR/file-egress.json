@@ -52,6 +52,7 @@
     "allOrganizations": "Tüm organizasyonlar",
     "partnerWide": "iş ortağı geneli",
     "thisOrganization": "Bu organizasyon",
+    "selectOrganization": "Bir kuruluş seçin…",
     "add": "Ekle",
     "remove": "Kaldır",
     "save": "Politikayı kaydet",
@@ -62,6 +63,7 @@
     "deleted": "Politika silindi.",
     "errors": {
       "nameRequired": "Ad zorunludur.",
+      "orgRequired": "Kuruluşa ait bir ilke için bir kuruluş seçin.",
       "save": "Politika kaydedilemedi.",
       "delete": "Politika silinemedi."
     }

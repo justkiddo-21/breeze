@@ -52,6 +52,7 @@
     "allOrganizations": "Alle Organisationen",
     "partnerWide": "partnerweit",
     "thisOrganization": "Diese Organisation",
+    "selectOrganization": "Organisation auswählen…",
     "add": "Hinzufügen",
     "remove": "Entfernen",
     "save": "Richtlinie speichern",
@@ -62,6 +63,7 @@
     "deleted": "Richtlinie gelöscht.",
     "errors": {
       "nameRequired": "Name ist erforderlich.",
+      "orgRequired": "Wählen Sie eine Organisation für eine organisationseigene Richtlinie.",
       "save": "Richtlinie konnte nicht gespeichert werden.",
       "delete": "Richtlinie konnte nicht gelöscht werden."
     }

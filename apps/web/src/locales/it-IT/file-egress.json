@@ -52,6 +52,7 @@
     "allOrganizations": "Tutte le organizzazioni",
     "partnerWide": "a livello di partner",
     "thisOrganization": "Questa organizzazione",
+    "selectOrganization": "Seleziona un'organizzazione…",
     "add": "Aggiungi",
     "remove": "Rimuovi",
     "save": "Salva criterio",
@@ -62,6 +63,7 @@
     "deleted": "Criterio eliminato.",
     "errors": {
       "nameRequired": "Il nome è obbligatorio.",
+      "orgRequired": "Seleziona un'organizzazione per un criterio di proprietà dell'organizzazione.",
       "save": "Impossibile salvare il criterio.",
       "delete": "Impossibile eliminare il criterio."
     }

@@ -52,6 +52,7 @@
     "allOrganizations": "All organizations",
     "partnerWide": "partner-wide",
     "thisOrganization": "This organization",
+    "selectOrganization": "Select an organization…",
     "add": "Add",
     "remove": "Remove",
     "save": "Save policy",
@@ -62,6 +63,7 @@
     "deleted": "Policy deleted.",
     "errors": {
       "nameRequired": "Name is required.",
+      "orgRequired": "Select an organization for an org-owned policy.",
       "save": "Failed to save policy.",
       "delete": "Failed to delete policy."
     }

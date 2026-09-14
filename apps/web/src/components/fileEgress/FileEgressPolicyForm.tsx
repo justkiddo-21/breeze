@@ -4,6 +4,8 @@ import { X, Plus, Trash2 } from "lucide-react";
 import { fetchWithAuth } from "../../stores/auth";
 import { runAction, ActionError } from "../../lib/runAction";
 import { useDefaultOwnerScope } from "../../hooks/useDefaultOwnerScope";
+import { useOrgScope } from "../../hooks/useOrgScope";
+import { useOrgStore } from "../../stores/orgStore";
 import type { FileEgressPolicy } from "./types";
 
 interface Props {
@@ -15,6 +17,8 @@ export default function FileEgressPolicyForm({ policy, onClose }: Props) {
   const { t } = useTranslation("file-egress");
   const isEdit = !!policy;
   const { isPartnerScope, defaultOwnerScope } = useDefaultOwnerScope();
+  const orgScope = useOrgScope();
+  const organizations = useOrgStore((s) => s.organizations);
 
   const [name, setName] = useState(policy?.name ?? "");
   const [enabled, setEnabled] = useState(policy?.enabled ?? false);
@@ -25,6 +29,13 @@ export default function FileEgressPolicyForm({ policy, onClose }: Props) {
   const [globs, setGlobs] = useState<string[]>(policy?.ignoreGlobs ?? []);
   const [minSize, setMinSize] = useState<number>(policy?.minFileSizeBytes ?? 0);
   const [ownerScope, setOwnerScope] = useState<"organization" | "partner">(defaultOwnerScope);
+  // Org-owned create needs a concrete org id. A partner admin in the "All
+  // organizations" view has no current org, so let them pick one here; default
+  // to whatever org the switcher currently has selected.
+  const [selectedOrgId, setSelectedOrgId] = useState<string>(
+    orgScope.scope === "org" ? orgScope.orgId : "",
+  );
+  const [orgError, setOrgError] = useState<string | null>(null);
 
   const [watchlistDraft, setWatchlistDraft] = useState("");
   const [globDraft, setGlobDraft] = useState("");
@@ -63,7 +74,19 @@ export default function FileEgressPolicyForm({ policy, onClose }: Props) {
       body.id = policy!.id;
     } else if (isPartnerScope) {
       body.ownerScope = ownerScope; // create-only; updates never move ownership axis
+      if (ownerScope === "organization") {
+        // Partner tokens span many orgs, so the server can't infer the target —
+        // it must be sent explicitly or the create fails with
+        // "orgId is required for this scope".
+        if (!selectedOrgId) {
+          setOrgError(t("policyForm.errors.orgRequired"));
+          setSaving(false);
+          return;
+        }
+        body.orgId = selectedOrgId;
+      }
     }
+    setOrgError(null);
     try {
       await runAction({
         request: () =>
@@ -265,6 +288,27 @@ export default function FileEgressPolicyForm({ policy, onClose }: Props) {
                 />
                 <span className="text-sm">{t("policyForm.thisOrganization")}</span>
               </label>
+              {ownerScope === "organization" && (
+                <div className="mt-2 pl-6">
+                  <select
+                    value={selectedOrgId}
+                    onChange={(e) => {
+                      setSelectedOrgId(e.target.value);
+                      setOrgError(null);
+                    }}
+                    data-testid="file-egress-policy-org-select"
+                    className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm"
+                  >
+                    <option value="">{t("policyForm.selectOrganization")}</option>
+                    {organizations.map((o) => (
+                      <option key={o.id} value={o.id}>
+                        {o.name}
+                      </option>
+                    ))}
+                  </select>
+                  {orgError && <p className="mt-1 text-xs text-destructive">{orgError}</p>}
+                </div>
+              )}
             </fieldset>
           )}
         </div>

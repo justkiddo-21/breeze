@@ -52,6 +52,7 @@
     "allOrganizations": "Toutes les organisations",
     "partnerWide": "à l'échelle du partenaire",
     "thisOrganization": "Cette organisation",
+    "selectOrganization": "Sélectionnez une organisation…",
     "add": "Ajouter",
     "remove": "Supprimer",
     "save": "Enregistrer la politique",
@@ -62,6 +63,7 @@
     "deleted": "Politique supprimée.",
     "errors": {
       "nameRequired": "Le nom est requis.",
+      "orgRequired": "Sélectionnez une organisation pour une politique propre à l'organisation.",
       "save": "Échec de l'enregistrement de la politique.",
       "delete": "Échec de la suppression de la politique."
     }
