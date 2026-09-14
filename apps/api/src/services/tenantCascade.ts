@@ -286,6 +286,8 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'escalation_policies',
   'event_delivery_receipts',
   'executive_summaries',
+  'file_egress_events',
+  'file_egress_policies',
   'fleet_finding_devices',
   'fleet_findings',
   'fleet_remediation_run_targets',

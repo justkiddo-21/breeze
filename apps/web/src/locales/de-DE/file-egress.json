@@ -1,0 +1,96 @@
+{
+  "fileEgressPage": {
+    "title": "Datenabfluss (DLP)",
+    "subtitle": "Überwachen Sie Dateien, die Geräte verlassen — kopiert auf USB-Sticks oder Netzwerkfreigaben und über Apps oder den Browser hochgeladen.",
+    "tabs": {
+      "policies": "Richtlinien",
+      "activity": "Aktivität"
+    }
+  },
+  "policiesList": {
+    "new": "Neue Richtlinie",
+    "empty": "Noch keine Richtlinien für Datenabfluss vorhanden. Erstellen Sie eine, um mit der Überwachung zu beginnen.",
+    "allOrgs": "Alle Organisationen",
+    "partnerWideTitle": "Partnerweite Richtlinie — gilt für alle Ihre Organisationen",
+    "loadError": "Richtlinien konnten nicht geladen werden.",
+    "status": {
+      "enabled": "Aktiviert",
+      "disabled": "Deaktiviert"
+    },
+    "columns": {
+      "name": "Name",
+      "scope": "Geltungsbereich",
+      "surfaces": "Bereiche",
+      "status": "Status"
+    },
+    "surfaces": {
+      "removable": "USB",
+      "network": "Netzwerk",
+      "uploads": "Uploads"
+    }
+  },
+  "policyForm": {
+    "newTitle": "Neue Richtlinie für Datenabfluss",
+    "editTitle": "Richtlinie für Datenabfluss bearbeiten",
+    "name": "Name",
+    "enabled": "Überwachung aktiviert",
+    "enabledHint": "Wenn deaktiviert, überwachen Agenten mit dieser zugewiesenen Richtlinie nicht.",
+    "surfacesLegend": "Zu überwachende Bereiche",
+    "watchRemovable": "USB / Wechseldatenträger",
+    "watchNetworkShares": "Netzwerkfreigaben",
+    "watchUploads": "App-/Browser-Uploads",
+    "watchUploadsHint": "Erkennt einen Prozess, der eine Datei liest und sie dann hochlädt (Messenger, Zalo, Browser). Dies ist eine Korrelationsheuristik — sie nennt die Datei, die App und das Ziel, ist aber kein Beweis für den genauen gesendeten Inhalt.",
+    "uploadWatchlist": "Überwachte Prozesse für Uploads",
+    "uploadWatchlistHint": "Prozessnamen, die bei Uploads überwacht werden sollen. Leer lassen, um die integrierte Standardeinstellung zu verwenden (Browser und gängige Chat-Apps).",
+    "uploadWatchlistPlaceholder": "z. B. Zalo.exe",
+    "ignoreGlobs": "Ignoriermuster",
+    "ignoreGlobsHint": "Pfade oder Glob-Muster, die übersprungen werden sollen, z. B. *.tmp oder der Name eines temporären Ordners.",
+    "ignoreGlobsPlaceholder": "z. B. *.tmp",
+    "minFileSize": "Mindestdateigröße (Byte)",
+    "minFileSizeHint": "Dateien ignorieren, die kleiner als dieser Wert sind. 0 = alle melden.",
+    "scope": "Geltungsbereich",
+    "allOrganizations": "Alle Organisationen",
+    "partnerWide": "partnerweit",
+    "thisOrganization": "Diese Organisation",
+    "add": "Hinzufügen",
+    "remove": "Entfernen",
+    "save": "Richtlinie speichern",
+    "cancel": "Abbrechen",
+    "delete": "Löschen",
+    "deleteConfirm": "Diese Richtlinie löschen? Dies kann nicht rückgängig gemacht werden.",
+    "saved": "Richtlinie gespeichert.",
+    "deleted": "Richtlinie gelöscht.",
+    "errors": {
+      "nameRequired": "Name ist erforderlich.",
+      "save": "Richtlinie konnte nicht gespeichert werden.",
+      "delete": "Richtlinie konnte nicht gelöscht werden."
+    }
+  },
+  "eventsTable": {
+    "empty": "Keine Abfluss-Ereignisse in diesem Zeitraum.",
+    "loadError": "Ereignisse konnten nicht geladen werden.",
+    "columns": {
+      "time": "Zeit",
+      "device": "Gerät",
+      "type": "Typ",
+      "file": "Datei",
+      "destination": "Ziel",
+      "process": "Prozess"
+    },
+    "types": {
+      "removable": "USB / Wechseldatenträger",
+      "network_share": "Netzwerkfreigabe",
+      "app_upload": "App-Upload"
+    },
+    "filters": {
+      "type": "Typ",
+      "allTypes": "Alle Typen",
+      "from": "Von",
+      "to": "Bis"
+    },
+    "prev": "Zurück",
+    "next": "Weiter",
+    "showing": "{{from}}–{{to}} von {{total}} werden angezeigt",
+    "none": "—"
+  }
+}

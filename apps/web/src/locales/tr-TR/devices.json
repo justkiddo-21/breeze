@@ -599,6 +599,8 @@
     "cvesDetectedOnThisDevice": "CVE'ler algılandı",
     "peripherals": "Çevre Birimleri",
     "usbBluetoothAndConnectedDevices": "USB, Bluetooth ve bağlı cihazlar",
+    "egress": "Sızıntı",
+    "fileEgressDlp": "Dosya sızıntısı (DLP)",
     "scripts": "Komut Dosyaları",
     "scriptExecutionHistory": "Komut dosyası yürütme geçmişi",
     "management": "Yönetim",

@@ -69,6 +69,10 @@ const namespaceDuplicateBaselines = {
     // Merged #4622 W04 + #5213 W02/W03 deltas (base 165 +4 +5).
     'devices.json': 174,
     'discovery.json': 17,
+    // +3: file-egress.json (Task: file-egress i18n) — "Status" and "USB" are
+    // identical cognates in pt-BR, and the "—" empty-events placeholder is
+    // locale-invariant punctuation (same exemption as ticketTimeBilling.noAmount).
+    'file-egress.json': 3,
     'integrations.json': 23,
     // +1: updateRingList.badges.manual — "Manual" is spelled identically in
     // pt-BR.
@@ -169,6 +173,10 @@ const namespaceDuplicateBaselines = {
     // Merged #4622 W04 + #5213 W02/W03 deltas (base 120 +2 +3).
     'devices.json': 125,
     'discovery.json': 17,
+    // +2: file-egress.json (Task: file-egress i18n) — "USB" is the identical
+    // acronym in es-419, and the "—" empty-events placeholder is locale-invariant
+    // punctuation (same exemption as ticketTimeBilling.noAmount).
+    'file-egress.json': 2,
     'integrations.json': 31,
     // +1: updateRingList.badges.manual — "Manual" is spelled identically in
     // es-419.
@@ -275,6 +283,11 @@ const namespaceDuplicateBaselines = {
     // Merged #4622 W04 + #5213 W02/W03 deltas (base 146 +2 +4).
     'devices.json': 152,
     'discovery.json': 15,
+    // +6: file-egress.json (Task: file-egress i18n) — "USB", "Surfaces",
+    // "Destination" and "Type" (columns.type + filters.type) are the same
+    // words in French, and the "—" empty-events placeholder is
+    // locale-invariant punctuation.
+    'file-egress.json': 6,
     'integrations.json': 38,
     'organizations.json': 8, // W01 #5075: cognates — "Contacts", "Sites", "Tickets", "{{count}} site(s)"; +1 W02: device status "Maintenance" spells identically in fr-FR
     'patches.json': 20,
@@ -386,6 +399,11 @@ const namespaceDuplicateBaselines = {
     // Merged #4622 W04 + #5213 W02/W03 deltas (base 146 +2 +4).
     'devices.json': 152,
     'discovery.json': 15,
+    // +6: file-egress.json (Task: file-egress i18n) — "USB", "Surfaces",
+    // "Destination" and "Type" (columns.type + filters.type) are the same
+    // words in French, and the "—" empty-events placeholder is
+    // locale-invariant punctuation.
+    'file-egress.json': 6,
     'integrations.json': 40,
     'organizations.json': 7, // W01 #5075: cognates — "Contacts", "Sites", "{{count}} site(s)"; +1 W02: device status "Maintenance" spells identically in fr-CA
     'patches.json': 20,
@@ -507,6 +525,11 @@ const namespaceDuplicateBaselines = {
     'devices.json': 164,
     // +1 (#5213 W03): assetTypes.website — "Website" is the German word.
     'discovery.json': 27,
+    // +6: file-egress.json (Task: file-egress i18n) — "USB", "Name" (columns.name
+    // + policyForm.name), "Status" and "Uploads" are identical cognates/loanwords
+    // in de-DE, and the "—" empty-events placeholder is locale-invariant
+    // punctuation.
+    'file-egress.json': 6,
     'integrations.json': 43,
     // +1: updateRingList.badges.os — "OS: {{severities}}" is an acronym plus an
     // interpolation; German uses the same "OS" acronym.
@@ -588,6 +611,10 @@ const namespaceDuplicateBaselines = {
     'common.json': 107, // +1 W06: lists.separator ", " is punctuation
     'devices.json': 144,
     'discovery.json': 22,
+    // +3: file-egress.json (Task: file-egress i18n) — "USB" and "File" are
+    // identical cognates/loanwords in it-IT, and the "—" empty-events
+    // placeholder is locale-invariant punctuation.
+    'file-egress.json': 3,
     'integrations.json': 81,
     'organizations.json': 3, // W01 #5075: "Workspace: {{orgName}}" — Workspace is the Italian UI term; +2 W02: device status "Online"/"Offline" are identical cognates in it-IT
     'patches.json': 18,
@@ -658,6 +685,10 @@ const namespaceDuplicateBaselines = {
     // Merged #4622 W04 + #5213 W02 deltas (base 83 +2 +3).
     'devices.json': 88,
     'discovery.json': 9,
+    // +2: file-egress.json (Task: file-egress i18n) — "USB" is the identical
+    // acronym in tr-TR, and the "—" empty-events placeholder is
+    // locale-invariant punctuation.
+    'file-egress.json': 2,
     'integrations.json': 22,
     'organizations.json': 1, // W01 #5075: cognate — "{{count}} site"
     'patches.json': 11,

@@ -25,6 +25,7 @@ import {
   Layers,
   Timer,
   Usb,
+  Upload,
   Ticket,
   TrendingUp,
   HeartPulse,
@@ -64,6 +65,7 @@ import DeviceChangeHistoryTab from "./DeviceChangeHistoryTab";
 import DeviceBootPerformanceTab from "./DeviceBootPerformanceTab";
 import DevicePlaybookHistory from "./DevicePlaybookHistory";
 import DevicePeripheralsTab from "./DevicePeripheralsTab";
+import DeviceFileEgressTab from "./DeviceFileEgressTab";
 import DeviceWarrantyCard from "./DeviceWarrantyCard";
 import DeviceBillingCard from "./DeviceBillingCard";
 import DeviceUserIdleStat from "./DeviceUserIdleStat";
@@ -113,6 +115,7 @@ type CoreTab =
   | "boot-performance"
   | "playbooks"
   | "peripherals"
+  | "egress"
   | "backup"
   | "linked-profiles"
   | "tickets"
@@ -211,6 +214,7 @@ const VALID_TABS: CoreTab[] = [
   "boot-performance",
   "playbooks",
   "peripherals",
+  "egress",
   "backup",
   "linked-profiles",
   "tickets",
@@ -508,6 +512,12 @@ export default function DeviceDetails({
       label: t("deviceDetails.peripherals"),
       icon: <Usb className="h-4 w-4" />,
       title: t("deviceDetails.usbBluetoothAndConnectedDevices"),
+    },
+    {
+      id: "egress",
+      label: t("deviceDetails.egress"),
+      icon: <Upload className="h-4 w-4" />,
+      title: t("deviceDetails.fileEgressDlp"),
     },
     // --- Management ---
     {
@@ -841,6 +851,13 @@ export default function DeviceDetails({
         <DeviceSecurityTab
           deviceId={device.id}
           orgId={device.orgId}
+          timezone={effectiveTimezone}
+        />
+      )}
+
+      {activeTab === "egress" && (
+        <DeviceFileEgressTab
+          deviceId={device.id}
           timezone={effectiveTimezone}
         />
       )}
