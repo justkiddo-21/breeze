@@ -453,6 +453,12 @@ type agentComponents struct {
 	// exited. Always non-nil (closed immediately when nothing was
 	// started) so callers don't need a nil check.
 	etwluaDone <-chan struct{}
+	// fileEgressCancel stops the Breeze-FileEgress real-time ETW session
+	// (Kernel-File). nil on non-Windows or when init was skipped/failed.
+	fileEgressCancel context.CancelFunc
+	// fileEgressDone closes after the file-egress monitor goroutine has
+	// exited. Always non-nil (closed immediately when nothing was started).
+	fileEgressDone <-chan struct{}
 
 	// supervisorCancel cancels long-lived supervisory goroutines started in
 	// startAgent (currently: the Windows watchdog supervisor). nil on
@@ -513,6 +519,17 @@ func shutdownAgent(comps *agentComponents) {
 		if comps.etwluaDone != nil {
 			components.run("etwlua stop", componentStopStage, func() {
 				<-comps.etwluaDone
+			})
+		}
+	}
+
+	// Same ordering rationale as etwlua: close the Breeze-FileEgress ETW
+	// session before later teardown can time out and orphan it.
+	if comps.fileEgressCancel != nil {
+		comps.fileEgressCancel()
+		if comps.fileEgressDone != nil {
+			components.run("fileegress stop", componentStopStage, func() {
+				<-comps.fileEgressDone
 			})
 		}
 	}
@@ -1020,6 +1037,22 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 		etwluaDone = startETWLua(etwCtx, hb)
 	}
 
+	// File-egress (DLP) monitor: its own real-time ETW session
+	// (Breeze-FileEgress, Kernel-File), independent of the LUA session above.
+	// Skipped in SupportMode for the same reason as etwlua — a transient
+	// support client must not open a second session with the same name
+	// alongside the installed agent. Self-gates on the heartbeat policy, so it
+	// idles until an enabled file_egress_policies row reaches this device.
+	feCtx, feCancel := context.WithCancel(context.Background())
+	var fileEgressDone <-chan struct{}
+	if cfg.SupportMode {
+		closed := make(chan struct{})
+		close(closed)
+		fileEgressDone = closed
+	} else {
+		fileEgressDone = startFileEgress(feCtx, hb)
+	}
+
 	log.Info("agent is running")
 
 	// Write state file so the watchdog can detect a running agent. Support
@@ -1062,6 +1095,8 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 		secureToken:          secureToken,
 		etwluaCancel:         etwCancel,
 		etwluaDone:           etwluaDone,
+		fileEgressCancel:     feCancel,
+		fileEgressDone:       fileEgressDone,
 		supervisorCancel:     supervisorCancel,
 		supervisorDone:       supervisorDone,
 		unifiCancel:          unifiCancel,
