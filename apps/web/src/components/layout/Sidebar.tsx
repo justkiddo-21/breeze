@@ -590,7 +590,7 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
   // Track whether viewport is below lg (1024px) or md (768px) to override mode
   const [isTablet, setIsTablet] = useState(false);  // < 1024px
   const [isMobile, setIsMobile] = useState(false);   // < 768px
-  const { isMobileMenuOpen, closeMobileMenu } = useUiStore();
+  const { isMobileMenuOpen, closeMobileMenu, toggleMobileMenu } = useUiStore();
 
   const [brandName, setBrandName] = useState<string | null>(null);
   const [brandLogoUrl, setBrandLogoUrl] = useState<string | null>(null);
@@ -779,6 +779,20 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
     return () => window.removeEventListener(SIDEBAR_CYCLE_MODE_EVENT, cycleMode);
   }, [cycleMode]);
 
+  // Expand the nav from the collapsed icon rail. In the rail the section icons
+  // are the only always-visible affordance (sub-items are hidden), so clicking
+  // one must reveal the full labeled nav: on tablet/mobile open the slide-out
+  // overlay; on desktop switch to open mode (the header toggle can be squeezed
+  // out of the 64px rail, so this is the reliable escape hatch).
+  const expandFromRail = useCallback(() => {
+    if (isMobile || isTablet) {
+      toggleMobileMenu();
+      return;
+    }
+    setMode('open');
+    try { localStorage.setItem('sidebar-mode', 'open'); } catch { /* Storage unavailable */ }
+  }, [isMobile, isTablet, toggleMobileMenu]);
+
   // Determine if a section is expanded (explicit toggle OR auto-expand)
   const isSectionExpanded = useCallback((sectionId: string): boolean => {
     // If user has explicitly toggled this section, respect that
@@ -939,11 +953,20 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
     return (
       <div key={section.id}>
         <div className="my-2 border-t" />
-        {/* In collapsed mode (no labels), show only the section icon */}
+        {/* In collapsed mode (no labels), the section icon is the only visible
+            affordance and its sub-items are hidden — so make it a button that
+            expands the nav, otherwise the rail is a dead end (you can see e.g.
+            Security but can't open it). */}
         {!labels ? (
-          <div className="flex justify-center py-1.5">
+          <button
+            type="button"
+            onClick={expandFromRail}
+            title={section.labelKey ? t(/* i18n-dynamic */ section.labelKey, { defaultValue: section.label }) : section.label}
+            aria-label={section.labelKey ? t(/* i18n-dynamic */ section.labelKey, { defaultValue: section.label }) : section.label}
+            className="flex w-full justify-center rounded-md py-1.5 cursor-pointer hover:bg-muted"
+          >
             <section.icon className="h-4 w-4 text-muted-foreground/70" />
-          </div>
+          </button>
         ) : (
           <button
             onClick={() => toggleSection(section.id)}
