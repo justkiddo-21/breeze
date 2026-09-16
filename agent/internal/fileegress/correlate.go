@@ -35,9 +35,15 @@ import (
 // deliberately excluded (they read cache/profile files and open connections
 // constantly); add them via policy uploadProcessWatchlist if desired.
 var defaultUploadWatchlist = []string{
+	// Windows executable names.
 	"zalo.exe", "messenger.exe", "telegram.exe", "skype.exe",
 	"discord.exe", "viber.exe", "whatsapp.exe", "slack.exe",
 	"lark.exe", "wechat.exe", "line.exe",
+	// Linux native chat-client binaries (from /proc/<pid>/exe basename). Web
+	// Zalo/Messenger run inside a browser, which is deliberately excluded as too
+	// noisy — add a browser via policy uploadProcessWatchlist if you accept that.
+	"zalo", "telegram-desktop", "telegram", "discord", "slack",
+	"signal-desktop", "viber", "whatsapp", "element-desktop", "wechat", "skypeforlinux",
 }
 
 // uploadInterestingExts are document/data/archive/media types worth flagging as
@@ -52,22 +58,31 @@ var uploadInterestingExts = map[string]bool{
 	".key": true, ".pem": true, ".pfx": true, ".p12": true,
 }
 
-// excludedPathParts are lowercased substrings that mark app-internal / system
-// locations. A source path containing any of these is NOT user-egress-worthy,
-// even with an interesting extension — this is the single biggest FP filter
-// (browser/app cache + profile churn).
+// excludedPathParts are lowercased substrings (forward-slash normalized) that
+// mark app-internal / system locations. A source path containing any of these
+// is NOT user-egress-worthy, even with an interesting extension — this is the
+// single biggest FP filter (browser/app cache + profile churn). Covers both
+// Windows and Linux locations since paths are normalized to '/' before matching.
 var excludedPathParts = []string{
-	`\appdata\`, `\local settings\`, `\windows\`, `\program files`,
-	`\programdata\`, `$recycle.bin`, `\$recycle`, `\temp\`, `\tmp\`,
-	`\cache`, `\code cache`, `\service worker`, `\cookies`, `\gpucache`,
-	`\crashpad`, `\indexeddb`, `\microsoft\`, `\packages\`,
+	// Windows.
+	`/appdata/`, `/local settings/`, `/windows/`, `/program files`,
+	`/programdata/`, `$recycle.bin`, `/$recycle`, `/code cache`,
+	`/service worker`, `/cookies`, `/gpucache`, `/crashpad`,
+	`/indexeddb`, `/microsoft/`, `/packages/`,
+	// Cross-platform noise.
+	`/temp/`, `/tmp/`, `/cache`,
+	// Linux app/system locations.
+	`/.cache/`, `/.config/`, `/.local/`, `/.mozilla/`, `/.thunderbird/`,
+	`/.var/`, `/snap/`, `/proc/`, `/sys/`, `/var/`, `/usr/`, `/etc/`,
 }
 
-// userDocMarkers are lowercased substrings that mark a genuine user document
-// location. A local path must contain one (UNC shares are allowed separately).
+// userDocMarkers are lowercased substrings (forward-slash normalized) that mark
+// a genuine user document location. A local path must contain one (UNC shares
+// are allowed separately). Linux home dirs use the same lowercase folder names.
 var userDocMarkers = []string{
-	`\documents\`, `\desktop\`, `\downloads\`, `\pictures\`,
-	`\my documents\`, `\onedrive\`, `\dropbox\`, `\google drive\`,
+	`/documents/`, `/desktop/`, `/downloads/`, `/pictures/`,
+	`/my documents/`, `/onedrive/`, `/dropbox/`, `/google drive/`,
+	`/videos/`, `/music/`,
 }
 
 type openRec struct {
@@ -310,7 +325,9 @@ func isInterestingUploadPath(path string) bool {
 	if path == "" {
 		return false
 	}
-	p := strings.ToLower(strings.ReplaceAll(path, "/", `\`))
+	// Normalize to lowercase forward-slash so one set of markers matches both
+	// Windows (C:\Users\…\Documents) and Linux (/home/…/Documents) paths.
+	p := strings.ToLower(strings.ReplaceAll(path, `\`, "/"))
 	ext := filepath.Ext(p)
 	if !uploadInterestingExts[ext] {
 		return false
@@ -320,8 +337,9 @@ func isInterestingUploadPath(path string) bool {
 			return false
 		}
 	}
-	// UNC share (\\server\share\...) counts as a user location.
-	if strings.HasPrefix(p, `\\`) {
+	// UNC share (\\server\share\... -> //server/share/...) counts as a user
+	// location.
+	if strings.HasPrefix(p, `//`) {
 		return true
 	}
 	for _, good := range userDocMarkers {

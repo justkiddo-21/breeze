@@ -20,11 +20,11 @@ import (
 )
 
 // fanotifySubscriber watches removable and network-share mounts for finished
-// writes (FAN_CLOSE_WRITE) — a file landing on a USB stick or an SMB/NFS share.
-// This is the Linux wave-2a surface, the analogue of the Windows Kernel-File
-// Create capture in monitor_windows.go. The read→upload correlation (wave-2b)
-// is not built here: it needs a network-side source (netlink/eBPF) that Linux
-// fanotify does not provide.
+// writes (FAN_CLOSE_WRITE) — a file landing on a USB stick or an SMB/NFS share
+// (wave-2a, the analogue of the Windows Kernel-File Create capture). It also
+// drives wave-2b (read→upload correlation): since fanotify has no network side,
+// that runs as a /proc poller (uploadPollLoop in upload_linux.go) feeding the
+// shared correlator, rather than the Windows ETW network/DNS streams.
 type fanotifySubscriber struct {
 	fd     int
 	events chan Event
@@ -35,6 +35,11 @@ type fanotifySubscriber struct {
 
 	mu     sync.Mutex
 	marked map[string]string // mountPoint -> egressType (already FAN_MARK'd)
+
+	// wave-2b: read→upload correlation, fed by the /proc poller in
+	// upload_linux.go (no system-wide fanotify FAN_OPEN — see uploadPollLoop).
+	corr     *correlator
+	connSeen map[string]time.Time // "pid|ip|port" -> last onConnect, to avoid re-firing
 }
 
 const fanotifyEventBufSize = 16 * 1024
@@ -52,18 +57,21 @@ func NewSubscriber(poster Poster) (Subscriber, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &fanotifySubscriber{
-		fd:     fd,
-		events: make(chan Event, 256),
-		poster: poster,
-		ctx:    ctx,
-		cancel: cancel,
-		marked: make(map[string]string),
+		fd:       fd,
+		events:   make(chan Event, 256),
+		poster:   poster,
+		ctx:      ctx,
+		cancel:   cancel,
+		marked:   make(map[string]string),
+		corr:     newCorrelator(poster.FileEgressConfig()),
+		connSeen: make(map[string]time.Time),
 	}
 	// Mark whatever egress mounts exist now; markLoop picks up later plug-ins.
 	s.refreshMarks()
-	s.wg.Add(2)
-	go s.readLoop()
-	go s.markLoop()
+	s.wg.Add(3)
+	go s.readLoop()       // wave-2a: removable/network-share writes (fanotify)
+	go s.markLoop()       // re-scan mounts for USB plug-ins
+	go s.uploadPollLoop() // wave-2b: read→upload correlation (/proc poller)
 	return s, nil
 }
 
