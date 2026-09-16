@@ -289,8 +289,22 @@ var serviceInstallCmd = &cobra.Command{
 			if started {
 				agentStateLine = "The agent service is installed and running."
 			}
+			// Fork fix (see the Windows equivalent): the fork publishes no signed
+			// release manifest, so the auto-download watchdog path 404s. If a
+			// breeze-watchdog binary sits next to the agent (the install one-liner
+			// places it), copy it root-owned into /usr/local/bin so bootstrapWatchdog
+			// takes the manifest-free "protected packaged sibling" path.
+			if wdSrc := filepath.Join(filepath.Dir(exePath), "breeze-watchdog"); fileExists(wdSrc) && wdSrc != linuxWatchdogBinaryPath {
+				if data, rErr := os.ReadFile(wdSrc); rErr != nil {
+					fmt.Fprintf(os.Stderr, "Warning: could not read local watchdog: %v\n", rErr)
+				} else if wErr := os.WriteFile(linuxWatchdogBinaryPath, data, 0o755); wErr != nil {
+					fmt.Fprintf(os.Stderr, "Warning: could not stage local watchdog: %v\n", wErr)
+				} else {
+					_ = os.Chown(linuxWatchdogBinaryPath, 0, 0) // root-owned for the protected-sibling check
+				}
+			}
 			err := bootstrapWatchdog(bootstrapOptions{
-				agentPath: exePath,
+				agentPath: linuxBinaryPath,
 				version:   version,
 				goos:      runtime.GOOS,
 				goarch:    runtime.GOARCH,

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"time"
 
@@ -125,6 +126,18 @@ var serviceInstallCmd = &cobra.Command{
 		}
 
 		if !noWatchdog {
+			// Fork fix: the fork does not publish the signed Ed25519 release
+			// manifest that the download path verifies against (only LanternOps
+			// can sign it), so an auto-download watchdog bootstrap 404s. If the
+			// operator placed breeze-watchdog.exe next to the agent (the install
+			// one-liner does), stage it into the protected Program Files dir so
+			// bootstrapWatchdog takes the manifest-free "protected packaged
+			// sibling" path — exactly the layout the MSI produces.
+			if wdSrc := filepath.Join(filepath.Dir(exePath), "breeze-watchdog.exe"); fileExists(wdSrc) {
+				if _, _, err := serviceinstall.InstallProtectedBinary(wdSrc, "breeze-watchdog.exe"); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: could not stage local watchdog into the protected dir: %v\n", err)
+				}
+			}
 			err := bootstrapWatchdog(bootstrapOptions{
 				agentPath: serviceExePath,
 				version:   version,
