@@ -3,6 +3,7 @@
 package agentapp
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -27,6 +28,8 @@ var serviceCmd = &cobra.Command{
 func reconcileServiceUnitIfNeeded() {}
 
 var noWatchdog bool
+var installUninstallPassword string
+var uninstallPassword string
 
 func init() {
 	rootCmd.AddCommand(serviceCmd)
@@ -35,6 +38,10 @@ func init() {
 	serviceCmd.AddCommand(serviceStartCmd)
 	serviceCmd.AddCommand(serviceStopCmd)
 	serviceInstallCmd.Flags().BoolVar(&noWatchdog, "no-watchdog", false, "Skip automatic watchdog installation")
+	serviceInstallCmd.Flags().StringVar(&installUninstallPassword, "uninstall-password", "",
+		"Require this password for `service uninstall` (tamper-resistance). Stored hashed under HKLM.")
+	serviceUninstallCmd.Flags().StringVar(&uninstallPassword, "password", "",
+		"Uninstall password, if one was set at install time with --uninstall-password.")
 }
 
 var serviceInstallCmd = &cobra.Command{
@@ -140,6 +147,23 @@ var serviceInstallCmd = &cobra.Command{
 			}
 		}
 
+		// Tamper-resistance: if an uninstall password was supplied, store its
+		// hash so `service uninstall` will demand it. The service exists at this
+		// point (outcome.Installed), so it is safe to arm the guard even when the
+		// service could not be started. Failure here is non-fatal — the service
+		// is installed either way; we just warn that the guard is not armed.
+		if installUninstallPassword != "" {
+			hash, hErr := hashUninstallPassword(installUninstallPassword)
+			if hErr == nil {
+				hErr = storeUninstallGuard(hash)
+			}
+			if hErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not arm the uninstall password guard: %v\n", hErr)
+			} else {
+				fmt.Println("Uninstall password guard armed: `service uninstall` now requires --password.")
+			}
+		}
+
 		// Reported last, and as a non-zero exit: the service is registered but
 		// not running, and the watchdog still needed installing first so it can
 		// recover the host. Exiting 0 here is what let the Linux half of this
@@ -158,6 +182,21 @@ var serviceUninstallCmd = &cobra.Command{
 	Use:   "uninstall",
 	Short: "Uninstall the agent Windows service",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// Tamper-resistance: if an uninstall password was armed at install time,
+		// require it here. A determined admin can still remove the service
+		// directly (sc delete) or via the nuke script — this only stops a
+		// casual/accidental `service uninstall`.
+		if guardHash, found, gErr := readUninstallGuard(); gErr != nil {
+			return fmt.Errorf("failed to read uninstall guard: %w", gErr)
+		} else if found {
+			if uninstallPassword == "" {
+				return errors.New("this agent is password-protected against uninstall; pass --password <password>")
+			}
+			if !verifyUninstallPassword(guardHash, uninstallPassword) {
+				return errors.New("incorrect uninstall password")
+			}
+		}
+
 		m, err := mgr.Connect()
 		if err != nil {
 			return fmt.Errorf("failed to connect to SCM (run as Administrator): %w", err)
@@ -187,6 +226,11 @@ var serviceUninstallCmd = &cobra.Command{
 
 		if err := s.Delete(); err != nil {
 			return fmt.Errorf("failed to delete service: %w", err)
+		}
+
+		// Clear the guard so a later reinstall isn't blocked by a stale hash.
+		if err := clearUninstallGuard(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not clear the uninstall guard: %v\n", err)
 		}
 
 		fmt.Printf("Service %q uninstalled.\n", windowsServiceName)
