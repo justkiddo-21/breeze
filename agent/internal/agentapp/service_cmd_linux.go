@@ -122,6 +122,10 @@ func init() {
 	serviceCmd.AddCommand(serviceReconcileUnitCmd)
 	serviceInstallCmd.Flags().BoolVar(&withUserHelper, "with-user-helper", false, "Also install the per-user desktop helper systemd unit")
 	serviceInstallCmd.Flags().BoolVar(&noWatchdog, "no-watchdog", false, "Skip automatic watchdog installation")
+	serviceInstallCmd.Flags().StringVar(&installUninstallPassword, "uninstall-password", "",
+		"Require this password for `service uninstall` (tamper-resistance). Stored hashed root-only under /etc/breeze.")
+	serviceUninstallCmd.Flags().StringVar(&uninstallPassword, "password", "",
+		"Uninstall password, if one was set at install time with --uninstall-password.")
 	// A failed start returns an error from RunE; usage text would bury it.
 	serviceInstallCmd.SilenceUsage = true
 }
@@ -304,6 +308,21 @@ var serviceInstallCmd = &cobra.Command{
 			}
 		}
 
+		// Tamper-resistance: arm the uninstall password guard if requested. The
+		// unit is installed at this point, so it is safe to arm even if the
+		// service could not start. Non-fatal on failure.
+		if installUninstallPassword != "" {
+			hash, hErr := hashUninstallPassword(installUninstallPassword)
+			if hErr == nil {
+				hErr = storeUninstallGuard(hash)
+			}
+			if hErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not arm the uninstall password guard: %v\n", hErr)
+			} else {
+				fmt.Println("Uninstall password guard armed: `service uninstall` now requires --password.")
+			}
+		}
+
 		// Reported last so the watchdog still gets bootstrapped, but reported:
 		// a silent exit 0 on a host whose agent is down is exactly how #5252
 		// went unnoticed until the device showed Offline.
@@ -317,6 +336,20 @@ var serviceUninstallCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if os.Geteuid() != 0 {
 			return fmt.Errorf("must run as root (sudo breeze-agent service uninstall)")
+		}
+
+		// Tamper-resistance: honor a uninstall password if one was armed. A root
+		// user can still bypass this with systemctl/rm directly — this only stops
+		// a casual/accidental `service uninstall`.
+		if guardHash, found, gErr := readUninstallGuard(); gErr != nil {
+			return fmt.Errorf("failed to read uninstall guard: %w", gErr)
+		} else if found {
+			if uninstallPassword == "" {
+				return fmt.Errorf("this agent is password-protected against uninstall; pass --password <password>")
+			}
+			if !verifyUninstallPassword(guardHash, uninstallPassword) {
+				return fmt.Errorf("incorrect uninstall password")
+			}
 		}
 
 		// Stop the service
@@ -347,6 +380,11 @@ var serviceUninstallCmd = &cobra.Command{
 		// Remove binary
 		if err := os.Remove(linuxBinaryPath); err != nil && !os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "Warning: failed to remove %s: %v\n", linuxBinaryPath, err)
+		}
+
+		// Clear the guard so a later reinstall isn't blocked by a stale hash.
+		if err := clearUninstallGuard(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not clear the uninstall guard: %v\n", err)
 		}
 
 		fmt.Println("Breeze Agent service uninstalled.")

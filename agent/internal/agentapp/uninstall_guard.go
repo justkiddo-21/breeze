@@ -20,6 +20,14 @@ import (
 
 const uninstallGuardSaltLen = 16
 
+// Shared flag targets for `service install --uninstall-password` and
+// `service uninstall --password`, declared here (untagged) so both the Windows
+// and Linux service command files bind to the same variables.
+var (
+	installUninstallPassword string
+	uninstallPassword        string
+)
+
 // hashUninstallPassword returns "saltHex:hashHex" for the given password.
 func hashUninstallPassword(password string) (string, error) {
 	if password == "" {

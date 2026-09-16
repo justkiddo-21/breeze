@@ -28,8 +28,6 @@ var serviceCmd = &cobra.Command{
 func reconcileServiceUnitIfNeeded() {}
 
 var noWatchdog bool
-var installUninstallPassword string
-var uninstallPassword string
 
 func init() {
 	rootCmd.AddCommand(serviceCmd)
