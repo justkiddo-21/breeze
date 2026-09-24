@@ -84,15 +84,26 @@ vi.mock('./quotePdf', async (importOriginal) => {
 
 vi.mock('./email', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./email')>();
-  return { ...actual, getEmailService: vi.fn(() => ({ sendEmail: sendEmailMock, fromWithDisplayName: (name: string) => `"${name}" <no-reply@test.example>` })) };
+  return { ...actual, getEmailService: vi.fn(() => ({ sendEmail: sendEmailMock })) };
 });
+
+// W04: the real resolveSender runs over the envelope this suite captures, with
+// only the database lookup mocked. This is what makes the assertion below
+// non-vacuous — `getEmailService` is mocked wholesale here, so asserting on
+// sendEmailMock alone could never prove the partner lane is REACHABLE.
+vi.mock('./emailDomains/partnerLaneLookup', () => ({
+  lookupPartnerLaneIdentity: vi.fn(async () => ({
+    ok: true, partnerName: 'Acme MSP', localPart: 'billing', displayName: null,
+    replyTo: null, domainId: 'd1', domain: 'mail.acmemsp.example',
+  })),
+}));
 
 vi.mock('./quoteDeviceSet', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./quoteDeviceSet')>();
   return { ...actual, countQuoteDeviceSetLines: vi.fn() };
 });
 
-import { buildPublicQuoteAcceptUrl, portalBase, sendQuote, resendQuote, getQuoteShareLink } from './quoteLifecycle';
+import { buildPublicQuoteAcceptUrl, portalBase, sendQuote, resendQuote, getQuoteShareLink, assertQuoteSendGates } from './quoteLifecycle';
 import { renderQuotePdf } from './quotePdf';
 import { countQuoteDeviceSetLines } from './quoteDeviceSet';
 
@@ -226,6 +237,25 @@ describe('quoteLifecycle portal URL', () => {
     const url = buildPublicQuoteAcceptUrl('a/b?c#d');
     expect(url).toBe('https://example.com/portal/quote/a%2Fb%3Fc%23d');
     expect(new URL(url).pathname).toBe('/portal/quote/a%2Fb%3Fc%23d');
+  });
+});
+
+// #6637: `action` used to default to 'send', which let a caller silently reuse
+// send-flavored gate messages for a non-send flow. Both real callers already
+// pass the verb explicitly (sendQuote → 'send', quoteAcceptService → 'accept'),
+// so this only needs to prove the compiler now refuses an omitted argument —
+// a type-level regression test, not a runtime one.
+describe('assertQuoteSendGates requires an explicit action', () => {
+  it('rejects a call with the action argument omitted (compile-time only)', () => {
+    // Dead code, same pattern as userSession.types.test.ts / schemas.test.ts:
+    // this branch never runs, it exists solely for tsc to typecheck (which it
+    // still does on unreachable code) — so there is nothing here for a future
+    // change to `assertQuoteSendGates`'s body to break for unrelated reasons.
+    if (false) {
+      // @ts-expect-error — action is required now; this line must fail to compile.
+      assertQuoteSendGates({} as never, [], [], []);
+    }
+    expect(true).toBe(true);
   });
 });
 
@@ -633,12 +663,40 @@ describe('sendQuote email delivery status', () => {
     // #3905 — delivery is deferred out of the send transaction.
     await (await sendQuote('q1', actor)).deliverEmail();
 
+    // The From itself is now decided inside EmailService and pinned by
+    // email.golden.test.ts ('"Acme MSP via Breeze" <EMAIL_FROM address>' for
+    // quote.sent). What THIS site is responsible for is naming the purpose and
+    // handing over the partner it already read.
     expect(sendEmailMock).toHaveBeenCalledWith(expect.objectContaining({
-      // Display name is the MSP ("via Breeze" keeps the platform address honest);
-      // the envelope address itself stays the platform's for SPF/DKIM alignment.
-      from: '"Acme MSP via Breeze" <no-reply@test.example>',
+      purpose: 'quote.sent',
+      partnerId: 'p1',
+      partnerName: 'Acme MSP',
       replyTo: 'accounts@acmemsp.example',
     }));
+    expect(sendEmailMock.mock.calls[0]![0]).not.toHaveProperty('from');
+
+    // …and that the id it hands over is enough to REACH the partner lane.
+    // Fails the moment this call site regresses to partnerId: null — which
+    // costs nothing at runtime and switches `billing` off for every quote.
+    const { resolveSender } = await import('./emailDomains/senderResolution');
+    process.env.EMAIL_DOMAINS_PROVIDER = 'fake';
+    process.env.EMAIL_DOMAINS_DAILY_SEND_CAP = '0';
+    delete process.env.EMAIL_DOMAINS_PARTNER_ALLOWLIST;
+    try {
+      const envelope = sendEmailMock.mock.calls[0]![0] as {
+        purpose: 'quote.sent'; partnerId: string | null; partnerName?: string | null;
+      };
+      const resolved = await resolveSender({
+        purpose: envelope.purpose,
+        partnerId: envelope.partnerId,
+        partnerName: envelope.partnerName,
+        defaultFrom: 'Breeze <no-reply@test.example>',
+      });
+      expect(resolved).toMatchObject({ lane: 'partner', from: '"Acme MSP" <billing@mail.acmemsp.example>' });
+    } finally {
+      delete process.env.EMAIL_DOMAINS_PROVIDER;
+      delete process.env.EMAIL_DOMAINS_DAILY_SEND_CAP;
+    }
   });
 
   it('uses composer recipients + cc over the billing-contact fallback', async () => {

@@ -21,6 +21,10 @@ import { eq, and, isNull, inArray } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import { buildOrgAccessClosures } from '../middleware/auth';
 import type { AiStreamEvent, AiApprovalMode } from '@breeze/shared/types/ai';
+// TYPE-ONLY, and it must stay that way: chatRunBridge.ts imports this module at
+// runtime for `streamingSessionManager.get`, so a value import back would be a
+// real runtime cycle. TypeScript erases this one.
+import type { PendingRunResult } from './workspace/chatRunBridge';
 import { AsyncEventQueue } from '../utils/asyncQueue';
 import {
   recordUsageFromSdkResult,
@@ -42,6 +46,8 @@ import { getLlmEgressProxy } from './llm/llmEgressProxy';
 import { recordLlmEgressEvent } from './llm/llmEgressRecorder';
 import { markAiBudgetReservationIndeterminate } from './aiBudgetReservations';
 import { getEffectiveAiBudget } from './effectiveSettings';
+import { resolveTenantTools, type TenantToolDescriptor } from './toolSources/resolver';
+import { buildTenantSdkTools, tenantMcpToolNames } from './toolSources/sdkBridge';
 
 const SESSION_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2h idle eviction (aligned with pre-flight check)
 const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24h hard limit
@@ -580,6 +586,17 @@ export interface ActiveSession {
   currentPlanStepIndex: number;
   /** Resolver for the plan approval promise (in-memory, no DB polling) */
   planApprovalResolver: ((approved: boolean) => void) | null;
+  /**
+   * Results of `analysis` runs associated with this session that have
+   * finished but whose summary has not yet been shown to the model
+   * (execution-plane spec §5.5). Chat-initiated launch is currently disabled
+   * (#6086), so nothing populates this from a live chat turn today; the field
+   * is retained for when delegated authorization lands. Filled by
+   * `services/workspace/chatRunBridge.ts` out of band; drained by
+   * `POST /ai/sessions/:id/messages` and prepended to the next user message.
+   * Optional so existing `ActiveSession` fixtures compile unchanged.
+   */
+  pendingRunResults?: PendingRunResult[];
   // ── AI for Office (client sessions) — set by routes/clientAi/sessions.ts ──
   /** Client org policy writeMode, refreshed on every client message; the
    *  client tool handler rejects mutating tools when 'readonly'. */
@@ -590,6 +607,15 @@ export interface ActiveSession {
   /** Extra per-turn usage recorder invoked in the result case alongside
    *  recordUsageFromSdkResult (client sessions: per-user client_ai_usage buckets). */
   recordExtraUsage?: (usage: { inputTokens: number; outputTokens: number; costCents: number }) => Promise<void>;
+  /**
+   * Tenant (BYO MCP) tools this session's `toolAuth` could see at session
+   * CREATION time, keyed by qualified name (e.g. `hudu__get_asset`) — Task
+   * A10. `createSessionPreToolUse` (aiAgentSdk.ts) consults this to gate a
+   * tenant tool call the same way `TOOL_TIERS` gates a core one. Empty for
+   * every session a `mcpServerFactory` builds its own MCP server for
+   * (script builder, client AI) — those surfaces don't resolve tenant tools.
+   */
+  tenantTools: ReadonlyMap<string, TenantToolDescriptor>;
 }
 
 /**
@@ -619,6 +645,21 @@ export interface ActiveSession {
  * in practice (`getSession` pre-filters by `auth.orgCondition`), but if auth
  * ever regresses we must fail loudly rather than run tools cross-org.
  */
+/**
+ * Stamp the interactive-chat AI origin onto a request AuthContext (#5022 W01).
+ *
+ * `breezeSessionId` is the persisted `ai_sessions.id` — not an MCP transport
+ * session id — so the resulting pointer is resolvable by the device-page chip.
+ * Returns the same reference when the origin is already correct, so a caller
+ * that identity-compares is not surprised.
+ */
+export function withChatAiOrigin(auth: AuthContext, breezeSessionId: string): AuthContext {
+  if (auth.aiOrigin?.kind === 'ai_assistant' && auth.aiOrigin.sessionId === breezeSessionId) {
+    return auth;
+  }
+  return { ...auth, aiOrigin: { kind: 'ai_assistant', sessionId: breezeSessionId } };
+}
+
 export function buildDeviceBoundSessionAuth(auth: AuthContext, sessionOrgId: string): AuthContext {
   if (!auth.canAccessOrg(sessionOrgId)) {
     throw new Error('Device-bound AI session org is not accessible to the caller');
@@ -694,11 +735,34 @@ export class StreamingSessionManager {
    * Rejects only true concurrent work and teardown/closed sessions.
    * Returns true if successful, false if session is not in a valid state.
    */
-  tryTransitionToProcessing(session: ActiveSession): boolean {
+  /**
+   * Claim the session's single turn slot, and — atomically with that claim —
+   * attach the reservation that turn will settle.
+   *
+   * #5557: `budgetReservationId` used to be assigned only when the session was
+   * CREATED, so from the second message onward on a warm in-memory session the
+   * reservation the route had just taken never reached the settle path: the
+   * turn's spend was recorded unsettled and the hold — the org's ENTIRE
+   * remaining cap — sat until the 30-minute sweep, locking the tenant out of
+   * its own budget.
+   *
+   * The attach belongs HERE and not in `getOrCreate` because `getOrCreate`
+   * awaits (`loadApprovalMode`) before returning, so two concurrent callers can
+   * attach and then return in the opposite order: the winner of the slot would
+   * be left carrying the LOSER's reservation, and the loser would release it —
+   * out from under a live dispatch — on its 409 path. This method has no
+   * awaits, so the claim and the attach cannot interleave: whoever takes the
+   * slot attaches their own reservation, and every loser releases a reservation
+   * that was never attached to anything.
+   */
+  tryTransitionToProcessing(session: ActiveSession, budgetReservationId?: string): boolean {
     if (session.state === 'processing' || session.state === 'closing' || session.state === 'closed') {
       return false;
     }
     session.state = 'processing';
+    if (budgetReservationId !== undefined) {
+      session.budgetReservationId = budgetReservationId;
+    }
     // The state and its staleness clock move together: eviction reads
     // lastActivityAt to tell a live turn from a wedged one, and before this the
     // stamp was refreshed only in getOrCreate() — so a session that had been
@@ -785,10 +849,14 @@ export class StreamingSessionManager {
         // `existing.orgId` snapshot captured at session creation — this is the
         // current DB value, so it survives the device being moved to a
         // different org mid-session.
-        reusable.auth = auth;
+        // #5022 W01: re-mint the chat origin on the REFRESHED auth. Stamping
+        // only at creation loses the origin on every follow-up message, since
+        // the request auth handed in here is built fresh per request.
+        const refreshedAuthWithOrigin = withChatAiOrigin(auth, breezeSessionId);
+        reusable.auth = refreshedAuthWithOrigin;
         reusable.toolAuth = reusable.deviceId
-          ? buildDeviceBoundSessionAuth(auth, dbSession.orgId)
-          : auth;
+          ? buildDeviceBoundSessionAuth(refreshedAuthWithOrigin, dbSession.orgId)
+          : refreshedAuthWithOrigin;
         reusable.auditSnapshot = snapshot;
         reusable.allowedTools = allowedTools;
         // Re-resolve the approval mode so a settings change applies to the NEXT
@@ -832,7 +900,41 @@ export class StreamingSessionManager {
     // is narrowed to the session org; `auth` stays raw so RBAC, rate limits,
     // and audit attribution keep resolving the login identity/role.
     const deviceId = dbSession.deviceId ?? null;
-    const toolAuth = deviceId ? buildDeviceBoundSessionAuth(auth, dbSession.orgId) : auth;
+    // #5022 W01: the AI-surface mint site for interactive chat. `breezeSessionId`
+    // IS the persisted `ai_sessions.id`, so it is the id a device-page chip can
+    // resolve back to a conversation. Applied to BOTH `auth` and `toolAuth`:
+    // the act/verify bypass lanes read the carrier off `auth`, while every
+    // MCP tool handler reads `toolAuth`.
+    const authWithOrigin = withChatAiOrigin(auth, breezeSessionId);
+    const toolAuth = deviceId
+      ? buildDeviceBoundSessionAuth(authWithOrigin, dbSession.orgId)
+      : authWithOrigin;
+
+    // Tenant (BYO MCP) tools — Task A10. Script-builder / client-AI sessions
+    // supply their own `mcpServerFactory` and keep their own (non-Breeze)
+    // server, so they never resolve tenant tools.
+    //
+    // A throw here (a source unreachable, a decrypt failure, a Redis blip in
+    // the resolver's own guardrail checks) must not fail the WHOLE chat turn
+    // — the MCP surface deliberately degrades per-source (see
+    // toolSources/discovery.ts), so a session simply loses its tenant tools
+    // for this turn rather than erroring out entirely. Mirrors
+    // `loadApprovalMode`'s degrade-on-failure shape above.
+    let tenantDescriptors: TenantToolDescriptor[] = [];
+    if (!mcpServerFactory) {
+      try {
+        // `dbSession.orgId` is this session's pinned, already-access-checked
+        // org (see the device-bound comment above) — passed as `targetOrgId`
+        // so a partner-scoped tech's session can resolve that org's own tool
+        // sources too, not just partner-wide ones (#6023). A no-op for
+        // org-scoped `toolAuth`, which ignores `targetOrgId`.
+        tenantDescriptors = await resolveTenantTools(toolAuth, dbSession.orgId);
+      } catch (err) {
+        captureException(err);
+        console.error('[StreamingSessionManager] Failed to resolve tenant tools, degrading to none:', err);
+      }
+    }
+    const tenantToolsByName = new Map(tenantDescriptors.map((d) => [d.qualifiedName, d]));
 
     // Build partial session object so callbacks can reference it.
     // query and processorPromise are filled in after creation.
@@ -864,7 +966,7 @@ export class StreamingSessionManager {
       state: 'initializing',
       lastActivityAt: now,
       createdAt: now,
-      auth,
+      auth: authWithOrigin,
       toolAuth,
       auditSnapshot: snapshot,
       mcpServer: null as unknown as McpSdkServerConfigWithInstance, // set below
@@ -885,6 +987,8 @@ export class StreamingSessionManager {
       approvedPlanSteps: new Map(),
       currentPlanStepIndex: 0,
       planApprovalResolver: null,
+      pendingRunResults: [],
+      tenantTools: tenantToolsByName,
     };
 
     // Create session-scoped callbacks (close over session object)
@@ -900,7 +1004,23 @@ export class StreamingSessionManager {
       mcpServer = custom.server;
       mcpServerName = custom.name;
     } else {
-      mcpServer = createBreezeMcpServer(() => session.toolAuth, preToolUse, postToolUse, () => session);
+      mcpServer = createBreezeMcpServer(
+        () => session.toolAuth,
+        preToolUse,
+        postToolUse,
+        () => session,
+        // `session.orgId` is set ONCE at session creation and never refreshed
+        // on reuse (unlike `session.toolAuth`, which the reuse branch above
+        // re-narrows to the CURRENT device org every turn, #3087). Since
+        // `execute.ts` now threads this org through the dispatch-time
+        // OWNER-predicate reload (#6023), a stale `session.orgId` would let a
+        // device-bound session keep dispatching a tool under its OLD org's
+        // credentials after the device moved — read `session.toolAuth.orgId`
+        // (fresh every turn for a device-bound session) and fall back to
+        // `session.orgId` only when `toolAuth` carries none (non-device
+        // sessions, whose org doesn't drift the same way).
+        buildTenantSdkTools(tenantDescriptors, () => session.toolAuth, () => session.toolAuth.orgId ?? session.orgId),
+      );
     }
     session.mcpServer = mcpServer;
     session.mcpPrefix = `mcp__${mcpServerName}__`;
@@ -1041,7 +1161,7 @@ export class StreamingSessionManager {
             maxTurns,
             maxBudgetUsd,
             tools: [],
-            allowedTools: allowedTools ?? BREEZE_MCP_TOOL_NAMES,
+            allowedTools: allowedTools ?? [...BREEZE_MCP_TOOL_NAMES, ...tenantMcpToolNames(tenantDescriptors)],
             mcpServers: { [mcpServerName]: mcpServer },
             includePartialMessages: true,
             abortController,
@@ -1507,6 +1627,48 @@ export class StreamingSessionManager {
               });
             }
 
+            // Per-user usage hook (AI for Office): runs alongside the org-level
+            // recordUsageFromSdkResult below, never instead of it.
+            //
+            // #5557: it runs BEFORE that call, and the order is load-bearing.
+            // Settling the reservation frees the org's held capacity, while the
+            // client sub-cap is read from `client_ai_usage` — so writing this
+            // ledger after the settle would leave a window in which a turn's
+            // spend was counted by neither the hold nor the ledger, and a
+            // concurrent add-in turn could be admitted against capacity that is
+            // really gone. Writing it first double-counts for a moment instead,
+            // which is the conservative direction.
+            // Catalog sessions price from the revision snapshot, matching what
+            // recordUsageFromSdkResult wrote to the ledger — otherwise the
+            // per-user buckets and the client's turn summary would quote
+            // Anthropic list pricing for third-party traffic.
+            const turnCostCents = session.catalogPricing
+              ? calculateCatalogCostCents(
+                  session.catalogPricing,
+                  usageData.usage.input_tokens,
+                  usageData.usage.output_tokens,
+                  usageData.usage.cache_read_input_tokens,
+                  usageData.usage.cache_creation_input_tokens,
+                )
+              : Math.round(usageData.total_cost_usd * 100 * 100) / 100;
+            // Cache-read and cache-creation tokens are input tokens — they are
+            // split out for PRICING only. Reporting the uncached slice alone made
+            // per-user ledgers and the client's turn summary read near-zero on
+            // any cached (i.e. any multi-turn) session. See sumInputTokens.
+            const turnInputTokens = sumInputTokens(usageData.usage);
+            if (session.recordExtraUsage) {
+              try {
+                await session.recordExtraUsage({
+                  inputTokens: turnInputTokens,
+                  outputTokens: usageData.usage.output_tokens,
+                  costCents: turnCostCents,
+                });
+              } catch (err) {
+                captureException(err);
+                console.error('[StreamingSessionManager] recordExtraUsage failed:', err);
+              }
+            }
+
             if (resultMsg.subtype === 'success') {
               try {
                 await withDbAccessContext(
@@ -1559,39 +1721,6 @@ export class StreamingSessionManager {
               } catch (err) {
                 captureException(err);
                 console.error('[StreamingSessionManager] Failed to record SDK usage on error:', err);
-              }
-            }
-
-            // Per-user usage hook (AI for Office): runs alongside the org-level
-            // recordUsageFromSdkResult above, never instead of it.
-            // Catalog sessions price from the revision snapshot, matching what
-            // recordUsageFromSdkResult wrote to the ledger — otherwise the
-            // per-user buckets and the client's turn summary would quote
-            // Anthropic list pricing for third-party traffic.
-            const turnCostCents = session.catalogPricing
-              ? calculateCatalogCostCents(
-                  session.catalogPricing,
-                  usageData.usage.input_tokens,
-                  usageData.usage.output_tokens,
-                  usageData.usage.cache_read_input_tokens,
-                  usageData.usage.cache_creation_input_tokens,
-                )
-              : Math.round(usageData.total_cost_usd * 100 * 100) / 100;
-            // Cache-read and cache-creation tokens are input tokens — they are
-            // split out for PRICING only. Reporting the uncached slice alone made
-            // per-user ledgers and the client's turn summary read near-zero on
-            // any cached (i.e. any multi-turn) session. See sumInputTokens.
-            const turnInputTokens = sumInputTokens(usageData.usage);
-            if (session.recordExtraUsage) {
-              try {
-                await session.recordExtraUsage({
-                  inputTokens: turnInputTokens,
-                  outputTokens: usageData.usage.output_tokens,
-                  costCents: turnCostCents,
-                });
-              } catch (err) {
-                captureException(err);
-                console.error('[StreamingSessionManager] recordExtraUsage failed:', err);
               }
             }
 

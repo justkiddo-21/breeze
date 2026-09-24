@@ -82,6 +82,8 @@ import {
   setupTestEnvironment,
 } from './db-utils';
 import { getTestDb } from './setup';
+import { withMoveOrgStepUpGrant } from './moveOrgStepUpFixture';
+import { awaitAuditRows } from './auditWait';
 
 const runDb = it.runIf(!!process.env.DATABASE_URL);
 
@@ -937,10 +939,11 @@ describe('device_custom_field_values — POST /devices/:id/move-org', () => {
     });
     const app = new Hono();
     app.route('/devices', moveOrgRoutes);
+    // Move-org step-up (spec 2026-09-18 W01): the route requires a fresh grant; mint one for exactly this request.
     const response = await app.request(`/devices/${deviceId}/move-org`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ orgId: targetOrg.id, siteId: targetSite.id }),
+      body: JSON.stringify(await withMoveOrgStepUpGrant(token, deviceId, { orgId: targetOrg.id, siteId: targetSite.id })),
     });
     expect(response.status, await response.clone().text()).toBe(200);
 
@@ -955,11 +958,18 @@ describe('device_custom_field_values — POST /devices/:id/move-org', () => {
     ]);
     expect(await readProjection(deviceId)).toEqual({ asset_tag: 'AB-1' });
 
-    const audits = await sys(() => db.execute<{ details: Record<string, unknown> }>(sql`
+    // `writeRouteAudit` is fire-and-forget: the route returns 200 while the
+    // audit INSERT is still in flight on its own pooled connection (it runs
+    // under `runOutsideDbContext` + `withSystemDbAccessContext`, so it cannot
+    // be part of the move transaction). Reading straight after the response
+    // races that write — it wins on an idle local database and loses under a
+    // loaded CI shard, which is how this assertion reddened the merge queue.
+    // Poll until both rows land, the way the sibling move-org suites do.
+    const audits = await awaitAuditRows(() => sys(() => db.execute<{ details: Record<string, unknown> }>(sql`
       SELECT details FROM public.audit_logs
        WHERE resource_id = ${deviceId}::uuid
-         AND action IN ('device.move_org.source', 'device.move_org.target')`));
-    expect(audits.length).toBeGreaterThan(0);
+         AND action IN ('device.move_org.source', 'device.move_org.target')`)), 2);
+    expect(audits.length, 'both move-org audit rows must land').toBe(2);
     for (const audit of audits) {
       expect(audit.details).toMatchObject({ customFieldValues: { rehomed: 1, dropped: 1 } });
     }

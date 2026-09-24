@@ -32,6 +32,7 @@ const { authRef, mocks } = vi.hoisted(() => ({
     restoreVerifiedConnection: vi.fn(async () => true),
     isMailboxConnectionSnapshotCurrent: vi.fn(async () => true),
     probeMailbox: vi.fn(),
+    refreshErrorReason: vi.fn(),
     bindVerifiedTenant: vi.fn(async () => {}),
     listMailboxConnections: vi.fn(async (): Promise<unknown[]> => []),
     disableConnection: vi.fn(async () => true),
@@ -42,6 +43,7 @@ const { authRef, mocks } = vi.hoisted(() => ({
     exchangeMicrosoftAuthorizationCode: vi.fn(),
     verifyMicrosoftAdminIdToken: vi.fn(),
     hasMailboxConsentAdminRole: vi.fn(() => true),
+    checkMailboxConsentAdminRoleViaGraph: vi.fn(async (): Promise<{ ok: boolean; reason?: string }> => ({ ok: false, reason: 'no_accepted_role' })),
     writeRouteAudit: vi.fn(),
     writeAuditEvent: vi.fn(),
     captureException: vi.fn(),
@@ -98,9 +100,11 @@ vi.mock('../../services/ticketMailbox/connectionService', () => ({
   restoreVerifiedConnection: mocks.restoreVerifiedConnection,
   isMailboxConnectionSnapshotCurrent: mocks.isMailboxConnectionSnapshotCurrent,
   probeMailbox: mocks.probeMailbox,
+  refreshErrorReason: mocks.refreshErrorReason,
   bindVerifiedTenant: mocks.bindVerifiedTenant,
   listMailboxConnections: mocks.listMailboxConnections,
   disableConnection: mocks.disableConnection,
+  MAILBOX_VERIFICATION_FAILED: 'Mailbox verification failed',
 }));
 vi.mock('../../services/ticketMailbox/consentSessionService', () => ({
   createAdminConsentSession: mocks.createAdminConsentSession,
@@ -117,6 +121,7 @@ vi.mock('../../services/ticketMailbox/microsoftIdentity', () => ({
   exchangeMicrosoftAuthorizationCode: mocks.exchangeMicrosoftAuthorizationCode,
   verifyMicrosoftAdminIdToken: mocks.verifyMicrosoftAdminIdToken,
   hasMailboxConsentAdminRole: mocks.hasMailboxConsentAdminRole,
+  checkMailboxConsentAdminRoleViaGraph: mocks.checkMailboxConsentAdminRoleViaGraph,
 }));
 vi.mock('../../services/auditEvents', () => ({
   writeRouteAudit: mocks.writeRouteAudit,
@@ -212,11 +217,14 @@ describe('M365 mailbox lifecycle routes', () => {
       session: session('identity_verification'), codeChallenge: 'stored-code-challenge',
     });
     mocks.consumeConsentSession.mockImplementation(async (_state: string, phase: string) => session(phase as never));
-    mocks.exchangeMicrosoftAuthorizationCode.mockResolvedValue({ idToken: 'verified-id-token' });
+    mocks.exchangeMicrosoftAuthorizationCode.mockResolvedValue({
+      idToken: 'verified-id-token', accessToken: 'delegated-access-token',
+    });
     mocks.verifyMicrosoftAdminIdToken.mockResolvedValue({
       tid: TENANT_ID, oid: MICROSOFT_OID, sub: 'microsoft-sub', wids: ['accepted-role'],
     });
     mocks.hasMailboxConsentAdminRole.mockReturnValue(true);
+    mocks.checkMailboxConsentAdminRoleViaGraph.mockResolvedValue({ ok: false, reason: 'no_accepted_role' });
     mocks.getMailboxConnection.mockResolvedValue(connection());
     mocks.probeMailbox.mockResolvedValue({ ok: true });
     app = new Hono();
@@ -405,6 +413,23 @@ describe('M365 mailbox lifecycle routes', () => {
     },
   );
 
+  it('treats Microsoft\'s admin-consent error shape (error + admin_consent=True) as a provider error, not a malformed callback', async () => {
+    // Observed in production 2026-09-21: a Conditional Access refusal (AADSTS50097)
+    // came back as ?error=invalid_grant&error_description=...&admin_consent=True&state=...
+    // and the route answered 400 "Invalid OAuth callback parameters", leaving the
+    // connection stuck in pending_consent with no recorded failure.
+    const response = await app.request(
+      '/callback?state=admin-state&error=invalid_grant&error_description=AADSTS50097%3a+Device+authentication+is+required&admin_consent=True',
+      { headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('admin_consent', 'admin-state')}` } },
+    );
+    expect(response.status).toBe(302);
+    expect(mocks.consumeConsentSession).toHaveBeenCalledWith('admin-state', 'admin_consent');
+    expect(mocks.markPendingConsentFailed).toHaveBeenCalledWith(
+      CONNECTION_ID, PARTNER_ID, ATTEMPT_ID, 'Mailbox verification failed',
+    );
+    expect(JSON.stringify(mocks.writeAuditEvent.mock.calls)).not.toContain('AADSTS50097');
+  });
+
   it('treats a consumed callback from an older consent attempt as one audited stale no-op', async () => {
     mocks.markPendingConsentFailed.mockResolvedValue(false);
     const response = await app.request(
@@ -578,8 +603,9 @@ describe('M365 mailbox lifecycle routes', () => {
     expect(serialized).not.toContain('bad-code');
   });
 
-  it('rejects an identity without an accepted administrator role', async () => {
+  it('rejects an identity without an accepted administrator role via wids or a live Graph lookup', async () => {
     mocks.hasMailboxConsentAdminRole.mockReturnValue(false);
+    mocks.checkMailboxConsentAdminRoleViaGraph.mockResolvedValue({ ok: false, reason: 'no_accepted_role' });
     const response = await app.request('/callback?state=identity-state&code=authorization-code', {
       headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
     });
@@ -589,6 +615,58 @@ describe('M365 mailbox lifecycle routes', () => {
     expect(mocks.writeAuditEvent).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       details: expect.objectContaining({ outcome: 'insufficient_role' }),
     }));
+    expect(mocks.captureException).not.toHaveBeenCalled();
+  });
+
+  it('logs which admin-role check failed server-side, without token material', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      mocks.hasMailboxConsentAdminRole.mockReturnValue(false);
+      mocks.checkMailboxConsentAdminRoleViaGraph.mockResolvedValue({ ok: false, reason: 'graph_http_error', status: 403 } as never);
+      await app.request('/callback?state=identity-state&code=authorization-code', {
+        headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
+      });
+      expect(warn).toHaveBeenCalledWith(
+        '[ticketMailbox] consent admin-role check failed',
+        expect.objectContaining({ widsAdminRole: false, graphCheck: 'graph_http_error', graphStatus: 403 }),
+      );
+      const logged = JSON.stringify(warn.mock.calls);
+      expect(logged).not.toContain('delegated-access-token');
+      expect(logged).not.toContain('verified-id-token');
+      expect(mocks.captureException).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'Mailbox consent admin-role check failed via Graph: graph_http_error' }),
+        expect.anything(),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('skips the live Graph lookup when the wids claim already carries an accepted role', async () => {
+    mocks.hasMailboxConsentAdminRole.mockReturnValue(true);
+    const response = await app.request('/callback?state=identity-state&code=authorization-code', {
+      headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
+    });
+    expect(response.headers.get('location')).toContain('ticketMailbox=connected');
+    expect(mocks.checkMailboxConsentAdminRoleViaGraph).not.toHaveBeenCalled();
+  });
+
+  it('falls back to a live Graph directory-role check when wids has no accepted role, and connects on success', async () => {
+    // Reproduces tenants where wids is absent or unaccepted in the ID token
+    // despite correct optionalClaims.idToken configuration.
+    mocks.hasMailboxConsentAdminRole.mockReturnValue(false);
+    mocks.checkMailboxConsentAdminRoleViaGraph.mockResolvedValue({ ok: true });
+    const response = await app.request('/callback?state=identity-state&code=authorization-code', {
+      headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
+    });
+    expect(response.status).toBe(302);
+    expect(response.headers.get('location')).toContain('ticketMailbox=connected');
+    expect(mocks.checkMailboxConsentAdminRoleViaGraph).toHaveBeenCalledWith(
+      'delegated-access-token',
+      { tid: TENANT_ID, oid: MICROSOFT_OID },
+    );
+    expect(mocks.probeMailbox).toHaveBeenCalled();
+    expect(mocks.bindVerifiedTenant).toHaveBeenCalled();
   });
 
   it('rejects replayed state before any identity or audit work', async () => {
@@ -620,6 +698,48 @@ describe('M365 mailbox lifecycle routes', () => {
       details: expect.objectContaining({ verifiedTenantId: TENANT_ID, outcome: 'probe_failed' }),
     }));
     expect(JSON.stringify(mocks.writeAuditEvent.mock.calls)).not.toContain('Graph leaked body');
+  });
+
+  it('carries the sanitized probe reason into lastError and the audit details', async () => {
+    mocks.probeMailbox.mockResolvedValue({ ok: false, error: 'Graph returned 403', reason: 'Graph 403 (ErrorAccessDenied)' });
+    await app.request('/callback?state=identity-state&code=authorization-code', {
+      headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', 'identity-state')}` },
+    });
+    expect(mocks.markPendingConsentFailed).toHaveBeenCalledWith(
+      CONNECTION_ID, PARTNER_ID, ATTEMPT_ID, 'Mailbox verification failed: Graph 403 (ErrorAccessDenied)',
+    );
+    expect(mocks.writeAuditEvent).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      details: expect.objectContaining({ outcome: 'probe_failed', probeReason: 'Graph 403 (ErrorAccessDenied)' }),
+    }));
+  });
+
+  it('retest returns and stores the sanitized probe reason', async () => {
+    mocks.setConnectedMailboxStatus.mockResolvedValue(true);
+    mocks.getMailboxConnection.mockResolvedValueOnce(connection({ status: 'connected' }));
+    mocks.probeMailbox.mockResolvedValueOnce({ ok: false, error: 'Graph returned 404', reason: 'Graph 404 (ErrorInvalidUser)' });
+    const res = await app.request(`/connections/${CONNECTION_ID}/retest`, { method: 'POST' });
+    await expect(res.json()).resolves.toEqual({
+      ok: false, error: 'Mailbox verification failed: Graph 404 (ErrorInvalidUser)',
+    });
+    expect(mocks.setConnectedMailboxStatus).toHaveBeenCalledWith(
+      expect.anything(), 'error', 'Mailbox verification failed: Graph 404 (ErrorInvalidUser)',
+    );
+    expect(mocks.writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      details: expect.objectContaining({ probeReason: 'Graph 404 (ErrorInvalidUser)' }),
+    }));
+  });
+
+  it('refreshes the stored reason on a repeated failed retest of an already-error connection (#6192)', async () => {
+    mocks.refreshErrorReason.mockResolvedValue(true);
+    mocks.getMailboxConnection.mockResolvedValueOnce(connection({ status: 'error' }));
+    mocks.probeMailbox.mockResolvedValueOnce({ ok: false, error: 'Graph returned 404', reason: 'Graph 404 (ErrorInvalidUser)' });
+    const res = await app.request(`/connections/${CONNECTION_ID}/retest`, { method: 'POST' });
+    await expect(res.json()).resolves.toEqual({
+      ok: false, error: 'Mailbox verification failed: Graph 404 (ErrorInvalidUser)',
+    });
+    expect(mocks.refreshErrorReason).toHaveBeenCalledWith(
+      expect.anything(), 'Mailbox verification failed: Graph 404 (ErrorInvalidUser)',
+    );
   });
 
   it('audits a cross-partner ownership conflict without exposing the service error', async () => {
@@ -766,7 +886,7 @@ describe('M365 mailbox lifecycle routes', () => {
     mocks.getMailboxConnection.mockResolvedValue(connection({ status: 'error' }));
     let finishProbe!: (value: { ok: false; error: string }) => void;
     mocks.probeMailbox.mockReturnValue(new Promise((resolve) => { finishProbe = resolve; }));
-    mocks.isMailboxConnectionSnapshotCurrent.mockResolvedValue(false);
+    mocks.refreshErrorReason.mockResolvedValue(false);
 
     const retest = app.request(`/connections/${CONNECTION_ID}/retest`, { method: 'POST' });
     await vi.waitFor(() => expect(mocks.probeMailbox).toHaveBeenCalledOnce());
@@ -774,9 +894,9 @@ describe('M365 mailbox lifecycle routes', () => {
     const response = await retest;
 
     expect(response.status).toBe(409);
-    expect(mocks.isMailboxConnectionSnapshotCurrent).toHaveBeenCalledWith(
+    expect(mocks.refreshErrorReason).toHaveBeenCalledWith(
       expect.objectContaining({ id: CONNECTION_ID, consentAttemptId: ATTEMPT_ID }),
-      'error',
+      'Mailbox verification failed',
     );
     expect(mocks.writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       details: expect.objectContaining({ outcome: 'stale' }),

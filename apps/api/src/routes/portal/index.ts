@@ -9,7 +9,7 @@ import { invoiceRoutes as portalInvoiceRoutes } from './invoices';
 import { quoteRoutes as portalQuoteRoutes } from './quotes';
 import {
   portalAssetCheckoutEnabledMiddleware,
-  portalSelfServiceEnabledMiddleware,
+  portalDevicesEnabledMiddleware,
   createPortalFeatureGateStrict,
   createPortalFeatureGateAny
 } from './featureFlags';
@@ -19,6 +19,7 @@ import { portalBackupRoutes } from './backups';
 import { portalReportRoutes } from './reports';
 import { portalServiceRoutes } from './service';
 import { portalDocumentRoutes } from './documents';
+import { portalNetworkRoutes } from './network';
 
 export const portalRoutes = new Hono();
 
@@ -39,7 +40,7 @@ portalRoutes.route('/', brandingRoutes);
 
 // Protected routes
 portalRoutes.use('/devices/*', portalAuthMiddleware);
-portalRoutes.use('/devices/*', portalSelfServiceEnabledMiddleware);
+portalRoutes.use('/devices/*', portalDevicesEnabledMiddleware);
 portalRoutes.use('/assets/*', portalAuthMiddleware);
 portalRoutes.use('/assets/*', portalAssetCheckoutEnabledMiddleware);
 portalRoutes.use('/profile/*', portalAuthMiddleware);
@@ -57,9 +58,16 @@ portalRoutes.use('/backups/*', portalAuthMiddleware);
 portalRoutes.use('/backups/*', createPortalFeatureGateStrict('enableBackups'));
 portalRoutes.use('/reports/*', portalAuthMiddleware);
 portalRoutes.use('/reports/*', createPortalFeatureGateStrict('enableReports'));
+// A second, narrower gate. Hono stacks middleware by matched prefix, so a
+// request to /reports/lifecycle/* needs both enableReports and
+// enableLifecycle; every other /reports/* path is untouched.
+portalRoutes.use('/reports/lifecycle/*', createPortalFeatureGateStrict('enableLifecycle'));
 // Service deliverables W04 — both new surfaces fail closed the same way.
 portalRoutes.use('/service/*', portalAuthMiddleware);
 portalRoutes.use('/service/*', createPortalFeatureGateStrict('enableService'));
+// Network Visibility has its own fail-closed availability response:
+// disabled or missing settings return dataStatus: 'not_enabled'.
+portalRoutes.use('/network/*', portalAuthMiddleware);
 portalRoutes.use('/documents/*', portalAuthMiddleware);
 portalRoutes.use('/documents/*', async (c, next) =>
   isDocumentContentPath(c) ? documentBytesGate(c, next) : documentsLibraryGate(c, next));
@@ -101,3 +109,4 @@ portalRoutes.route('/', portalBackupRoutes);
 portalRoutes.route('/', portalReportRoutes);
 portalRoutes.route('/', portalServiceRoutes);
 portalRoutes.route('/', portalDocumentRoutes);
+portalRoutes.route('/', portalNetworkRoutes);

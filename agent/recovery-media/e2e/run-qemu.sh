@@ -27,7 +27,7 @@ iso="$(cd "$(dirname "$iso")" && pwd)/$(basename "$iso")"
 store_dir="$(cd "$store_dir" && pwd)"
 out_dir="$(cd "$out_dir" && pwd)"
 
-snapshot_id="e2e-1"
+snapshot_id="e2e-3"
 recovery_code="ABCDEFGHJ"
 fake_addr="0.0.0.0:18080"
 guest_server_url="http://10.0.2.2:18080"
@@ -135,6 +135,19 @@ echo "run-qemu: building breeze-recovery-fakeserver"
 progress_log="$out_dir/progress.json"
 rm -f "$progress_log"
 fakeserver_log="$out_dir/fakeserver.log"
+# Out-of-band probe token (fake server only): lets this script issue real
+# /recover/download requests from the host after the guest run, proving
+# R7/R8 over the wire — the rebuild engine itself never requests an object
+# its manifest does not list, so nothing in the guest would touch
+# not-referenced.gz.
+probe_token="e2e-probe-$(date +%s)"
+# D-W09-2 + D-W09-3 in one object: the systemd unit seed-snapshot.sh re-keyed
+# to the real agent's key shape carries a literal backslash in its key
+# (e2e-3 references it from e2e-1), and the fake server drops the
+# connection mid-body on the guest's FIRST request for it. The rebuild only
+# completes if the client (a) admits the backslash key and (b) retries the
+# transport failure; asserted after boot 1 below.
+fault_key_substring='system-systemd\x2dcryptsetup.slice'
 "$fakeserver_bin" \
   --addr "$fake_addr" \
   --code "$recovery_code" \
@@ -142,6 +155,10 @@ fakeserver_log="$out_dir/fakeserver.log"
   --store-dir "$store_dir" \
   --progress-log "$progress_log" \
   --identity new \
+  --capabilities snapshot-file-membership-v1 \
+  --referenced-snapshot-ids e2e-1,e2e-2 \
+  --probe-token "$probe_token" \
+  --fault-transport-once "$fault_key_substring" \
   > "$fakeserver_log" 2>&1 &
 fakeserver_pid=$!
 
@@ -181,9 +198,24 @@ cmdline="boot=live components console=ttyS0,115200n8 breeze.media=1 breeze.ci=1 
 # 13,140/16,325 when the previous 20 min cap killed QEMU mid-restore), so the
 # whole boot → rebuild → validate → poweroff cycle needs ~25 min plus margin.
 # ci.yml's job timeout-minutes covers this plus the ~7 min ISO build.
+# -no-reboot: this is the only boot in this script that can ever be asked
+# to reset rather than power off, and it is booted via -kernel/-initrd/
+# -append, which QEMU RE-APPLIES on every reset — so a guest reset here
+# would silently re-enter the live recovery environment with breeze.ci=1
+# still on the cmdline and run a whole second unattended recovery attempt,
+# appending another "media_booted" to progress.json. That is not what
+# caused issue #5890 (the trailing media_booted there came from the losing
+# in-guest console instance reclaiming the recovery-console lock during
+# the shutdown window — fixed in internal/recoveryconsole/console.go), but
+# it is the same observable failure from a second cause, and it is only
+# not reachable today because the CI cmdline happens to say
+# breeze.after=poweroff. -no-reboot makes QEMU exit on a guest reset
+# instead, so that second cause can never masquerade as the first.
+# Asserted by run-qemu_test.sh.
 echo "run-qemu: boot 1 — recovery ISO (CI-unattended), cmdline: $cmdline"
 timeout 2400 "$qemu_bin" \
   -machine q35,accel=tcg -cpu max -m 3G -smp 2 \
+  -no-reboot \
   -drive if=pflash,format=raw,readonly=on,file="$ovmf_code" \
   -drive if=pflash,format=raw,file="$out_dir/OVMF_VARS.fd" \
   -drive file="$target_img",format=raw,if=virtio \
@@ -214,6 +246,76 @@ if [ "$actual" != "$expected" ]; then
   exit 1
 fi
 echo "run-qemu: PASS — progress phases match: $actual"
+
+# Post-check (D-W09-2 / D-W09-3): the backslash-keyed systemd unit must have
+# been (1) requested by the guest — proving the client admitted a key with a
+# literal backslash instead of refusing the manifest (ExternalObjectKeys
+# `bad`) — (2) faulted exactly once by the fake server, and (3) requested
+# AGAIN afterwards, proving the transport failure was retried rather than
+# recorded as a failed file. The URL-encoded form (%5C) is what the fake's
+# request log carries.
+fault_key_encoded='system-systemd%5Cx2dcryptsetup.slice'
+if ! grep -q "transport fault injected (connection dropped mid-body)" "$fakeserver_log" 2>/dev/null; then
+  echo "run-qemu: FAIL — the fake server never injected the transport fault on $fault_key_substring (was the key ever requested? does the seed still carry it?)" >&2
+  grep -ic "$fault_key_encoded" "$fakeserver_log" >&2 || true
+  exit 1
+fi
+fault_requests="$(grep -ic "GET .*$fault_key_encoded" "$fakeserver_log" || true)"
+if [ "${fault_requests:-0}" -lt 2 ]; then
+  echo "run-qemu: FAIL — backslash-keyed object was requested $fault_requests time(s); want >= 2 (transport failure must be retried, D-W09-3)" >&2
+  exit 1
+fi
+# ...and the retry must have SUCCEEDED: a per-file failure under the
+# consecutive-failure breaker still reaches `validated`, so also read the
+# result the console posted with that phase and require zero failed files.
+validated_result="${progress_log%.json}.validated.json"
+if [ ! -f "$validated_result" ]; then
+  echo "run-qemu: FAIL — fake server did not persist the validated result ($validated_result missing)" >&2
+  exit 1
+fi
+# The counter is rebuild.Result.filesFailed (rebuild/types.go). It is NOT
+# `failedFiles` — that is bmr.RecoveryResult's list of paths on a different
+# payload, and reading it here made a clean rebuild report "-1" (#6491).
+# read-failed-files.py refuses any body it cannot read an exact
+# non-negative count out of, so a missing counter can never pass as one.
+if ! failed_files="$(python3 "$script_dir/read-failed-files.py" "$validated_result")"; then
+  echo "run-qemu: FAIL — could not read the failed-file count from the validated result: $(cat "$validated_result")" >&2
+  exit 1
+fi
+if [ "$failed_files" != "0" ]; then
+  echo "run-qemu: FAIL — validated result reports filesFailed=$failed_files (want 0): $(cat "$validated_result")" >&2
+  exit 1
+fi
+echo "run-qemu: PASS — backslash-keyed systemd unit admitted (D-W09-2), re-requested after the injected transport fault ($fault_requests requests) and the rebuild validated with filesFailed=0 (D-W09-3)"
+
+# Post-check (R7/R8 over the wire): with the probe token, a referenced
+# external key (an unchanged e2e-1 file that e2e-3's manifest names) must
+# download, and the unrelated object seeded under e2e-1's prefix
+# (not-referenced.gz, in no manifest) must be refused with 409 not_authorized.
+probe_url="http://127.0.0.1:18080/api/v1/backup/bmr/recover/download"
+referenced_key="$(python3 -c '
+import json,sys
+m=json.load(open(sys.argv[1]))
+for e in m.get("files", []):
+    bp=e.get("backupPath","")
+    if bp.startswith("snapshots/e2e-1/files/"):
+        print(bp); break
+' "$store_dir/snapshots/e2e-3/manifest.json")"
+if [ -z "$referenced_key" ]; then
+  echo "run-qemu: FAIL — e2e-3 manifest has no e2e-1 reference to probe" >&2
+  exit 1
+fi
+ok_status="$(curl -s -o /dev/null -w '%{http_code}' --get "$probe_url" --data-urlencode "token=$probe_token" --data-urlencode "path=$referenced_key")"
+refused_status="$(curl -s -o /dev/null -w '%{http_code}' --get "$probe_url" --data-urlencode "token=$probe_token" --data-urlencode "path=snapshots/e2e-1/files/not-referenced.gz")"
+if [ "$ok_status" != "200" ] || [ "$refused_status" != "409" ]; then
+  echo "run-qemu: FAIL — probe: referenced key -> $ok_status (want 200), unreferenced key -> $refused_status (want 409)" >&2
+  exit 1
+fi
+if ! grep -q "not-referenced.gz" "$fakeserver_log" 2>/dev/null; then
+  echo "run-qemu: FAIL — expected the fake server log to record the refused request for not-referenced.gz" >&2
+  exit 1
+fi
+echo "run-qemu: PASS — referenced external key served (200), unreferenced object refused (409)"
 
 # --- Boot 2: target.img alone, expect a login prompt on serial ---
 serial2_log="$out_dir/serial-2.log"
@@ -256,8 +358,17 @@ if [ "$found" != "1" ]; then
   exit 1
 fi
 
-if ! grep -q "e2e-restored-src login:" "$serial2_log"; then
-  echo "run-qemu: WARNING — login prompt found but hostname banner does not read 'e2e-restored-src login:' (checked loosely above); see serial-2.log" >&2
+# /etc/hostname was rewritten to "e2e-3-changed-hostname" for the e2e-3
+# generation seeded above (seed-snapshot.sh), so the restored guest's own
+# login banner (which getty renders from /etc/hostname) is the proof,
+# without a host-side mount, that recovery pulled e2e-3's OWN changed
+# content rather than an ancestor generation's — R20 in Part 0 §4. This
+# script has no host-side mount of target.img (boot 2 only ever exercises
+# it through QEMU), so the serial banner is the only observation point.
+if ! grep -q "e2e-3-changed-hostname-restored login:" "$serial2_log"; then
+  echo "run-qemu: FAIL — expected the restored guest's login banner to read 'e2e-3-changed-hostname-restored login:' (proving the e2e-3 generation's own content was restored, not an ancestor's); see serial-2.log" >&2
+  exit 1
 fi
+echo "run-qemu: PASS — restored guest hostname matches e2e-3's changed value"
 
 echo "E2E-OK"

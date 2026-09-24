@@ -186,6 +186,7 @@
       "failedToAssignOrg": "Impossibile assegnare l'org",
       "organizations": "Organizzazioni",
       "thisPartnerLibraryPolicyAppliesOnlyTo": "Questo criterio della libreria partner si applica solo alle organizzazioni selezionate.",
+      "filtersApplyOnAssign": "Questi filtri si applicano quando assegni sotto. Vuoto significa ogni ruolo e ogni sistema operativo. Per cambiare i filtri di un'assegnazione, disattivala e riattivala.",
       "allOrganizationsPartnerWide": "Tutte le organizzazioni (a livello di partner)",
       "allOrganizationsPartnerWide2": "Tutte le organizzazioni (a livello di partner)",
       "assigned": "Assegnata",
@@ -441,6 +442,7 @@
         "maxVersions": "Versioni massime",
         "gFSRetention": "Conservazione GFS",
         "keepLongerRunningRestorePointsForGrandfather": "Mantieni punti di ripristino a lungo termine per la conservazione nonno-padre-figlio.",
+        "dailyRetentionBelowFloor": "La conservazione giornaliera è impostata su {{gfsDays}} giorni, inferiore al limite minimo di conservazione di {{effectiveDays}} giorni. La scadenza di questo snapshot è impostata su {{effectiveDays}} giorni, non {{gfsDays}} -- la scadenza non scende mai sotto il minimo. Un limite separato sul numero massimo di versioni può comunque rimuovere prima gli snapshot più vecchi.",
         "daily2": "Giornaliero",
         "weekly2": "Settimanale",
         "monthly2": "Mensile",
@@ -844,7 +846,14 @@
         "inherited": "Ereditato",
         "overrideValue": "Valore di override",
         "overridesLabel": "Override:",
-        "failedToLoadMonitors": "Impossibile caricare i monitor"
+        "failedToLoadMonitors": "Impossibile caricare i monitor",
+        "createMonitor": "Crea monitor",
+        "monitorDeleted": "Monitor eliminato",
+        "recommended": {
+          "title": "Monitor consigliati",
+          "body": "Breeze include monitor integrati per CPU, memoria, disco e conformità delle patch. Nessuno è ancora collegato a questa policy.",
+          "action": "Collega tutti i monitor integrati"
+        }
       },
       "pamTab": {
         "captureWindowsUACElevationPrompts": "Acquisisci prompt di elevazione UAC di Windows",
@@ -1051,7 +1060,6 @@
         "fri": "Ven",
         "sat": "Sab",
         "sun": "Dom",
-        "realTimeProtection": "Protezione in tempo reale",
         "scheduledScans": "Scansioni pianificate",
         "minute": "Minuto",
         "hour": "Ora",
@@ -1060,30 +1068,22 @@
         "exclusions": "Esclusioni",
         "skipTrustedLocationsDuringScans": "Ignora le posizioni attendibili durante le scansioni.",
         "addPathOrProcess": "Aggiungi percorso o processo",
-        "realTimeFileMonitoring": "Monitoraggio file in tempo reale",
-        "scanNewAndModifiedFilesContinuously": "Esegui continuamente la scansione dei file nuovi e modificati.",
-        "realTimeProtection2": "realTimeProtection",
-        "behavioralMonitoring": "Monitoraggio comportamentale",
-        "detectSuspiciousProcessBehaviorAndScripts": "Rileva comportamenti sospetti di processi e script.",
-        "behavioralMonitoring2": "behavioralMonitoring",
-        "cloudThreatLookup": "Ricerca minacce nel cloud",
-        "useCloudReputationForNewIndicators": "Usa la reputazione cloud per nuovi indicatori.",
-        "cloudLookup": "cloudLookup",
         "autoQuarantine": "Quarantena automatica",
         "moveThreatsToQuarantineImmediately": "Sposta immediatamente le minacce in quarantena.",
         "autoQuarantine2": "autoQuarantine",
-        "notifyUserOnDetection": "Notifica l'utente al rilevamento",
-        "sendDeviceNotificationsWhenThreatsAreFound": "Invia notifiche al dispositivo quando vengono trovate minacce.",
-        "notifyUser": "notifyUser",
-        "blockUntrustedUSBDevices": "Blocca dispositivi USB non attendibili",
-        "preventUnknownRemovableMedia": "Impedisci supporti rimovibili sconosciuti.",
-        "blockUntrustedUsb": "blockUntrustedUsb",
         "scheduledScans2": "scheduledScans",
         "scanMinute": "scanMinute",
         "scanHour": "scanHour",
         "scanDayOfMonth": "scanDayOfMonth",
         "scanDayOfWeek": "scanDayOfWeek",
-        "enter": "Invio"
+        "enter": "Invio",
+        "scanSettings": "Impostazioni di scansione",
+        "scanType": "Tipo di scansione",
+        "quickScan": "Scansione rapida",
+        "fullScan": "Scansione completa",
+        "maxFileSizeMb": "Dimensione massima file (MB)",
+        "scanTimeoutMinutes": "Timeout scansione (minuti)",
+        "scanRunsServerSideDescription": "Breeze avvia questa scansione dal server — il dispositivo non necessita di una pianificazione locale."
       },
       "sensitiveDataTab": {
         "credentials": "Credenziali",
@@ -1201,7 +1201,15 @@
         "save": "Salva",
         "cancel": "Annulla",
         "none": "Nessuna motivazione registrata."
-
+      },
+      "legacyFreeze": {
+        "title": "Le nuove regole vengono create come monitor",
+        "body": "Le regole esistenti restano modificabili qui e verranno convertite in monitor nella prossima versione.",
+        "link": "Apri la scheda Monitor"
+      },
+      "duplicate": {
+        "title": "I dispositivi di questa policy genereranno avvisi doppi",
+        "body": "Queste condizioni esistono sia come monitor collegato sia come regola o controllo legacy: {{names}}"
       }
     }
   },
@@ -1336,6 +1344,8 @@
       "readyToDeployStandalone": "Pronto per la distribuzione."
     },
     "complianceDashboard": {
+      "autoInstallArmed": "Installazione automatica attivata",
+      "complianceCheckQueued": "Verifica di conformità in coda",
       "failedToLoadSoftwarePolicyData": "Impossibile caricare i dati del criterio software",
       "couldNotLoadLatestPolicyDetailsShowing": "Impossibile caricare i dettagli più recenti del criterio. Visualizzazione dei dati memorizzati nella cache.",
       "couldNotLoadPolicyDetailsShowingCached": "Impossibile caricare i dettagli del criterio. Visualizzazione dei dati memorizzati nella cache.",
@@ -1375,7 +1385,19 @@
       "failedToUpdatePolicy": "Impossibile aggiornare il criterio",
       "failedToCreatePolicy": "Impossibile creare il criterio",
       "policyUpdated": "Criterio aggiornato correttamente",
-      "policyCreated": "Criterio creato correttamente"
+      "policyCreated": "Criterio creato correttamente",
+      "armInstallRequiresMfa": "L'attivazione dell'installazione automatica richiede l'autenticazione a più fattori. Completa la MFA, quindi riprova.",
+      "armInstallRequiresPermission": "L'attivazione dell'installazione automatica richiede l'autorizzazione devices.execute. Chiedi a un amministratore di concederla, quindi riprova.",
+      "installStatusPending": "Installazione in coda",
+      "installStatusInProgress": "Installazione in corso…",
+      "installStatusCompleted": "Installato",
+      "installStatusFailed": "Installazione non riuscita",
+      "installStatusGaveUp": "Rinuncia dopo ripetuti fallimenti",
+      "installStatusSkipped": "Saltato in questo passaggio",
+      "installSkippedNoCatalog": "Una regola obbligatoria non ha un elemento del catalogo collegato, quindi non c'è nulla da installare. Aggiungi un collegamento al catalogo nell'editor dei criteri per risolvere il problema.",
+      "installSkippedCapOrPlatform": "Non è un errore: è stato raggiunto il limite di installazioni per passaggio oppure la piattaforma di questo dispositivo non ha un metodo di installazione per il software. Potrebbe essere ritentato al passaggio successivo.",
+      "installAttempts": "{{count}} tentativo/i",
+      "installLastAttempt": "Ultimo tentativo di installazione: "
     },
     "deploymentList": {
       "running": "In esecuzione",
@@ -1413,7 +1435,9 @@
       "noDeploymentsYet": "Non è stata ancora creata alcuna distribuzione.",
       "failedToCancelDeployment": "Impossibile annullare la distribuzione",
       "deploymentCancelled": "Distribuzione annullata",
-      "pageOf": "Pagina {{page}} di {{pages}}"
+      "pageOf": "Pagina {{page}} di {{pages}}",
+      "policyOwned": "Gestito da criterio",
+      "policyOwnedTooltip": "Creato automaticamente dalla remediation di installazione automatica di un criterio software"
     },
     "deploymentProgress": {
       "queued": "In coda",
@@ -1597,6 +1621,9 @@
       "s": "s"
     },
     "policyForm": {
+      "dryRunUnassigned": "0 dispositivi — di solito perché questa policy non è ancora assegnata ad alcun dispositivo, ma anche una flotta interamente conforme o un elenco di siti vuoto dà 0",
+      "manageAssignments": "Gestisci le assegnazioni delle policy di configurazione",
+      "gracePeriodHelp": "Applicato alla prossima verifica di conformità",
       "scope": "Ambito",
       "allOrganizations": "Tutte le organizzazioni",
       "partnerWideTemplate": "(template a livello di partner)",
@@ -1641,7 +1668,16 @@
       "autoUninstall2": "autoUninstall",
       "gracePeriod": "grace-period",
       "gracePeriod2": "gracePeriod",
-      "saving": "Salvataggio..."
+      "saving": "Salvataggio...",
+      "catalogLink": "Elemento del catalogo collegato",
+      "catalogLinkNone": "Nessuno — non collegato",
+      "autoInstall": "Installa automaticamente il software mancante",
+      "autoInstallCatalogWarning": "{{count}} di {{total}} regola/e non hanno un elemento del catalogo collegato e verranno rilevate come mancanti ma mai installate.",
+      "dryRunLoading": "Verifica di quanti dispositivi saranno interessati...",
+      "dryRunResult": "Questo installerà il software mancante su circa {{count}} dispositivo/i.",
+      "dryRunUnavailable": "L'anteprima del numero di dispositivi non è ancora disponibile. L'attivazione avrà comunque effetto alla prossima verifica di conformità.",
+      "dryRunNewPolicy": "Questo è un nuovo criterio — l'impatto sui dispositivi non sarà noto fino alla prima verifica di conformità dopo il salvataggio.",
+      "catalogUnavailable": "Non è stato possibile caricare il catalogo software, quindi i selettori di collegamento al catalogo qui sotto sono vuoti. Non è la stessa cosa che non avere elementi nel catalogo: ricarica la pagina prima di dare per scontato che una regola non possa essere collegata."
     },
     "softwareCatalog": {
       "ready": "Pronto",

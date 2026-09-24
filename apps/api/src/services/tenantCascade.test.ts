@@ -14,6 +14,10 @@ const mockState = vi.hoisted(() => ({
   /** rows the W08 attachment object pre-clear SELECT returns (default: none). */
   attachmentKeyRows: [] as Array<{ storage_key: string }>,
   softwareKeyRows: [] as Array<{ storageKey: string | null }>,
+  /** rows the execution-plane W01 artifact blob pre-clear SELECT returns. */
+  artifactKeyRows: [] as Array<{ blob_key: string }>,
+  /** when set, the artifact key SELECT rejects with this instead of returning rows. */
+  artifactKeyError: null as unknown,
 }));
 
 function sqlToText(q: unknown): string {
@@ -32,7 +36,10 @@ function sqlToText(q: unknown): string {
         }
         return '';
       })
-      .join(' ');
+      .join(' ')
+      // sql.raw() identifiers are separate chunks, so the join above leaves
+      // runs of whitespace; collapse them so assertions read like the SQL.
+      .replace(/\s+/g, ' ');
   }
   return String(q);
 }
@@ -58,8 +65,14 @@ vi.mock('../db', () => ({
       // It must NOT consume a queued rowCount response, or every existing
       // `executeResponses` fixture silently shifts by one and the row-count
       // assertions below start measuring the wrong statements.
-      if (text.includes('SELECT storage_key')) {
+      if (text.includes('AS storage_key')) {
         return Promise.resolve(mockState.attachmentKeyRows);
+      }
+      // Execution plane W01: the artifact blob pre-clear is a SELECT too, and
+      // for the same reason must not consume a queued rowCount response.
+      if (text.includes('SELECT blob_key')) {
+        if (mockState.artifactKeyError) return Promise.reject(mockState.artifactKeyError);
+        return Promise.resolve(mockState.artifactKeyRows);
       }
       if (text.includes('SELECT v.s3_key')) {
         return Promise.resolve(mockState.softwareKeyRows);
@@ -91,6 +104,13 @@ vi.mock('../db', () => ({
 const { deleteObjectKeysMock } = vi.hoisted(() => ({ deleteObjectKeysMock: vi.fn() }));
 vi.mock('./ticketAttachmentStorage', () => ({
   deleteObjectKeys: deleteObjectKeysMock,
+}));
+
+// Execution plane W01: the artifact blob store. Only `delete` is used by the
+// erasure pre-clear.
+const { artifactBlobDeleteMock } = vi.hoisted(() => ({ artifactBlobDeleteMock: vi.fn(async (_key: string) => undefined) }));
+vi.mock('./artifacts/blobStorage', () => ({
+  getBlobStorage: () => ({ delete: artifactBlobDeleteMock }),
 }));
 
 const { deleteSoftwareObjectsMock } = vi.hoisted(() => ({ deleteSoftwareObjectsMock: vi.fn() }));
@@ -187,6 +207,8 @@ describe('getOrgCascadeDeleteOrder()', () => {
       'audit_logs',
       'agent_logs',
       'ml_feedback_events',
+      'monitor_conversion_outputs',
+      'monitor_conversions',
       'organizations',
     ]) {
       expect(set.has(required), `missing required table ${required}`).toBe(true);
@@ -370,7 +392,7 @@ describe('cascadeDeleteOrg', () => {
       // W08 #3902: the attachment object pre-clear SELECT runs before the
       // associated-table loop; excluded from the index so `associatedCount + 1`
       // still names the FIRST ordered cascade-table DELETE.
-      if (text.includes('SELECT storage_key')) {
+      if (text.includes('AS storage_key')) {
         return Promise.resolve([]);
       }
       callIdx += 1;
@@ -443,7 +465,7 @@ describe('cascadeDeleteOrg attachment object pre-clear (W08 #3902)', () => {
         return Promise.resolve(mockState.fkEdges);
       }
       mockState.executedSql.push(text);
-      if (text.includes('SELECT storage_key')) return Promise.resolve(rows);
+      if (text.includes('AS storage_key')) return Promise.resolve(rows);
       return Promise.resolve({ rowCount: 0 });
     }) as any);
   }
@@ -456,13 +478,11 @@ describe('cascadeDeleteOrg attachment object pre-clear (W08 #3902)', () => {
       if (text.includes('pg_constraint') || text.includes('contype')) {
         return Promise.resolve(mockState.fkEdges);
       }
-      if (text.includes('SELECT storage_key')) {
+      if (text.includes('AS storage_key')) {
         order.push('select-keys');
-        return Promise.resolve(
-          text.includes('org_documents')
-            ? [{ storage_key: 'org-documents/d1' }]
-            : [{ storage_key: 'ticket-attachments/a1' }],
-        );
+        if (text.includes('org_documents')) return Promise.resolve([{ storage_key: 'org-documents/d1' }]);
+        if (text.includes('ticket_attachments')) return Promise.resolve([{ storage_key: 'ticket-attachments/a1' }]);
+        return Promise.resolve([]);
       }
       if (/^\s*delete/i.test(text)) order.push(`delete:${text.slice(0, 60)}`);
       return Promise.resolve({ rowCount: 0 });
@@ -484,7 +504,7 @@ describe('cascadeDeleteOrg attachment object pre-clear (W08 #3902)', () => {
   it('scopes the key read to this org and to s3-backed rows only, for every byte table', async () => {
     rigKeys([]);
     await cascadeDeleteOrg(ORG, BY);
-    const keyQueries = mockState.executedSql.filter((t) => t.includes('SELECT storage_key'));
+    const keyQueries = mockState.executedSql.filter((t) => t.includes('AS storage_key'));
     // W03: one read PER byte table, not a UNION. A union means a missing table
     // blinds the read for the other one too (a 42P01 on either is tolerated),
     // which would skip the object pre-clear for a table that does exist.
@@ -494,6 +514,34 @@ describe('cascadeDeleteOrg attachment object pre-clear (W08 #3902)', () => {
       expect(q).toContain('org_id');
       expect(q).toContain("storage_backend = 's3'");
     }
+  });
+
+  it('pre-clears on-behalf acceptance EVIDENCE objects (#6633) from their own key/backend columns', async () => {
+    const keyQueries: string[] = [];
+    vi.mocked(db.execute).mockImplementation(((q: unknown) => {
+      const text = sqlToText(q);
+      if (text.includes('pg_constraint') || text.includes('contype')) {
+        return Promise.resolve(mockState.fkEdges);
+      }
+      if (text.includes('AS storage_key')) {
+        keyQueries.push(text);
+        return Promise.resolve(
+          text.includes('quote_acceptances')
+            ? [{ storage_key: 'quote-acceptance-evidence/e1' }]
+            : [],
+        );
+      }
+      return Promise.resolve({ rowCount: 0 });
+    }) as any);
+
+    await cascadeDeleteOrg(ORG, BY);
+
+    const evidenceRead = keyQueries.find((q) => q.includes('quote_acceptances'));
+    expect(evidenceRead).toBeDefined();
+    expect(evidenceRead).toContain('evidence_storage_key');
+    expect(evidenceRead).toContain("evidence_storage_backend = 's3'");
+    expect(evidenceRead).toContain('org_id');
+    expect(deleteObjectKeysMock).toHaveBeenCalledWith(['quote-acceptance-evidence/e1']);
   });
 
   it('an absent org_documents table does NOT blind the ticket-attachment pre-clear', async () => {
@@ -506,9 +554,10 @@ describe('cascadeDeleteOrg attachment object pre-clear (W08 #3902)', () => {
       if (text.includes('pg_constraint') || text.includes('contype')) {
         return Promise.resolve(mockState.fkEdges);
       }
-      if (text.includes('SELECT storage_key')) {
+      if (text.includes('AS storage_key')) {
         if (text.includes('org_documents')) return Promise.reject(undefinedTable);
-        return Promise.resolve([{ storage_key: 'ticket-attachments/a1' }]);
+        if (text.includes('ticket_attachments')) return Promise.resolve([{ storage_key: 'ticket-attachments/a1' }]);
+        return Promise.resolve([]);
       }
       return Promise.resolve({ rowCount: 0 });
     }) as any);
@@ -531,7 +580,7 @@ describe('cascadeDeleteOrg attachment object pre-clear (W08 #3902)', () => {
       if (text.includes('pg_constraint') || text.includes('contype')) {
         return Promise.resolve(mockState.fkEdges);
       }
-      if (text.includes('SELECT storage_key')) {
+      if (text.includes('AS storage_key')) {
         return Promise.resolve([{ storage_key: 'ticket-attachments/a1' }]);
       }
       if (/^\s*delete/i.test(text)) deletes.push(text);
@@ -581,7 +630,7 @@ describe('software package object lifecycle pre-clear', () => {
       const text = sqlToText(q);
       mockState.executedSql.push(text);
       if (text.includes('pg_constraint') || text.includes('contype')) return Promise.resolve([]);
-      if (text.includes('SELECT storage_key')) return Promise.resolve([]);
+      if (text.includes('AS storage_key')) return Promise.resolve([]);
       if (text.includes('SELECT v.s3_key')) {
         order.push('lock-keys');
         return Promise.resolve(mockState.softwareKeyRows);
@@ -678,5 +727,95 @@ describe('m365 tenant sync cascade registration', () => {
     expect(order.at(-1)).toBe('organizations');
     const prefix = order.slice(0, -1);
     expect(prefix).toEqual([...prefix].sort((a, b) => a.localeCompare(b)));
+  });
+});
+
+describe('cascadeDeleteOrg — artifact blob pre-clear (execution-plane W01, spec §8)', () => {
+  const ORG = '00000000-0000-0000-0000-000000000021';
+  const BY = '00000000-0000-0000-0000-000000000022';
+
+  /** Ordered trace of blob deletes and row deletes, in the order they fire. */
+  let callTrace: string[] = [];
+
+  beforeEach(() => {
+    mockState.executeResponses = [];
+    mockState.executedSql = [];
+    mockState.fkEdges = [];
+    mockState.attachmentKeyRows = [];
+    mockState.softwareKeyRows = [];
+    mockState.artifactKeyRows = [];
+    mockState.artifactKeyError = null;
+    callTrace = [];
+    vi.mocked(db.execute).mockReset();
+    deleteObjectKeysMock.mockReset();
+    deleteObjectKeysMock.mockResolvedValue(undefined);
+    deleteSoftwareObjectsMock.mockReset();
+    deleteSoftwareObjectsMock.mockResolvedValue(undefined);
+    artifactBlobDeleteMock.mockReset();
+    artifactBlobDeleteMock.mockImplementation(async () => {
+      callTrace.push('blob:delete');
+    });
+    createAuditLogMock.mockClear();
+
+    vi.mocked(db.execute).mockImplementation(((q: unknown) => {
+      const text = sqlToText(q);
+      if (text.includes('pg_constraint') || text.includes('contype')) {
+        return Promise.resolve(mockState.fkEdges);
+      }
+      if (text.includes('AS storage_key')) return Promise.resolve(mockState.attachmentKeyRows);
+      if (text.includes('SELECT blob_key')) {
+        if (mockState.artifactKeyError) return Promise.reject(mockState.artifactKeyError);
+        return Promise.resolve(mockState.artifactKeyRows);
+      }
+      if (/^\s*delete/i.test(text)) callTrace.push(`delete:${text.slice(0, 40)}`);
+      return Promise.resolve({ rowCount: 0 });
+    }) as any);
+  });
+
+  function queueArtifactKeys(keys: string[]) {
+    mockState.artifactKeyRows = keys.map((blob_key) => ({ blob_key }));
+  }
+
+  function failNextBlobDelete(err: Error) {
+    artifactBlobDeleteMock.mockImplementation(async () => {
+      callTrace.push('blob:delete');
+      throw err;
+    });
+  }
+
+  function failArtifactKeyQuery(err: unknown) {
+    mockState.artifactKeyError = err;
+  }
+
+  it('deletes every ai_run_artifacts blob BEFORE any row is deleted', async () => {
+    queueArtifactKeys(['us/2026/10/k1', 'eu/2026/10/k2']);
+    await cascadeDeleteOrg(ORG, BY);
+    // The ordered call trace must show both blob deletes ahead of the first
+    // row delete of ANY table — the row is the only index to the key.
+    const firstRowDelete = callTrace.findIndex((c) => c.startsWith('delete:'));
+    const lastBlobDelete = callTrace
+      .map((c, i) => (c === 'blob:delete' ? i : -1))
+      .filter((i) => i >= 0)
+      .pop();
+    expect(lastBlobDelete).toBeGreaterThanOrEqual(0);
+    expect(firstRowDelete).toBeGreaterThanOrEqual(0);
+    expect(lastBlobDelete!).toBeLessThan(firstRowDelete);
+    expect(artifactBlobDeleteMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('aborts the erasure with a rerunnable message when a blob delete fails, deleting no rows', async () => {
+    queueArtifactKeys(['us/2026/10/k1']);
+    failNextBlobDelete(new Error('bucket down'));
+    await expect(cascadeDeleteOrg(ORG, BY)).rejects.toThrow(
+      /artifact blob pre-clear failed[\s\S]*rerunnable/,
+    );
+    expect(callTrace.some((c) => c.startsWith('delete:'))).toBe(false);
+  });
+
+  it('tolerates the table not existing yet (a DB behind this migration)', async () => {
+    failArtifactKeyQuery(
+      Object.assign(new Error('relation "ai_run_artifacts" does not exist'), { code: '42P01' }),
+    );
+    await expect(cascadeDeleteOrg(ORG, BY)).resolves.toBeDefined();
   });
 });

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Hono } from 'hono';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { scriptRoutes } from './scripts';
 
 // Valid UUID constants for tests
@@ -113,12 +114,14 @@ vi.mock('../db', () => {
 });
 
 vi.mock('../db/schema', () => ({
-  scripts: { id: 'scripts.id', updatedAt: 'scripts.updatedAt' },
+  scripts: { id: 'scripts.id', updatedAt: 'scripts.updatedAt', orgId: 'scripts.orgId', partnerId: 'scripts.partnerId', name: 'scripts.name', deletedAt: 'scripts.deletedAt' },
   // POST /scripts/:id/clone (#4887) reads/writes tags via scriptBundle's
   // ensureTagIds/linkTags helpers, which key off these two column refs.
   scriptTags: { id: 'stg.id', name: 'stg.name', orgId: 'stg.orgId', partnerId: 'stg.partnerId' },
   scriptToTags: { scriptId: 'stt.scriptId', tagId: 'stt.tagId' },
-  scriptExecutions: {},
+  // Column sentinels the #5040 projection assertions key off; the rest of this
+  // file only needs the object to exist.
+  scriptExecutions: { cancelState: 'se.cancelState' },
   scriptExecutionBatches: {},
   devices: {},
   deviceCommands: {},
@@ -1088,6 +1091,113 @@ describe('scripts routes', () => {
     });
   });
 
+  describe('system library import ownership (#5002)', () => {
+    let inserted: Record<string, unknown> | undefined;
+    let duplicateWhere: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      inserted = undefined;
+      duplicateWhere = vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([]) });
+      vi.mocked(db.select).mockImplementation((() => ({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([{
+            id: SCRIPT_ID_2, name: 'System Script', content: 'echo hi', parameters: null,
+            language: 'bash', osTypes: ['linux'], isSystem: true
+          }]) })
+        })
+      })) as any);
+      vi.mocked(db.insert).mockImplementation((() => ({
+        values: vi.fn().mockImplementation((values: Record<string, unknown>) => {
+          inserted = values;
+          return { returning: vi.fn().mockResolvedValue([{ id: SCRIPT_ID_1, ...values }]) };
+        })
+      })) as any);
+    });
+
+    async function usePartner(partnerOrgAccess: 'all' | 'selected' = 'all', partnerId: string | null = PARTNER_ID) {
+      const { authMiddleware } = await import('../middleware/auth');
+      vi.mocked(authMiddleware).mockImplementationOnce((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-123' }, scope: 'partner', orgId: null, partnerId, partnerOrgAccess,
+          accessibleOrgIds: [ORG_ID, ORG_ID_2],
+          canAccessOrg: (id: string) => [ORG_ID, ORG_ID_2].includes(id)
+        });
+        return next();
+      });
+    }
+
+    async function importScript(body: Record<string, unknown>) {
+      // Use a per-call implementation so early denials leave no queued mocks.
+      const sourceSelect = vi.mocked(db.select).getMockImplementation()!;
+      let selects = 0;
+      vi.mocked(db.select).mockImplementation(((...args: any[]) => {
+        selects++;
+        return selects === 2
+          ? { from: vi.fn().mockReturnValue({ where: duplicateWhere }) }
+          : (sourceSelect as any)(...args);
+      }) as any);
+      return app.request(`/scripts/import/${SCRIPT_ID_2}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      });
+    }
+
+    it('imports partner-wide with exclusive ownership and checks duplicates within that partner', async () => {
+      await usePartner();
+      const res = await importScript({ ownerScope: 'partner' });
+      expect(res.status).toBe(201);
+      expect(inserted).toMatchObject({ orgId: null, partnerId: PARTNER_ID, isSystem: false });
+      const query = new PgDialect().sqlToQuery(duplicateWhere.mock.calls[0]![0]);
+      expect(query.params).toEqual(['scripts.orgId', 'scripts.partnerId', PARTNER_ID, 'scripts.name', 'System Script', 'scripts.deletedAt']);
+      expect(query.sql).toContain('is null');
+    });
+
+    it.each(['selected', 'organization', 'missing-partner'])('denies partner-wide import for %s callers with a friendly error', async (caller) => {
+      if (caller !== 'organization') await usePartner(caller === 'selected' ? 'selected' : 'all', caller === 'missing-partner' ? null : PARTNER_ID);
+      const res = await importScript({ ownerScope: 'partner' });
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toContain('Choose an organization');
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it.each([{}, { ownerScope: 'organization' }])('keeps organization imports unchanged for %j', async (body) => {
+      const res = await importScript(body);
+      expect(res.status).toBe(201);
+      expect(inserted).toMatchObject({ orgId: ORG_ID, partnerId: null });
+    });
+
+    it('allows a selected-access partner to import into an accessible organization', async () => {
+      await usePartner('selected');
+      expect((await importScript({ ownerScope: 'organization', orgId: ORG_ID_2 })).status).toBe(201);
+      expect(inserted).toMatchObject({ orgId: ORG_ID_2, partnerId: null });
+    });
+
+    it('rejects an organization outside the partner grant', async () => {
+      await usePartner();
+      expect((await importScript({ orgId: 'ffffffff-ffff-4fff-8fff-ffffffffffff' })).status).toBe(403);
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('rejects a duplicate under the selected partner owner', async () => {
+      await usePartner();
+      duplicateWhere.mockReturnValue({ limit: vi.fn().mockResolvedValue([{ id: SCRIPT_ID_1 }]) });
+      expect((await importScript({ ownerScope: 'partner' })).status).toBe(409);
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('asks multi-org callers to choose an organization when no target is supplied', async () => {
+      await usePartner('selected');
+      const res = await importScript({});
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe('Choose an organization to import this script into.');
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('rejects an invalid owner scope', async () => {
+      expect((await importScript({ ownerScope: 'system' })).status).toBe(400);
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+  });
+
   // -------------------------------------------------------------------
   // POST /scripts/:id/clone (#4887) — the general "Duplicate" action.
   // Tenancy resolution lives in resolveScriptCloneScope (services/scriptWrite.ts);
@@ -1776,6 +1886,102 @@ describe('scripts routes', () => {
     expect(res.status).toBe(403);
     const body = await res.json();
     expect(body.error).toBe('Access to this site denied');
+  });
+
+  // ==========================================================================
+  // cancelState on the execution READ endpoints (#5040)
+  //
+  // The web UI qualifies a terminal status with the cancel outcome
+  // (resolveExecutionStatusLabel(status, cancelState)); if these two SELECTs
+  // omit the column, that copy is unreachable against real data. The db mock
+  // returns whatever it is handed, so asserting on the response body alone
+  // would be vacuous — these assert the PROJECTION the route passes to
+  // db.select(), which is the thing that was missing.
+  // ==========================================================================
+  describe('cancelState is returned by the execution read endpoints (#5040)', () => {
+    it('GET /scripts/:id/executions selects cancelState', async () => {
+      vi.mocked(db.select)
+        // getScriptWithOrgCheck
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([{ id: SCRIPT_ID_1, name: 'Script One', isSystem: false, orgId: ORG_ID }])
+            })
+          })
+        } as any)
+        // count
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            leftJoin: vi.fn().mockReturnValue({
+              where: vi.fn().mockResolvedValue([{ count: 1 }])
+            })
+          })
+        } as any)
+        // the execution page itself
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            leftJoin: vi.fn().mockReturnValue({
+              where: vi.fn().mockReturnValue({
+                orderBy: vi.fn().mockReturnValue({
+                  limit: vi.fn().mockReturnValue({
+                    offset: vi.fn().mockResolvedValue([{
+                      id: EXECUTION_ID,
+                      scriptId: SCRIPT_ID_1,
+                      deviceId: 'device-1',
+                      status: 'completed',
+                      cancelState: 'unconfirmed'
+                    }])
+                  })
+                })
+              })
+            })
+          })
+        } as any);
+
+      const res = await app.request(`/scripts/${SCRIPT_ID_1}/executions`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer valid-token' }
+      });
+
+      expect(res.status).toBe(200);
+      const projection = vi.mocked(db.select).mock.calls[2]?.[0] as Record<string, unknown>;
+      expect(projection).toHaveProperty('cancelState', 'se.cancelState');
+      const body = await res.json();
+      expect(body.data[0].cancelState).toBe('unconfirmed');
+    });
+
+    it('GET /scripts/executions/:id selects cancelState', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          leftJoin: vi.fn().mockReturnValue({
+            leftJoin: vi.fn().mockReturnValue({
+              where: vi.fn().mockReturnValue({
+                limit: vi.fn().mockResolvedValue([{
+                  id: EXECUTION_ID,
+                  scriptId: SCRIPT_ID_1,
+                  deviceId: 'device-1',
+                  status: 'cancelled',
+                  cancelState: 'confirmed',
+                  deviceOrgId: ORG_ID,
+                  deviceSiteId: 'site-allowed'
+                }])
+              })
+            })
+          })
+        })
+      } as any);
+
+      const res = await app.request(`/scripts/executions/${EXECUTION_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer valid-token' }
+      });
+
+      expect(res.status).toBe(200);
+      const projection = vi.mocked(db.select).mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(projection).toHaveProperty('cancelState', 'se.cancelState');
+      const body = await res.json();
+      expect(body.cancelState).toBe('confirmed');
+    });
   });
 
   // ==========================================================================

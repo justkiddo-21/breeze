@@ -3,11 +3,13 @@ import { useTranslation } from 'react-i18next';
 import '@/lib/i18n';
 import { fetchWithAuth } from '../../stores/auth';
 import { navigateTo } from '@/lib/navigation';
+import { showToast } from '../shared/Toast';
 import { runAction, ActionError } from '@/lib/runAction';
 import { fetchTicketConfig, priorityLabel } from '@/lib/ticketConfigApi';
 import type { TicketConfig } from '@/lib/ticketConfigApi';
 import { priorityConfig } from '../tickets/ticketConfig';
 import type { TicketPriority } from '../tickets/ticketConfig';
+import InheritedField from '../shared/InheritedField';
 
 const PRIORITIES = Object.keys(priorityConfig) as TicketPriority[];
 
@@ -19,23 +21,7 @@ type SlaOverride = {
 type OrgTicketSettings = {
   orgId: string;
   slaOverrides: Partial<Record<TicketPriority, SlaOverride>>;
-  defaultHourlyRate: string | null;
-  defaultBillable: boolean | null;
-  /** Currency the stored rate was stamped in (null until a rate is set). */
-  rateCurrency: string | null;
-  /** Both come from the ticket-settings GET itself so the editor works for
-   *  partner- AND system-scope users (`/orgs/partners/me` 403s for system). */
-  orgCurrency: string;
-  partnerCurrency: string;
 };
-
-/** Normalize a rate for change detection: '100' and '100.00' are the same
- *  value; blank / null both mean "no rate". Returned as a string so the
- *  comparison is a plain `!==`. */
-function normalizeRate(value: string | null | undefined): string {
-  const trimmed = (value ?? '').trim();
-  return trimmed === '' ? 'null' : String(Number(trimmed));
-}
 
 type DraftSlaRow = {
   responseMinutes: string;
@@ -60,8 +46,6 @@ export default function OrgTicketSettingsEditor({ orgId, onDirty, onSave }: OrgT
   const [slaRows, setSlaRows] = useState<Record<TicketPriority, DraftSlaRow>>(
     () => Object.fromEntries(PRIORITIES.map(p => [p, { responseMinutes: '', resolutionMinutes: '' }])) as Record<TicketPriority, DraftSlaRow>
   );
-  const [hourlyRate, setHourlyRate] = useState('');
-  const [billable, setBillable] = useState<'inherit' | 'true' | 'false'>('inherit');
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -92,12 +76,7 @@ export default function OrgTicketSettingsEditor({ orgId, onDirty, onSave }: OrgT
         })
       ) as Record<TicketPriority, DraftSlaRow>;
       setSlaRows(newRows);
-      setHourlyRate(data.defaultHourlyRate ?? '');
-      setBillable(
-        data.defaultBillable === true ? 'true' :
-        data.defaultBillable === false ? 'false' :
-        'inherit'
-      );
+
     } catch (err) {
       console.warn('[OrgTicketSettingsEditor] load failed', err);
       setLoadError(true);
@@ -130,17 +109,7 @@ export default function OrgTicketSettingsEditor({ orgId, onDirty, onSave }: OrgT
         }
       }
 
-      const defaultBillable = billable === 'true' ? true : billable === 'false' ? false : null;
-      const patch: Record<string, unknown> = { slaOverrides, defaultBillable };
-
-      // Dirty-field rule (#3776): only carry the rate when it actually changed.
-      // The server restamps `rate_currency` only when the stored rate value
-      // changes, but an SLA-only save must not even resend the rate — belt
-      // and braces against an accidental restamp after an org currency change.
-      const rateStr = hourlyRate.trim();
-      if (normalizeRate(rateStr) !== normalizeRate(settings.defaultHourlyRate)) {
-        patch.defaultHourlyRate = rateStr !== '' ? Number(rateStr) : null;
-      }
+      const patch = { slaOverrides };
 
       await runAction({
         request: () => fetchWithAuth(`/orgs/organizations/${orgId}/ticket-settings`, {
@@ -153,20 +122,21 @@ export default function OrgTicketSettingsEditor({ orgId, onDirty, onSave }: OrgT
       });
       onSave();
     } catch (err) {
-      if (!(err instanceof ActionError)) throw err;
+      if (err instanceof ActionError && err.status === 401) return;
+      if (!(err instanceof ActionError)) showToast({ type: 'error', message: t('orgTicketSettingsEditor.errors.save') });
     } finally {
       setSaving(false);
     }
-  }, [settings, saving, slaRows, hourlyRate, billable, orgId, onSave, t]);
+  }, [settings, saving, slaRows, orgId, onSave, t]);
 
-  // Compute placeholder for a given priority+field:
-  // If partnerConfig has a value, show the number; otherwise show "Partner default"
-  const getPlaceholder = (priority: TicketPriority, field: 'response' | 'resolution'): string => {
-    if (!partnerConfig) return t('orgTicketSettingsEditor.partnerDefault');
-    const pSetting = partnerConfig.priorities[priority];
-    if (!pSetting) return t('orgTicketSettingsEditor.partnerDefault');
+  // The inherited (partner-default) SLA number for a given priority+field, or
+  // null when the partner has no value configured — feeds InheritedField's
+  // inheritedValue prop (rule 4: always show the VALUE, not just the source).
+  const partnerSlaValue = (priority: TicketPriority, field: 'response' | 'resolution'): string | null => {
+    const pSetting = partnerConfig?.priorities[priority];
+    if (!pSetting) return null;
     const val = field === 'response' ? pSetting.responseSlaMinutes : pSetting.resolutionSlaMinutes;
-    return val != null ? String(val) : t('orgTicketSettingsEditor.partnerDefault');
+    return val != null ? String(val) : null;
   };
 
   if (loading) {
@@ -191,6 +161,9 @@ export default function OrgTicketSettingsEditor({ orgId, onDirty, onSave }: OrgT
         <p className="mt-1 text-sm text-muted-foreground">
           {t('orgTicketSettingsEditor.sla.description')}
         </p>
+        <p className="mt-1 text-xs text-amber-700" data-testid="org-ticket-sla-direction-note">
+          {t('orgTicketSettingsEditor.sla.categoryOverridesNote')}
+        </p>
         <div className="mt-4 overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
@@ -207,24 +180,32 @@ export default function OrgTicketSettingsEditor({ orgId, onDirty, onSave }: OrgT
                     {priorityLabel(partnerConfig, p)}
                   </td>
                   <td className="py-1.5 pr-4">
-                    <input
+                    <InheritedField
+                      id={`org-ticket-sla-${p}-response`}
+                      label={`${priorityLabel(partnerConfig, p)} ${t('orgTicketSettingsEditor.sla.response')}`}
+                      hideLabel
+                      value={slaRows[p].responseMinutes}
+                      onChange={(v) => updateSlaRow(p, 'responseMinutes', v)}
+                      inheritedValue={partnerSlaValue(p, 'response')}
+                      inheritedSource={t('orgTicketSettingsEditor.partnerDefault')}
                       type="number"
                       min={1}
-                      value={slaRows[p].responseMinutes}
-                      onChange={(e) => updateSlaRow(p, 'responseMinutes', e.target.value)}
-                      placeholder={getPlaceholder(p, 'response')}
-                      className="w-28 rounded-md border bg-background px-3 py-1.5 text-sm"
+                      inputWidthClassName="w-28"
                       data-testid={`org-ticket-sla-${p}-response`}
                     />
                   </td>
                   <td className="py-1.5">
-                    <input
+                    <InheritedField
+                      id={`org-ticket-sla-${p}-resolution`}
+                      label={`${priorityLabel(partnerConfig, p)} ${t('orgTicketSettingsEditor.sla.resolution')}`}
+                      hideLabel
+                      value={slaRows[p].resolutionMinutes}
+                      onChange={(v) => updateSlaRow(p, 'resolutionMinutes', v)}
+                      inheritedValue={partnerSlaValue(p, 'resolution')}
+                      inheritedSource={t('orgTicketSettingsEditor.partnerDefault')}
                       type="number"
                       min={1}
-                      value={slaRows[p].resolutionMinutes}
-                      onChange={(e) => updateSlaRow(p, 'resolutionMinutes', e.target.value)}
-                      placeholder={getPlaceholder(p, 'resolution')}
-                      className="w-28 rounded-md border bg-background px-3 py-1.5 text-sm"
+                      inputWidthClassName="w-28"
                       data-testid={`org-ticket-sla-${p}-resolution`}
                     />
                   </td>
@@ -232,56 +213,6 @@ export default function OrgTicketSettingsEditor({ orgId, onDirty, onSave }: OrgT
               ))}
             </tbody>
           </table>
-        </div>
-      </section>
-
-      <section className="rounded-lg border bg-card p-6 shadow-xs">
-        <h2 className="text-lg font-semibold">{t('orgTicketSettingsEditor.billing.title')}</h2>
-        <p className="mt-1 text-sm text-muted-foreground">
-          {t('orgTicketSettingsEditor.billing.description')}
-        </p>
-        <div className="mt-4 grid gap-4 sm:grid-cols-2">
-          <div>
-            <label className="text-sm font-medium" htmlFor="org-ticket-rate">
-              {t('orgTicketSettingsEditor.billing.hourlyRate', { currency: settings.orgCurrency })}
-            </label>
-            {settings.orgCurrency !== settings.partnerCurrency && (
-              <p
-                data-testid="org-ticket-currency-nudge"
-                className="mt-2 rounded-md border border-amber-300 bg-amber-50 p-2 text-xs text-amber-900"
-              >
-                {t('orgTicketSettingsEditor.billing.currencyNudge', {
-                  orgCurrency: settings.orgCurrency,
-                  partnerCurrency: settings.partnerCurrency
-                })}
-              </p>
-            )}
-            <input
-              id="org-ticket-rate"
-              type="number"
-              min={0}
-              step="0.01"
-              value={hourlyRate}
-              onChange={(e) => { setHourlyRate(e.target.value); onDirty(); }}
-              placeholder={t('orgTicketSettingsEditor.partnerDefault')}
-              className="mt-1 w-full rounded-md border bg-background px-3 py-1.5 text-sm"
-              data-testid="org-ticket-rate"
-            />
-          </div>
-          <div>
-            <label className="text-sm font-medium" htmlFor="org-ticket-billable">{t('orgTicketSettingsEditor.billing.billable')}</label>
-            <select
-              id="org-ticket-billable"
-              value={billable}
-              onChange={(e) => { setBillable(e.target.value as 'inherit' | 'true' | 'false'); onDirty(); }}
-              className="mt-1 w-full rounded-md border bg-background px-3 py-1.5 text-sm"
-              data-testid="org-ticket-billable"
-            >
-              <option value="inherit">{t('orgTicketSettingsEditor.billing.inherit')}</option>
-              <option value="true">{t('orgTicketSettingsEditor.billing.billableOption')}</option>
-              <option value="false">{t('orgTicketSettingsEditor.billing.nonBillableOption')}</option>
-            </select>
-          </div>
         </div>
       </section>
 

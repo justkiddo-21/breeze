@@ -345,7 +345,8 @@ async function persistInvoiceCurrencyMismatchErrorInOwnContext(
  * config problems on the dependency mapping that no amount of retrying the
  * QuickBooks call will fix. The first two are re-typed to their exact
  * counterparts (mirrors `translateMappingError`); `quickbooks_error` passes
- * through unchanged; everything else collapses to `dependency_not_ready` so
+ * through unchanged, and concurrent mapping sync contention stays retryable;
+ * everything else collapses to `dependency_not_ready` so
  * it is never mistaken for a retryable `quickbooks_error`/502. Every message
  * here is already sanitized/user-safe — never a raw provider body.
  */
@@ -353,7 +354,9 @@ function translateNestedSyncError(err: unknown): never {
   if (err instanceof AccountingMappingError) {
     if (err.code === 'not_connected') throw new AccountingInvoicePushError('not_connected', 404, err.message);
     if (err.code === 'reauth_required') throw new AccountingInvoicePushError('reauth_required', 409, err.message);
-    if (err.code === 'quickbooks_error') throw new AccountingInvoicePushError('quickbooks_error', 502, err.message);
+    if (err.code === 'quickbooks_error' || err.code === 'sync_in_progress') {
+      throw new AccountingInvoicePushError('quickbooks_error', 502, err.message);
+    }
     throw new AccountingInvoicePushError('dependency_not_ready', err.status === 404 ? 404 : 409, err.message);
   }
   throw err;
@@ -599,12 +602,30 @@ function computeTaxVariance(
 // Payload construction
 // ---------------------------------------------------------------------------
 
+// #6467: the worked-vs-billed disclosure (§3.5) used to reach the accounting
+// push BY ACCIDENT — it was baked into `description`, which this function
+// passes straight through. Now that the disclosure lives in `workedMinutes`
+// (structured data, so an editor edit can no longer erase it), it has to be
+// appended here explicitly or the accounting copy of the invoice would lose
+// the disclosure entirely. Plain English, matching the old baked-in text
+// byte-for-byte (no locale concept for this export) and every other
+// renderer's condition: empty for a non-time-entry line or when the two
+// quantities agree.
+function accountingLineNote(line: { quantity: string; workedMinutes: number | null }): string {
+  if (line.workedMinutes == null) return '';
+  const worked = (line.workedMinutes / 60).toFixed(2);
+  const billed = Number(line.quantity).toFixed(2);
+  if (worked === billed) return '';
+  return ` — ${worked} h worked, ${billed} h billed`;
+}
+
 function buildLinePayload(line: InvoiceLineRow): AccountingInvoiceLinePayload {
+  // Legacy-line fallback mirrors invoiceService/invoicePdf's own
+  // name-then-description title resolution.
+  const title = line.name ?? line.description ?? '';
   return {
     invoiceLineId: line.id,
-    // Legacy-line fallback mirrors invoiceService/invoicePdf's own
-    // name-then-description title resolution.
-    description: line.name ?? line.description ?? '',
+    description: `${title}${accountingLineNote(line)}`,
     quantity: line.quantity,
     unitPrice: line.unitPrice,
     lineTotal: line.lineTotal,

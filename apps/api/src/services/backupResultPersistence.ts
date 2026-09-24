@@ -18,6 +18,7 @@ import {
   computeExpiresAt,
   resolveGfsConfigForJob,
 } from '../jobs/backupRetention';
+import { enqueueSnapshotFileIndexHydration } from '../jobs/backupSnapshotFileIndexWorker';
 import type { ParsedBackupCommandResult } from '../routes/backup/resultSchemas';
 import {
   applyBackupSnapshotImmutability,
@@ -955,6 +956,23 @@ export async function applyBackupCommandResultToJob(params: {
     if (result.referencedFiles !== undefined) {
       updateData.referencedFiles = result.referencedFiles;
     }
+    // #5410: finalize the transferred counter from the terminal result. While
+    // the run is in flight, backupProgress.ts mirrors the agent's `current`
+    // (bytes PROCESSED toward `total`, referenced files included — that is
+    // what a progress bar needs) into transferred_size. Left as-is, a fully
+    // deduped incremental run reads as having uploaded the whole corpus, and a
+    // job that completed while the API was restarting keeps whatever mid-run
+    // value the last progress message carried. The terminal result is the
+    // authority: uploaded bytes = protected bytes minus the bytes satisfied by
+    // referencing an earlier snapshot. An agent that reports no dedup stats
+    // (full backup, or one predating incrementals) uploaded everything it
+    // protected.
+    if (result.bytesBackedUp !== undefined) {
+      updateData.transferredSize =
+        result.referencedBytes !== undefined
+          ? Math.max(0, result.bytesBackedUp - result.referencedBytes)
+          : result.bytesBackedUp;
+    }
   } else {
     updateData.status = terminalStatus;
     // Both, not either. `error` is the failure reason; `warning` is the run's
@@ -1361,7 +1379,13 @@ export async function applyBackupCommandResultToJob(params: {
         .returning()
     : await db.insert(backupSnapshots).values(snapshotValues).returning();
 
-  if (snapshot && result.snapshot?.files) {
+  if (snapshot && result.snapshot?.files && snapshot.fileIndexStatus !== 'complete') {
+    // W09 (#6464): once the server has hydrated a verified-complete index
+    // (fileIndexStatus === 'complete'), that index is authoritative and this
+    // delete+reinsert of the agent-reported rows must NOT run — it would
+    // silently downgrade a verified index back to an unverified one on the
+    // next ordinary backup run's result post for the SAME snapshot
+    // (re-adoption / reconcile can revisit an already-hydrated row).
     await db
       .delete(backupSnapshotFiles)
       .where(eq(backupSnapshotFiles.snapshotDbId, snapshot.id));
@@ -1391,6 +1415,32 @@ export async function applyBackupCommandResultToJob(params: {
       for (let i = 0; i < fileRows.length; i += BATCH_SIZE) {
         await db.insert(backupSnapshotFiles).values(fileRows.slice(i, i + BATCH_SIZE));
       }
+
+      // Rows just came from the AGENT-reported index, not server hydration —
+      // mark that explicitly rather than leaving 'none' (which would read as
+      // "never assessed" even though rows now exist).
+      await db.update(backupSnapshots).set({ fileIndexStatus: 'agent' }).where(eq(backupSnapshots.id, snapshot.id));
+    }
+  }
+
+  if (snapshot && result.referencedFiles !== undefined && result.referencedFiles > 0) {
+    // W09 (#6464): a snapshot with references needs a server-verified index
+    // before ANY token-mode recovery can be authorized against it — enqueue
+    // hydration now so it's usually already 'complete' by the time an
+    // operator creates a recovery. Enqueue is dedupe-keyed by snapshot id
+    // (Task 4), so a re-adoption/reconcile re-posting the same result is safe
+    // to call again.
+    //
+    // The job/snapshot rows above are already committed by this point, so a
+    // throw here (e.g. Redis unreachable) would make BullMQ retry an
+    // already-terminal backup result — catch only this enqueue and continue.
+    // The creation-time preflight (bareMetalRecoveryService.ts) is the
+    // documented fallback that enqueues hydration again if it's still
+    // missing when a recovery is actually created.
+    try {
+      await enqueueSnapshotFileIndexHydration(snapshot.id, 'result');
+    } catch (err) {
+      console.error(`[backupResultPersistence] Failed to enqueue file-index hydration for snapshot ${snapshot.id}:`, err);
     }
   }
 

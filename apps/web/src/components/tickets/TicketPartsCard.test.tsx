@@ -139,11 +139,57 @@ describe('TicketPartsCard', () => {
     });
   });
 
+  // BQ-7: a PATCH 404 means the part was deleted underneath the tech. Saving
+  // must not leave a ghost row stuck in edit mode — exit edit mode and
+  // refetch so the row disappears from the list.
+  it('exits edit mode and refetches when saving a 404d (deleted) part', async () => {
+    let listCalls = 0;
+    fetchWithAuth.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === '/tickets/parts/p-1' && init?.method === 'PATCH') {
+        return { ok: false, status: 404, json: async () => ({ error: 'not found' }) } as Response;
+      }
+      if (url === '/tickets/tk-1/parts') {
+        listCalls += 1;
+        return jsonRes(listCalls === 1 ? parts : []);
+      }
+      return jsonRes({});
+    });
+    render(<TicketPartsCard ticketId="tk-1" />);
+    fireEvent.click(await screen.findByTestId('ticket-part-edit-p-1'));
+    fireEvent.change(screen.getByTestId('ticket-parts-form-description'), { target: { value: 'SSD 2TB' } });
+    fireEvent.click(screen.getByTestId('ticket-parts-form-submit'));
+    await waitFor(() => expect(screen.queryByTestId('ticket-parts-form')).toBeNull());
+    await waitFor(() => expect(listCalls).toBeGreaterThanOrEqual(2));
+    await waitFor(() => expect(screen.queryByTestId('ticket-part-p-1')).toBeNull());
+  });
+
+  // BQ-7: same pattern for delete — a 404 (already gone) must not leave the
+  // confirm affordance stuck on a ghost row.
+  it('exits confirm mode and refetches when deleting a 404d (already-deleted) part', async () => {
+    let listCalls = 0;
+    fetchWithAuth.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === '/tickets/parts/p-1' && init?.method === 'DELETE') {
+        return { ok: false, status: 404, json: async () => ({ error: 'not found' }) } as Response;
+      }
+      if (url === '/tickets/tk-1/parts') {
+        listCalls += 1;
+        return jsonRes(listCalls === 1 ? parts : []);
+      }
+      return jsonRes({});
+    });
+    render(<TicketPartsCard ticketId="tk-1" />);
+    fireEvent.click(await screen.findByTestId('ticket-part-delete-p-1'));
+    fireEvent.click(await screen.findByTestId('ticket-part-delete-confirm-yes-p-1'));
+    await waitFor(() => expect(screen.queryByTestId('ticket-part-delete-confirm-p-1')).toBeNull());
+    await waitFor(() => expect(listCalls).toBeGreaterThanOrEqual(2));
+    await waitFor(() => expect(screen.queryByTestId('ticket-part-p-1')).toBeNull());
+  });
+
   it('adds a part from the catalog — prefills fields and links catalogItemId (#1368)', async () => {
     const catItem = {
       id: 'cat-1', partnerId: 'p1', itemType: 'hardware', name: 'NVMe 1TB', sku: 'NV-1', description: null,
-      // unitPrice is the deprecated mirror (#3775) — the prefill must come from the price book.
-      billingType: 'one_time', unitPrice: '999.00', costBasis: '90.00', costCurrency: 'USD', markupPercent: null, unitOfMeasure: 'each',
+      // The prefill must come from the price book row in the org currency.
+      billingType: 'one_time', costBasis: '90.00', costCurrency: 'USD', markupPercent: null, unitOfMeasure: 'each',
       taxable: false, taxCategory: null, isBundle: false, isActive: true, createdAt: '', updatedAt: '',
       prices: [{ currencyCode: 'USD', unitPrice: '150.00' }],
     };
@@ -231,7 +277,7 @@ describe('TicketPartsCard', () => {
       expect(screen.getByTestId('ticket-parts-form-cost-basis')).toHaveValue(null);
     });
 
-    it('leaves the price blank when the book has no row in the org currency (never the unitPrice mirror)', async () => {
+    it('leaves the price blank when the book has no row in the org currency', async () => {
       fetchWithAuth.mockImplementation(async (url: string) =>
         url.startsWith('/catalog') ? jsonRes([catItem({ prices: [{ currencyCode: 'USD', unitPrice: '150.00' }] })]) : url === '/tickets/tk-1/parts' ? jsonRes(parts) : jsonRes({}));
       await pick('EUR');

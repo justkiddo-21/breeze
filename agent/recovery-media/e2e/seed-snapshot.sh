@@ -34,6 +34,25 @@ mmdebstrap \
 
 echo "e2e-restored-src" > "$seed_root/etc/hostname"
 
+# D-W09-2 (#6491 KIT lab): every systemd Linux host ships unit files whose
+# names carry a literal backslash (`system-systemd\x2dcryptsetup.slice`), and
+# the real agent writes that name into the object key verbatim. bookworm's
+# systemd already installs this file; write it explicitly so the seed never
+# silently loses the trait if the package layout changes, and so its bytes
+# are known for the run-qemu.sh post-check.
+systemd_unit_dir="$seed_root/usr/lib/systemd/system"
+mkdir -p "$systemd_unit_dir"
+cat > "$systemd_unit_dir/system-systemd\\x2dcryptsetup.slice" <<'UNIT'
+#  SPDX-License-Identifier: LGPL-2.1-or-later
+#
+#  This file is part of systemd.
+[Unit]
+Description=Cryptsetup Units Slice
+Documentation=man:systemd.special(7)
+DefaultDependencies=no
+Before=cryptsetup.target
+UNIT
+
 cat > "$seed_root/etc/fstab" <<'FSTAB'
 # Written by agent/recovery-media/e2e/seed-snapshot.sh for the QEMU e2e
 # proof. The rebuild engine generates fresh filesystem UUIDs at mkfs time
@@ -65,6 +84,36 @@ echo "seed-snapshot: walking seed root into $store_dir/snapshots/$snapshot_id"
   --out "$store_dir" \
   --snapshot-id "$snapshot_id" \
   --exclude proc --exclude sys --exclude dev --exclude run --exclude tmp
+
+# snapshot-dir keys every object by sha256(sourcePath), so a filename never
+# reaches a key and the QEMU e2e could not see D-W09-2 (a backslash inside a
+# key). Re-key the systemd unit written above to the REAL agent's key shape
+# — snapshots/<id>/files/path_0/<source path> (backup.go: path.Join(prefix,
+# "files", filepath.ToSlash(rootLabel/rel))) — so a literal backslash sits
+# in an object key that e2e-2 and e2e-3 then reference from e2e-1 verbatim.
+# No .gz suffix: the seeded store is raw (see snapshot_dir_cmd.go's doc).
+python3 - "$store_dir" "$snapshot_id" <<'PYEOF'
+import json, os, shutil, sys
+
+store, snap = sys.argv[1], sys.argv[2]
+manifest_path = f"{store}/snapshots/{snap}/manifest.json"
+with open(manifest_path) as f:
+    m = json.load(f)
+unit = "/usr/lib/systemd/system/system-systemd\\x2dcryptsetup.slice"
+for entry in m["files"]:
+    if entry.get("sourcePath") == unit and entry.get("backupPath"):
+        old_key = entry["backupPath"]
+        new_key = f"snapshots/{snap}/files/path_0" + unit
+        os.makedirs(os.path.dirname(f"{store}/{new_key}"), exist_ok=True)
+        shutil.move(f"{store}/{old_key}", f"{store}/{new_key}")
+        entry["backupPath"] = new_key
+        break
+else:
+    raise SystemExit(f"expected {unit!r} as a content entry in the {snap} manifest (D-W09-2 seed trait)")
+with open(manifest_path, "w") as f:
+    json.dump(m, f, indent=2)
+print(f"seed-snapshot: re-keyed {unit} to {new_key}")
+PYEOF
 
 # Synthetic single-disk UEFI layout matching target.img's geometry
 # (8 GiB, created by run-qemu.sh). FSUUID is deliberately empty on both
@@ -124,4 +173,88 @@ cat > "$layout_path" <<JSON
 }
 JSON
 
-echo "seed-snapshot: done — $layout_path"
+OUT="$store_dir"
+
+# e2e-2: one changed file (uploaded fresh under e2e-2), everything else
+# references e2e-1 verbatim (backupPath unchanged from e2e-1's manifest).
+# snapshot-dir has no diffing/"--only-changed" mode (it emits one full
+# manifest per invocation) — hand-write e2e-2/manifest.json instead
+# (simpler and matches how layout.json is already hand-written by this
+# script): copy e2e-1/manifest.json, change "id" to "e2e-2", and for
+# exactly one file entry (etc/debian_version — base-files guarantees this
+# file in an mmdebstrap minbase chroot, unlike /etc/motd) recompute its
+# backupPath under snapshots/e2e-2/files/<sha256 of sourcePath> and
+# re-upload that one file's bytes to that key; every other file entry's
+# backupPath stays "snapshots/e2e-1/files/...".
+python3 - "$OUT" <<'PYEOF'
+import json, hashlib, os, sys, shutil
+
+out = sys.argv[1]
+with open(f"{out}/snapshots/e2e-1/manifest.json") as f:
+    gen1 = json.load(f)
+
+gen2 = json.loads(json.dumps(gen1))
+gen2["id"] = "e2e-2"
+for entry in gen2["files"]:
+    if entry.get("sourcePath") == "/etc/debian_version":
+        key = "snapshots/e2e-2/files/" + hashlib.sha256(entry["sourcePath"].encode()).hexdigest()
+        entry["backupPath"] = key
+        os.makedirs(os.path.dirname(f"{out}/{key}"), exist_ok=True)
+        body = b"e2e-2-changed-debian-version\n"
+        with open(f"{out}/{key}", "wb") as fh:
+            fh.write(body)
+        # The manifest's checksum/size describe the bytes at the key
+        # (restore verifies them — a stale e2e-1 checksum fails the file).
+        entry["checksum"] = hashlib.sha256(body).hexdigest()
+        entry["size"] = len(body)
+        break
+else:
+    raise SystemExit("expected /etc/debian_version in the e2e-1 manifest to mark as changed in e2e-2")
+
+os.makedirs(f"{out}/snapshots/e2e-2", exist_ok=True)
+with open(f"{out}/snapshots/e2e-2/manifest.json", "w") as f:
+    json.dump(gen2, f, indent=2)
+# The console refuses without a captured disk layout ("no disk layout was
+# captured for snapshot ..."), so every generation carries the same
+# synthetic layout.json as e2e-1 (a hard copy, not optional).
+shutil.copy(f"{out}/snapshots/e2e-1/layout.json", f"{out}/snapshots/e2e-2/layout.json")
+PYEOF
+
+# e2e-3: references into BOTH e2e-1 (unchanged files) and e2e-2 (the
+# changed /etc/debian_version), plus its own newly changed file (/etc/hostname).
+python3 - "$OUT" <<'PYEOF'
+import json, hashlib, os, sys, shutil
+
+out = sys.argv[1]
+with open(f"{out}/snapshots/e2e-2/manifest.json") as f:
+    gen2 = json.load(f)
+
+gen3 = json.loads(json.dumps(gen2))
+gen3["id"] = "e2e-3"
+for entry in gen3["files"]:
+    if entry.get("sourcePath") == "/etc/hostname":
+        key = "snapshots/e2e-3/files/" + hashlib.sha256(entry["sourcePath"].encode()).hexdigest()
+        entry["backupPath"] = key
+        os.makedirs(os.path.dirname(f"{out}/{key}"), exist_ok=True)
+        body = b"e2e-3-changed-hostname\n"
+        with open(f"{out}/{key}", "wb") as fh:
+            fh.write(body)
+        entry["checksum"] = hashlib.sha256(body).hexdigest()
+        entry["size"] = len(body)
+        break
+else:
+    raise SystemExit("expected /etc/hostname in the manifest to mark as changed in e2e-3")
+
+os.makedirs(f"{out}/snapshots/e2e-3", exist_ok=True)
+with open(f"{out}/snapshots/e2e-3/manifest.json", "w") as f:
+    json.dump(gen3, f, indent=2)
+shutil.copy(f"{out}/snapshots/e2e-1/layout.json", f"{out}/snapshots/e2e-3/layout.json")
+PYEOF
+
+# One unrelated, unreferenced object under e2e-1's own prefix, so the fake
+# server's refusal path (handleDownload / not_authorized) is exercised by
+# a real request during the run — R7/R8 in Part 0 §4.
+mkdir -p "$OUT/snapshots/e2e-1/files"
+echo "not part of any manifest" > "$OUT/snapshots/e2e-1/files/not-referenced.gz"
+
+echo "seed-snapshot: done — $layout_path (plus e2e-2, e2e-3 generations and one unreferenced object)"

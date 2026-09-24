@@ -17,6 +17,10 @@ Both modes share the same rebuild engine, [`breeze-backup rebuild`](#rebuilding-
 
 A recovery token is scoped to **one snapshot**. A `file`-mode snapshot recovers data; a `system_image`-mode snapshot applies OS state. To recover both for one machine, generate two tokens (one per snapshot) and run `bmr-recover` twice, or back the machine up with a [Whole machine profile](/backup/profiles/#whole-machine-templates) so one snapshot carries both — a whole-machine profile is a single `system_image` selection that also walks the OS root, so it produces exactly one snapshot with files, layout, and system state together, not a separate file snapshot plus a files-less `system_image` snapshot.
 
+<Aside type="tip">
+  Recovering from an **incremental** snapshot — one that reuses files unchanged since an earlier snapshot instead of re-uploading them — works the same as recovering from a full snapshot, in every mode on this page. Breeze resolves those cross-snapshot references automatically at recovery time.
+</Aside>
+
 ---
 
 ## Recover from Breeze recovery media
@@ -45,6 +49,23 @@ The media is a Debian live system with the `breeze-backup` binary and nothing el
 
 <Aside type="note">
   One recovery at a time per device. While a recovery is anywhere between `created` and `rebooted`, creating another for the same device is refused with `recovery_in_progress`; it clears once the recovery reaches a terminal state (`checked_in`, `completed`, `failed` or `refused`).
+</Aside>
+
+<Aside type="note">
+  **Recovery media too old.** If this snapshot's files reference objects
+  stored under an earlier snapshot, the console needs recovery media that
+  supports cross-snapshot references. An older ISO is refused with a
+  message telling you to download the current recovery media and boot
+  again — the target disk is never touched.
+</Aside>
+
+<Aside type="note">
+  **Preparing file index.** The first time you recover from an incremental
+  snapshot, Breeze may need a few seconds to a few minutes to verify which
+  older-snapshot objects it references. The console retries automatically
+  and shows "Breeze is preparing the file index for this snapshot…" while
+  it waits — this is expected and does not consume one of your three code
+  attempts.
 </Aside>
 
 ### 3. Boot and follow the console
@@ -128,6 +149,8 @@ The run ends with a status and a short result summary (`filesRestored`, `failedF
 | `partial` | Some files restored or the state was applied, but something else failed — read `warnings`. A `system_image` run whose state manifest was found but could not be applied (missing required step, failed checksum) is never reported as `completed`. |
 | `failed` | Nothing was restored. Also the outcome when the token's snapshot advertised system state that could not be found, or a step the snapshot marks as **required** was never collected. |
 
+A snapshot counts as advertising system state when its backup type is `system_image` **or** it recorded a state manifest — so a `system_image` snapshot whose state collection failed is held to the same rule rather than recovering "successfully" with files only. The same gate applies to [`breeze-backup rebuild`](#rebuilding-a-linux-disk-from-scratch-breeze-backup-rebuild) and the recovery media, which refuse such a snapshot before touching the disk.
+
 <Aside type="caution" title="Before v0.112.0, a completed system_image recovery applied nothing">
   Snapshots taken before v0.112.0 published their OS-state artifacts under a location the recovery binary never looked at, so a `system_image` recovery downloaded them, applied nothing and still reported `completed` with `stateApplied: false`. Both halves are fixed in v0.112.0 — the agent publishes state where the consumer reads it, and the consumer refuses to report `completed` when advertised state was not applied — but only for snapshots **taken by a v0.112.0 or later agent**. To recover OS state, take a fresh `system_image` backup after upgrading.
 </Aside>
@@ -187,7 +210,7 @@ The badge governs only the `rebuild` path below. A snapshot marked *not* restora
 `breeze-backup rebuild` is the from-scratch counterpart to `bmr-recover`: instead of restoring onto an OS you installed, it takes a **blank disk (or a raw image file)**, provisions the partitions recorded in the snapshot's layout manifest, restores a whole-machine snapshot into them, applies the system state offline, installs GRUB and validates the result. It ships in the same `breeze-backup` binary as the recovery bundle.
 
 <Aside type="note" title="Scope">
-  Linux hosts and Linux snapshots only, run from a booted Linux environment; the snapshot must be marked **Bare-metal restorable** and the target must be UEFI/GPT. The [recovery media](#recover-from-breeze-recovery-media) runs it for you; the command below is for scripted or unusual recoveries and does not appear in the device's command history. Restore-as-VM is later work built on this engine.
+  Linux hosts and Linux snapshots only, run from a booted Linux environment; the snapshot must be marked **Bare-metal restorable** and the target must be UEFI/GPT. The [recovery media](#recover-from-breeze-recovery-media) runs it for you; the command below is for scripted or unusual recoveries and does not appear in the device's command history. [Restore as VM](#restore-as-vm) and [DR bare-metal rebuild steps](/backup/disaster-recovery/#bare-metal-rebuild-step) also run this engine, targeting a VHDX image instead of a disk.
 </Aside>
 
 ```
@@ -208,18 +231,42 @@ breeze-backup rebuild \
 | `--dry-run` | Run the preflight only — fetch and verify the layout, plan the partitions, check the target — and print the plan without writing anything. |
 | `--state-dir` | Where the resumable state file lives (default `/var/lib/breeze/rebuild`). |
 | `--force-reprovision`, `--allow-partial`, `--no-initramfs` | Re-partition even if a previous run already did; continue when some files failed to restore; skip the initramfs regeneration. |
+| `--expect-system-state` | `auto` (default), `true` or `false`: whether the snapshot must carry system state that the rebuild applies. `auto` says yes for a `system_image` snapshot (the recovery media and `--token` mode take this from the server's bootstrap; `--provider-config` mode infers it from a `layout.json` or state manifest in the snapshot). `false` rebuilds a file-only snapshot with a warning. |
 
 The rebuild runs seven phases in order — **preflight → provision → restore → boot → identity → encryption → validate**:
 
-1. **Preflight** downloads `layout.json`, refuses a snapshot that is not restorable or not Linux, checks the target is safe and large enough, plans the partitions, and downloads and checksum-verifies the snapshot and system-state manifests. Nothing is written.
+1. **Preflight** downloads `layout.json`, refuses a snapshot that is not restorable or not Linux, checks the target is safe and large enough, plans the partitions, and downloads and checksum-verifies the snapshot and system-state manifests. Nothing is written. A `system_image` snapshot whose `system-state/manifest.json` is missing (or lists no artifacts) is **refused** here — the rebuild never proceeds files-only when system state was expected.
 2. **Provision** wipes the target, recreates the GPT partitions with their original type codes, GUIDs, names and filesystem UUIDs/labels, and formats them.
 3. **Restore** mounts the new partitions, restores the file snapshot into them, then applies the system state **offline** into that tree. Unlike a live `bmr-recover`, `/etc` is restored **without** the identity/network excludes (`fstab`, `machine-id`, `hostname` and network configuration do land, because the rebuilt disk is the original machine), services are enabled with `systemctl --root`, crontabs are written straight into the spool, and firewall rules are written to `/etc/iptables/rules.v4` (or `/etc/breeze/recovery/iptables.rules` with a warning if `iptables-persistent` is absent). Package reinstall is skipped offline.
 4. **Boot** installs GRUB for UEFI (Debian/Ubuntu via `grub-install` + `update-grub`, RHEL-family via `grub2-mkconfig` + `efibootmgr`), regenerates the initramfs, and always writes the removable-media fallback loader (`EFI/BOOT/BOOTX64.EFI` / `BOOTAA64.EFI`). Other distribution families are not supported.
 5. **Identity** applies the `--identity` choice.
 6. **Encryption** is a no-op in this release — encrypted layouts are refused at preflight.
-7. **Validate** spot-checks a sample of restored files against their checksums, confirms the bootloader and `grub.cfg` exist, cross-checks `fstab` UUIDs against the new partitions, then syncs and unmounts.
+7. **Validate** spot-checks a sample of restored files against their checksums, confirms the bootloader and `grub.cfg` exist, cross-checks `fstab` UUIDs against the new partitions, then syncs and unmounts. When system state was expected, it also fails with `system state not applied` if the restore phase did not apply it.
+
+The result JSON carries `stateManifestFound` and `stateApplied` alongside `status`; a rebuild is never `completed` unless `stateApplied` is `true` whenever system state was expected.
 
 Progress is checkpointed to `<state-dir>/rebuild-<snapshot>-<target>.json` after every phase. If a run is interrupted, re-running the same command **resumes**: phases already completed are skipped, the partitions are re-attached rather than re-created, and the state file is removed only on success.
+
+---
+
+## Restore as VM
+
+The **VM Restore Wizard**'s **Rebuild engine (Linux)** option runs the same [rebuild engine](#rebuilding-a-linux-disk-from-scratch-breeze-backup-rebuild) described above, but writes the result straight to a **VHDX** disk image instead of a physical disk — a Hyper-V-ready virtual disk built from a Linux whole-machine snapshot. It's offered alongside **Full Restore** and **Instant Boot** whenever the selected snapshot carries a layout manifest (the same **Bare-metal restorable** Linux snapshots the recovery media uses).
+
+<Steps>
+1. Open the restore workflow for the device and choose **Restore as VM**.
+2. Select the backup snapshot to restore.
+3. On the **Restore mode** step, choose **Rebuild engine (Linux)**.
+4. Pick a **rebuild host** — an online Linux device running the Breeze helper with `qemu-utils` installed and enough free disk space for the image. Preflight refuses the run if either requirement isn't met.
+5. Enter an absolute **output path** on the rebuild host ending in `.vhdx`.
+6. Click **Start Rebuild**. The VHDX appears at that path on the rebuild host once the rebuild completes; attach it to a Hyper-V VM the same way you would any other virtual disk.
+</Steps>
+
+The rebuilt image always gets a **new machine identity** — a new machine ID, a `-restored` hostname, and no agent enrollment — since it's building a standalone copy, not reclaiming the original device.
+
+<Aside type="note">
+  Breeze does not yet create the Hyper-V VM from the VHDX automatically — attach the image to a VM yourself once the rebuild finishes.
+</Aside>
 
 ---
 

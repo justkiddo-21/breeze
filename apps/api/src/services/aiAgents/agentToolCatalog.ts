@@ -6,6 +6,7 @@
  * capability placement and kind presets are authored. Contract test:
  * agentToolCatalog.contract.test.ts.
  */
+import type { AiToolDomain } from '@breeze/shared';
 import type {
   AiAgentKind,
   AgentToolCatalogDto,
@@ -29,7 +30,7 @@ export type AgentCapabilityId =
   | 'alerts_monitoring' | 'services_startup' | 'files_disk' | 'scripts_commands' | 'tickets'
   | 'patching_software' | 'security_response' | 'backup_recovery' | 'config_policies' | 'network'
   | 'remote_access' | 'endpoint_agent' | 'automations_reports' | 'business' | 'tenancy'
-  | 'author_scripts';
+  | 'author_scripts' | 'workspace';
 
 export const AGENT_CAPABILITIES: readonly { id: AgentCapabilityId; tone: 'standard' | 'high' }[] = [
   { id: 'alerts_monitoring', tone: 'standard' },
@@ -50,7 +51,38 @@ export const AGENT_CAPABILITIES: readonly { id: AgentCapabilityId; tone: 'standa
   { id: 'automations_reports', tone: 'standard' },
   { id: 'business', tone: 'standard' },
   { id: 'tenancy', tone: 'high' },
+  // W04 adds the `workspace_*` tools under this same capability — whichever
+  // wave lands first adds it, the second finds it already present.
+  { id: 'workspace', tone: 'standard' },
 ];
+
+/**
+ * Which tool domains (spec 2026-09-17, `AI_TOOL_DOMAINS`) a capability may
+ * contain. The capability is the agent-builder grouping (with `tone`); the
+ * domain is the load/grant grouping. They overlap but are not 1:1, so this
+ * relation is what keeps them from drifting silently: a tool whose domain is
+ * not in its capability's set fails agentToolCatalog.domainRelation.contract.
+ * Widen an entry in the same commit as the tool that needs it, with a reason.
+ */
+export const CAPABILITY_DOMAINS: Readonly<Record<AgentCapabilityId, readonly AiToolDomain[]>> = {
+  alerts_monitoring: ['monitoring', 'integrations', 'devices', 'patching'], // notification channels; fleet hygiene findings; manage_maintenance_windows domain is patching (#6341)
+  services_startup: ['devices'],
+  files_disk: ['devices'],
+  scripts_commands: ['scripts', 'devices'],
+  author_scripts: ['scripts'],
+  tickets: ['tickets'],
+  patching_software: ['patching', 'security'], // compliance policies and enforcement status
+  security_response: ['security', 'integrations', 'monitoring'], // S1/Huntress; incident tools
+  backup_recovery: ['backup', 'integrations'], // M365/Google cloud-to-cloud backup and restore
+  config_policies: ['security', 'patching', 'backup', 'network'], // policy prerequisites; DNS security policies
+  network: ['network'],
+  remote_access: ['devices'],
+  endpoint_agent: ['admin', 'devices'],
+  automations_reports: ['scripts', 'admin', 'monitoring', 'core', 'devices', 'security'], // core context/docs; device inventory/performance; audit/change logs
+  business: ['billing', 'accounts', 'tickets'],
+  tenancy: ['accounts', 'admin', 'core', 'integrations', 'ai'], // list_organizations is core; webhooks/PSA/M365; AI-agent governance
+  workspace: ['ai', 'admin'], // dataset exports feed workspace analysis
+};
 
 /**
  * Every registered headless tool → capability. The contract test fails on a
@@ -65,13 +97,20 @@ export const AGENT_CAPABILITIES: readonly { id: AgentCapabilityId; tone: 'standa
  */
 export const TOOL_CAPABILITY: Readonly<Record<string, AgentCapabilityId>> = {
   // ---- alerts_monitoring ----
+  list_remediation_suggestions: 'alerts_monitoring',
+  list_incidents: 'alerts_monitoring',
   manage_alerts: 'alerts_monitoring',
+  manage_delivery: 'alerts_monitoring',
   manage_alert_rules: 'alerts_monitoring',
   manage_monitors: 'alerts_monitoring',
   // #5289 — monitor DEFINITIONS (the authored condition+response object), not
   // the network monitors `manage_monitors` above covers.
   list_monitors: 'alerts_monitoring',
   get_monitor: 'alerts_monitoring',
+  // #5290 (W03): per-device breach activity/escalation for a monitor
+  // definition, same capability as the other monitor-definition tools above.
+  get_monitor_activity: 'alerts_monitoring',
+  reset_monitor_escalation: 'alerts_monitoring',
   manage_monitor_definitions: 'alerts_monitoring',
   manage_service_monitors: 'alerts_monitoring',
   manage_notification_channels: 'alerts_monitoring',
@@ -91,6 +130,11 @@ export const TOOL_CAPABILITY: Readonly<Record<string, AgentCapabilityId>> = {
   file_operations: 'files_disk',
   disk_cleanup: 'files_disk',
   analyze_disk_usage: 'files_disk',
+  // Deliberately NOT added to any AGENT_KIND_PRESETS default (spec §9.3 item
+  // 7): an operator turns this on per agent, on purpose. `triage` and
+  // `helpdesk` ship with `disk_cleanup:execute` because a previewed,
+  // path-pinned file delete is rule-equivalent; a native cleaner is not.
+  system_cleanup: 'files_disk',
 
   // ---- author_scripts ----
   propose_script: 'author_scripts',
@@ -114,6 +158,10 @@ export const TOOL_CAPABILITY: Readonly<Record<string, AgentCapabilityId>> = {
 
   // ---- tickets ----
   manage_tickets: 'tickets',
+  list_time_entries: 'tickets',
+  get_running_timer: 'tickets',
+  get_timesheet: 'tickets',
+
 
   // ---- patching_software ----
   manage_patches: 'patching_software',
@@ -221,6 +269,9 @@ export const TOOL_CAPABILITY: Readonly<Record<string, AgentCapabilityId>> = {
   configure_network_baseline: 'network',
   get_network_changes: 'network',
   get_ip_history: 'network',
+  list_network_assets: 'network',
+  get_network_asset: 'network',
+  get_network_asset_reachability: 'network',
 
   // ---- remote_access ----
   take_screenshot: 'remote_access',
@@ -290,6 +341,12 @@ export const TOOL_CAPABILITY: Readonly<Record<string, AgentCapabilityId>> = {
 
   // ---- tenancy (tone: high) ----
   manage_organizations: 'tenancy',
+  list_ai_agents: 'tenancy',
+  list_ai_agent_runs: 'tenancy',
+  get_ai_agent_run: 'tenancy',
+  list_sites: 'tenancy',
+  get_site: 'tenancy',
+  list_org_contacts: 'tenancy',
   list_organizations: 'tenancy',
   delete_tenant: 'tenancy',
   test_webhook: 'tenancy',
@@ -306,6 +363,14 @@ export const TOOL_CAPABILITY: Readonly<Record<string, AgentCapabilityId>> = {
   m365_query_groups: 'tenancy',
   m365_query_org: 'tenancy',
   m365_query_sites: 'tenancy',
+
+  // ---- workspace ----
+  export_dataset: 'workspace',
+  // ---- workspace (execution plane W04) ----
+  workspace_stage: 'workspace',
+  workspace_run: 'workspace',
+  workspace_collect: 'workspace',
+  workspace_cancel: 'workspace',
 };
 
 export const AGENT_KIND_PRESETS: Readonly<Record<AiAgentKind, readonly string[]>> = {
@@ -317,10 +382,14 @@ export const AGENT_KIND_PRESETS: Readonly<Record<AiAgentKind, readonly string[]>
     'disk_cleanup:execute',
     'run_script',
   ],
+  // AI patch agent (W01): `manage_deployments:start` dropped — it is the
+  // software-rollout engine, not patch jobs. This is the create-time default
+  // for the DEVICE lane only; existing agents keep their stored allowlists,
+  // and a `patch`-profile run ignores this entirely (patchToolAllowlist is a
+  // floor, not an intersection).
   patch: [
     'manage_patches:approve',
     'manage_patches:install',
-    'manage_deployments:start',
     'manage_services:restart',
   ],
   helpdesk: ['manage_services:restart', 'disk_cleanup:execute', 'run_script'],

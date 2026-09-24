@@ -7,7 +7,7 @@ import { captureException } from '../sentry';
 export type VerificationOutcome = 'verified' | 'verification_failed' | 'unknown';
 
 export const SCRIPT_VERIFY_QUEUE = 'script-verify';
-/** The single job name on the queue; the worker asserts it (bullmqValidation). */
+/** Execution verification job name; reconciliation uses a separate scheduled name. */
 export const SCRIPT_VERIFY_JOB_NAME = 'verify';
 export const SCRIPT_VERIFY_MAX_ATTEMPTS = 3;
 /** 3 attempts over 20 minutes (spec §4.9): t=0, t=10m, t=20m. */
@@ -104,7 +104,19 @@ export async function evaluateVerificationClaim(
     }
 
     case 'process_absent': {
-      const { verification, detail } = await verifyProcessAbsentByNameForTask({ processName: c.name }, device, actorUserId);
+      // #5789: this worker has no agent run behind it (a proposal
+      // verification, not an act-lane run), so there is no `agentRunId` to
+      // point at — but the read is still AI-decided (a proposal-verification
+      // job), so a kind-only origin is threaded rather than leaving the
+      // dispatched `list_processes` command unattributed. Mirrors
+      // `actVerify.ts`'s own `runAiOrigin` pattern (omit ids it doesn't have,
+      // never fabricate one).
+      const { verification, detail } = await verifyProcessAbsentByNameForTask(
+        { processName: c.name },
+        device,
+        actorUserId,
+        { kind: 'ai_agent' },
+      );
       return {
         outcome: verification === 'passed' ? 'verified' : verification === 'failed' ? 'verification_failed' : 'unknown',
         evidence: { independentRead: 'list_processes', process: c.name, verification, detail: detail ?? null },
@@ -159,10 +171,10 @@ export async function evaluateVerificationClaim(
 // Queue accessor + enqueue
 // ---------------------------------------------------------------------------
 
-let verifyQueue: Queue<ScriptVerifyJobData> | null = null;
-export function getScriptVerifyQueue(): Queue<ScriptVerifyJobData> {
+let verifyQueue: Queue<ScriptVerifyJobData | { type: 'reconcile' }> | null = null;
+export function getScriptVerifyQueue(): Queue<ScriptVerifyJobData | { type: 'reconcile' }> {
   if (!verifyQueue) {
-    verifyQueue = new Queue<ScriptVerifyJobData>(SCRIPT_VERIFY_QUEUE, { connection: getBullMQConnection() });
+    verifyQueue = new Queue<ScriptVerifyJobData | { type: 'reconcile' }>(SCRIPT_VERIFY_QUEUE, { connection: getBullMQConnection() });
   }
   return verifyQueue;
 }

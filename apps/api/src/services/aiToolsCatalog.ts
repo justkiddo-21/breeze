@@ -215,14 +215,41 @@ function sanitizeDistributorProductForAi(p: TdSynnexEcProduct, auth: AuthContext
   return out;
 }
 
+
+/**
+ * SCOPE PARITY WITH THE HTTP DOOR (#6110 review, finding 1).
+ *
+ * A tool must require exactly what its route requires. Every route file under `routes/catalog/` is
+ * `requireScope('partner','system')` (catalog.ts:21, pricing.ts:20, bundles.ts:15,
+ * distributors.ts:51, enrich.ts:14). The catalog is the PARTNER's price book:
+ * its costs, margins and per-customer overrides are seller-side data.
+ * An organization-scoped token therefore cannot reach this domain over HTTP at
+ * all — and an org token still carries the OWNING PARTNER's partnerId, so a
+ * bare partnerId-presence check is not a substitute. Autonomous AI-agent runs
+ * mint `scope: 'organization'` too (aiAgents/agentAuthContext.ts), so this gate
+ * refuses them as well; the `business` capability group that carries these
+ * tools already contains partner-only tools (aiToolsDeliverables.ts), so that is
+ * an existing, expected shape rather than a new one.
+ */
+function partnerScopeRefusal(auth: AuthContext): string | null {
+  if (auth.scope === 'partner' || auth.scope === 'system') return null;
+  return JSON.stringify({
+    error: 'Catalog access requires a partner-scoped session; organization-scoped callers cannot reach the '
+      + 'matching HTTP routes either',
+    code: 'PARTNER_SCOPE_REQUIRED',
+  });
+}
+
 export function registerCatalogTools(aiTools: Map<string, AiTool>): void {
   aiTools.set('search_catalog', {
     tier: 2 as AiToolTier,
     deviceArgs: [],
+    domain: 'billing',
+    searchHint: 'product catalog search by name, SKU or distributor part number, hardware, software, services and bundles',
     definition: {
       name: 'search_catalog',
       description:
-        'Search the partner product catalog (hardware, software, services, and bundles). The search term matches item name, SKU, and distributor part numbers (manufacturer part number / SYNNEX SKU). Optional filters: item type, bundle flag, currency. Each item lists `prices` per currency (no conversion); an item with no price in a document\'s currency needs a manual line. Read-only.',
+        "Search partner catalog hardware, software, services and bundles by name, SKU or distributor part number. Filter by type, bundle flag or currency; returns per-currency prices with no conversion. For products outside the catalog use lookup_distributor_product.",
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -249,6 +276,8 @@ export function registerCatalogTools(aiTools: Map<string, AiTool>): void {
       }
     },
     handler: async (input, auth) => {
+      const refusal = partnerScopeRefusal(auth);
+      if (refusal) return refusal;
       const partnerId = auth.partnerId;
       if (!partnerId) {
         return JSON.stringify({ error: 'Catalog is partner-scoped; no partner in context' });
@@ -302,10 +331,12 @@ export function registerCatalogTools(aiTools: Map<string, AiTool>): void {
   aiTools.set('lookup_distributor_product', {
     tier: 2 as AiToolTier,
     deviceArgs: [],
+    domain: 'billing',
+    searchHint: 'TD SYNNEX live price and stock availability for one SKU or manufacturer part number outside the catalog',
     definition: {
       name: 'lookup_distributor_product',
       description:
-        'Live TD SYNNEX (EC Express) price & availability lookup for a SINGLE distributor SKU or manufacturer part number. Returns reseller cost, MSRP, currency, total stock, and per-warehouse availability. Read-only, but makes an outbound call to the distributor (partner-scoped). Use this to price a distributor product that is NOT yet in the catalog before adding it to a quote; for items already in the catalog use search_catalog instead.',
+        "Get live TD SYNNEX reseller cost, MSRP, currency, stock and warehouse availability for one SKU or manufacturer part number. Makes a partner-scoped outbound distributor call. For items already in the catalog use search_catalog.",
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -357,6 +388,8 @@ export function registerCatalogTools(aiTools: Map<string, AiTool>): void {
   aiTools.set('get_catalog_item', {
     tier: 2 as AiToolTier,
     deviceArgs: [],
+    domain: 'billing',
+    searchHint: 'catalog item details, currency prices and bundle components',
     definition: {
       name: 'get_catalog_item',
       description:
@@ -370,6 +403,8 @@ export function registerCatalogTools(aiTools: Map<string, AiTool>): void {
       }
     },
     handler: async (input, auth) => {
+      const refusal = partnerScopeRefusal(auth);
+      if (refusal) return refusal;
       const partnerId = auth.partnerId;
       if (!partnerId) {
         return JSON.stringify({ error: 'Catalog is partner-scoped; no partner in context' });
@@ -434,10 +469,12 @@ export function registerCatalogTools(aiTools: Map<string, AiTool>): void {
   aiTools.set('manage_catalog', {
     tier: 2 as AiToolTier,
     deviceArgs: [],
+    domain: 'billing',
+    searchHint: 'product catalog: create, update items, set/remove currency prices, manage organization overrides and bundles',
     definition: {
       name: 'manage_catalog',
       description:
-        'Create and manage partner catalog items, per-currency price-book entries (set_price / remove_price), organization price overrides (with currency), and bundle components.',
+        'Create and manage partner catalog items, per-currency price-book entries (set_price / remove_price), organization price overrides (with currency), and bundle components. Actions: create_item, update_item, archive_item, set_price, remove_price, set_org_price, remove_org_price, set_bundle_components.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -467,13 +504,15 @@ export function registerCatalogTools(aiTools: Map<string, AiTool>): void {
           },
           allocationCurrency: {
             type: 'string',
-            description: 'ISO-4217 currency the component revenueAllocation amounts are authored in (set_bundle_components; required when any component carries a revenueAllocation). Allocations are only used in this currency — never converted.',
+            description: "ISO-4217 currency for component revenueAllocation; required when any allocation is set. Allocations apply only in this currency, never converted.",
           },
         },
         required: ['action'],
       },
     },
     handler: async (input, auth) => {
+      const refusal = partnerScopeRefusal(auth);
+      if (refusal) return refusal;
       const actor = actorFromAuth(auth);
 
       const action = String(input.action);

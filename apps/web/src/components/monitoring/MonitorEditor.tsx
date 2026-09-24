@@ -1,4 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
+import DeliveryPreview from '../alerts/delivery/DeliveryPreview';
+import { useDeliveryResource } from '../alerts/delivery/useDeliveryResource';
+import type { EscalationPolicy } from '../alerts/delivery/deliveryActions';
+import { useJwtClaims } from '../../lib/authScope';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useHashState } from '@/lib/useHashState';
 import { useForm, FormProvider, Controller } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
@@ -13,11 +18,15 @@ import {
   type MonitorDeliveryMode,
 } from '@breeze/shared';
 import { fetchWithAuth } from '../../stores/auth';
+import { useOrgStore } from '../../stores/orgStore';
 import { navigateTo } from '@/lib/navigation';
 import { extractApiError } from '@/lib/apiError';
 import { asList } from '@/lib/asList';
+import { runAction, handleActionError, ActionError } from '@/lib/runAction';
 import { useDefaultOwnerScope } from '@/hooks/useDefaultOwnerScope';
+import { useHydrated } from '@/hooks/useHydrated';
 import { BuiltInBadge } from './BuiltInBadge';
+import { ScopeBadge } from '../shared/ScopeBadge';
 import ActionsEditor, {
   type Script,
   type NotificationChannel,
@@ -26,13 +35,16 @@ import ActionsEditor, {
 import MonitorConditionFields from './MonitorConditionFields';
 import DeployMonitorDialog from './DeployMonitorDialog';
 import MonitorDevicesTable from './MonitorDevicesTable';
+import MonitorActivityTab from './MonitorActivityTab';
 import { defaultConditionFor } from './monitorKindFields';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import Breadcrumbs from '../layout/Breadcrumbs';
 // Initializes the shared i18next singleton. Islands hydrate independently, so
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
-import '../../lib/i18n';
+import { i18n } from '../../lib/i18n';
+
+const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
 type KindMeta = {
   kind: MonitorKind;
@@ -42,7 +54,6 @@ type KindMeta = {
 };
 
 type AiAgent = { id: string; name: string };
-type EscalationPolicy = { id: string; name: string };
 type Attachment = {
   id: string;
   configPolicyId: string;
@@ -131,10 +142,62 @@ export interface MonitorEditorProps {
   monitorId?: string;
 }
 
+type EditorTab = 'settings' | 'activity';
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function editorHashParams(hash: string): URLSearchParams {
+  const raw = hash.replace(/^#/, '');
+  const first = raw.split('/')[0];
+  if (!raw.includes('=') && (first === 'settings' || first === 'activity')) {
+    return new URLSearchParams({ tab: first });
+  }
+  return new URLSearchParams(raw);
+}
+export function tabFromHash(hash: string): EditorTab | undefined {
+  const params = editorHashParams(hash);
+  const tab = params.get('tab');
+  if (tab === 'settings' || tab === 'activity') return tab;
+  return params.has('policy') ? 'settings' : undefined;
+}
+export function editorHashForTab(hash: string, tab: EditorTab): string {
+  const params = editorHashParams(hash);
+  if (!params.has('policy')) return `#${tab}`;
+  params.set('tab', tab);
+  return `#${params.toString()}`;
+}
+export async function attachAfterCreate(
+  monitorId: string,
+  hash: string,
+  fetcher: (url: string, init?: RequestInit) => Promise<Response> = fetchWithAuth,
+): Promise<string> {
+  const policyId = editorHashParams(hash).get('policy');
+  if (!policyId || !UUID_RE.test(policyId)) return `/alerts/monitors/${monitorId}`;
+  const attachFailure = `${i18n.t('monitoring:editor.saved')}. ${i18n.t('monitoring:deploy.errors.attach')}`;
+  await runAction({
+    request: () => fetcher(`/monitor-definitions/${monitorId}/attachments`, {
+      method: 'POST', body: JSON.stringify({ configPolicyId: policyId }),
+    }),
+    errorFallback: attachFailure,
+    friendly: () => attachFailure,
+    successMessage: i18n.t('monitoring:editor.attachedToPolicy'),
+    onUnauthorized: UNAUTHORIZED,
+  });
+  return `/configuration-policies/${policyId}#monitors`;
+}
+
 export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
   const { t } = useTranslation(['monitoring', 'common']);
   const isNew = !monitorId;
+  const jwt = useJwtClaims();
+  const currentPartnerId = jwt.status === 'resolved' ? jwt.claims.partnerId : null;
+  const createdEditorUrl = useRef<string | undefined>(undefined);
   const { isPartnerScope, defaultOwnerScope } = useDefaultOwnerScope();
+  // `isPartnerScope` decodes the access token, which the server never has, so
+  // the owner-scope block would otherwise appear only on the client and make
+  // the hydration pass structurally disagree with the SSR markup (#6391).
+  // Markup only — the submit path keeps reading `isPartnerScope` directly.
+  const hydrated = useHydrated();
+  const currentOrgId = useOrgStore((s) => s.currentOrgId);
 
   const [loading, setLoading] = useState(!isNew);
   const [saving, setSaving] = useState(false);
@@ -152,12 +215,22 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
 
   const [kindsMeta, setKindsMeta] = useState<KindMeta[]>([]);
   const [scripts, setScripts] = useState<Script[]>([]);
-  const [notificationChannels, setNotificationChannels] = useState<NotificationChannel[]>([]);
   const [softwareCatalog, setSoftwareCatalog] = useState<SoftwareCatalogItem[]>([]);
   const [aiAgents, setAiAgents] = useState<AiAgent[]>([]);
-  const [escalationPolicies, setEscalationPolicies] = useState<EscalationPolicy[]>([]);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [builtinKey, setBuiltinKey] = useState<string | null>(null);
+  // Null for a partner-wide monitor — DeployMonitorDialog falls back to the
+  // currently selected org from the org store in that case.
+  const [monitorOrgId, setMonitorOrgId] = useState<string | null>(null);
+  const [monitorPartnerId, setMonitorPartnerId] = useState<string | null>(null);
+
+  const [hashTab, setHashTab] = useHashState<EditorTab>('settings', tabFromHash);
+  // The Activity tab needs a saved monitor id (#5290); an unsaved monitor
+  // simply never shows it, so a stale `#activity` hash (e.g. a bookmark from
+  // an old monitor that was deleted and re-created as `isNew`) falls back to
+  // Settings rather than rendering a blank tab — same posture as
+  // DeviceDetails' `#linked-profiles` fallback.
+  const activeTab: EditorTab = isNew ? 'settings' : hashTab;
 
   const methods = useForm<MonitorFormValues>({
     resolver: zodResolver(monitorFormSchema),
@@ -174,9 +247,43 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
   } = methods;
 
   const watchKind = watch('kind');
+  const watchSeverity = watch('severity');
+  const watchDeliveryChannelIds = watch('deliveryChannelIds');
   const watchAiAgentId = watch('aiAgentId');
   const watchDeliveryMode = watch('deliveryMode');
+  const watchOwnerScope = watch('ownerScope');
+  const watchEscalationPolicyId = watch('escalationPolicyId');
   const isLoading = saving || isSubmitting;
+  const isPartnerOwned = isNew ? watchOwnerScope === 'partner' : monitorPartnerId !== null;
+  const ownerOrgId = isNew ? currentOrgId : monitorOrgId;
+  const deliveryChoiceOrgId = ownerOrgId ?? currentOrgId;
+  const deliveryChoiceSuffix = deliveryChoiceOrgId ? `&orgId=${encodeURIComponent(deliveryChoiceOrgId)}` : '';
+  const channelRail = useDeliveryResource<NotificationChannel>(`/alerts/delivery/rails?rail=channels${deliveryChoiceSuffix}`);
+  const escalationRail = useDeliveryResource<EscalationPolicy>(`/alerts/delivery/rails?rail=escalation${deliveryChoiceSuffix}`);
+  const notificationChannels = useMemo(() => [...new Map([
+    ...channelRail.data.map(({ id, name, type }) => ({ id, name, type })),
+    ...channelRail.inherited,
+  ].map(channel => [channel.id, channel] as const)).values()], [channelRail.data, channelRail.inherited]);
+  const escalationPolicies = escalationRail.data;
+
+  const compatibleEscalationPolicies = useMemo(() => escalationPolicies.filter(policy => {
+    if (policy.inherited === true) {
+      return !isPartnerOwned || isNew || monitorPartnerId === currentPartnerId;
+    }
+    if (policy.orgId === null && policy.partnerId !== null) {
+      return !isPartnerOwned || isNew || policy.partnerId === monitorPartnerId;
+    }
+    return !isPartnerOwned && policy.orgId === ownerOrgId;
+  }), [escalationPolicies, isPartnerOwned, isNew, monitorPartnerId, currentPartnerId, ownerOrgId]);
+
+  useEffect(() => {
+    // Changing create ownership must not submit a now-hidden org policy.
+    if (isNew && watchEscalationPolicyId
+      && escalationPolicies.some((policy) => policy.id === watchEscalationPolicyId)
+      && !compatibleEscalationPolicies.some((policy) => policy.id === watchEscalationPolicyId)) {
+      setValue('escalationPolicyId', null, { shouldDirty: true });
+    }
+  }, [isNew, watchEscalationPolicyId, escalationPolicies, compatibleEscalationPolicies, setValue]);
 
   const fetchKinds = useCallback(async () => {
     try {
@@ -196,18 +303,6 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
       if (response.ok) {
         const data = await response.json();
         setScripts(data.data ?? data.scripts ?? []);
-      }
-    } catch {
-      // Silently fail
-    }
-  }, []);
-
-  const fetchChannels = useCallback(async () => {
-    try {
-      const response = await fetchWithAuth('/alerts/channels');
-      if (response.ok) {
-        const data = await response.json();
-        setNotificationChannels(data.data ?? data.channels ?? []);
       }
     } catch {
       // Silently fail
@@ -238,18 +333,6 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
     }
   }, []);
 
-  const fetchEscalationPolicies = useCallback(async () => {
-    try {
-      const response = await fetchWithAuth('/alerts/policies');
-      if (response.ok) {
-        const data = await response.json();
-        setEscalationPolicies(Array.isArray(data?.data) ? data.data : []);
-      }
-    } catch {
-      // Silently fail
-    }
-  }, []);
-
   const fetchMonitor = useCallback(async () => {
     if (isNew || !monitorId) return;
     try {
@@ -261,6 +344,8 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
       const monitor = data?.data ?? data;
       setAttachments(Array.isArray(monitor.attachments) ? monitor.attachments : []);
       setBuiltinKey(typeof monitor.builtinKey === 'string' ? monitor.builtinKey : null);
+      setMonitorOrgId(typeof monitor.orgId === 'string' ? monitor.orgId : null);
+      setMonitorPartnerId(typeof monitor.partnerId === 'string' ? monitor.partnerId : null);
       reset({
         name: monitor.name ?? '',
         description: monitor.description ?? '',
@@ -291,21 +376,27 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
   useEffect(() => {
     void fetchKinds();
     void fetchScripts();
-    void fetchChannels();
     void fetchSoftwareCatalog();
     void fetchAiAgents();
-    void fetchEscalationPolicies();
     void fetchMonitor();
-  }, [fetchKinds, fetchScripts, fetchChannels, fetchSoftwareCatalog, fetchAiAgents, fetchEscalationPolicies, fetchMonitor]);
-
-  const activeKindMeta = kindsMeta.find((k) => k.kind === watchKind);
+  }, [fetchKinds, fetchScripts, fetchSoftwareCatalog, fetchAiAgents, fetchMonitor]);
 
   const handleKindChange = (kind: MonitorKind) => {
     setValue('kind', kind, { shouldDirty: true });
     setValue('condition', defaultConditionFor(kind), { shouldDirty: true });
   };
 
+  const switchTab = (tab: EditorTab) => {
+    window.location.hash = editorHashForTab(window.location.hash, tab);
+    setHashTab(tab);
+  };
+
   const onSubmit = async (values: MonitorFormValues) => {
+    // Navigation can lag behind a successful create; never POST a second monitor.
+    if (createdEditorUrl.current) {
+      void navigateTo(createdEditorUrl.current);
+      return;
+    }
     setSaving(true);
     setError(undefined);
     try {
@@ -335,19 +426,30 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
 
       const url = isNew ? '/monitor-definitions' : `/monitor-definitions/${monitorId}`;
       const method = isNew ? 'POST' : 'PATCH';
-      const response = await fetchWithAuth(url, { method, body: JSON.stringify(payload) });
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(extractApiError(data, t('monitoring:editor.errors.save')));
-      }
-      const data = await response.json();
+      const data = await runAction<{ data?: { id?: string } }>({
+        request: () => fetchWithAuth(url, { method, body: JSON.stringify(payload) }),
+        errorFallback: t('monitoring:editor.errors.save'),
+        successMessage: t('monitoring:editor.saved'),
+        friendly: (_code, message) => message.replace(/^INVALID_MONITOR:\s*/, ''),
+        onUnauthorized: UNAUTHORIZED,
+      });
       const savedId = data?.data?.id ?? monitorId;
-      if (isNew) {
-        void navigateTo(`/alerts/monitors/${savedId}`);
+      if (isNew && savedId) {
+        const hash = window.location.hash;
+        createdEditorUrl.current = `/alerts/monitors/${savedId}${hash}`;
+        try {
+          void navigateTo(await attachAfterCreate(savedId, hash));
+        } catch (err) {
+          if (err instanceof ActionError && err.status === 401) return;
+          handleActionError(err, `${t('monitoring:editor.saved')}. ${t('monitoring:deploy.errors.attach')}`);
+          void navigateTo(createdEditorUrl.current);
+        }
       } else {
         void fetchMonitor();
       }
     } catch (err) {
+      if (err instanceof ActionError && err.status === 401) return;
+      handleActionError(err, t('monitoring:editor.errors.save'));
       setError(err instanceof Error ? err.message : t('monitoring:editor.errors.save'));
     } finally {
       setSaving(false);
@@ -358,13 +460,16 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
     if (!monitorId) return;
     setDeleting(true);
     try {
-      const response = await fetchWithAuth(`/monitor-definitions/${monitorId}`, { method: 'DELETE' });
-      if (!response.ok && response.status !== 204) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(extractApiError(data, t('monitoring:editor.errors.delete')));
-      }
+      await runAction({
+        request: () => fetchWithAuth(`/monitor-definitions/${monitorId}`, { method: 'DELETE' }),
+        errorFallback: t('monitoring:editor.errors.delete'),
+        successMessage: t('monitoring:editor.deleted'),
+        onUnauthorized: UNAUTHORIZED,
+      });
       void navigateTo('/alerts/monitors');
     } catch (err) {
+      if (err instanceof ActionError && err.status === 401) return;
+      handleActionError(err, t('monitoring:editor.errors.delete'));
       setError(err instanceof Error ? err.message : t('monitoring:editor.errors.delete'));
     } finally {
       setDeleting(false);
@@ -376,15 +481,19 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
     if (!monitorId) return;
     setError(undefined);
     try {
-      const response = await fetchWithAuth(`/monitor-definitions/${monitorId}/attachments/${attachmentId}`, {
-        method: 'DELETE',
+      await runAction({
+        request: () =>
+          fetchWithAuth(`/monitor-definitions/${monitorId}/attachments/${attachmentId}`, {
+            method: 'DELETE',
+          }),
+        errorFallback: t('monitoring:deploy.errors.detach'),
+        successMessage: t('monitoring:editor.detached'),
+        onUnauthorized: UNAUTHORIZED,
       });
-      if (!response.ok && response.status !== 204) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(extractApiError(data, t('monitoring:deploy.errors.detach')));
-      }
       setAttachments((prev) => prev.filter((a) => a.id !== attachmentId));
     } catch (err) {
+      if (err instanceof ActionError && err.status === 401) return;
+      handleActionError(err, t('monitoring:deploy.errors.detach'));
       setError(err instanceof Error ? err.message : t('monitoring:deploy.errors.detach'));
     }
   };
@@ -411,6 +520,10 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
     setTestSubmitting(true);
     setTestResult(null);
     try {
+      // runaction-exempt: the test result panel below IS the outcome surface —
+      // both the failure and the triggered/not-triggered verdict render inline,
+      // and a toast would report "done" for a test whose whole payload is the
+      // answer.
       const response = await fetchWithAuth(`/monitor-definitions/${monitorId}/test`, {
         method: 'POST',
         body: JSON.stringify({ deviceId: testDeviceId }),
@@ -454,6 +567,7 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
             <h1 className="text-xl font-semibold tracking-tight">
               {isNew ? t('monitoring:editor.titleNew') : t('monitoring:editor.titleEdit')}
             </h1>
+            {!isNew && <ScopeBadge orgId={monitorOrgId} partnerId={monitorPartnerId} isSystem={false} />}
             {builtinKey && <BuiltInBadge label={t('monitoring:list.builtIn')} hint={t('monitoring:list.builtInHint')} />}
           </div>
           {!isNew && (
@@ -468,6 +582,34 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
           )}
         </div>
 
+        {!isNew && (
+          <div className="flex gap-2 border-b" role="tablist" data-testid="monitor-editor-tabs">
+            {(['settings', 'activity'] as const).map((tab) => (
+              <button
+                key={tab}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === tab}
+                data-testid={`monitor-editor-tab-${tab}`}
+                onClick={() => switchTab(tab)}
+                className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors ${
+                  activeTab === tab
+                    ? 'border-primary text-foreground'
+                    : 'border-transparent text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                {t(/* i18n-dynamic */ `monitoring:editor.tabs.${tab}`)}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {activeTab === 'activity' && !isNew && monitorId ? (
+          <MonitorActivityTab monitorId={monitorId} recurrenceThreshold={watch('recurrenceThreshold')} />
+        ) : null}
+
+        {activeTab === 'settings' && (
+        <>
         {!isNew && testOpen && (
           <div className="rounded-lg border bg-card p-4 shadow-xs" data-testid="monitor-editor-test-panel">
             <div className="flex flex-wrap items-end gap-3">
@@ -529,19 +671,19 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
         )}
 
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <div data-testid="monitor-editor-error" className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
           </div>
         )}
 
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-6 rounded-lg border bg-card p-6 shadow-xs">
-          {isNew && isPartnerScope && (
+          {isNew && hydrated && isPartnerScope && (
             <fieldset className="space-y-2 rounded-md border p-4" data-testid="monitor-editor-owner-scope">
               <legend className="px-1 text-xs font-medium uppercase text-muted-foreground">
                 {t('monitoring:editor.ownerScope.legend')}
               </legend>
               <label className="flex items-center gap-2 text-sm">
-                <input type="radio" value="partner" {...register('ownerScope')} />
+                <input data-testid="monitor-editor-owner-partner" type="radio" value="partner" {...register('ownerScope')} />
                 {t('monitoring:editor.ownerScope.partner')}
               </label>
               <label className="flex items-center gap-2 text-sm">
@@ -595,9 +737,6 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
                 ))}
               </select>
             </div>
-            {activeKindMeta?.agentDelivered && (
-              <p className="text-xs text-muted-foreground">{t('monitoring:editor.agentDeliveredHint')}</p>
-            )}
             <MonitorConditionFields kind={watchKind} name="condition" />
           </section>
 
@@ -695,14 +834,22 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
                 </div>
               )}
             />
+            {[channelRail, escalationRail].map((rail, index) => rail.status === 'error'
+              ? <div key={index} role="alert">{t('alerts:deliveryPage.loadFailed')}
+                  <button type="button" data-testid={`monitor-editor-delivery-rail-${index}-retry`} onClick={rail.reload}>{t('common:actions.retry')}</button></div>
+              : rail.status === 'loading' ? <p key={index} role="status">{t('alerts:deliveryPage.loading')}</p> : null)}
+
             {watchDeliveryMode === 'channels' && (
               <div className="space-y-2">
-                <label className="text-xs font-medium text-muted-foreground">{t('monitoring:editor.fields.channels')}</label>
+                <label htmlFor="monitor-editor-channels" className="text-xs font-medium text-muted-foreground">{t('monitoring:editor.fields.channels')}</label>
                 <select
                   multiple
+                  id="monitor-editor-channels"
                   data-testid="monitor-editor-channels"
                   className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
                   {...register('deliveryChannelIds')}
+                  value={watchDeliveryChannelIds}
+                  disabled={channelRail.status !== 'success'}
                 >
                   {notificationChannels.map((channel) => (
                     <option key={channel.id} value={channel.id}>
@@ -712,6 +859,31 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
                 </select>
               </div>
             )}
+            {watchDeliveryMode === 'inherit' && <p className="text-xs text-muted-foreground">{t('monitoring:editor.deliveryPreview.draft')}</p>}
+            {watchDeliveryMode === 'inherit' && (
+              <DeliveryPreview
+                orgId={monitorOrgId ?? currentOrgId}
+                severity={watchSeverity}
+                kind={watchKind}
+                escalationOverride={compatibleEscalationPolicies.find(p => p.id === watchEscalationPolicyId) ?? null}
+              />
+            )}
+            {watchDeliveryMode !== 'none' && (
+              <div className="space-y-2">
+                <label htmlFor="monitor-editor-escalation-policy" className="text-xs font-medium text-muted-foreground">
+                  {t('monitoring:editor.fields.escalationPolicy')}
+                </label>
+                <select id="monitor-editor-escalation-policy" data-testid="monitor-editor-escalation-policy"
+                  className="h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring" {...register('escalationPolicyId')}
+                  value={watchEscalationPolicyId ?? ''} disabled={escalationRail.status !== 'success'}>
+                  <option value="">{t('monitoring:editor.deliveryModes.inherit')}</option>
+                  {compatibleEscalationPolicies.map(policy => <option key={policy.id} value={policy.id}>{policy.name}</option>)}
+                </select>
+              </div>
+            )}
+            <a href="/alerts/delivery" data-testid="monitor-editor-delivery-home" className="text-sm text-primary underline">
+              {t('monitoring:editor.deliveryPreview.manage')}
+            </a>
           </section>
 
           <section className="space-y-3">
@@ -768,24 +940,7 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
                 )}
               </div>
             </div>
-            <div className="space-y-2">
-              <label className="text-xs font-medium text-muted-foreground" htmlFor="monitor-editor-escalation-policy">
-                {t('monitoring:editor.fields.escalationPolicy')}
-              </label>
-              <select
-                id="monitor-editor-escalation-policy"
-                data-testid="monitor-editor-escalation-policy"
-                className="h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
-                {...register('escalationPolicyId')}
-              >
-                <option value="">—</option>
-                {escalationPolicies.map((policy) => (
-                  <option key={policy.id} value={policy.id}>
-                    {policy.name}
-                  </option>
-                ))}
-              </select>
-            </div>
+
             <ActionsEditor
               name="recurrenceActions"
               compact
@@ -866,10 +1021,13 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
             </button>
           </div>
         </form>
+        </>
+        )}
 
         {!isNew && monitorId && (
           <DeployMonitorDialog
             monitorId={monitorId}
+            orgId={monitorOrgId}
             open={deployOpen}
             onClose={() => setDeployOpen(false)}
             onDeployed={() => {

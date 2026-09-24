@@ -62,6 +62,16 @@ const API_SRC = resolve(__dirname, '..');
  * partner-wide capability gate. Every entry carries the reason it is exempt.
  */
 const ALLOWED_WITHOUT_CAPABILITY_CHECK: Record<string, string> = {
+  // --- network_monitors became dual-axis in #5291 W04 ------------------------
+  // A partner-wide `network_monitors` row is ALWAYS a compiled artefact of a
+  // `network_check` monitor definition — the compiler is its only writer, and
+  // every caller-facing create/update/delete path below refuses one outright
+  // rather than gating it. So none of these four can reach a partner-owned row
+  // at all, which is a stronger property than passing the capability gate.
+  'routes/monitors.ts': 'legacy network-monitor CRUD is org-axis only: requireMonitorAccess refuses an org_id NULL row as 404, and a managed row as 409',
+  'routes/monitoring.ts': 'every write is scoped `networkMonitors.orgId = <org>`, which can never match a partner-wide (org_id NULL) row',
+  'routes/discovery.ts': 'asset-unlink delete is scoped `networkMonitors.orgId = <asset org>`, which can never match a partner-wide (org_id NULL) row',
+  'services/aiToolsMonitoring.ts': 'assertMonitorSiteAccess fails closed on org_id NULL, and a managed row is refused, so the AI tool cannot mutate a partner-owned row',
   // #5289 — the compiler's only write to monitor_definitions stamps the
   // compiled_* ids and hash back onto a definition its CALLER already loaded
   // and authorised. Every caller-facing write path (create/update/delete) runs
@@ -73,6 +83,18 @@ const ALLOWED_WITHOUT_CAPABILITY_CHECK: Record<string, string> = {
   // no caller-supplied partner id, never reachable with a partner token's choice
   // of target.
   'services/monitors/builtInMonitors.ts': 'one-time per-partner provisioning of the partner\'s own built-in rows; callers are createPartner(), a requireScope(system) route, and the boot backfill',
+  // --- tool_sources / tool_source_tools became dual-axis in #5216 -----------
+  // Discovery is a BullMQ job, not a caller-facing write: it loads the source
+  // row by id, copies that row's OWN owner axis onto the tools it upserts (the
+  // constraint trigger tool_source_tools_owner_guard_trg rejects anything
+  // else), and never reads an owner from a request. All FIVE caller-facing
+  // mutating routes in routes/toolSources.ts run the
+  // `existing.orgId === null && !canManagePartnerWidePolicies(auth)` gate
+  // before touching a partner-wide row: PATCH /:id, DELETE /:id, PATCH
+  // /:id/tools/:toolId, POST /:id/tools/bulk, and POST /:id/discover (the
+  // one enqueue site a caller can reach — added in the same PR that added
+  // this allowlist entry, after a review round found it missing).
+  'services/toolSources/discovery.ts': 'background discovery copies the owner axis off the source row it was handed; every caller-facing write in routes/toolSources.ts (PATCH /:id, DELETE /:id, PATCH /:id/tools/:toolId, POST /:id/tools/bulk, POST /:id/discover) runs canManagePartnerWidePolicies() first',
   // --- `users` is dual-axis (shape 4) but these are AUTHENTICATION flows -----
   // They mutate the acting user's own credential/session columns (password
   // hash, MFA secret, passkeys, phone, email verification, last-login), never
@@ -146,6 +168,7 @@ const ALLOWED_WITHOUT_CAPABILITY_CHECK: Record<string, string> = {
   'services/llm/llmConfigResolver.ts': 'runtime resolver; only write is the system-context version-CASed credential-error stamp',
   'services/partnerCreate.ts': 'new-partner bootstrap seeds first roles/user/org before any partner capability can exist',
   'services/platformAdminBootstrap.ts': 'startup-only platform-admin bootstrap (index.ts boot path); no tenant route calls it',
+  'services/patchAlerts.ts': 'patch-job finalizer / reboot sweep creating derived alert artifacts (global built-in templates, org-owned rules) in system context — no tenant caller, same class as policyAlertBridge',
   'services/policyAlertBridge.ts': 'startup event subscriber creating derived alert artifacts in system context',
   'services/stripeConnectService.ts': 'Stripe-signed webhook records provider-side disconnect status; no tenant caller',
   'services/stripeFinancialEventPoller.ts': 'system reconciliation worker persists provider cursor/error state; no tenant caller',
@@ -237,6 +260,17 @@ const ALLOWED_WITHOUT_CAPABILITY_CHECK: Record<string, string> = {
   'services/pax8SyncService.ts': 'every /pax8 route passes the global capability middleware in routes/pax8.ts',
   'services/policyEvaluationService.ts': 'partner-policy writes gated at routes/policyManagement/actions.ts; workers are system context',
   'services/scriptClone.ts': 'gated via resolveScriptCloneScope → resolveScriptCreateScope (services/scriptWrite.ts), which calls canManagePartnerWidePolicies before any partner-wide insert',
+  // #6008 W01. The scanner is file-local; both gates are one import away.
+  'routes/backup/providers.ts': 'every connection write calls requireProviderPartnerAdmin (routes/backup/providerAccess.ts), which calls canManagePartnerWidePolicies and returns 403 + PARTNER_WIDE_WRITE_DENIED_MESSAGE',
+  'services/backupProviders/mapping.ts': 'remapCustomer has one caller, PUT /backup/providers/customers/:id/mapping, which passes requireProviderPartnerAdmin (→ canManagePartnerWidePolicies) before it is reached',
+  // #6008 W02. persistVendorSnapshot has exactly one caller, syncConnectionById
+  // (jobs/backupProviderSync.ts), invoked only from the backup-provider-sync
+  // BullMQ worker under system DB context with no caller and no auth context —
+  // it takes a connection id from a job payload/advisory lock, not from a
+  // request, and every backupProviderCustomers row it writes takes the
+  // connection's OWN partner_id (never a caller-supplied one). The one
+  // caller-facing write to this table, remapCustomer, is the entry above.
+  'services/backupProviders/persist.ts': 'persistVendorSnapshot runs only inside the backup-provider-sync worker under system context, invoked from a job payload with no caller to gate; it writes each row under the syncing connection\'s own partner_id',
   // W01a (#5612). cutScriptVersion's only write to `scripts` is
   // `.set({ version, updatedAt })` on a row it just located by id and locked
   // FOR UPDATE — it never reads or writes org_id/partner_id, so it can neither
@@ -285,6 +319,20 @@ const ALLOWED_WITHOUT_CAPABILITY_CHECK: Record<string, string> = {
   // --- org lifecycle (org lifecycle wave 2, #4074) --------------------------
   'services/orgMerge.ts': 'org_merge_events writes run under system context from the merge engine; the HTTP surface is gated by routes/orgMerge.ts\'s requireScope(partner,system) + requireOrgWrite + MFA with partner ownership and a fresh raw partner-member selection check for both merge participants — not a partner-wide policy table. Every write is already scoped to orgs the caller could act on individually; gating on canManagePartnerWidePolicies would incorrectly block partner members with plain org-write access from merging orgs they already manage.',
   'services/orgArchive.ts': 'archive/restore writes run under system context from the org-lifecycle service; the HTTP surface is gated by routes/orgArchive.ts\'s requireScope(partner,system) + requireOrgWrite + MFA, partner ownership of the target, AND the caller\'s own partner_users.org_ids selection (partnerMemberMayReachOrg, fail-closed for org_access=none) — organizations is not a partner-wide policy table. Every write is scoped to one org the caller may manage; gating on canManagePartnerWidePolicies would incorrectly block partner members with plain org-write access from archiving or restoring an org they already manage.',
+  // --- partner sending domains (spec 2026-09-17 W02) -----------------------
+  'services/emailDomains/domainRelease.ts': 'releaseSendingDomainsForPartner has no caller-facing surface at all: it is invoked only by cascadeDeletePartner and finalizePartnerOffboarding, both of which run in system context on a partner already being destroyed, and it takes the partner id from those functions rather than from any request. It writes exactly two things — an outbox row and provider_domain_id = NULL — and creates no partner-owned configuration, so there is no partner-wide policy decision for canManagePartnerWidePolicies to gate.',
+  'services/emailDomains/sendingDomainService.ts': 'the partner-wide gate for every caller-facing sending-domain write lives one layer up, in routes/partnerSendingDomains.ts, which calls canManagePartnerWidePolicies on all six mutating routes; this service takes the partner id from the verified auth context its route passed, never from request input, and its remaining callers are the platform-admin routes (already behind platformAdminMiddleware + requireMfa) and the sending-domains worker, which has no caller at all',
+  // --- reports became dual-axis (org XOR partner) in #3198 W01 --------------
+  // Partner-owned definitions are created/updated/deleted ONLY through
+  // routes/reports/core.ts (and generated through runs.ts), both of which call
+  // canManagePartnerWidePolicies. Every writer below is org-axis by
+  // construction: it sets or matches a concrete, non-null org_id.
+  'routes/reports/recipients.ts': 'recipient writers refuse a partner-owned definition with 409 partner_owned_report before any write; the only reports write (legacy emailRecipients cleanup in /recipients/convert) is keyed on the resolved non-null org_id',
+  'services/aiAgents/narrativeReport.ts': 'system-authored weekly AI narrative: inserts with org_id = run.org_id and updates WHERE org_id = run.org_id — never a partner-owned row, no caller-facing surface',
+  'services/aiAgents/fleetDesignReport.ts': 'system-authored Fleet Design: inserts with org_id = run.org_id and updates WHERE org_id = run.org_id — never a partner-owned row, no caller-facing surface',
+  'services/managedEvidenceDefinitions.ts': 'provisions the org\'s managed evidence definition with a concrete org_id (#5784); never partner-owned',
+  'services/portal/reportsSelfService.ts': 'customer-portal self-service: inserts portal definitions with the portal org_id and updates a definition it loaded by org_id + portal_self_service; partner-owned rows are never portal-visible (spec 3.5)',
+  'services/emailDomains/domainSync.ts': 'the sending-domain state machine runs only inside the sending-domains BullMQ worker, under system DB scope, with no caller and no auth context: it takes a domain id from a job payload, advances that ONE row between provider-observed statuses, and creates no partner-owned configuration. Every caller-facing create/update/delete of partner_sending_domains goes through routes/partnerSendingDomains.ts, which carries the canManagePartnerWidePolicies gate',
 };
 
 /** Table export names whose rows can be partner-owned (org_id absent or nullable). */

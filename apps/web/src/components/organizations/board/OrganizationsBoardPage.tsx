@@ -26,6 +26,7 @@ import {
   BOARD_SORTS,
   DEFAULT_FILTER,
   DEFAULT_LENS,
+  deriveIntegrationBadges,
   deriveReadinessChips,
   isBoardLens,
   isBoardSort,
@@ -43,11 +44,14 @@ import {
   type BoardRow,
   type BoardSort,
 } from '@/lib/orgReadiness';
+import { useEventStreamScope } from '@/hooks/useEventStream';
 import { useAccountReadiness } from './useAccountReadiness';
 import { useManualOrder } from './useManualOrder';
 import { useArchivedOrganizations } from './useArchivedOrganizations';
 import { RollupBand, type RollupCell } from './RollupBand';
 import { AccountBoardTable, REORDER_HINT_ID } from './AccountBoardTable';
+
+type BoardOrganization = Organization & { partnerId?: string };
 
 type ModalMode = 'closed' | 'add' | 'archive' | 'merge';
 
@@ -127,7 +131,7 @@ export default function OrganizationsBoardPage() {
   const workspaceOrgId = useOrgStore((s) => s.currentOrgId);
   const storeMode = useOrgStore((s) => s.serviceManagementMode);
 
-  const [organizations, setOrganizations] = useState<Organization[]>([]);
+  const [organizations, setOrganizations] = useState<BoardOrganization[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [modalMode, setModalMode] = useState<ModalMode>('closed');
@@ -153,8 +157,17 @@ export default function OrganizationsBoardPage() {
   const lens: BoardLens = hashState.lens ?? storedLens;
   const filter: BoardFilter = hashState.filter ?? DEFAULT_FILTER;
 
-  const orgIds = useMemo(() => organizations.map((o) => o.id), [organizations]);
-  const readiness = useAccountReadiness(orgIds);
+  const isSystem = jwt.status === 'resolved' && jwt.claims.scope === 'system';
+  const [selectedPartnerId, setSelectedPartnerId] = useState<string>();
+  const partnerIds = useMemo(() => [...new Set(organizations.flatMap((org) => org.partnerId ? [org.partnerId] : []))], [organizations]);
+  const partnerId = isSystem ? (selectedPartnerId && partnerIds.includes(selectedPartnerId) ? selectedPartnerId : partnerIds[0]) : undefined;
+  const boardOrganizations = useMemo(() => isSystem ? organizations.filter((org) => org.partnerId === partnerId) : organizations, [organizations, isSystem, partnerId]);
+  useEffect(() => {
+    useEventStreamScope.getState().setPartnerId(partnerId);
+    return () => useEventStreamScope.getState().setPartnerId(undefined);
+  }, [partnerId]);
+  const orgIds = useMemo(() => jwt.status === 'unresolved' || (isSystem && !partnerId) ? [] : boardOrganizations.map((o) => o.id), [boardOrganizations, jwt.status, isSystem, partnerId]);
+  const readiness = useAccountReadiness(orgIds, partnerId);
   const capabilities = readiness.capabilities;
   const mode = readiness.mode ?? storeMode;
   const archived = useArchivedOrganizations({ enabled: filter === 'archived', search: searchQuery });
@@ -166,7 +179,7 @@ export default function OrganizationsBoardPage() {
       try {
         if (!silent) setLoading(true);
         setError(undefined);
-        const list = await fetchAllOrganizations<Organization>(async (page, limit) => {
+        const list = await fetchAllOrganizations<BoardOrganization>(async (page, limit) => {
           const response = await fetchWithAuth(`/orgs/organizations?page=${page}&limit=${limit}`);
           if (!response.ok) {
             if (response.status === 401) {
@@ -178,7 +191,7 @@ export default function OrganizationsBoardPage() {
             throw new Error(t('orgBoard.errors.fetchOrganizations'));
           }
           return response.json();
-        });
+        }, { order: 'server' });
         if (list === null) return;
         setOrganizations(list);
       } catch (err) {
@@ -207,14 +220,21 @@ export default function OrganizationsBoardPage() {
   // ---- Derived rows ----
   const rows: BoardRow[] = useMemo(() => {
     const now = new Date();
-    return organizations.map((org) => {
+    return boardOrganizations.map((org) => {
       const r = readiness.byOrg.get(org.id);
-      return { org, readiness: r, state: readiness.rowState.get(org.id) ?? 'pending', chips: deriveReadinessChips(org, r, capabilities, mode, now) };
+      const state = readiness.rowState.get(org.id) ?? 'pending';
+      return {
+        org,
+        readiness: r,
+        state,
+        chips: deriveReadinessChips(org, r, capabilities, mode, now),
+        badges: state === 'ready' ? deriveIntegrationBadges(r, readiness.connectors, capabilities) : null,
+      };
     });
-  }, [organizations, readiness.byOrg, readiness.rowState, capabilities, mode]);
+  }, [boardOrganizations, readiness.byOrg, readiness.rowState, readiness.connectors, capabilities, mode]);
 
   const archivedRows: BoardRow[] = useMemo(
-    () => archived.archivedOrgs.map((org) => ({ org, readiness: undefined, state: 'ready' as const, chips: null })),
+    () => archived.archivedOrgs.map((org) => ({ org, readiness: undefined, state: 'ready' as const, chips: null, badges: null })),
     [archived.archivedOrgs],
   );
 
@@ -230,7 +250,7 @@ export default function OrganizationsBoardPage() {
   }, [archivedRows, filter, rows, searchQuery, sort]);
 
   /** Manual order only means something against the full, server-ordered list. */
-  const manualOrderActive = sort === 'manual' && filter === 'all' && searchQuery.trim().length === 0;
+  const manualOrderActive = !isSystem && sort === 'manual' && filter === 'all' && searchQuery.trim().length === 0;
   const columns = useMemo(() => visibleColumns(lens, capabilities), [lens, capabilities]);
   const filters = useMemo(() => visibleFilters(capabilities), [capabilities]);
   const readinessKnown = readiness.status === 'ready' || readiness.status === 'partial';
@@ -291,13 +311,14 @@ export default function OrganizationsBoardPage() {
       suspended: rows.filter((r) => r.org.status === 'suspended').length,
       setupIncomplete: readinessKnown ? count('setupIncomplete') : null,
       accountMissing: readinessKnown ? count('accountMissing') : null,
+      unlinked: readinessKnown ? count('unlinked') : null,
       openTickets: readinessKnown ? count('openTickets') : null,
       slaBreached: rows.reduce((sum, r) => sum + (r.readiness?.tickets?.slaBreached ?? 0), 0),
       openTicketTotal: rows.reduce((sum, r) => sum + (r.readiness?.tickets?.open ?? 0), 0),
-      deviceTotal: organizations.reduce((sum, o) => sum + (o.deviceCount ?? 0), 0),
+      deviceTotal: boardOrganizations.reduce((sum, o) => sum + (o.deviceCount ?? 0), 0),
       archived: archived.loaded ? archived.archivedOrgs.length : null,
     };
-  }, [rows, organizations, readinessKnown, archived.loaded, archived.archivedOrgs.length]);
+  }, [rows, boardOrganizations, readinessKnown, archived.loaded, archived.archivedOrgs.length]);
 
   const filterCount = (key: BoardFilter): number | null => {
     switch (key) {
@@ -305,6 +326,8 @@ export default function OrganizationsBoardPage() {
         return counts.setupIncomplete;
       case 'accountMissing':
         return counts.accountMissing;
+      case 'unlinked':
+        return counts.unlinked;
       case 'openTickets':
         return counts.openTickets;
       case 'trial':
@@ -336,6 +359,7 @@ export default function OrganizationsBoardPage() {
               onPress,
             };
           }
+          if (key === 'unlinked') return { key, count: counts.unlinked, pressed, onPress };
           return { key, count: key === 'setupIncomplete' ? counts.setupIncomplete : counts.accountMissing, pressed, onPress };
         }),
     [filters, filter, rows.length, counts, readinessKnown, changeFilter, t],
@@ -510,11 +534,11 @@ export default function OrganizationsBoardPage() {
     <p data-testid="org-board-footer" className="text-xs text-muted-foreground">
       {capabilities?.tickets && readinessKnown
         ? t('orgBoard.footer.summaryWithTickets', {
-            accounts: formatNumber(organizations.length),
+            accounts: formatNumber(boardOrganizations.length),
             devices: formatNumber(counts.deviceTotal),
             tickets: formatNumber(counts.openTicketTotal),
           })
-        : t('orgBoard.footer.summary', { accounts: formatNumber(organizations.length), devices: formatNumber(counts.deviceTotal) })}
+        : t('orgBoard.footer.summary', { accounts: formatNumber(boardOrganizations.length), devices: formatNumber(counts.deviceTotal) })}
       {manualOrderActive && <> · {t('orgBoard.footer.manualHint')}</>}
     </p>
   );
@@ -569,6 +593,7 @@ export default function OrganizationsBoardPage() {
             menuItemsFor={menuItemsFor}
             archivedView
             now={new Date()}
+            connectors={readiness.connectors}
           />
           {filteredRows.length === 0 && (
             // Keyed on whether a search is active: once a term is present the loaded
@@ -619,6 +644,7 @@ export default function OrganizationsBoardPage() {
         menuItemsFor={menuItemsFor}
         archivedView={false}
         now={new Date()}
+        connectors={readiness.connectors}
       />
     );
   };
@@ -649,7 +675,25 @@ export default function OrganizationsBoardPage() {
 
       {error && <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>}
 
-      <RollupBand cells={bandCells} status={readiness.status} onRetry={readiness.retry} />
+      {isSystem && partnerIds.length > 1 && (
+        <div className="space-y-1">
+          <label className="flex items-center gap-2 text-sm">
+            {t('common:nav.partner')}
+            <select data-testid="board-partner-select" aria-describedby="board-partner-scope-hint" value={partnerId} onChange={(event) => setSelectedPartnerId(event.target.value)} className="h-9 rounded-md border bg-background py-0 pl-2 pr-7 text-sm">
+              {partnerIds.map((id) => (
+                <option key={id} value={id}>
+                  {t('orgBoard.partnerOption', { id: id.slice(0, 8), count: organizations.filter((org) => org.partnerId === id).length })}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p id="board-partner-scope-hint" data-testid="board-partner-scope-hint" className="text-xs text-muted-foreground">
+            {t('orgBoard.partnerScopeHint')}
+          </p>
+        </div>
+      )}
+
+      <RollupBand cells={bandCells} status={readiness.status} onRetry={readiness.retry} connectors={readiness.connectors} />
 
       {/* Toolbar: search · filter chips · lens · sort */}
       <div className="flex flex-col gap-3 rounded-lg border bg-card p-3 shadow-xs lg:flex-row lg:items-center lg:justify-between">

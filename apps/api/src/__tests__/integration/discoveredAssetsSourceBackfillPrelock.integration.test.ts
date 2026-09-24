@@ -66,6 +66,12 @@ interface SeededTenants {
  * `source`.
  */
 async function openPreMigrationWindow(): Promise<void> {
+  // Capture was installed after this backfill and requires the now-NOT-NULL
+  // source. Recreate the historical schema without disabling the export-lock
+  // triggers whose ordering this regression exercises.
+  await getTestDb().execute(
+    sql`ALTER TABLE public.discovered_assets DISABLE TRIGGER topology_capture_legacy_change`,
+  );
   await getTestDb().execute(
     sql`ALTER TABLE public.discovered_assets ALTER COLUMN source DROP NOT NULL`,
   );
@@ -77,11 +83,22 @@ async function openPreMigrationWindow(): Promise<void> {
 /**
  * Always restore, in a `finally`: DDL here is global for the whole vitest
  * process, and a later suite in the same shard would otherwise see a nullable
- * `source` with no default. Seeded rows are DELETEd first — the DELETE
- * trigger only locks for `approved` rows of device-shaped asset types, and
- * every row below is `pending`, so the cleanup itself cannot deadlock.
+ * `source` with no default. Seeded rows are DELETEd first in ONE statement:
+ * they are approved switches, so the DELETE trigger locks all four orgs, but a
+ * single statement acquires its full partner-then-org set in sorted order, so
+ * the cleanup itself cannot trip the hierarchy check.
  */
 async function closePreMigrationWindow(): Promise<void> {
+  try {
+    await restoreSourceColumn();
+  } finally {
+    await getTestDb().execute(
+      sql`ALTER TABLE public.discovered_assets ENABLE TRIGGER topology_capture_legacy_change`,
+    );
+  }
+}
+
+async function restoreSourceColumn(): Promise<void> {
   await getTestDb().execute(sql`DELETE FROM public.discovered_assets WHERE source IS NULL`);
   await getTestDb().execute(
     sql`ALTER TABLE public.discovered_assets ALTER COLUMN source SET DEFAULT 'scan'`,
@@ -91,7 +108,14 @@ async function closePreMigrationWindow(): Promise<void> {
   );
 }
 
-/** Two partners, two orgs each, one site per org, one NULL-source asset per org. */
+/**
+ * Two partners, two orgs each, one site per org, one NULL-source asset per org.
+ * Assets are APPROVED SWITCHES: since
+ * 2026-10-28-100000-partner-export-child-update-lock-on-change.sql the site
+ * update trigger locks only for rows the partner export publishes, so pending
+ * or non-equipment rows would (correctly) take no lock and hide the ordering
+ * bug this suite reproduces. The outage data was real approved equipment.
+ */
 async function seedTwoPartnersFourOrgs(): Promise<SeededTenants> {
   const partnerA = await createPartner();
   const partnerB = await createPartner();
@@ -110,9 +134,9 @@ async function seedTwoPartnersFourOrgs(): Promise<SeededTenants> {
     // strict SUBSET of the partners statement 2 needs.
     const detectedTypeSource = key === 'orgA1' ? 'unifi_controller' : null;
     await getTestDb().execute(sql`
-      INSERT INTO public.discovered_assets (org_id, site_id, ip_address, source, detected_type_source)
+      INSERT INTO public.discovered_assets (org_id, site_id, ip_address, source, detected_type_source, asset_type, approval_status)
       VALUES (${orgId}::uuid, ${site.id}::uuid, ${`192.0.2.${octet}`}::inet, NULL,
-              ${detectedTypeSource}::discovered_asset_detection_source)
+              ${detectedTypeSource}::discovered_asset_detection_source, 'switch', 'approved')
     `);
     octet += 1;
   }

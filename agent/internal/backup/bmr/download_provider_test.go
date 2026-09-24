@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -519,6 +520,270 @@ func TestRecoveryDownloadProviderGivesUpAfterFiveMinuteRetryBudget(t *testing.T)
 	}
 }
 
+// TestRecoveryDownloadProviderRetriesTransportFailure is D-W09-3's core
+// proof (#6491 KIT lab): a 4 h 01 m, 107,636-file rebuild died on ONE file
+// whose presigned GET failed with `context deadline exceeded` — a
+// transport-class error with no HTTP status, which the retry loop treated
+// as permanent because it only retried a downloadStatusError of 429/502/
+// 503/504. A transport failure (reset, EOF, per-request timeout) must be
+// retried on the same backoff schedule. The fault here is a connection
+// closed mid-body: the response is 200 with Content-Length announced, then
+// the server hijacks and drops the socket, so the client sees io.Copy fail
+// with an unexpected EOF — no status to branch on, exactly the class the
+// old loop discarded. Attempt 1 fails at the transport, attempt 2 must
+// succeed and the destination must hold the full body.
+func TestRecoveryDownloadProviderRetriesTransportFailure(t *testing.T) {
+	recorded := withFakeRetrySleep(t)
+
+	const body = "the-whole-object-body"
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			// Announce a full body, send half, then drop the connection.
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, body[:5])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("test server does not support hijacking")
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Fatalf("hijack: %v", err)
+			}
+			_ = conn.Close()
+			return
+		}
+		_, _ = io.WriteString(w, body)
+	}))
+	defer server.Close()
+
+	provider := newRecoveryDownloadProvider(context.Background(), server.URL, "brz_rec_test", &AuthenticatedDownloadDescriptor{
+		URL:            server.URL + "/download",
+		PathQueryParam: "path",
+		PathPrefix:     "snapshots/provider-snapshot-1",
+	})
+
+	dest := filepath.Join(t.TempDir(), "f.bin")
+	if err := provider.Download("snapshots/provider-snapshot-1/f.bin", dest); err != nil {
+		t.Fatalf("Download: %v (a transport failure must be retried, not treated as permanent)", err)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 2 {
+		t.Fatalf("attempts = %d, want 2 (transport failure, then success)", got)
+	}
+	if len(*recorded) != 1 || (*recorded)[0] != downloadRetryInitialDelay {
+		t.Fatalf("recorded sleeps = %v, want exactly one %v backoff step", *recorded, downloadRetryInitialDelay)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("read dest: %v", err)
+	}
+	if string(got) != body {
+		t.Fatalf("dest = %q, want the full body %q from the retried attempt", got, body)
+	}
+}
+
+// TestRecoveryDownloadProviderRetriesTransportFailureOnRedirectHop covers the
+// third transport site — the redirect hop in followDownloadRedirects, which
+// is the one a production BMR actually exercises (the API answers 302 with
+// a presigned storage URL; the KIT failure was on exactly that presigned
+// GET). The API stub redirects to a storage stub whose FIRST request is
+// dropped before any response; the second must succeed and the redirect
+// must be followed again with no auth header.
+func TestRecoveryDownloadProviderRetriesTransportFailureOnRedirectHop(t *testing.T) {
+	recorded := withFakeRetrySleep(t)
+
+	const body = "presigned-object-body"
+	var storageAttempts int32
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			t.Errorf("recovery token forwarded to the storage redirect target")
+		}
+		if atomic.AddInt32(&storageAttempts, 1) == 1 {
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("test server does not support hijacking")
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Fatalf("hijack: %v", err)
+			}
+			_ = conn.Close()
+			return
+		}
+		_, _ = io.WriteString(w, body)
+	}))
+	defer storage.Close()
+
+	var apiAttempts int32
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&apiAttempts, 1)
+		http.Redirect(w, r, storage.URL+"/obj?X-Amz-Signature=sig", http.StatusFound)
+	}))
+	defer api.Close()
+
+	provider := newRecoveryDownloadProvider(context.Background(), api.URL, "brz_rec_test", &AuthenticatedDownloadDescriptor{
+		URL:               api.URL + "/download",
+		TokenHeaderName:   "authorization",
+		TokenHeaderFormat: "Bearer <recovery-token>",
+		PathQueryParam:    "path",
+		PathPrefix:        "snapshots/provider-snapshot-1",
+	})
+
+	dest := filepath.Join(t.TempDir(), "f.bin")
+	if err := provider.Download("snapshots/provider-snapshot-1/f.bin", dest); err != nil {
+		t.Fatalf("Download: %v (a transport failure on the redirect hop must be retried)", err)
+	}
+	if got := atomic.LoadInt32(&apiAttempts); got != 2 {
+		t.Fatalf("api attempts = %d, want 2 (the whole download, redirect included, is retried)", got)
+	}
+	if got := atomic.LoadInt32(&storageAttempts); got != 2 {
+		t.Fatalf("storage attempts = %d, want 2 (dropped, then served)", got)
+	}
+	if len(*recorded) != 1 {
+		t.Fatalf("recorded sleeps = %v, want exactly one backoff step", *recorded)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil || string(got) != body {
+		t.Fatalf("dest = %q err %v, want the full presigned body", got, err)
+	}
+}
+
+// TestRecoveryDownloadProviderTransportFailureRemovesPartialFile pins the
+// cleanup: a final transport failure must not leave a half-written object
+// at the restore target for the caller to count as present.
+func TestRecoveryDownloadProviderTransportFailureRemovesPartialFile(t *testing.T) {
+	withFakeRetrySleep(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "partial")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		hj, _ := w.(http.Hijacker)
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Fatalf("hijack: %v", err)
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	provider := newRecoveryDownloadProvider(context.Background(), server.URL, "brz_rec_test", &AuthenticatedDownloadDescriptor{
+		URL:            server.URL + "/download",
+		PathQueryParam: "path",
+		PathPrefix:     "snapshots/provider-snapshot-1",
+	})
+
+	dest := filepath.Join(t.TempDir(), "f.bin")
+	if err := provider.Download("snapshots/provider-snapshot-1/f.bin", dest); err == nil {
+		t.Fatal("expected the download to fail after transport retries are exhausted")
+	}
+	if _, err := os.Stat(dest); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial destination file still exists after a final transport failure (stat err = %v)", err)
+	}
+}
+
+// TestRecoveryDownloadProviderTransportRetriesAreBounded proves a
+// persistently unreachable object does not turn every file into a
+// 5-minute stall: transport failures get downloadTransportMaxAttempts
+// attempts total, then the error surfaces (still wrapping the transport
+// cause) so restore's per-file failure accounting and consecutive-failure
+// breaker (bmr.go) see it.
+func TestRecoveryDownloadProviderTransportRetriesAreBounded(t *testing.T) {
+	recorded := withFakeRetrySleep(t)
+
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("test server does not support hijacking")
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Fatalf("hijack: %v", err)
+		}
+		_ = conn.Close() // no response at all: the client sees EOF
+	}))
+	defer server.Close()
+
+	provider := newRecoveryDownloadProvider(context.Background(), server.URL, "brz_rec_test", &AuthenticatedDownloadDescriptor{
+		URL:            server.URL + "/download",
+		PathQueryParam: "path",
+		PathPrefix:     "snapshots/provider-snapshot-1",
+	})
+
+	dest := filepath.Join(t.TempDir(), "f.bin")
+	err := provider.Download("snapshots/provider-snapshot-1/f.bin", dest)
+	if err == nil {
+		t.Fatal("expected an error once transport retries are exhausted")
+	}
+	var transportErr *downloadTransportError
+	if !errors.As(err, &transportErr) {
+		t.Fatalf("error = %v, want it to wrap *downloadTransportError so callers can tell transport from status failures", err)
+	}
+	if got := atomic.LoadInt32(&attempts); got != downloadTransportMaxAttempts {
+		t.Fatalf("attempts = %d, want exactly downloadTransportMaxAttempts (%d)", got, downloadTransportMaxAttempts)
+	}
+	if len(*recorded) != downloadTransportMaxAttempts-1 {
+		t.Fatalf("recorded sleeps = %v, want %d backoff steps between %d attempts", *recorded, downloadTransportMaxAttempts-1, downloadTransportMaxAttempts)
+	}
+}
+
+// TestRecoveryDownloadProviderDoesNotRetryTransportFailureAfterParentCancel
+// pins the boundary D-W09-3 must not cross: a transport error that is
+// really the PARENT recovery context being cancelled (the operator aborted,
+// the run-level deadline fired) must stop immediately — never a backoff,
+// never a second request — because every subsequent attempt would fail the
+// same way and the caller is trying to stop. The server blocks until the
+// test cancels the context mid-request, so the transport error IS the
+// cancellation.
+func TestRecoveryDownloadProviderDoesNotRetryTransportFailureAfterParentCancel(t *testing.T) {
+	recorded := withFakeRetrySleep(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var attempts int32
+	started := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		started <- struct{}{}
+		<-r.Context().Done() // hold the request open until the client goes away
+	}))
+	defer server.Close()
+
+	provider := newRecoveryDownloadProvider(ctx, server.URL, "brz_rec_test", &AuthenticatedDownloadDescriptor{
+		URL:            server.URL + "/download",
+		PathQueryParam: "path",
+		PathPrefix:     "snapshots/provider-snapshot-1",
+	})
+
+	go func() {
+		<-started
+		cancel()
+	}()
+
+	dest := filepath.Join(t.TempDir(), "f.bin")
+	err := provider.Download("snapshots/provider-snapshot-1/f.bin", dest)
+	if err == nil {
+		t.Fatal("expected an error when the parent context is cancelled mid-request")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want it to wrap context.Canceled", err)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Fatalf("attempts = %d, want exactly 1 — a cancelled parent context must never be retried", got)
+	}
+	if len(*recorded) != 0 {
+		t.Fatalf("recorded sleeps = %v, want none — no backoff after a parent cancel", *recorded)
+	}
+}
+
 // TestRecoveryDownloadProviderRetryBackoffIsContextAware proves item 4's
 // fix: retrySleep must respect ctx cancellation instead of blocking out the
 // full backoff — the retry loop can wait up to downloadRetryMaxTotalWait (5
@@ -706,5 +971,137 @@ func TestRecoveryDownloadProviderFailsOnRedirectLoopBeyondCap(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(err.Error()), "redirect") {
 		t.Fatalf("error = %v, want it to mention redirects", err)
+	}
+}
+
+// TestRecoveryDownloadProvider_OwnPrefixAlwaysAllowed proves that a key
+// under the token's own snapshot prefix is always downloadable, whether or
+// not the descriptor negotiated snapshot-file-membership-v1 (Task 9).
+func TestRecoveryDownloadProvider_OwnPrefixAlwaysAllowed(t *testing.T) {
+	var requested int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requested, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data"))
+	}))
+	defer server.Close()
+
+	p := newRecoveryDownloadProvider(context.Background(), server.URL, "tok", &AuthenticatedDownloadDescriptor{
+		Type: "breeze_proxy", Method: http.MethodGet, URL: server.URL + "/download",
+		PathQueryParam: "path", PathPrefix: "snapshots/gen-2",
+	})
+	dest := filepath.Join(t.TempDir(), "out")
+	if err := p.Download("snapshots/gen-2/files/a.gz", dest); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if got := atomic.LoadInt32(&requested); got != 1 {
+		t.Fatalf("requested = %d, want 1", got)
+	}
+}
+
+// TestRecoveryDownloadProvider_ExternalKeyRefusedWithoutAdmission proves an
+// external key is refused before any HTTP request when it has never been
+// added to the admissible set (Task 9).
+func TestRecoveryDownloadProvider_ExternalKeyRefusedWithoutAdmission(t *testing.T) {
+	var requested int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requested, 1)
+	}))
+	defer server.Close()
+
+	p := newRecoveryDownloadProvider(context.Background(), server.URL, "tok", &AuthenticatedDownloadDescriptor{
+		Type: "breeze_proxy", Method: http.MethodGet, URL: server.URL + "/download",
+		PathQueryParam: "path", PathPrefix: "snapshots/gen-2",
+	})
+	err := p.Download("snapshots/gen-1/files/a.gz", filepath.Join(t.TempDir(), "out"))
+	if err == nil {
+		t.Fatal("expected an error for an external key never admitted")
+	}
+	if got := atomic.LoadInt32(&requested); got != 0 {
+		t.Fatalf("requested = %d, want 0 (no HTTP request for a key outside the admissible set)", got)
+	}
+}
+
+// TestRecoveryDownloadProvider_ExternalKeyAllowedOnceAdmittedWithMembership
+// proves an external key becomes downloadable once ExtendAdmissible has
+// widened the set AND the descriptor granted the membership capability
+// (Task 9).
+func TestRecoveryDownloadProvider_ExternalKeyAllowedOnceAdmittedWithMembership(t *testing.T) {
+	var requested int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requested, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data"))
+	}))
+	defer server.Close()
+
+	p := newRecoveryDownloadProvider(context.Background(), server.URL, "tok", &AuthenticatedDownloadDescriptor{
+		Type: "breeze_proxy", Method: http.MethodGet, URL: server.URL + "/download",
+		PathQueryParam: "path", PathPrefix: "snapshots/gen-2",
+		Capabilities: []string{CapabilitySnapshotFileMembershipV1},
+	})
+	if !p.MembershipNegotiated() {
+		t.Fatal("MembershipNegotiated() = false, want true")
+	}
+	p.ExtendAdmissible([]string{"snapshots/gen-1/files/a.gz"})
+	if !p.Admits("snapshots/gen-1/files/a.gz") {
+		t.Fatal("Admits() = false for a key just widened into scope")
+	}
+	if err := p.Download("snapshots/gen-1/files/a.gz", filepath.Join(t.TempDir(), "out")); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if got := atomic.LoadInt32(&requested); got != 1 {
+		t.Fatalf("requested = %d, want 1", got)
+	}
+}
+
+// TestRecoveryDownloadProvider_ExternalKeyRefusedWithoutMembershipEvenIfListed
+// is the belt-and-braces case: a key must never be admitted from
+// ExtendAdmissible alone if the descriptor never granted the capability —
+// this defends against a future caller widening the set without checking
+// MembershipNegotiated() first (Task 9).
+func TestRecoveryDownloadProvider_ExternalKeyRefusedWithoutMembershipEvenIfListed(t *testing.T) {
+	p := newRecoveryDownloadProvider(context.Background(), "http://example.invalid", "tok", &AuthenticatedDownloadDescriptor{
+		Type: "breeze_proxy", Method: http.MethodGet, URL: "http://example.invalid/download",
+		PathQueryParam: "path", PathPrefix: "snapshots/gen-2",
+	})
+	p.ExtendAdmissible([]string{"snapshots/gen-1/files/a.gz"})
+	if p.MembershipNegotiated() {
+		t.Fatal("MembershipNegotiated() = true, want false (descriptor never granted the capability)")
+	}
+	if p.Admits("snapshots/gen-1/files/a.gz") {
+		t.Fatal("Admits() = true, want false: ExtendAdmissible alone must never grant access without membership")
+	}
+}
+
+// TestRecoveryDownloadProvider_AdmitsOwnPrefixKey proves Admits() alone
+// (the predicate the rebuild engine's preflight ObjectAdmission sweep uses,
+// preflight.go ~:153) admits a key under the descriptor's own PathPrefix
+// even when membership was never negotiated and the admissible set is
+// empty — i.e. an entirely self-contained, own-prefix-only manifest must
+// never be refused at preflight. Before the fix, Admits() only consulted
+// the external admissible map and unconditionally returned false without
+// membership, so every own-prefix file failed preflight's sweep (review
+// finding #1).
+func TestRecoveryDownloadProvider_AdmitsOwnPrefixKey(t *testing.T) {
+	p := newRecoveryDownloadProvider(context.Background(), "http://example.invalid", "tok", &AuthenticatedDownloadDescriptor{
+		Type: "breeze_proxy", Method: http.MethodGet, URL: "http://example.invalid/download",
+		PathQueryParam: "path", PathPrefix: "snapshots/gen-2",
+		// No Capabilities — this token never negotiated membership, as is
+		// normal for a self-contained snapshot (R1).
+	})
+	if p.MembershipNegotiated() {
+		t.Fatal("MembershipNegotiated() = true, want false (no capability granted)")
+	}
+	if !p.Admits("snapshots/gen-2/files/a.gz") {
+		t.Fatal("Admits() = false for a key under the descriptor's own PathPrefix, want true")
+	}
+	if !p.Admits("snapshots/gen-2") {
+		t.Fatal("Admits() = false for the bare own-prefix key itself, want true")
+	}
+	// A key under a DIFFERENT prefix, with no membership negotiated, must
+	// still be refused.
+	if p.Admits("snapshots/gen-1/files/a.gz") {
+		t.Fatal("Admits() = true for an external key with no membership negotiated, want false")
 	}
 }

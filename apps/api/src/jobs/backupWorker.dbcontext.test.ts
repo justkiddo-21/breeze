@@ -24,6 +24,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { DispatchOutcome } from '../services/agentCommandRelay';
 
+vi.mock('../services/auditService', () => ({ createAuditLogAsync: vi.fn() }));
+
 const { mockDb, ctxState } = vi.hoisted(() => {
   const db = {
     select: vi.fn(),
@@ -73,7 +75,7 @@ vi.mock('../db', () => ({
 // DB context (see the describe block below).
 const cleanupExpiredSnapshotsMock = vi.fn(async () => {
   ctxState.events.push(`cleanupExpiredSnapshots@depth${ctxState.depth}`);
-  return { deleted: 0, skippedLegalHold: 0, skippedImmutable: 0, skippedPinned: 0, skippedUnresolved: 0, prunedByMaxVersions: 0, failed: 0 };
+  return { deleted: 0, skippedLegalHold: 0, skippedImmutable: 0, skippedPinned: 0, skippedUnresolved: 0, skippedChainBase: 0, prunedByMaxVersions: 0, failed: 0 };
 });
 const sweepUnreferencedBackupObjectsMock = vi.fn(async () => {
   ctxState.events.push(`sweepUnreferencedBackupObjects@depth${ctxState.depth}`);
@@ -143,6 +145,8 @@ describe('processDispatchBackup DB-context scoping (final-review fix, #4084/#110
         rows = configFound ? [CONFIG_ROW] : []; label = 'configSelect'; // config load: db.select() with no arg
       } else if (keys.length === 1 && keys[0] === 'status') {
         rows = cancelled ? [{ status: 'cancelled' }] : []; label = 'cancelledSelect'; // isBackupJobCancelled
+      } else if (keys.length === 1 && keys[0] === 'orgId') {
+        rows = [{ orgId: 'org-1' }]; label = 'deviceOrgSelect';
       } else if (keys.length === 1 && keys[0] === 'agentId') {
         rows = [{ agentId: 'agent-1' }]; label = 'deviceSelect'; // device -> agent lookup
       } else if (keys.includes('featureLinkId')) {
@@ -152,6 +156,10 @@ describe('processDispatchBackup DB-context scoping (final-review fix, #4084/#110
         // no eligible base for these depth-scoping tests (irrelevant to what
         // this file asserts).
         rows = []; label = 'baseCandidateSelect';
+      } else if (keys.includes('retirementId')) {
+        // #6351: fallback-reason probe -- runs in the same transaction as the
+        // (empty) candidate select and only feeds the log line.
+        rows = []; label = 'baseFallbackProbeSelect';
       } else if (keys.length === 1 && keys[0] === 'id') {
         rows = []; label = 'baseLockOrRetirementSelect';
       } else {
@@ -234,11 +242,15 @@ describe('processDispatchBackup DB-context scoping (final-review fix, #4084/#110
       // context (no eligible base -> one candidate select, one update).
       'baseCandidateSelect@depth1',
       'update@depth1',
+      'baseFallbackProbeSelect@depth1',
       'recordExpectation@depth1',
       'ctx:exit',
       // Phase 4: the actual send, NO context held. This is the #1105 fix —
       // this call used to run at depth1, pinning a pooled connection across
       // dispatchCommandToAgent's ack-wait poll.
+      'ctx:enter',
+      'deviceOrgSelect@depth1',
+      'ctx:exit',
       'wsDispatch@depth0',
       // Phase 5 (settle): final cancellation guard + status flip — ONE short
       // context.
@@ -321,7 +333,11 @@ describe('processDispatchBackup DB-context scoping (final-review fix, #4084/#110
       // context (no eligible base -> one candidate select, one update).
       'baseCandidateSelect@depth1',
       'update@depth1',
+      'baseFallbackProbeSelect@depth1',
       'recordExpectation@depth1',
+      'ctx:exit',
+      'ctx:enter',
+      'deviceOrgSelect@depth1',
       'ctx:exit',
       'wsDispatch@depth0',
       'ctx:enter',

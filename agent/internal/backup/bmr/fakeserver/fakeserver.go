@@ -13,6 +13,7 @@ package fakeserver
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -21,9 +22,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/breeze-rmm/agent/internal/backup/bmr"
 )
 
 // Config configures one fake recovery server instance.
@@ -45,6 +49,11 @@ type Config struct {
 	RecoveryID string
 	Nonce      string
 	Identity   string
+	// ProbeToken, when set, is pre-registered as an authenticated download
+	// token so an out-of-band client (run-qemu.sh on the host) can issue
+	// real /recover/download requests and prove the scope refusal fires over
+	// the wire. Fake server only — never mirrored by the real API.
+	ProbeToken string
 	// MinHelperVersion is echoed on BootstrapResponse.MinHelperVersion —
 	// the console's version gate compares its own version against this.
 	MinHelperVersion string
@@ -53,6 +62,30 @@ type Config struct {
 	// this back (as a JSON array of `status` values) to assert the console
 	// drove the recovery through every expected phase.
 	ProgressLogPath string
+	// Capabilities are the capability strings this fake server GRANTS when
+	// the client requests them (subset semantics, mirroring the real
+	// server's negotiateRecoveryCapabilities). Empty means "grants
+	// nothing" — a client that needs the membership capability (because
+	// ReferencedSnapshotIDs is non-empty) is refused.
+	Capabilities []string
+	// ReferencedSnapshotIDs, when non-empty, makes bootstrapFor emit a
+	// "complete" fileIndex computed from the manifest.json this fake
+	// server already has on disk for SnapshotID, and makes
+	// handleAuthenticate/handleExchange require the membership capability
+	// from the client (409 client_capability_required otherwise).
+	ReferencedSnapshotIDs []string
+	// FaultTransportOnceKey, when non-empty, makes the FIRST /recover/download
+	// whose key contains this substring fail at the TRANSPORT layer: the
+	// response starts as a 200 with Content-Length, a partial body is sent,
+	// and the connection is dropped — so the client sees an unexpected EOF
+	// / reset with no HTTP status to branch on. Every later request for the
+	// same key is served normally. This is the e2e stand-in for D-W09-3
+	// (#6491 KIT lab: one presigned GET timed out at the transport 97,296
+	// files into a 4-hour rebuild and the file was recorded failed without
+	// a retry). run-qemu.sh points it at a referenced external key and
+	// asserts the key was requested at least twice and the run still
+	// validated. Fake server only — never mirrored by the real API.
+	FaultTransportOnceKey string
 }
 
 // Server is the fake recovery server. Create with New, then serve its
@@ -61,6 +94,20 @@ type Server struct {
 	cfg    Config
 	mu     sync.Mutex
 	tokens map[string]bool // minted, not-yet-expired tokens
+
+	manifestOnce sync.Once
+	manifestSet  map[string]struct{} // backupPath set of the token snapshot's manifest
+
+	faultMu    sync.Mutex
+	faultFired bool
+}
+
+// TransportFaultFired reports whether the one-shot transport fault
+// (Config.FaultTransportOnceKey) has already been injected.
+func (s *Server) TransportFaultFired() bool {
+	s.faultMu.Lock()
+	defer s.faultMu.Unlock()
+	return s.faultFired
 }
 
 // New builds a Server for cfg. Panics on an unusable config (test-only code
@@ -79,7 +126,11 @@ func New(cfg Config) *Server {
 	if cfg.RecoveryID == "" {
 		cfg.RecoveryID = "e2e-recovery-1"
 	}
-	return &Server{cfg: cfg, tokens: map[string]bool{}}
+	srv := &Server{cfg: cfg, tokens: map[string]bool{}}
+	if cfg.ProbeToken != "" {
+		srv.tokens[cfg.ProbeToken] = true
+	}
+	return srv
 }
 
 // Handler returns the http.Handler serving every route this fake
@@ -139,7 +190,113 @@ func (s *Server) newToken() string {
 	return "e2e_tok_" + hex.EncodeToString(buf)
 }
 
-func (s *Server) bootstrapFor(tokenID string) bootstrapPayload {
+// manifestEntry is the subset of backup.SnapshotFile the fake needs. Kind
+// is "" (or omitted) for a regular file whose bytes live at BackupPath and
+// "symlink"/"dir" for a content-less entry that legitimately carries
+// BackupPath "" — see agent/internal/backup/snapshot.go.
+type manifestEntry struct {
+	SourcePath string `json:"sourcePath"`
+	BackupPath string `json:"backupPath"`
+	Kind       string `json:"kind"`
+}
+
+// validateManifest applies the SAME gate the real server's hydration does
+// (apps/api/src/services/backupSnapshotFileIndex.ts): a content entry
+// (kind "") must name its object — backupPath "" there is manifest_invalid
+// — and every non-empty backupPath must pass the shared object-key contract
+// (bmr.ParseObjectKey) or the whole manifest is manifest_key_invalid. A
+// dir/symlink entry with backupPath "" is fine (D-W09-1). Failing closed
+// here is what lets the QEMU e2e catch a manifest the real server would
+// refuse (the KIT rig's real manifest failed both checks on 94d07c466 and
+// the e2e passed because its fake accepted anything).
+func validateManifest(files []manifestEntry) error {
+	for _, f := range files {
+		if f.BackupPath == "" {
+			if f.Kind == "dir" || f.Kind == "symlink" {
+				continue
+			}
+			return fmt.Errorf("manifest_invalid: content entry %q has an empty backupPath", f.SourcePath)
+		}
+		if _, ok := bmr.ParseObjectKey(f.BackupPath); !ok {
+			return fmt.Errorf("manifest_key_invalid: unparseable backupPath %q", f.BackupPath)
+		}
+	}
+	return nil
+}
+
+// computeFileIndex reads the seeded manifest.json for s.cfg.SnapshotID and
+// returns its sha256 (hex) plus a count of file entries whose backupPath
+// points outside this snapshot's own prefix (the fake server's stand-in
+// for the real server's hydrated fileIndex.externalCount). It fails when
+// the manifest would not pass the real server's hydration gate — see
+// validateManifest.
+func (s *Server) computeFileIndex() (sha string, externalCount int, err error) {
+	data, err := os.ReadFile(filepath.Join(s.cfg.StoreDir, "snapshots", s.cfg.SnapshotID, "manifest.json"))
+	if err != nil {
+		return "", 0, err
+	}
+	sum := sha256.Sum256(data)
+	var m struct {
+		Files []manifestEntry `json:"files"`
+	}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return "", 0, err
+	}
+	if err := validateManifest(m.Files); err != nil {
+		return "", 0, err
+	}
+	own := "snapshots/" + s.cfg.SnapshotID + "/"
+	for _, f := range m.Files {
+		if f.BackupPath != "" && !strings.HasPrefix(f.BackupPath, own) {
+			externalCount++
+		}
+	}
+	return hex.EncodeToString(sum[:]), externalCount, nil
+}
+
+type fileIndexInfo struct {
+	sha           string
+	externalCount int
+}
+
+// fileIndexRefusal mirrors negotiateRecoveryCapabilities' 409
+// snapshot_index_failed: when references exist, the membership capability
+// would be GRANTED, and the manifest fails the hydration gate, the real
+// server refuses the session rather than handing out a fileIndex it could
+// not build. On success it returns the computed index for bootstrapFor, so
+// the manifest is read and validated exactly once per request. code is ""
+// when there is nothing to refuse.
+func (s *Server) fileIndexRefusal(clientCapabilities []string) (fi *fileIndexInfo, code string) {
+	granted := intersectCapabilities(clientCapabilities, s.cfg.Capabilities)
+	if len(s.cfg.ReferencedSnapshotIDs) == 0 || !bmr.HasCapability(granted, bmr.CapabilitySnapshotFileMembershipV1) {
+		return nil, ""
+	}
+	sha, externalCount, err := s.computeFileIndex()
+	if err != nil {
+		log.Printf("fakeserver: refusing session, manifest fails the hydration gate: %v", err)
+		return nil, "snapshot_index_failed"
+	}
+	return &fileIndexInfo{sha: sha, externalCount: externalCount}, ""
+}
+
+// intersectCapabilities returns the capability strings present in both
+// client and granted (order follows granted, mirroring "what the server is
+// willing to give, filtered by what the client asked for").
+func intersectCapabilities(client, granted []string) []string {
+	var out []string
+	for _, g := range granted {
+		if bmr.HasCapability(client, g) {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// bootstrapFor builds the bootstrap payload. fileIndex is the result of
+// computeFileIndex when references exist and membership was granted — the
+// handler computes it ONCE (fileIndexRefusal) and passes it in, so the
+// payload can never silently omit a fileIndex the gate already accepted.
+func (s *Server) bootstrapFor(tokenID string, clientCapabilities []string, fileIndex *fileIndexInfo) bootstrapPayload {
 	recovery := map[string]any{
 		"id":         s.cfg.RecoveryID,
 		"identity":   s.cfg.Identity,
@@ -149,6 +306,34 @@ func (s *Server) bootstrapFor(tokenID string) bootstrapPayload {
 	if s.cfg.Identity == "original" {
 		recovery["nonce"] = s.cfg.Nonce
 	}
+
+	granted := intersectCapabilities(clientCapabilities, s.cfg.Capabilities)
+	download := map[string]any{
+		"type":                   "http",
+		"method":                 "GET",
+		"url":                    "/api/v1/backup/bmr/recover/download",
+		"tokenQueryParam":        "token",
+		"pathQueryParam":         "path",
+		"requiresAuthentication": true,
+		"pathPrefix":             "snapshots/" + s.cfg.SnapshotID,
+		"expiresAt":              "",
+		"capabilities":           granted,
+	}
+	snapshot := map[string]any{
+		"id":         s.cfg.SnapshotID,
+		"snapshotId": s.cfg.SnapshotID,
+		"size":       0,
+		"fileCount":  0,
+	}
+	if len(s.cfg.ReferencedSnapshotIDs) > 0 && bmr.HasCapability(granted, bmr.CapabilitySnapshotFileMembershipV1) && fileIndex != nil {
+		snapshot["fileIndex"] = map[string]any{
+			"status":            "complete",
+			"manifestSha256":    fileIndex.sha,
+			"externalCount":     fileIndex.externalCount,
+			"originSnapshotIds": s.cfg.ReferencedSnapshotIDs,
+		}
+	}
+
 	return bootstrapPayload{
 		Version:          1,
 		MinHelperVersion: s.cfg.MinHelperVersion,
@@ -162,22 +347,8 @@ func (s *Server) bootstrapFor(tokenID string) bootstrapPayload {
 			"hostname": "e2e-source",
 			"osType":   "linux",
 		},
-		Snapshot: map[string]any{
-			"id":         s.cfg.SnapshotID,
-			"snapshotId": s.cfg.SnapshotID,
-			"size":       0,
-			"fileCount":  0,
-		},
-		Download: map[string]any{
-			"type":                   "http",
-			"method":                 "GET",
-			"url":                    "/api/v1/backup/bmr/recover/download",
-			"tokenQueryParam":        "token",
-			"pathQueryParam":         "path",
-			"requiresAuthentication": true,
-			"pathPrefix":             "snapshots/" + s.cfg.SnapshotID,
-			"expiresAt":              "",
-		},
+		Snapshot:        snapshot,
+		Download:        download,
 		AuthenticatedAt: nowRFC3339(),
 		Recovery:        recovery,
 	}
@@ -197,7 +368,8 @@ func (s *Server) handleExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Code string `json:"code"`
+		Code         string   `json:"code"`
+		Capabilities []string `json:"capabilities,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_body")
@@ -205,6 +377,20 @@ func (s *Server) handleExchange(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(body.Code) != s.cfg.Code {
 		writeError(w, http.StatusNotFound, "code_invalid")
+		return
+	}
+	// Refuse before the code is consumed / token minted, matching Part 0
+	// §1's "code NOT consumed" requirement for R2.
+	if len(s.cfg.ReferencedSnapshotIDs) > 0 && !bmr.HasCapability(body.Capabilities, bmr.CapabilitySnapshotFileMembershipV1) {
+		writeError(w, http.StatusConflict, "client_capability_required")
+		return
+	}
+	// Also before the code is consumed: the real server's
+	// negotiateRecoveryCapabilities refuses snapshot_index_failed at the
+	// same point when the manifest could not be hydrated.
+	fileIndex, code := s.fileIndexRefusal(body.Capabilities)
+	if code != "" {
+		writeError(w, http.StatusConflict, code)
 		return
 	}
 
@@ -221,7 +407,7 @@ func (s *Server) handleExchange(w http.ResponseWriter, r *http.Request) {
 	// `bootstrap` that carries download/recovery. The e2e previously sent the
 	// inner object directly, which hid the console's envelope-decoding bug
 	// until the first run against a real API.
-	inner := s.bootstrapFor("e2e-token-1")
+	inner := s.bootstrapFor("e2e-token-1", body.Capabilities, fileIndex)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token": token,
 		"bootstrap": map[string]any{
@@ -246,14 +432,16 @@ func (s *Server) handleExchange(w http.ResponseWriter, r *http.Request) {
 // Deps.Provider re-authenticates; not exercised by the console's own
 // Exchange->Provider flow directly (which uses the exchange response's
 // bootstrap in-memory), but kept for parity with real recovery tokens and
-// for recoveryDownloadProvider's re-auth-on-401/403 path.
+// for recoveryDownloadProvider's session refresh (proactive before
+// expiresAt, reactive on 401).
 func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
 	}
 	var body struct {
-		Token string `json:"token"`
+		Token        string   `json:"token"`
+		Capabilities []string `json:"capabilities,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_body")
@@ -266,7 +454,16 @@ func (s *Server) handleAuthenticate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid_token")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"bootstrap": s.bootstrapFor("e2e-token-1")})
+	if len(s.cfg.ReferencedSnapshotIDs) > 0 && !bmr.HasCapability(body.Capabilities, bmr.CapabilitySnapshotFileMembershipV1) {
+		writeError(w, http.StatusConflict, "client_capability_required")
+		return
+	}
+	fileIndex, code := s.fileIndexRefusal(body.Capabilities)
+	if code != "" {
+		writeError(w, http.StatusConflict, code)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"bootstrap": s.bootstrapFor("e2e-token-1", body.Capabilities, fileIndex)})
 }
 
 type progressRecord struct {
@@ -284,15 +481,27 @@ func (s *Server) handleProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Token  string `json:"token"`
-		Status string `json:"status"`
-		Reason string `json:"reason,omitempty"`
+		Token    string          `json:"token"`
+		Status   string          `json:"status"`
+		Reason   string          `json:"reason,omitempty"`
+		Result   json.RawMessage `json:"result,omitempty"`
+		Warnings []string        `json:"warnings,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_body")
 		return
 	}
 	s.appendProgress(progressRecord{Status: body.Status})
+	if body.Status == "validated" {
+		// The console posts the full bmr.RecoveryResult (failedFiles,
+		// filesRestored, warnings) alongside `validated`; persist it next
+		// to the progress log so run-qemu.sh can assert a CLEAN rebuild
+		// (failedFiles == 0) — a per-file failure that stays under the
+		// consecutive-failure breaker still reaches `validated`, so the
+		// phase list alone cannot tell "retried and succeeded" from
+		// "retried and still lost the file".
+		s.writeValidatedResult(body.Result, body.Warnings)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": body.Status})
 }
 
@@ -329,8 +538,11 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("path")
 	prefix := "snapshots/" + s.cfg.SnapshotID
 	if key != prefix && !strings.HasPrefix(key, prefix+"/") {
-		writeError(w, http.StatusForbidden, "outside_prefix")
-		return
+		if !s.externalKeyReferenced(key) {
+			log.Printf("fakeserver: download refused (not_authorized): %s", key)
+			writeError(w, http.StatusConflict, "not_authorized")
+			return
+		}
 	}
 
 	full, err := containedPath(s.cfg.StoreDir, key)
@@ -349,14 +561,144 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = f.Close() }()
 	w.Header().Set("Content-Type", "application/octet-stream")
+	if s.shouldInjectTransportFault(key) {
+		s.injectTransportFault(w, f, key)
+		return
+	}
 	if _, err := io.Copy(w, f); err != nil {
 		log.Printf("fakeserver: download %s: copy failed: %v", key, err)
 	}
 }
 
+// shouldInjectTransportFault claims the one-shot fault for key when it
+// matches Config.FaultTransportOnceKey and nothing has claimed it yet.
+func (s *Server) shouldInjectTransportFault(key string) bool {
+	if s.cfg.FaultTransportOnceKey == "" || !strings.Contains(key, s.cfg.FaultTransportOnceKey) {
+		return false
+	}
+	s.faultMu.Lock()
+	defer s.faultMu.Unlock()
+	if s.faultFired {
+		return false
+	}
+	s.faultFired = true
+	return true
+}
+
+// injectTransportFault announces the full object (200 + Content-Length),
+// writes at most half of it, flushes, then hijacks and closes the TCP
+// connection so the client's body read fails with an unexpected EOF /
+// connection reset — a transport-class failure with no HTTP status. If the
+// ResponseWriter cannot be hijacked the fault is logged as NOT injected and
+// the object is served normally, so the e2e's log assertion fails loudly
+// rather than the run silently passing without the fault.
+func (s *Server) injectTransportFault(w http.ResponseWriter, f *os.File, key string) {
+	info, err := f.Stat()
+	if err != nil {
+		log.Printf("fakeserver: transport fault: stat %s: %v", key, err)
+		return
+	}
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		log.Printf("fakeserver: transport fault NOT injected (ResponseWriter is not hijackable): %s", key)
+		_, _ = io.Copy(w, f)
+		return
+	}
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.CopyN(w, f, info.Size()/2)
+	if fl, ok := w.(http.Flusher); ok {
+		fl.Flush()
+	}
+	conn, _, err := hj.Hijack()
+	if err != nil {
+		log.Printf("fakeserver: transport fault: hijack %s: %v", key, err)
+		return
+	}
+	_ = conn.Close()
+	log.Printf("fakeserver: transport fault injected (connection dropped mid-body): %s", key)
+}
+
+// externalKeyReferenced reports whether key belongs to one of the seeded
+// ReferencedSnapshotIDs generations — the fake server's stand-in for the
+// real server's backup_snapshot_files/backup_snapshot_origins membership
+// check.
+func (s *Server) externalKeyReferenced(key string) bool {
+	// Exact membership, never prefix widening (Part 0 Global Constraints):
+	// an external key is admissible only if the token snapshot's own
+	// manifest names it verbatim AND it lives under one of the configured
+	// origin ids. A sibling object under a referenced origin's prefix that
+	// no manifest entry names (e2e's not-referenced.gz) must be refused.
+	underOrigin := false
+	for _, id := range s.cfg.ReferencedSnapshotIDs {
+		if strings.HasPrefix(key, "snapshots/"+id+"/") {
+			underOrigin = true
+			break
+		}
+	}
+	if !underOrigin {
+		return false
+	}
+	_, ok := s.manifestKeys()[key]
+	return ok
+}
+
+// manifestKeys returns the set of backupPath values in the token
+// snapshot's manifest (loaded once; the store is immutable for a run).
+func (s *Server) manifestKeys() map[string]struct{} {
+	s.manifestOnce.Do(func() {
+		s.manifestSet = map[string]struct{}{}
+		data, err := os.ReadFile(filepath.Join(s.cfg.StoreDir, "snapshots", s.cfg.SnapshotID, "manifest.json"))
+		if err != nil {
+			log.Printf("fakeserver: manifest for membership check unavailable: %v", err)
+			return
+		}
+		var m struct {
+			Files []manifestEntry `json:"files"`
+		}
+		if err := json.Unmarshal(data, &m); err != nil {
+			log.Printf("fakeserver: manifest for membership check invalid: %v", err)
+			return
+		}
+		if err := validateManifest(m.Files); err != nil {
+			// Same gate as computeFileIndex: a manifest the real server
+			// would refuse to hydrate must not widen anything.
+			log.Printf("fakeserver: manifest for membership check fails the hydration gate: %v", err)
+			return
+		}
+		for _, f := range m.Files {
+			if f.BackupPath != "" {
+				s.manifestSet[f.BackupPath] = struct{}{}
+			}
+		}
+	})
+	return s.manifestSet
+}
+
 // appendProgress appends one status to ProgressLogPath as a JSON array,
 // read-modify-write under the server's own mutex (call volume here is a
 // handful of calls across one recovery — no concurrency concern).
+// ValidatedResultPath is where the `validated` progress post's result is
+// persisted: ProgressLogPath with a `.validated.json` suffix.
+func (s *Server) ValidatedResultPath() string {
+	return strings.TrimSuffix(s.cfg.ProgressLogPath, ".json") + ".validated.json"
+}
+
+func (s *Server) writeValidatedResult(result json.RawMessage, warnings []string) {
+	payload := map[string]any{"warnings": warnings}
+	if len(result) > 0 {
+		payload["result"] = result
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		log.Printf("fakeserver: marshal validated result: %v", err)
+		return
+	}
+	if err := os.WriteFile(s.ValidatedResultPath(), data, 0o644); err != nil {
+		log.Printf("fakeserver: write validated result: %v", err)
+	}
+}
+
 func (s *Server) appendProgress(rec progressRecord) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

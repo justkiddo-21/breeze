@@ -115,6 +115,7 @@ const INTENTIONAL_UNSCOPED: ReadonlySet<string> = new Set<string>([
   'sso_token_exchange_grants', // One-time SSO exchange authority. Forced RLS, one system-only ALL policy; only guarded auth lifecycle transactions may consume it.
   'installed_extensions', // Global runtime-extension operational state (version/trust/lifecycle/enabled). No tenant axis. Forced RLS, system-only policy → only system context.
   'extension_schema_history', // Global append-only record of the schema-compatibility floor each extension bundle version applied. No tenant axis. Forced RLS, system-only policy → only system context.
+  'email_provider_domain_releases', // Provider-side "delete this domain" outbox (spec 2026-09-17 partner sending domains §3.3). Deliberately carries NO partner_id: cascadeDeletePartner deletes from every table that has one, which would erase the provider handle this table exists to keep across the partner's deletion. No tenant axis. Forced RLS, single system-only policy → only system context. Not in EXEMPT_TABLES: with no org_id and no shape-list entry, no offender scan reaches it.
 ]);
 
 // Tables with org_id metadata that are intentionally not generic org-tenant
@@ -133,6 +134,8 @@ const ORG_AXIS_POLICY_EXCLUDED_TABLES: ReadonlySet<string> = new Set<string>([
   // parent ticket at write time for filtering only — the RLS axis is
   // partner_id. Spec §8a / Phase 3 plan: deliberately no org/portal policies.
   'time_entries',
+  // Partner-axis: org metadata must not hide suspended customers' assignments.
+  'org_billing_profile_assignments',
   // Huntress credentials and discovered-org mappings are partner-scoped.
   // org_id is retained only as legacy/mapping metadata and may be NULL for
   // quarantined Huntress orgs.
@@ -173,6 +176,15 @@ const ORG_AXIS_POLICY_EXCLUDED_TABLES: ReadonlySet<string> = new Set<string>([
   // here keeps that generic check honest; PARENT_FK_JOIN_POLICY_TABLES is the
   // real assertion for this table's policy shape.
   'ticket_form_org_links',
+  // backup_provider_customers (#6008 W01): partner-axis (Shape 3) carrying a
+  // denormalized NULLABLE org_id — the MAPPING TARGET, not the tenancy axis.
+  // An unmapped customer has org_id NULL and must stay visible to the partner
+  // admin who has to map it, so breeze_has_org_access(org_id) is the wrong
+  // predicate here. Identical treatment to huntress_org_mappings /
+  // s1_org_mappings. Its sibling backup_provider_devices IS direct-org_id
+  // (Shape 1) and is deliberately NOT excluded — it is auto-discovered and
+  // must carry breeze_has_org_access(org_id) on all four commands.
+  'backup_provider_customers',
 ]);
 
 // Tables whose own `id` column is the tenant identifier (no `org_id`).
@@ -190,6 +202,17 @@ const PARTNER_TENANT_TABLES: ReadonlyMap<string, string> = new Map<string, strin
   ['oauth_client_partner_grants', 'partner_id'],
   ['email_verification_tokens', 'partner_id'],
   ['ticket_categories', 'partner_id'],
+  // work_types (#4615, spec 2026-09-17 §4.2): partner-owned labour label.
+  // Shape 3, flat breeze_has_partner_access(partner_id). No org_id and no
+  // device_id by design (spec §4.1), so this is its ONLY registration list:
+  // not in CORE_ORG_CASCADE_DELETE_ORDER, not in CORE_TENANT_EXPORT_POLICY,
+  // not in orgMergeRegistry, and deliberately NOT in DUAL_AXIS_TENANT_TABLES
+  // or PARTNER_WIDE_SELECT_BRANCH_EXEMPT. Functional forge proof:
+  // workTypesPartnerRls.integration.test.ts.
+  ['work_types', 'partner_id'],
+  ['billing_profiles', 'partner_id'],
+  ['billing_profile_rules', 'partner_id'],
+  ['org_billing_profile_assignments', 'partner_id'],
   ['ticket_response_templates', 'partner_id'],
   ['ticket_mailbox_connections', 'partner_id'],
   ['ticket_mailbox_tenant_ownerships', 'partner_id'],
@@ -316,12 +339,66 @@ const PARTNER_TENANT_TABLES: ReadonlyMap<string, string> = new Map<string, strin
   // for cascadeDeletePartner's dynamic partner_id sweep.
   // Functional cross-partner forge proof: orgMergeEventsRls.integration.test.ts.
   ['org_merge_events', 'partner_id'],
+  // Backup Provider Integration (#6008 W01): the MSP registers one external
+  // backup vendor connection (Cove) and maps its discovered customers to
+  // Breeze orgs. Both tables are partner-axis (Shape 3), four per-command
+  // breeze_has_partner_access policies each, the customers table additionally
+  // re-checking its parent connection's partner_id in INSERT/UPDATE WITH
+  // CHECK. backup_provider_customers is ALSO in
+  // ORG_AXIS_POLICY_EXCLUDED_TABLES (dual-list trap — it has an org_id column
+  // that is not its tenancy axis). backup_provider_devices and
+  // backup_provider_device_history carry a NOT NULL org_id and are ordinary
+  // Shape 1 tables, auto-discovered — not listed here, and their denormalized
+  // partner_id is deliberately NOT a second RLS read branch.
+  // Functional cross-partner forge proof:
+  // backupProviderRls.integration.test.ts.
+  ['backup_provider_connections', 'partner_id'],
+  ['backup_provider_customers', 'partner_id'],
+  // partner_sending_domains / partner_sender_identities (spec 2026-09-17,
+  // partner sending domains W02): the MSP's custom outbound From domain and
+  // one sender identity per (partner, mail stream). Partner-axis (Shape 3),
+  // deliberately no org_id — the From domain is the MSP's identity, and a
+  // per-org sending domain is the internal-phishing shape (spec §3.1). No
+  // org_id means no cascade / export-policy / org-merge registration;
+  // cascadeDeletePartner's dynamic partner_id sweep erases both, and its
+  // topological order puts identities before domains via the composite FK.
+  // GRANT includes DELETE for that sweep. The sibling outbox
+  // email_provider_domain_releases is INTENTIONAL_UNSCOPED above — it must
+  // never gain a partner_id column.
+  // Functional cross-partner forge proof: partnerSendingDomainsRls.integration.test.ts.
+  ['partner_sending_domains', 'partner_id'],
+  ['partner_sender_identities', 'partner_id'],
+  // partner_sending_daily_stats (spec 2026-09-17 §9.3, partner sending domains
+  // W06): per-partner, per-UTC-day delivery counters written by the Resend
+  // delivery webhook. Partner-axis (Shape 3) like its two siblings above, and
+  // deliberately without a domain_id dimension — the spec's bounce/complaint
+  // thresholds and the auto-suspension kill switch are both per PARTNER. No
+  // org_id means no cascade / export-policy / org-merge registration;
+  // cascadeDeletePartner's dynamic partner_id sweep erases it, and the GRANT
+  // includes DELETE for that sweep.
+  // Functional cross-partner forge proof: partnerSendingDailyStats.integration.test.ts.
+  ['partner_sending_daily_stats', 'partner_id'],
 ]);
 
 // Tables whose policies reference both helpers (org OR partner). `users`
 // is the canonical case: a user row is visible if the caller has access
 // to the user's partner OR the user's org OR is the user themselves.
 const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
+  // caller_verification_policies (#6354 W01): org XOR partner via
+  // caller_verification_policies_one_owner_chk; SELECT-only partner-wide branch
+  // cv_policy_partner_select ships in 2026-10-26-170100. Functional forge
+  // proof: callerVerification.integration.test.ts.
+  'caller_verification_policies',
+  'topology_config_templates',
+  'topology_config_template_versions',
+  // network_monitors (#5287 W04): reshaped from org-only to org XOR partner by
+  // 2026-10-16-181300-monitor-coverage-kinds, so one MSP-authored "is the
+  // gateway up" check runs for every org under the partner. CHECK
+  // network_monitors_one_owner_chk enforces exactly one axis; the partner-wide
+  // SELECT branch (network_monitors_partner_wide_select) ships in the same
+  // migration and is load-bearing on the agent path. Functional cross-partner
+  // forge proof: networkMonitorPartnerRls.integration.test.ts.
+  'network_monitors',
   // monitor_definitions (#5287 W02): a monitor is org-scoped (org_id set) or
   // partner-wide (partner_id set, org_id NULL — one MSP-authored monitor
   // deployed across every customer). Created dual-axis from day one in
@@ -330,6 +407,16 @@ const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
   // exactly one axis. Functional cross-partner forge proof:
   // monitorDefinitionsPartnerRls.integration.test.ts.
   'monitor_definitions',
+  // monitor_conversions / monitor_conversion_outputs (W05c1, alerting
+  // consolidation §Conversion): the ledger of legacy-row → monitor conversions.
+  // Owned on the SAME axis as the converted policy (org-owned policy → org
+  // ledger row; partner-wide policy → partner row), so org XOR partner from day
+  // one in 2026-10-23-110000-monitor-conversions with the partner-wide SELECT
+  // branch in the same migration. CHECK monitor_conversions_one_owner_chk /
+  // monitor_conversion_outputs_one_owner_chk. Functional forge proof:
+  // monitorConversionsPartnerRls.integration.test.ts (Task 18).
+  'monitor_conversions',
+  'monitor_conversion_outputs',
   // ai_script_policies (AI script authoring W04, #5612): a policy row is
   // org-scoped (org_id set — the GRANT) or partner-wide (partner_id set,
   // org_id NULL — the CEILING). Created dual-axis from day one in
@@ -351,6 +438,34 @@ const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
   // cross-partner forge proof: deliverableTemplatesPartnerRls.integration.test.ts.
   'deliverable_template_sets',
   'deliverable_template_items',
+  // ticket_checklist_templates / ticket_checklist_template_items (spec #5783
+  // §4.2, §4.3): a checklist template is org-scoped (org_id set) OR
+  // partner-wide (partner_id set, org_id NULL — one MSP-authored procedure
+  // every customer inherits). Created dual-axis from day one in
+  // 2026-10-16-191300-ticket-checklist-templates. The org_id column means
+  // org-tenant auto-discovery already asserts the breeze_has_org_access branch,
+  // so these entries are what assert the breeze_has_partner_access
+  // (partner-wide) branch. CHECKs <table>_one_owner_chk enforce exactly one
+  // axis. Functional cross-partner forge proof:
+  // ticketChecklistTemplatesPartnerRls.integration.test.ts.
+  'ticket_checklist_templates',
+  'ticket_checklist_template_items',
+  // tool_sources / tool_source_tools (Tool catalog W01, #5215 / #5216, spec
+  // 2026-09-07 §5): a registration of an external MCP server is org-scoped
+  // (org_id set) OR partner-wide (partner_id set, org_id NULL — one MSP
+  // registration every customer's AI session can reach). Created dual-axis from
+  // day one in 2026-10-16-193500-tool-sources, with both partner-wide SELECT
+  // branches in that same migration, so neither needs a
+  // PARTNER_WIDE_SELECT_BRANCH_EXEMPT entry. tool_source_tools DENORMALISES the
+  // owner from its parent (constraint trigger tool_source_tools_owner_guard_trg
+  // keeps them equal) so the per-session resolver stays one indexed query. The
+  // org_id column means org-tenant auto-discovery already asserts the
+  // breeze_has_org_access branch, so these entries are what assert the
+  // breeze_has_partner_access (partner-wide) branch. CHECKs
+  // <table>_one_owner_chk enforce exactly one axis. Functional cross-partner
+  // forge proof: toolSourcesPartnerRls.integration.test.ts.
+  'tool_sources',
+  'tool_source_tools',
   'users',
   'deployment_invites',
   'access_reviews',
@@ -604,6 +719,14 @@ const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
   // policy gained the partner branch in the same migration. Functional
   // cross-partner forge proof: psaConnectionsPartnerRls.integration.test.ts.
   'psa_connections',
+  // #3198 W01: reports is org_id XOR partner_id (reports_one_owner_chk,
+  // 2026-10-27-130100). This entry registers reports for the FORCE-RLS and
+  // four-command dual-axis coverage checks — either helper satisfies those, so
+  // it does NOT prove the breeze_has_partner_access branch (an org-only policy
+  // would still pass). The partner branch is proven only by
+  // reportsPartnerRls.integration.test.ts. Deliberately NOT in
+  // XOR_OWNERSHIP_DUAL_AXIS_TABLES — see the exclusion note there.
+  'reports',
 ]);
 
 // Wave 4 of #4673: the subset of DUAL_AXIS_TENANT_TABLES whose ownership
@@ -629,18 +752,45 @@ const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
 // drives the partner-wide SELECT-branch assertions below — so nothing else
 // changes. If access_reviews ever gains a CHECK, this note has no examples
 // left and should be deleted rather than patched.
+//
+// … and `reports` (#3198 W01): org XOR partner by CHECK, but NOT a config
+// table — a partner-owned report is a partner-PRIVATE cross-org aggregate
+// (money, utilisation), and spec §2 forbids org-scope sessions from reading
+// it. The partner-wide SELECT branch this set asserts would grant exactly that
+// read, so reports must never carry one. Its partner branch is proven
+// functionally by reportsPartnerRls.integration.test.ts instead.
 const XOR_OWNERSHIP_DUAL_AXIS_TABLES: ReadonlySet<string> = new Set<string>([
+  'caller_verification_policies',
+  'topology_config_templates',
+  'topology_config_template_versions',
   // monitor_definitions_one_owner_chk ((org_id IS NULL) <> (partner_id IS
   // NULL)), 2026-10-16-160300 (#5287 W02). Its partner-wide SELECT branch
   // (monitor_definitions_partner_wide_select) ships in the same migration, so
   // it needs no PARTNER_WIDE_SELECT_BRANCH_EXEMPT entry.
   'monitor_definitions',
+  // monitor_conversions_one_owner_chk / monitor_conversion_outputs_one_owner_chk,
+  // 2026-10-23-110000 (W05c1). Partner-wide SELECT branch ships in the same file.
+  'monitor_conversions',
+  'monitor_conversion_outputs',
   // ai_script_policies_one_owner_chk, 2026-10-16-120200 (#5612 W04).
   'ai_script_policies',
   // deliverable_template_sets_one_owner_chk / deliverable_template_items_one_owner_chk
   // ((org_id IS NULL) <> (partner_id IS NULL)), 2026-10-16-100500.
   'deliverable_template_sets',
   'deliverable_template_items',
+  // ticket_checklist_templates_one_owner_chk /
+  // ticket_checklist_template_items_one_owner_chk
+  // ((org_id IS NULL) <> (partner_id IS NULL)), 2026-10-16-191300. Both
+  // partner-wide SELECT branches ship in that same migration, so neither needs
+  // a PARTNER_WIDE_SELECT_BRANCH_EXEMPT entry.
+  'ticket_checklist_templates',
+  'ticket_checklist_template_items',
+  // tool_sources_one_owner_chk / tool_source_tools_one_owner_chk
+  // ((org_id IS NULL) <> (partner_id IS NULL)), 2026-10-16-193500 (#5216).
+  // Both partner-wide SELECT branches ship in that same migration, so neither
+  // needs a PARTNER_WIDE_SELECT_BRANCH_EXEMPT entry.
+  'tool_sources',
+  'tool_source_tools',
   'access_reviews',
   'custom_field_definitions',
   'configuration_policies',
@@ -751,6 +901,10 @@ const PARENT_FK_JOIN_POLICY_TABLES: ReadonlyMap<string, readonly string[]> = new
   // `scripts` could not satisfy the system-script INSERT under bound parameters.
   ['software_versions', ['software_catalog']],
   ['software_install_methods', ['software_catalog']],
+  // alert_correlations has TWO not-null FKs into `alerts` (parent_alert_id,
+  // child_alert_id). Because both parents are the SAME table, the all-of
+  // parent rule below cannot express "check both endpoints" — that half of the
+  // contract lives in PARENT_FK_REQUIRED_FK_COLUMNS instead (#5607).
   ['alert_correlations', ['alerts']],
   ['alert_notifications', ['alerts']],
   // 2026-06-13-b backstop: seven more child tables that shipped with NO rls and
@@ -760,10 +914,21 @@ const PARENT_FK_JOIN_POLICY_TABLES: ReadonlyMap<string, readonly string[]> = new
   // breeze_has_org_access and joins through `roles`, so this assertion holds.
   ['webhook_deliveries', ['webhooks']],
   ['network_monitor_alert_rules', ['network_monitors']],
-  ['network_monitor_results', ['network_monitors']],
+  // network_monitor_results was HERE until #5287 W04: it now carries its own
+  // denormalized org_id (the parent can be partner-wide, which made the join
+  // blind), so it is auto-discovered as an ordinary Shape 1 org-tenant table.
   ['role_permissions', ['roles']],
   ['plugin_logs', ['plugin_installations']],
   ['report_runs', ['reports']],
+  // #4248 W03: per-recipient narrative delivery. Declared parent is `reports`,
+  // NOT `report_runs` -- the strict per-command assertion below runs
+  // predicateCoversParent, which needs breeze_has_org_access(<alias>.org_id) on
+  // the DECLARED parent's alias, and report_runs has no org_id. The policy
+  // therefore reaches `reports` through a scalar subquery, exactly like the
+  // config_policy_* children do (2026-06-23-sec-review-1-fk-child-rls-backstop.sql).
+  // Its ONLY registration: the FK is ON DELETE CASCADE, so the existing
+  // report_runs pre-clear in tenantCascade.ts removes deliveries for free.
+  ['report_run_deliveries', ['reports']],
   ['maintenance_occurrences', ['maintenance_windows']],
   // 2026-06-23 security-review #1 backstop: five tenant child tables that
   // shipped with NO rls and reach their org only through a parent FK. The three
@@ -784,6 +949,7 @@ const PARENT_FK_JOIN_POLICY_TABLES: ReadonlyMap<string, readonly string[]> = new
   ['config_policy_event_log_settings', ['configuration_policies']],
   ['dashboard_widgets', ['analytics_dashboards']],
   ['backup_snapshot_files', ['backup_snapshots']],
+  ['backup_snapshot_origins', ['backup_snapshots']],
   // psa_ticket_mappings already shipped a correct single-table-join policy
   // (2026-04-11-bucket-c-dead-cleanup-rls.sql) but had no org_id column and was
   // never allowlisted, so the contract test couldn't see it. Register it so a
@@ -895,11 +1061,11 @@ const USER_ID_SCOPED_TABLES: ReadonlySet<string> = new Set<string>([
 ]);
 
 // Platform bookkeeping tables that hold no tenant data and are not a tenancy
-// shape. Exactly one entry today. Adding here requires the same justification
-// as INTENTIONAL_UNSCOPED (a plan-doc entry per CLAUDE.md "Intentionally
-// system-scoped").
+// shape. Adding here requires the same justification as INTENTIONAL_UNSCOPED
+// (a plan-doc entry per CLAUDE.md "Intentionally system-scoped").
 const PLATFORM_INFRASTRUCTURE_TABLES: ReadonlySet<string> = new Set<string>([
   'breeze_migrations', // autoMigrate's applied-migration ledger (filename + checksum). No tenant data. See apps/api/src/db/autoMigrate.ts MIGRATION_TABLE.
+  'breeze_version_history', // #6605: API versions this deployment has booted (version, first_seen_at), written at boot over the migration connection; breeze_app is SELECT-only. Plan doc: docs/superpowers/plans/platform-ci/2026-09-22-upgrade-preflight-6605.md.
 ]);
 
 // Tables that carry NO tenancy classification in this catalog (most also
@@ -981,6 +1147,34 @@ const PARENT_FK_REQUIRED_PARENTS_PER_COMMAND: ReadonlyMap<string, PerCommandPare
       DELETE: { qual: { kind: 'any-of', parents: ['scripts'] } },
     },
   ],
+]);
+
+// Child tables that reach their tenant through MORE THAN ONE FK column into
+// the SAME parent table. PARENT_FK_REQUIRED_PARENTS_PER_COMMAND's 'all-of'
+// rule keys on parent TABLE names, so it is blind to this shape: listing
+// `['alerts', 'alerts']` proves nothing. This map pins the FK COLUMNS that
+// must appear in the slot Postgres evaluates, for every required command.
+//
+// alert_correlations (#5607): the 2026-05-30 parent-FK migration joined
+// `alerts` on parent_alert_id only, so an edge whose parent is org A's and
+// whose child is org B's was DB-visible (and insertable) under an org-A token.
+// 2026-10-16-170100-alert-correlations-child-org-rls.sql ANDs the same EXISTS
+// on child_alert_id. Both columns are NOT NULL, so the conjunction cannot go
+// three-valued.
+//
+// Scope limit, stated plainly: this is a co-presence check on column NAMES in
+// the evaluated predicate. It catches a column dropped from a slot entirely,
+// which is the regression this class has actually shipped. It does NOT parse
+// boolean structure, so it cannot tell `EXISTS(parent) AND EXISTS(child)` from
+// `EXISTS(parent) OR EXISTS(child)` — and the OR form is a full reopening of
+// the leak that mentions both columns. A green run here is therefore NOT proof
+// of isolation. The proof is behavioural, in
+// alertCorrelationsChildRls.integration.test.ts, which does discriminate the
+// OR form on the SELECT policy — the load-bearing one, since Postgres enforces
+// it on the rows an UPDATE/DELETE reads and writes too. See that file's header
+// for the measurement.
+const PARENT_FK_REQUIRED_FK_COLUMNS: ReadonlyMap<string, readonly string[]> = new Map<string, readonly string[]>([
+  ['alert_correlations', ['parent_alert_id', 'child_alert_id']],
 ]);
 
 async function loadPublicPolicies(): Promise<Map<string, PolicyRow[]>> {
@@ -1932,6 +2126,36 @@ describe('RLS coverage contract', () => {
         `Fix: SELECT/DELETE need the parent-alias helper in USING, INSERT in WITH CHECK, UPDATE in BOTH. ` +
         `Tables listed in PARENT_FK_REQUIRED_PARENTS_PER_COMMAND must satisfy every parent in their all-of rules. ` +
         `Shape reference: 2026-05-30-fk-child-tables-rls.sql; matcher: src/db/rlsPolicyShape.ts.`
+    ).toEqual([]);
+  });
+
+  // #5607: the two assertions above are blind to a child table with several FK
+  // columns into the SAME parent — they only ever prove the policy joins
+  // `alerts` once. Require every declared FK column to appear in the evaluated
+  // slot so a half predicate (parent checked, child not) cannot come back.
+  it('every multi-FK child table guards each declared FK column in the slot Postgres evaluates', async () => {
+    const policiesByTable = await loadPublicPolicies();
+    const offenders: Array<{ table: string; missing_cmds: string[] }> = [];
+
+    for (const [table, columns] of PARENT_FK_REQUIRED_FK_COLUMNS) {
+      const covered = coveredCommands(policiesByTable.get(table) ?? [], (pred) => {
+        if (!pred) return false;
+        const text = pred.toLowerCase();
+        return columns.every((col) => text.includes(col.toLowerCase()));
+      });
+      const missing = requiredCmdsFor(table).filter((cmd) => !covered.has(cmd));
+      if (missing.length > 0) offenders.push({ table, missing_cmds: missing });
+    }
+
+    expect(
+      offenders,
+      `Multi-FK child tables whose policies do not reference every tenant-bearing FK column:\n` +
+        `${JSON.stringify(offenders, null, 2)}\n\n` +
+        `Fix: AND one EXISTS-through-the-parent branch per FK column, in USING for SELECT/DELETE, ` +
+        `WITH CHECK for INSERT, and BOTH for UPDATE — e.g. ` +
+        `EXISTS (SELECT 1 FROM alerts p WHERE p.id = alert_correlations.parent_alert_id AND breeze_has_org_access(p.org_id)) ` +
+        `AND EXISTS (SELECT 1 FROM alerts c WHERE c.id = alert_correlations.child_alert_id AND breeze_has_org_access(c.org_id)). ` +
+        `Shape reference: 2026-10-16-170100-alert-correlations-child-org-rls.sql.`
     ).toEqual([]);
   });
 

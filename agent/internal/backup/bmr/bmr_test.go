@@ -331,12 +331,16 @@ func TestRunRecoveryWithToken_AuthenticatesAndCompletes(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/backup/bmr/recover/authenticate":
-			var payload map[string]string
+			var payload map[string]json.RawMessage
 			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 				t.Fatalf("decode authenticate payload: %v", err)
 			}
-			if payload["token"] != "brz_rec_test" {
-				t.Fatalf("unexpected token %q", payload["token"])
+			var token string
+			if err := json.Unmarshal(payload["token"], &token); err != nil {
+				t.Fatalf("decode authenticate token: %v", err)
+			}
+			if token != "brz_rec_test" {
+				t.Fatalf("unexpected token %q", token)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"bootstrap": BootstrapResponse{
@@ -405,6 +409,64 @@ func TestRunRecoveryWithToken_AuthenticatesAndCompletes(t *testing.T) {
 	}
 	if !bytes.Equal(restored, content) {
 		t.Fatalf("restored content mismatch: got %q", string(restored))
+	}
+}
+
+// scopeGuardProvider wraps scopedTestProvider (scope_test.go) and records
+// every key Download is asked for, so a test can prove that once the scope
+// check refuses, restoreFiles never reaches a content download — the "no
+// write before the scope check" guarantee this task exists to prove.
+type scopeGuardProvider struct {
+	scopedTestProvider
+	downloaded []string
+}
+
+func (p *scopeGuardProvider) Download(remote, local string) error {
+	p.downloaded = append(p.downloaded, remote)
+	return p.scopedTestProvider.Download(remote, local)
+}
+
+// TestRunRecoveryContext_RefusesBeforeAnyWriteWhenScopeDenied proves the
+// scope check wired into RunRecoveryContext (bmr.go, immediately after
+// downloadManifest): a manifest referencing an OLDER snapshot's objects,
+// against a scoped provider that negotiated no membership capability, must
+// refuse before restoreFiles ever downloads a single content object — only
+// the manifest itself may be fetched.
+func TestRunRecoveryContext_RefusesBeforeAnyWriteWhenScopeDenied(t *testing.T) {
+	snapshotID := "gen-2"
+	manifest := backup.Snapshot{
+		ID: snapshotID,
+		Files: []backup.SnapshotFile{
+			{SourcePath: "/a", BackupPath: "snapshots/gen-1/files/a.gz", Size: 1},
+		},
+	}
+	manifestData, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	manifestKey := filepath.ToSlash(path.Join("snapshots", snapshotID, "manifest.json"))
+	provider := &scopeGuardProvider{scopedTestProvider: scopedTestProvider{
+		membership:        false, // fake server's bootstrap granted no capability
+		nonScopedProvider: nonScopedProvider{files: map[string][]byte{manifestKey: manifestData}},
+	}}
+
+	result, err := RunRecoveryContext(context.Background(), RecoveryConfig{SnapshotID: snapshotID}, provider)
+	if err != nil {
+		t.Fatalf("RunRecoveryContext returned an error instead of a refused result: %v", err)
+	}
+	if result == nil || result.Status != "refused" {
+		t.Fatalf("result = %+v, want Status=refused", result)
+	}
+	if result.FilesRestored != 0 {
+		t.Fatalf("FilesRestored = %d, want 0", result.FilesRestored)
+	}
+	if !strings.Contains(result.Error, "cross-snapshot") {
+		t.Fatalf("Error = %q, want it to mention cross-snapshot", result.Error)
+	}
+	for _, k := range provider.downloaded {
+		if k != manifestKey {
+			t.Fatalf("provider.Download was called for %q; only the manifest itself may be downloaded before the scope check refuses", k)
+		}
 	}
 }
 

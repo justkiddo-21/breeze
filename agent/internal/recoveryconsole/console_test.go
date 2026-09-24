@@ -2,8 +2,10 @@ package recoveryconsole
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -66,6 +68,7 @@ type fakeDeps struct {
 	collectFn  func(ctx context.Context) (*layout.Manifest, error)
 	mediaFn    func() ([]string, error)
 	rebuildFn  func(ctx context.Context, opts rebuild.Options) (*rebuild.Result, error)
+	widenFn    func(ctx context.Context, provider providers.BackupProvider, bs *bmr.BootstrapResponse) error
 
 	rebuildCalls  []rebuild.Options
 	progressCalls []bmr.ProgressUpdate
@@ -90,6 +93,7 @@ func (f *fakeDeps) build(version string) Deps {
 		Provider: func(ctx context.Context, server, token string, bs *bmr.BootstrapResponse) (providers.BackupProvider, error) {
 			return nil, nil
 		},
+		WidenScope: f.widenFn,
 		Progress: func(ctx context.Context, server, token string, u bmr.ProgressUpdate) error {
 			f.progressCalls = append(f.progressCalls, u)
 			return f.progressErr
@@ -475,6 +479,203 @@ func TestConsole_LockAcquisitionFailureAbortsBeforeAnyIO(t *testing.T) {
 	}
 }
 
+// TestMain replaces the package's real holdAfterPower — which blocks
+// FOREVER by design, see its doc comment — with a no-op for every test in
+// this package. Without it, every test whose flow reaches c.power() (the
+// happy path, CI mode, the failure menu's [p]oweroff, …) would hang the
+// whole run rather than fail. A test that needs to ASSERT on the hold
+// stubs it again with stubHoldAfterPower.
+func TestMain(m *testing.M) {
+	holdAfterPower = func() {}
+	os.Exit(m.Run())
+}
+
+// stubHoldAfterPower replaces holdAfterPower with a recording no-op for
+// the duration of one test and returns the call counter.
+func stubHoldAfterPower(t *testing.T) *int {
+	t.Helper()
+	prev := holdAfterPower
+	calls := 0
+	holdAfterPower = func() { calls++ }
+	t.Cleanup(func() { holdAfterPower = prev })
+	return &calls
+}
+
+// TestConsole_HoldsAfterPowerSoTheLockHolderPidStaysAlive is the red-first
+// regression test for issue #5890 — the THIRD layer of the same
+// two-consoles race, after AcquireLock (#5588) and after
+// never-releasing-once-powering-off
+// (TestConsole_AcquiresLockAndNeverReleasesOnceItPowersOff).
+//
+// Holding the lock is not enough on its own, because the lock's
+// mutual-exclusion primitive is the holder's PID, not the file: the loser
+// polls, reads the holder PID out of the lock file, and reclaims the lock
+// as stale the moment that PID stops being alive
+// (acquireRecoveryConsoleLock in cmd/breeze-backup/recovery_console_cmd.go
+// — deliberately, so an OOM-killed holder can't wedge the media forever).
+// `systemctl poweroff` is asynchronous and returns in milliseconds, so the
+// winner's Run() returned, the console process exited, its PID died, and
+// the losing instance's next 2 s poll reclaimed the lock and started a
+// whole second recovery attempt inside the multi-second real shutdown
+// window — posting one extra "media_booted" before the kernel finally
+// halted. Verified against CI run 34919726987 (merge-group for PR #5871):
+// serial-1.log shows exactly ONE boot ending in a clean "reboot: Power
+// down", so nothing ever re-booted the live ISO, yet progress.json read
+// ["media_booted","planned","restoring","validated","rebooted","media_booted"].
+//
+// Fix: once Run() has committed to powering the machine off or rebooting,
+// it blocks forever instead of returning, keeping this PID alive (and
+// therefore the lock genuinely held) until the kernel halts the machine.
+func TestConsole_HoldsAfterPowerSoTheLockHolderPidStaysAlive(t *testing.T) {
+	holdCalls := stubHoldAfterPower(t)
+
+	io := &fakeIO{FailReadLine: true}
+	deps := &fakeDeps{
+		exchangeFn: happyExchange(t),
+		collectFn:  func(ctx context.Context) (*layout.Manifest, error) { return singleDiskLayout(), nil },
+		rebuildFn: func(ctx context.Context, opts rebuild.Options) (*rebuild.Result, error) {
+			if opts.DryRun {
+				return samplePlan(), nil
+			}
+			return &rebuild.Result{Status: "completed"}, nil
+		},
+	}
+	cmdline := "breeze.media=1 breeze.ci=1 breeze.server=https://breeze.example breeze.code=abc-def-ghj breeze.target=/dev/sda breeze.confirm=6002248 breeze.after=poweroff"
+	c := &Console{IO: io, Deps: deps.build("0.111.1"), Cmdline: cmdline}
+
+	if err := c.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if strings.Join(deps.powerCalls, ",") != "poweroff" {
+		t.Fatalf("power calls = %v, want [poweroff]", deps.powerCalls)
+	}
+	if *holdCalls != 1 {
+		t.Errorf("holdAfterPower called %d times, want 1 (the console must keep its PID alive after powering off, or the losing instance reclaims the lock as stale and runs a second attempt)", *holdCalls)
+	}
+}
+
+// TestConsole_PowerFailurePrintsBeforeHolding covers the one operator-
+// visible cost of holding forever: because Run no longer returns after
+// committing to power the machine down, a failing `systemctl poweroff`
+// no longer reaches cobra's error printer and no longer exits 1 — so
+// without an explicit line here the console would just stop responding,
+// silently, in front of an operator standing at a bare-metal recovery
+// console. Holding is still correct (a second recovery attempt is exactly
+// as unsafe when the machine fails to go down), but holding SILENTLY is
+// not. Same norm as postProgress, which prints its non-fatal errors
+// rather than swallowing them.
+func TestConsole_PowerFailurePrintsBeforeHolding(t *testing.T) {
+	holdCalls := stubHoldAfterPower(t)
+
+	io := &fakeIO{FailReadLine: true}
+	deps := &fakeDeps{
+		exchangeFn: happyExchange(t),
+		collectFn:  func(ctx context.Context) (*layout.Manifest, error) { return singleDiskLayout(), nil },
+		rebuildFn: func(ctx context.Context, opts rebuild.Options) (*rebuild.Result, error) {
+			if opts.DryRun {
+				return samplePlan(), nil
+			}
+			return &rebuild.Result{Status: "completed"}, nil
+		},
+	}
+	d := deps.build("0.111.1")
+	d.Power = func(action string) error {
+		deps.powerCalls = append(deps.powerCalls, action)
+		return errors.New("Failed to power off system via logind: Connection timed out")
+	}
+
+	cmdline := "breeze.media=1 breeze.ci=1 breeze.server=https://breeze.example breeze.code=abc-def-ghj breeze.target=/dev/sda breeze.confirm=6002248 breeze.after=poweroff"
+	c := &Console{IO: io, Deps: d, Cmdline: cmdline}
+
+	if err := c.Run(context.Background()); err == nil {
+		t.Fatal("Run() error = nil, want the power error")
+	}
+
+	transcript := io.transcript.String()
+	for _, want := range []string{"poweroff", "Connection timed out"} {
+		if !strings.Contains(transcript, want) {
+			t.Errorf("transcript missing %q — a failed power action must be printed, not swallowed by the hold; got:\n%s", want, transcript)
+		}
+	}
+	if *holdCalls != 1 {
+		t.Errorf("holdAfterPower called %d times, want 1 (a failed power action must still hold — a second recovery attempt is exactly as unsafe when the machine fails to go down)", *holdCalls)
+	}
+}
+
+// realHoldAfterPower captures the package's genuine holdAfterPower before
+// TestMain replaces it, so one test can still exercise the real closure.
+// Package-level vars are initialised before TestMain runs, and Go orders
+// this after holdAfterPower's own initialisation because it depends on it.
+var realHoldAfterPower = holdAfterPower
+
+// TestHoldAfterPowerDoesNotReturn proves the real (unstubbed) closure
+// actually blocks. It cannot prove "forever" in finite time, but it does
+// catch the regressions that matter: a "simplification" to a single
+// non-looping time.Sleep, or to something that returns immediately — both
+// of which would silently restore the #5890 race, since every other test
+// runs against the TestMain no-op and would stay green.
+//
+// It deliberately does NOT assert the sleep-loop-vs-`select {}` choice
+// documented on holdAfterPower (that `select {}` as the last runnable
+// goroutine trips Go's all-goroutines-asleep panic, exiting the process).
+// That property is unobservable from inside a test binary that always has
+// other goroutines running; the doc comment carries it instead.
+func TestHoldAfterPowerDoesNotReturn(t *testing.T) {
+	returned := make(chan struct{})
+	go func() {
+		realHoldAfterPower()
+		close(returned)
+	}()
+
+	select {
+	case <-returned:
+		t.Fatal("holdAfterPower returned; it must block until the kernel halts the machine, or the losing console instance reclaims the recovery lock as stale (issue #5890)")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestConsole_NoPowerSeamDoesNotHold covers the other side of the
+// `c.Deps.Power != nil` guard: a Deps that never asked for the machine to
+// go down must not block forever. Without this, dropping the guard (always
+// hold) or inverting it would pass every other test, because they all run
+// against TestMain's no-op stub.
+func TestConsole_NoPowerSeamDoesNotHold(t *testing.T) {
+	holdCalls := stubHoldAfterPower(t)
+
+	deps := &fakeDeps{
+		exchangeFn: happyExchange(t),
+		collectFn:  func(ctx context.Context) (*layout.Manifest, error) { return singleDiskLayout(), nil },
+		rebuildFn: func(ctx context.Context, opts rebuild.Options) (*rebuild.Result, error) {
+			if opts.DryRun {
+				return samplePlan(), nil
+			}
+			return &rebuild.Result{Status: "completed"}, nil
+		},
+	}
+	d := deps.build("0.111.1")
+	d.Power = nil
+
+	cmdline := "breeze.media=1 breeze.ci=1 breeze.server=https://breeze.example breeze.code=abc-def-ghj breeze.target=/dev/sda breeze.confirm=6002248 breeze.after=poweroff"
+	c := &Console{IO: &fakeIO{FailReadLine: true}, Deps: d, Cmdline: cmdline}
+
+	// Bounded, so an inverted guard fails the test instead of hanging the
+	// whole package run.
+	done := make(chan error, 1)
+	go func() { done <- c.Run(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() error = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return within 5s with no Power seam — the hold must be skipped when nothing was asked to power down")
+	}
+
+	if *holdCalls != 0 {
+		t.Errorf("holdAfterPower called %d times, want 0 (nothing asked the machine to power down)", *holdCalls)
+	}
+}
+
 func TestVersionAtLeast(t *testing.T) {
 	cases := []struct {
 		have, want string
@@ -490,5 +691,253 @@ func TestVersionAtLeast(t *testing.T) {
 		if got := versionAtLeast(tc.have, tc.want); got != tc.result {
 			t.Errorf("versionAtLeast(%q, %q) = %v, want %v", tc.have, tc.want, got, tc.result)
 		}
+	}
+}
+
+// TestConsole_ExpectSystemStateFollowsBootstrap pins #5412 for the console
+// path: the rebuild.Options it builds must carry ExpectSystemState derived
+// from the bootstrap snapshot (backupType system_image OR an advertised
+// state manifest), on both the dry and the real run, so the engine refuses
+// a state-less system_image snapshot at preflight instead of completing.
+func TestConsole_ExpectSystemStateFollowsBootstrap(t *testing.T) {
+	tests := []struct {
+		name string
+		snap *bmr.AuthenticatedSnapshot
+		want bool
+	}{
+		{"system_image with NULL manifest", &bmr.AuthenticatedSnapshot{SnapshotID: "snap-1", BackupType: "system_image", SystemStateManifest: json.RawMessage(`null`)}, true},
+		{"file backup with no manifest", &bmr.AuthenticatedSnapshot{SnapshotID: "snap-1", BackupType: "file"}, false},
+		{"manifest advertised", &bmr.AuthenticatedSnapshot{SnapshotID: "snap-1", SystemStateManifest: json.RawMessage(`{"platform":"linux"}`)}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			io := &fakeIO{Answers: []string{"https://breeze.example", "abc-def-ghj", "6002248"}}
+			deps := &fakeDeps{
+				exchangeFn: func(ctx context.Context, server, code string) (string, *bmr.BootstrapResponse, error) {
+					return "tok-1", &bmr.BootstrapResponse{
+						Version: 1, MinHelperVersion: "0.100.0", SnapshotID: "snap-1", Snapshot: tt.snap,
+						Recovery: &bmr.RecoveryBinding{ID: "rec-1", Identity: "new"},
+					}, nil
+				},
+				collectFn: func(ctx context.Context) (*layout.Manifest, error) { return singleDiskLayout(), nil },
+				rebuildFn: func(ctx context.Context, opts rebuild.Options) (*rebuild.Result, error) {
+					if opts.DryRun {
+						return samplePlan(), nil
+					}
+					return &rebuild.Result{Status: "completed", StateApplied: opts.ExpectSystemState}, nil
+				},
+			}
+			c := &Console{IO: io, Deps: deps.build("0.111.1"), Cmdline: "breeze.media=1"}
+			if err := c.Run(context.Background()); err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if len(deps.rebuildCalls) != 2 {
+				t.Fatalf("rebuild calls = %d, want 2", len(deps.rebuildCalls))
+			}
+			for i, call := range deps.rebuildCalls {
+				if call.ExpectSystemState != tt.want {
+					t.Errorf("call %d ExpectSystemState = %v, want %v", i, call.ExpectSystemState, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestConsole_SnapshotIndexPendingAutoRetries(t *testing.T) {
+	calls := 0
+	deps := &fakeDeps{
+		exchangeFn: func(ctx context.Context, server, code string) (string, *bmr.BootstrapResponse, error) {
+			calls++
+			if calls < 3 {
+				return "", nil, &bmr.RecoveryNegotiationError{
+					Code:              "snapshot_index_pending",
+					Message:           "Breeze is preparing the file index for this snapshot (3 files reference earlier snapshots). Retry in 30 seconds.",
+					RetryAfterSeconds: 0, // zeroed for the test's fast clock
+				}
+			}
+			return "recv-token", &bmr.BootstrapResponse{SnapshotID: "gen-3"}, nil
+		},
+	}
+	io := &fakeIO{}
+	c := &Console{
+		IO:   io,
+		Deps: deps.build("0.111.1"),
+		sleep: func(time.Duration) <-chan time.Time {
+			ch := make(chan time.Time, 1)
+			ch <- time.Now()
+			return ch
+		},
+	}
+	token, bs, err := c.promptCodeAndExchange(context.Background(), true, Answers{Code: "ABCDEFGHJ"}, "https://example.invalid")
+	if err != nil {
+		t.Fatalf("promptCodeAndExchange() error = %v", err)
+	}
+	if token != "recv-token" {
+		t.Fatalf("token = %q, want recv-token", token)
+	}
+	if bs == nil {
+		t.Fatalf("bootstrap = nil, want non-nil")
+	}
+	if calls != 3 {
+		t.Fatalf("Exchange calls = %d, want 3", calls)
+	}
+}
+
+// TestConsole_PendingWaitBudgetResetsPerPromptCodeAndExchangeCall is the
+// regression test for review finding #5: the doc comment on
+// Console.pendingWaitElapsed (console.go ~:82-85) says the 20-minute
+// snapshot_index_pending wait budget is "across one promptCodeAndExchange
+// call", but pendingWaitElapsed is a Console field that promptCodeAndExchange
+// never reset — so a Console instance reused for a second exchange attempt
+// (e.g. after a code the operator mistyped once, sharing the same *Console)
+// silently inherited whatever budget the FIRST attempt had already burned,
+// making the second attempt's 20-minute budget shorter than documented (or,
+// as here, already exhausted). This drives waitAndRetryPending's actual
+// caller (promptCodeAndExchange -> exchangeWithNegotiation) rather than
+// calling waitAndRetryPending directly, so it proves the reset happens at
+// the documented boundary.
+func TestConsole_PendingWaitBudgetResetsPerPromptCodeAndExchangeCall(t *testing.T) {
+	calls := 0
+	deps := &fakeDeps{
+		exchangeFn: func(ctx context.Context, server, code string) (string, *bmr.BootstrapResponse, error) {
+			calls++
+			if calls < 2 {
+				return "", nil, &bmr.RecoveryNegotiationError{
+					Code:              "snapshot_index_pending",
+					Message:           "Breeze is preparing the file index for this snapshot. Retry in 30 seconds.",
+					RetryAfterSeconds: 0, // zeroed for the test's fast clock -> defaults to 30s
+				}
+			}
+			return "recv-token", &bmr.BootstrapResponse{SnapshotID: "gen-3"}, nil
+		},
+	}
+	io := &fakeIO{}
+	c := &Console{
+		IO:   io,
+		Deps: deps.build("0.111.1"),
+		sleep: func(time.Duration) <-chan time.Time {
+			ch := make(chan time.Time, 1)
+			ch <- time.Now()
+			return ch
+		},
+		// Simulates a Console instance that already burned its entire
+		// 20-minute budget on a PRIOR promptCodeAndExchange call (e.g. the
+		// operator typed a wrong code, retried, and the console reused the
+		// same struct) — the field the doc comment says is scoped to "one
+		// promptCodeAndExchange call".
+		pendingWaitElapsed: 20 * time.Minute,
+	}
+
+	token, bs, err := c.promptCodeAndExchange(context.Background(), true, Answers{Code: "ABCDEFGHJ"}, "https://example.invalid")
+	if err != nil {
+		t.Fatalf("promptCodeAndExchange() error = %v, want nil (the wait budget should have reset for this call)", err)
+	}
+	if token != "recv-token" {
+		t.Fatalf("token = %q, want recv-token", token)
+	}
+	if bs == nil {
+		t.Fatal("bootstrap = nil, want non-nil")
+	}
+	if calls != 2 {
+		t.Fatalf("Exchange calls = %d, want 2 (one pending, one success)", calls)
+	}
+}
+
+func TestConsole_ClientCapabilityRequiredReturnsToCodePromptWithMessage(t *testing.T) {
+	deps := &fakeDeps{
+		exchangeFn: func(ctx context.Context, server, code string) (string, *bmr.BootstrapResponse, error) {
+			return "", nil, &bmr.RecoveryNegotiationError{
+				Code:    "client_capability_required",
+				Message: "This backup references files stored with earlier snapshots. The recovery media you booted is too old to read them — download the current recovery media from Breeze and boot again.",
+			}
+		},
+	}
+	io := &fakeIO{}
+	c := &Console{IO: io, Deps: deps.build("0.111.1")}
+	_, _, err := c.promptCodeAndExchange(context.Background(), true, Answers{Code: "ABCDEFGHJ"}, "https://example.invalid")
+	if err == nil {
+		t.Fatalf("promptCodeAndExchange() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "too old to read them") {
+		t.Fatalf("error = %q, want it to contain %q", err.Error(), "too old to read them")
+	}
+}
+
+func TestConsole_StorageIdentityDriftShowsMessageVerbatim(t *testing.T) {
+	deps := &fakeDeps{
+		exchangeFn: func(ctx context.Context, server, code string) (string, *bmr.BootstrapResponse, error) {
+			return "", nil, &bmr.RecoveryNegotiationError{
+				Code:    "storage_identity_drift",
+				Message: "The backup destination for this device has changed since this snapshot was written. Restore the previous destination settings or choose a snapshot written to the current destination.",
+			}
+		},
+	}
+	io := &fakeIO{}
+	c := &Console{IO: io, Deps: deps.build("0.111.1")}
+	_, _, err := c.promptCodeAndExchange(context.Background(), true, Answers{Code: "ABCDEFGHJ"}, "https://example.invalid")
+	if err == nil {
+		t.Fatalf("promptCodeAndExchange() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "destination for this device has changed") {
+		t.Fatalf("error = %q, want it to contain %q", err.Error(), "destination for this device has changed")
+	}
+}
+
+// W09 (#6464): the console gates on the download scope BEFORE the DryRun —
+// a ScopeRefusalError from WidenScope posts `refused`, never calls
+// Rebuild (no target write), and offers the failure menu.
+func TestConsole_ScopeRefusalPostsRefusedBeforeRebuild(t *testing.T) {
+	io := &fakeIO{Answers: []string{"https://breeze.example", "abc-def-ghj", "p"}}
+	deps := &fakeDeps{
+		exchangeFn: happyExchange(t),
+		collectFn:  func(ctx context.Context) (*layout.Manifest, error) { return singleDiskLayout(), nil },
+		rebuildFn: func(ctx context.Context, opts rebuild.Options) (*rebuild.Result, error) {
+			t.Fatal("Rebuild must not run after a scope refusal")
+			return nil, nil
+		},
+		widenFn: func(ctx context.Context, provider providers.BackupProvider, bs *bmr.BootstrapResponse) error {
+			return &bmr.ScopeRefusalError{Reason: "this backup references 3 file(s) stored with earlier snapshots and the server did not grant cross-snapshot downloads", External: 3}
+		},
+	}
+	c := &Console{IO: io, Deps: deps.build("0.111.1"), Cmdline: "breeze.media=1"}
+
+	if err := c.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(deps.rebuildCalls) != 0 {
+		t.Fatalf("rebuild calls = %d, want 0", len(deps.rebuildCalls))
+	}
+	if len(deps.progressCalls) != 1 || deps.progressCalls[0].Status != "refused" || !strings.Contains(deps.progressCalls[0].Reason, "earlier snapshots") {
+		t.Errorf("progress calls = %+v, want one 'refused' naming earlier snapshots", deps.progressCalls)
+	}
+	if strings.Join(deps.powerCalls, ",") != "poweroff" {
+		t.Errorf("power calls = %v, want [poweroff]", deps.powerCalls)
+	}
+}
+
+// A WidenScope success must leave the normal flow untouched (called once,
+// before the DryRun).
+func TestConsole_WidenScopeRunsBeforeDryRun(t *testing.T) {
+	io := &fakeIO{Answers: []string{"https://breeze.example", "abc-def-ghj", "ERASE"}}
+	order := []string{}
+	deps := &fakeDeps{
+		exchangeFn: happyExchange(t),
+		collectFn:  func(ctx context.Context) (*layout.Manifest, error) { return singleDiskLayout(), nil },
+		rebuildFn: func(ctx context.Context, opts rebuild.Options) (*rebuild.Result, error) {
+			order = append(order, "rebuild")
+			return &rebuild.Result{Status: "validated"}, nil
+		},
+		widenFn: func(ctx context.Context, provider providers.BackupProvider, bs *bmr.BootstrapResponse) error {
+			order = append(order, "widen")
+			return nil
+		},
+	}
+	c := &Console{IO: io, Deps: deps.build("0.111.1"), Cmdline: "breeze.media=1"}
+	_ = c.Run(context.Background())
+	if len(order) < 2 || order[0] != "widen" || order[1] != "rebuild" {
+		t.Fatalf("call order = %v, want widen before the first rebuild", order)
+	}
+	if strings.Count(strings.Join(order, ","), "widen") != 1 {
+		t.Fatalf("widen called %d times, want 1", strings.Count(strings.Join(order, ","), "widen"))
 	}
 }

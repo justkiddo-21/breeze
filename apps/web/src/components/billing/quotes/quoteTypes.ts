@@ -303,6 +303,28 @@ export interface QuoteOrder {
   lines: QuoteOrderLine[];
 }
 
+/** The acceptance record behind an accepted/converted quote, as returned by
+ *  `GET /quotes/:id`. `origin` is the whole point: `customer` is a click in the
+ *  portal, `on_behalf` is a tech recording an agreement that arrived by phone,
+ *  email or purchase order — and only the latter has a `reference` and a
+ *  recorder to name. `recordedBy` is null when the recording tech's user row is
+ *  gone (ON DELETE SET NULL), which must read as "unknown", never as a blank. */
+export interface QuoteAcceptance {
+  id: string;
+  signerName: string;
+  signerEmail: string | null;
+  signedAt: string;
+  origin: 'customer' | 'on_behalf';
+  /** Free-form on purpose — the customer path writes its own tokens
+   *  ('typed-signature'), so this is NOT the on-behalf method enum. */
+  method: string;
+  reference: string | null;
+  recordedBy: { id: string; name: string | null } | null;
+  // #6633 — the file attached as evidence for an on-behalf acceptance, or null
+  // when none has been attached. Never exposed on the customer-facing portal.
+  evidence?: { filename: string; contentType: string; sizeBytes: number; uploadedAt: string } | null;
+}
+
 /** Shape of `GET /quotes/:id` — `{ data: { quote, blocks, lines, branding, billTo } }`. */
 export interface QuoteDetail {
   quote: Quote;
@@ -320,6 +342,9 @@ export interface QuoteDetail {
    *  that predate the recipient record. Optional: older payloads/fixtures omit
    *  it entirely, which must read as "unknown", not "sent to nobody". */
   recipients?: string[];
+  /** The latest acceptance record, or null when nobody has accepted. Optional:
+   *  older payloads and list fixtures omit it entirely. */
+  acceptance?: QuoteAcceptance | null;
   /** Persisted fulfillment staged during acceptance. Included in the detail
    * read model so technicians can discover the order after a reload. */
   pax8OrderId?: string | null;
@@ -361,6 +386,13 @@ export interface QuoteDetail {
    *  the cached account currency. null = nothing to say (matches, or not
    *  connected). */
   currencyWarning?: StripeCurrencyWarning | null;
+  /** Whether the quote's PARTNER auto-emails the invoice on acceptance —
+   *  read for the quote's own partner, never the caller's (#6636). Used only
+   *  to preview the accept-on-behalf consequence; the server always emails
+   *  or not per the partner's live setting regardless of this preview.
+   *  Optional: older payloads/fixtures omit it, which reads as "unknown"
+   *  (AcceptOnBehalfDialog shows no email promise). */
+  autoEmailInvoiceOnAccept?: boolean;
 }
 
 export const STATUS_LABELS: Record<QuoteStatus, string> = {

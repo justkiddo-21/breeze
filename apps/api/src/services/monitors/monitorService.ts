@@ -2,6 +2,8 @@ import { and, asc, eq, isNull, or, sql, type SQL } from 'drizzle-orm';
 import { db } from '../../db';
 import { monitorDefinitions } from '../../db/schema/monitorDefinitions';
 import type { MonitorDefinitionRow } from '../../db/schema/monitorDefinitions';
+import { escalationPolicies } from '../../db/schema/alerts';
+import { organizations } from '../../db/schema/orgs';
 import type { AuthContext } from '../../middleware/auth';
 import {
   canManagePartnerWidePolicies,
@@ -10,7 +12,8 @@ import {
 import { normalizeAutomationActions } from '../automationRuntime';
 import type { AutomationAction } from '../automationRuntime';
 import { getMonitorKindSpec, MonitorValidationError } from './kinds';
-import { compileMonitorInTx } from './monitorCompiler';
+import { compileMonitorInTx, type CompileOptions, type DbExecutor } from './monitorCompiler';
+import { isPgForeignKeyViolation, pgErrorConstraint } from '../../utils/pgErrors';
 import type {
   CreateMonitorDefinitionInput,
   MonitorKind,
@@ -31,6 +34,21 @@ export class MonitorOwnershipError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'MonitorOwnershipError';
+  }
+}
+
+/**
+ * 409 at the route layer (#6509): the delete cascaded into a row some OTHER
+ * table still references with no ON DELETE action. `alerts.rule_id` is fixed
+ * (SET NULL, 2026-10-25-130200) so this should not fire in the ordinary case
+ * any more, but it stays as a belt-and-braces map so any future/residual FK a
+ * monitor's cascade touches surfaces as a clean 409 instead of a raw
+ * postgres constraint-violation message leaking to the client.
+ */
+export class MonitorHasDependentsError extends Error {
+  constructor(id: string, options?: ErrorOptions) {
+    super(`Monitor definition ${id} still has rows referencing it that cannot be cascaded`, options);
+    this.name = 'MonitorHasDependentsError';
   }
 }
 
@@ -91,6 +109,64 @@ function resolveOwnerForCreate(input: CreateMonitorDefinitionInput, auth: AuthCo
     throw new MonitorOwnershipError('Access to this organization denied');
   }
   return { orgId, partnerId: null };
+}
+
+/**
+ * Owner-compatibility guard for `escalation_policy_id` (#5676).
+ *
+ * `monitor_definitions` and `escalation_policies` are both dual-axis
+ * (org_id XOR partner_id, or partner-wide with org_id NULL) but nothing tied
+ * them together: a partner-wide monitor could reference an org-owned
+ * escalation policy, which resolves fine for devices in THAT org but fails
+ * closed for every other org the partner-wide monitor also applies to
+ * (misconfiguration, not a tenant leak — dispatch already fails closed on a
+ * cross-tenant policy id). Reject the mismatch at write time instead.
+ *
+ * Compatible pairings:
+ *   - partner-wide monitor (orgId null)  -> no policy, or a partner-wide
+ *     policy owned by the SAME partner.
+ *   - org-scoped monitor (orgId set)     -> no policy, a policy owned by
+ *     that same org, or a partner-wide policy owned by the org's partner.
+ *
+ * Deny on a lookup miss (matches `isMonitorAttachableToPolicy`'s
+ * COALESCE(..., false) posture) rather than letting a bad id fall through to
+ * the FK's own error shape.
+ */
+async function assertEscalationPolicyCompatible(
+  escalationPolicyId: string | null,
+  owner: MonitorOwner,
+  executor: DbExecutor = db,
+): Promise<void> {
+  if (!escalationPolicyId) return;
+
+  const [policy] = await executor
+    .select({ orgId: escalationPolicies.orgId, partnerId: escalationPolicies.partnerId })
+    .from(escalationPolicies)
+    .where(eq(escalationPolicies.id, escalationPolicyId))
+    .limit(1);
+  if (!policy) {
+    throw new MonitorValidationError('Escalation policy not found');
+  }
+
+  if (owner.partnerId) {
+    if (policy.orgId === null && policy.partnerId === owner.partnerId) return;
+    throw new MonitorValidationError(
+      'A partner-wide monitor may only reference a partner-wide escalation policy owned by the same partner',
+    );
+  }
+
+  if (policy.orgId === owner.orgId) return;
+  if (policy.orgId === null) {
+    const [org] = await executor
+      .select({ partnerId: organizations.partnerId })
+      .from(organizations)
+      .where(eq(organizations.id, owner.orgId!))
+      .limit(1);
+    if (org?.partnerId && org.partnerId === policy.partnerId) return;
+  }
+  throw new MonitorValidationError(
+    'Escalation policy must be owned by this organization or be partner-wide for its partner',
+  );
 }
 
 /**
@@ -167,9 +243,10 @@ export async function listMonitorDefinitions(
 export async function getMonitorDefinition(
   id: string,
   auth: AuthContext,
+  executor: DbExecutor = db,
 ): Promise<MonitorDefinitionRow | null> {
   const read = monitorReadCondition(auth);
-  const [row] = await db
+  const [row] = await executor
     .select()
     .from(monitorDefinitions)
     .where(read ? and(eq(monitorDefinitions.id, id), read) : eq(monitorDefinitions.id, id))
@@ -180,8 +257,11 @@ export async function getMonitorDefinition(
 export async function createMonitorDefinition(
   input: CreateMonitorDefinitionInput,
   auth: AuthContext,
+  options: CompileOptions = {},
+  executor: DbExecutor = db,
 ): Promise<MonitorDefinitionRow> {
   const owner = resolveOwnerForCreate(input, auth);
+  await assertEscalationPolicyCompatible(input.escalationPolicyId ?? null, owner, executor);
   const shape = validateDefinitionShape({
     kind: input.kind,
     condition: input.condition,
@@ -190,7 +270,15 @@ export async function createMonitorDefinition(
     aiAgentId: input.aiAgentId ?? null,
   });
 
-  return db.transaction(async (tx) => {
+  return createValidatedMonitorInTx(input, auth, owner, shape, options, executor);
+}
+
+async function createValidatedMonitorInTx(
+  input: CreateMonitorDefinitionInput, auth: AuthContext,
+  owner: ReturnType<typeof resolveOwnerForCreate>, shape: ReturnType<typeof validateDefinitionShape>,
+  _options: CompileOptions, executor: DbExecutor,
+): Promise<MonitorDefinitionRow> {
+  return executor.transaction(async (tx) => {
     const [created] = await tx
       .insert(monitorDefinitions)
       .values({
@@ -214,7 +302,7 @@ export async function createMonitorDefinition(
         recurrenceActions: shape.recurrenceActions as unknown as Array<Record<string, unknown>>,
         pauseResponsesOnEscalation: input.pauseResponsesOnEscalation,
         aiAgentId: input.aiAgentId ?? null,
-        createdBy: auth.user.id,
+        createdBy: auth.scope === 'system' ? null : auth.user.id,
       })
       .returning();
     if (!created) throw new Error('Failed to create monitor definition');
@@ -249,6 +337,15 @@ export async function updateMonitorDefinition(
     aiAgentId: input.aiAgentId !== undefined ? input.aiAgentId : existing.aiAgentId,
   };
   const shape = validateDefinitionShape(merged);
+
+  const effectiveEscalationPolicyId =
+    input.escalationPolicyId !== undefined
+      ? (input.escalationPolicyId ?? null)
+      : existing.escalationPolicyId;
+  await assertEscalationPolicyCompatible(effectiveEscalationPolicyId, {
+    orgId: existing.orgId,
+    partnerId: existing.partnerId,
+  });
 
   const recurrenceThreshold =
     input.recurrenceThreshold !== undefined ? input.recurrenceThreshold : existing.recurrenceThreshold;
@@ -310,14 +407,33 @@ export async function updateMonitorDefinition(
   });
 }
 
-export async function deleteMonitorDefinition(id: string, auth: AuthContext): Promise<void> {
-  const existing = await getMonitorDefinition(id, auth);
+export async function deleteMonitorDefinition(id: string, auth: AuthContext, executor: DbExecutor = db): Promise<void> {
+  const existing = await getMonitorDefinition(id, auth, executor);
   if (!existing) throw new MonitorNotFoundError(id);
   assertCanWrite(auth, { orgId: existing.orgId, partnerId: existing.partnerId });
   // The compiled template/rule/automation rows and every policy attachment go
   // with it through ON DELETE CASCADE; alerts keep their history with
-  // monitor_id set to NULL.
-  await db.delete(monitorDefinitions).where(eq(monitorDefinitions.id, id));
+  // monitor_id (and rule_id, once the cascade reaches the compiled rule) set
+  // to NULL.
+  try {
+    await executor.delete(monitorDefinitions).where(eq(monitorDefinitions.id, id));
+  } catch (error) {
+    if (isPgForeignKeyViolation(error)) {
+      // Belt-and-braces catch-all (see MonitorHasDependentsError's doc
+      // comment) — it maps ANY residual FK violation the cascade hits to the
+      // same clean 409, which is deliberately the right client behavior but
+      // would otherwise discard the one thing that tells an operator WHICH
+      // constraint fired if it's ever something other than the known,
+      // already-fixed alerts.rule_id case. Log the constraint name and keep
+      // the original error as `cause` so Sentry/logs still have it.
+      console.error(
+        `[deleteMonitorDefinition] ${id} blocked by FK ${pgErrorConstraint(error) ?? '(unknown constraint)'}`,
+        error,
+      );
+      throw new MonitorHasDependentsError(id, { cause: error });
+    }
+    throw error;
+  }
 }
 
 /** Count of policy attachments per monitor, for the list view. */

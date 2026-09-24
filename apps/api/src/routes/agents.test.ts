@@ -43,6 +43,8 @@ vi.mock('../services/partnerDeviceCapacity', () => ({
   PartnerDeviceCapacityError: class PartnerDeviceCapacityError extends Error {},
 }));
 vi.mock('../services/filesystemAnalysis', () => ({
+  claimFilesystemScanGeneration: vi.fn(async () => 'claimed'),
+  setFilesystemScanGeneration: vi.fn(),
   parseFilesystemAnalysisStdout: vi.fn(() => ({ summary: { filesScanned: 1 } })),
   saveFilesystemSnapshot: vi.fn(() => Promise.resolve({ id: 'snapshot-1' })),
   getFilesystemScanState: vi.fn(() => Promise.resolve(null)),
@@ -202,6 +204,13 @@ vi.mock('../services/eventBus', () => ({
   EventType: {}
 }));
 
+// Topology flags are resolved before the heartbeat's org block (US 2026-09-22
+// pool deadlock); keep that read off the positional select mocks below.
+vi.mock('../services/topology/flags', () => ({
+  loadTopologyFlags: vi.fn(async () => ({ materialization: false, ui: false, physical: false, interfaceHealth: false, diagnostics: false, ai: false })),
+  withResolvedTopologyFlags: vi.fn(async (_resolved: unknown, fn: () => Promise<unknown>) => fn()),
+}));
+
 vi.mock('../services/sentry', () => ({
   captureException: vi.fn(),
 }));
@@ -276,6 +285,7 @@ describe('agent routes', () => {
     vi.mocked(db.insert).mockImplementation(() => defaultInsertChain() as any);
     vi.mocked(db.update).mockImplementation(() => defaultUpdateChain() as any);
     vi.mocked(db.transaction).mockReset();
+    vi.mocked(db.transaction).mockImplementation(async (fn) => fn(db as never));
     app = new Hono();
     app.route('/agents', agentRoutes);
   });
@@ -1330,7 +1340,9 @@ describe('agent routes', () => {
 
       expect(res.status).toBe(200);
       expect(saveFilesystemSnapshot).toHaveBeenCalled();
-      const [sfDeviceId, , sfTrigger, sfPayload] =
+      // (deviceId, orgId, trigger, scanPath, payload) since W02 — scanPath is
+      // index 3, so the payload moved to index 4.
+      const [sfDeviceId, , sfTrigger, , sfPayload] =
         vi.mocked(saveFilesystemSnapshot).mock.calls[0]!;
       expect(sfDeviceId).toBe('device-123');
       expect(sfTrigger).toBe('threshold');
@@ -1373,7 +1385,9 @@ describe('agent routes', () => {
 
       expect(res.status).toBe(200);
       expect(saveFilesystemSnapshot).toHaveBeenCalled();
-      const [sfDeviceId, , sfTrigger, sfPayload] =
+      // (deviceId, orgId, trigger, scanPath, payload) since W02 — scanPath is
+      // index 3, so the payload moved to index 4.
+      const [sfDeviceId, , sfTrigger, , sfPayload] =
         vi.mocked(saveFilesystemSnapshot).mock.calls[0]!;
       expect(sfDeviceId).toBe('device-123');
       expect(sfTrigger).toBe('on_demand');

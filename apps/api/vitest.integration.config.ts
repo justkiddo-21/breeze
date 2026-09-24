@@ -2,13 +2,16 @@ import { defineConfig } from 'vitest/config';
 import { config } from 'dotenv';
 
 // Load test environment variables
-config({ path: '../../.env.test' });
+config({ path: '../../.env.test', quiet: true });
 
 export default defineConfig({
   test: {
+    // explicit: vitest 5 flips the default to true; flip per package in a follow-up
+    clearMocks: false,
     globals: true,
     environment: 'node',
     include: [
+      'src/jobs/scriptVerifyReconciliation.integration.test.ts',
       'src/__tests__/integration/**/*.test.ts',
       'src/routes/integrationConnectionScope.integration.test.ts',
       'src/db/auditRetentionDefault.integration.test.ts',
@@ -23,6 +26,9 @@ export default defineConfig({
       // Co-located real-DB integration test for the contract renewal sweep
       // service. Follows the same pattern as the inboundEmail test above.
       'src/services/contractRenewal.integration.test.ts',
+      // #5861 Customer Portal Network Visibility: real-Postgres proof of
+      // org isolation and partner-wide monitor result scoping.
+      'src/services/portal/networkVisibilityReadModel.integration.test.ts',
       // Co-located real-DB integration test for the platform-admin bootstrap
       // (#2655): the mocked unit suite executes no SQL, so it never caught the
       // prod-bundle `= ANY(::text[])` array-literal failure. This drives the

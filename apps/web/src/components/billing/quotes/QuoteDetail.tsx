@@ -9,6 +9,7 @@ import { navigateTo } from '@/lib/navigation';
 import { runAction, handleActionError, ActionError } from '../../../lib/runAction';
 import { useAuthedImage } from './useQuoteImage';
 import QuoteActions, { QuoteSendOutcomeBanners } from './QuoteActions';
+import AcceptanceEvidenceControl from './AcceptanceEvidenceControl';
 import QuoteOrderBreakdown, { orderableLines } from './QuoteOrderBreakdown';
 import { RecurringBillingNote, MarginPanel, MarginToggle, useShowMargin } from '../billingUi';
 import ChangeCurrencyDialog, { type CurrencyChangeMode } from '../ChangeCurrencyDialog';
@@ -17,6 +18,9 @@ import {
   type QuoteDetail as QuoteDetailData,
   type QuoteBlock,
   type QuoteLine,
+  type ContractBlockContent,
+  type QuoteTableContent,
+  type QuoteCalloutContent,
   STATUS_ROLES,
   stripHtml,
   formatDate,
@@ -275,6 +279,33 @@ export default function QuoteDetail({ detail, onChanged, actionsInHeader }: Prop
                 {quote.declinedAt && <LifecycleStage label={t('quotes.detail.lifecycle.declined')} date={quote.declinedAt} first={!quote.sentAt && !quote.viewedAt && !quote.acceptedAt} danger testId="quote-detail-lifecycle-declined" />}
               </dl>
             )}
+            {/* Provenance for an MSP-recorded acceptance. A customer click
+                needs no line — the lifecycle stamp above says all there is to
+                say. An on-behalf record must name who recorded it and against
+                what, or the audit trail lives only in the audit log. */}
+            {detail.acceptance?.origin === 'on_behalf' && (
+              <p className="mt-2 text-xs text-muted-foreground" data-testid="quote-acceptance-provenance">
+                {t('quotes.detail.acceptedOnBehalf', {
+                  signer: detail.acceptance.signerName,
+                  // The recorder can be gone (ON DELETE SET NULL) — never render
+                  // a blank where a person's name belongs.
+                  recorder: detail.acceptance.recordedBy?.name ?? t('quotes.detail.deletedUser'),
+                  date: formatDate(detail.acceptance.signedAt),
+                  // i18n-dynamic: the method comes from the acceptance record.
+                  method: t(/* i18n-dynamic */ `quotes.actions.acceptOnBehalf.method.${detail.acceptance.method}`,
+                    { defaultValue: detail.acceptance.method }),
+                  reference: detail.acceptance.reference ?? '',
+                })}
+              </p>
+            )}
+            {detail.acceptance?.origin === 'on_behalf' && (
+              <AcceptanceEvidenceControl
+                quoteId={quote.id}
+                evidence={detail.acceptance.evidence ?? null}
+                canAttach={can('quotes', 'accept')}
+                onChanged={onChanged}
+              />
+            )}
             {/* Who the quote actually went to. Recorded at send but previously
                 invisible to the tech who sent it. Rendered only when we have
                 addresses: an ABSENT `recipients` (older payload) and an EMPTY
@@ -512,6 +543,66 @@ function BlockView({ block, lines, currency, taxRate, showTax }: { block: QuoteB
         <DetailImage quoteId={block.quoteId} imageId={imageId} caption={caption} />
         {caption && <figcaption className="text-xs text-muted-foreground">{caption}</figcaption>}
       </figure>
+    );
+  }
+  if (block.blockType === 'contract') {
+    // Read-only summary — the Detail tab isn't the customer document, so skip
+    // the PDF preview/iframe (QuoteDocument's DocContractFile) and just show
+    // what a staff member needs: which agreement this is and its body text.
+    const content = (block.content ?? {}) as Partial<ContractBlockContent>;
+    const templateName = content.templateName?.trim() || '';
+    const versionNumber = content.versionNumber ?? 0;
+    const bodyText = content.renderedHtml ? stripHtml(content.renderedHtml) : '';
+    return (
+      <div className="space-y-1 rounded-lg border bg-card p-4" data-testid={`quote-detail-block-${block.id}`}>
+        {templateName && <h3 className="text-sm font-semibold text-foreground">{templateName}</h3>}
+        {bodyText ? (
+          <p className="whitespace-pre-wrap text-sm text-foreground">{bodyText}</p>
+        ) : (
+          <p className="text-sm text-muted-foreground">{t('quotes.document.contract.unavailable')}</p>
+        )}
+        <p className="text-xs text-muted-foreground">
+          {t('quotes.document.contract.versionFooter', { name: templateName, version: versionNumber })}
+        </p>
+      </div>
+    );
+  }
+  if (block.blockType === 'table') {
+    const content = block.content as Partial<QuoteTableContent> | undefined;
+    if (!content?.columns?.length || !content?.rows?.length) return null;
+    return (
+      <div className="overflow-x-auto rounded-lg border bg-card" data-testid={`quote-detail-block-${block.id}`}>
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b text-left text-xs uppercase tracking-wide text-muted-foreground">
+              {content.columns.map((col, i) => (
+                <th key={i} className="px-3 py-2 font-medium" style={{ textAlign: col.align ?? 'left' }}>{stripHtml(col.label)}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {content.rows.map((row, ri) => (
+              <tr key={ri} className="border-t">
+                {row.cells.map((cell, ci) => (
+                  <td key={ci} className="px-3 py-2 align-top" style={{ textAlign: content.columns?.[ci]?.align ?? 'left' }}>{stripHtml(cell)}</td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {content.caption && <p className="px-3 py-2 text-xs text-muted-foreground">{content.caption}</p>}
+      </div>
+    );
+  }
+  if (block.blockType === 'callout') {
+    const content = block.content as Partial<QuoteCalloutContent> | undefined;
+    const text = content?.html ? stripHtml(content.html) : '';
+    if (!text && !content?.title) return null;
+    return (
+      <div className="rounded-lg border-l-4 border-border bg-muted/40 p-4" data-testid={`quote-detail-block-${block.id}`}>
+        {content?.title && <p className="mb-1 text-sm font-semibold text-foreground">{content.title}</p>}
+        {text && <p className="whitespace-pre-wrap text-sm text-foreground">{text}</p>}
+      </div>
     );
   }
   // line_items

@@ -186,6 +186,7 @@
       "failedToAssignOrg": "Impossible d’assigner l’organisation",
       "organizations": "Organisations",
       "thisPartnerLibraryPolicyAppliesOnlyTo": "Cette politique de bibliothèque partenaire ne s’applique qu’aux organisations que vous sélectionnez.",
+      "filtersApplyOnAssign": "Ces filtres s’appliquent lors de l’assignation ci-dessous. Vide signifie chaque rôle et chaque système d’exploitation. Pour modifier les filtres d’une affectation, désactivez-la puis réactivez-la.",
       "allOrganizationsPartnerWide": "Toutes les organisations (à l’échelle des partenaires)",
       "allOrganizationsPartnerWide2": "Toutes les organisations (à l’échelle des partenaires)",
       "assigned": "Assigné",
@@ -441,6 +442,7 @@
         "maxVersions": "Nombre maximal de versions",
         "gFSRetention": "Rétention GFS",
         "keepLongerRunningRestorePointsForGrandfather": "Conservez des points de restauration plus longs pour la rétention grand-père-fils.",
+        "dailyRetentionBelowFloor": "La rétention quotidienne est définie sur {{gfsDays}} jours, ce qui est inférieur au plancher de rétention de {{effectiveDays}} jours. L'expiration de cet instantané est fixée à {{effectiveDays}} jours, et non {{gfsDays}} -- l'expiration ne descend jamais sous le plancher. Une limite distincte de nombre maximal de versions peut néanmoins supprimer des instantanés plus anciens plus tôt.",
         "daily2": "Quotidien",
         "weekly2": "Hebdomadaire",
         "monthly2": "Mensuelle",
@@ -844,7 +846,14 @@
         "inherited": "Hérité",
         "overrideValue": "Valeur de remplacement",
         "overridesLabel": "Remplacements :",
-        "failedToLoadMonitors": "Échec du chargement des moniteurs"
+        "failedToLoadMonitors": "Échec du chargement des moniteurs",
+        "createMonitor": "Créer un moniteur",
+        "monitorDeleted": "Moniteur supprimé",
+        "recommended": {
+          "title": "Moniteurs recommandés",
+          "body": "Breeze fournit des moniteurs intégrés pour le processeur, la mémoire, le disque et la conformité des correctifs. Aucun n'est encore attaché à cette politique.",
+          "action": "Attacher tous les moniteurs intégrés"
+        }
       },
       "pamTab": {
         "captureWindowsUACElevationPrompts": "Capture Windows Prompts d’élévation UAC",
@@ -1051,7 +1060,6 @@
         "fri": "ven.",
         "sat": "sam.",
         "sun": "dim.",
-        "realTimeProtection": "Protection en temps réel",
         "scheduledScans": "Scans programmés",
         "minute": "Minute",
         "hour": "Heure",
@@ -1060,30 +1068,22 @@
         "exclusions": "Exclusions",
         "skipTrustedLocationsDuringScans": "Ignorer les emplacements approuvés pendant les analyses.",
         "addPathOrProcess": "Ajouter un chemin ou un processus",
-        "realTimeFileMonitoring": "Surveillance des fichiers en temps réel",
-        "scanNewAndModifiedFilesContinuously": "Numérisez en continu les fichiers nouveaux et modifiés.",
-        "realTimeProtection2": "RealTimeProtection",
-        "behavioralMonitoring": "Surveillance comportementale",
-        "detectSuspiciousProcessBehaviorAndScripts": "Détectez des comportements et scripts suspects de processus.",
-        "behavioralMonitoring2": "Surveillance comportementale",
-        "cloudThreatLookup": "Recherche de menaces cloud",
-        "useCloudReputationForNewIndicators": "Utilisez la réputation du cloud pour de nouveaux indicateurs.",
-        "cloudLookup": "CloudLookup",
         "autoQuarantine": "Auto-quarantaine",
         "moveThreatsToQuarantineImmediately": "Mettez les menaces en quarantaine immédiatement.",
         "autoQuarantine2": "autoQuarantine",
-        "notifyUserOnDetection": "Notifier l’utilisateur lors de la détection",
-        "sendDeviceNotificationsWhenThreatsAreFound": "Envoyez des notifications aux appareils lorsque des menaces sont détectées.",
-        "notifyUser": "notifyUser",
-        "blockUntrustedUSBDevices": "Bloquer les périphériques USB non approuvés",
-        "preventUnknownRemovableMedia": "Empêcher les supports amovibles inconnus.",
-        "blockUntrustedUsb": "blockUntrustedUsb",
         "scheduledScans2": "Scans programmés",
         "scanMinute": "scanMinute",
         "scanHour": "scanHour",
         "scanDayOfMonth": "scanDayDeMonth",
         "scanDayOfWeek": "scanDayOfWeek",
-        "enter": "Alors"
+        "enter": "Alors",
+        "scanSettings": "Paramètres de balayage",
+        "scanType": "Type de balayage",
+        "quickScan": "Analyse rapide",
+        "fullScan": "Balayage complet",
+        "maxFileSizeMb": "Taille de fichier maximale (Mo)",
+        "scanTimeoutMinutes": "Délai d'expiration du balayage (minutes)",
+        "scanRunsServerSideDescription": "Breeze envoie ce balayage depuis le serveur — l'appareil n'a pas besoin d'une planification locale."
       },
       "sensitiveDataTab": {
         "credentials": "Diplômes",
@@ -1201,7 +1201,15 @@
         "save": "Enregistrer",
         "cancel": "Annuler",
         "none": "Aucune justification enregistrée."
-
+      },
+      "legacyFreeze": {
+        "title": "Les nouvelles règles sont créées sous forme de moniteurs",
+        "body": "Les règles existantes restent modifiables ici et seront converties en moniteurs dans la prochaine version.",
+        "link": "Ouvrir l'onglet Moniteurs"
+      },
+      "duplicate": {
+        "title": "Les appareils de cette politique alerteront deux fois",
+        "body": "Ces conditions existent à la fois comme moniteur attaché et comme règle ou surveillance héritée : {{names}}"
       }
     }
   },
@@ -1336,6 +1344,8 @@
       "readyToDeployStandalone": "Prêts à être déployés."
     },
     "complianceDashboard": {
+      "autoInstallArmed": "Installation automatique activée",
+      "complianceCheckQueued": "Vérification de conformité mise en file d’attente",
       "failedToLoadSoftwarePolicyData": "Impossible de charger les données de politique logicielle",
       "couldNotLoadLatestPolicyDetailsShowing": "Impossible de charger les derniers détails de la stratégie. Affichage des données mises en cache.",
       "couldNotLoadPolicyDetailsShowingCached": "Impossible de charger les détails de la stratégie. Affichage des données mises en cache.",
@@ -1375,7 +1385,19 @@
       "failedToUpdatePolicy": "Impossible de mettre à jour la politique",
       "failedToCreatePolicy": "Impossible de créer une politique",
       "policyUpdated": "Mise à jour de la politique avec succès",
-      "policyCreated": "Politique créée avec succès"
+      "policyCreated": "Politique créée avec succès",
+      "armInstallRequiresMfa": "L'activation de l'installation automatique nécessite l'authentification multifacteur. Terminez la MFA, puis réessayez.",
+      "armInstallRequiresPermission": "L'activation de l'installation automatique nécessite la permission devices.execute. Demandez à un administrateur de l'accorder, puis réessayez.",
+      "installStatusPending": "Installation en file d'attente",
+      "installStatusInProgress": "Installation en cours…",
+      "installStatusCompleted": "Installé",
+      "installStatusFailed": "Échec de l'installation",
+      "installStatusGaveUp": "Abandon après des échecs répétés",
+      "installStatusSkipped": "Ignoré lors de ce passage",
+      "installSkippedNoCatalog": "Une règle obligatoire n'a pas d'élément de catalogue lié, il n'y a donc rien à installer. Ajoutez un lien de catalogue dans l'éditeur de politique pour corriger cela.",
+      "installSkippedCapOrPlatform": "Ce n'est pas un échec : soit la limite d'installations par passage a été atteinte, soit la plateforme de cet appareil n'a pas de méthode d'installation pour ce logiciel. Une nouvelle tentative pourra avoir lieu au prochain passage.",
+      "installAttempts": "{{count}} tentative(s)",
+      "installLastAttempt": "Dernière tentative d'installation : "
     },
     "deploymentList": {
       "running": "En cours",
@@ -1413,7 +1435,9 @@
       "noDeploymentsYet": "Aucun déploiement n’a encore été créé.",
       "failedToCancelDeployment": "Échec de l’annulation du déploiement",
       "deploymentCancelled": "Déploiement annulé",
-      "pageOf": "Page {{page}} sur {{pages}}"
+      "pageOf": "Page {{page}} sur {{pages}}",
+      "policyOwned": "Géré par une politique",
+      "policyOwnedTooltip": "Créé automatiquement par la remédiation d'installation automatique d'une politique logicielle"
     },
     "deploymentProgress": {
       "queued": "En file d’attente",
@@ -1597,6 +1621,9 @@
       "s": "s"
     },
     "policyForm": {
+      "dryRunUnassigned": "0 appareil — généralement parce que cette stratégie n’est encore affectée à aucun appareil, mais un parc entièrement conforme ou une liste de sites vide donne aussi 0",
+      "manageAssignments": "Gérer les affectations des stratégies de configuration",
+      "gracePeriodHelp": "Appliqué lors de la prochaine vérification de conformité",
       "scope": "Portée",
       "allOrganizations": "Toutes les organisations",
       "partnerWideTemplate": "(modèle à l’échelle du partenaire)",
@@ -1641,7 +1668,16 @@
       "autoUninstall2": "autoUninstall",
       "gracePeriod": "grace-period",
       "gracePeriod2": "Période de grâce",
-      "saving": "Enregistrement..."
+      "saving": "Enregistrement...",
+      "catalogLink": "Élément de catalogue lié",
+      "catalogLinkNone": "Aucun — non lié",
+      "autoInstall": "Installer automatiquement les logiciels manquants",
+      "autoInstallCatalogWarning": "{{count}} règle(s) sur {{total}} n'ont pas d'élément de catalogue lié et seront détectées comme manquantes mais jamais installées.",
+      "dryRunLoading": "Vérification du nombre d'appareils concernés...",
+      "dryRunResult": "Cela installera les logiciels manquants sur environ {{count}} appareil(s).",
+      "dryRunUnavailable": "L'aperçu du nombre d'appareils n'est pas encore disponible. L'activation prendra tout de même effet lors du prochain contrôle de conformité.",
+      "dryRunNewPolicy": "Il s'agit d'une nouvelle politique — l'impact sur les appareils ne sera connu qu'après le premier contrôle de conformité suivant l'enregistrement.",
+      "catalogUnavailable": "Le catalogue de logiciels n'a pas pu être chargé, les sélecteurs de lien de catalogue ci-dessous sont donc vides. Ce n'est pas équivalent à une absence d'éléments de catalogue — rechargez la page avant de supposer qu'une règle ne peut pas être liée."
     },
     "softwareCatalog": {
       "ready": "Prêt",

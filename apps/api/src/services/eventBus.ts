@@ -101,6 +101,13 @@ export type EventType =
   // Backup SLA events
   | 'backup.sla_breach'
   | 'backup.sla_resolved'
+  // External backup provider (Cove et al., feature #6008 W02). Published on
+  // condition TRANSITIONS only, for linked AND unlinked provider device rows,
+  // with orgId = the provider row's org. Webhooks and automations can
+  // subscribe; the notification dispatcher deliberately does not (it is
+  // alert-lifecycle-only, services/eventSubscribers.ts:185-190).
+  | 'backup.provider_device_unhealthy'
+  | 'backup.provider_device_recovered'
   // Ticket SLA events (Phase 2, ticketSlaWorker)
   | 'ticket.sla_breached'
   // Ticket lifecycle events (#3828 wave-6-3 task 2). Published by
@@ -175,6 +182,7 @@ export type EventType =
   | 'ai.agent.policy_changed'
   | 'ai.agent.run.queued'
   | 'ai.agent.run.started'
+  | 'ai.agent.run.progress'
   | 'ai.agent.run.awaiting_approval'
   | 'ai.agent.run.completed'
   | 'ai.agent.run.failed'
@@ -616,6 +624,9 @@ export const EVENT_TYPES = {
   // Backup and ticket SLA
   BACKUP_SLA_BREACH: 'backup.sla_breach' as const,
   BACKUP_SLA_RESOLVED: 'backup.sla_resolved' as const,
+  // External backup provider (feature #6008 W02)
+  BACKUP_PROVIDER_DEVICE_UNHEALTHY: 'backup.provider_device_unhealthy' as const,
+  BACKUP_PROVIDER_DEVICE_RECOVERED: 'backup.provider_device_recovered' as const,
   TICKET_SLA_BREACHED: 'ticket.sla_breached' as const,
   // Ticket lifecycle (#3828 wave-6-3 task 2) — id-only payloads.
   TICKET_CREATED: 'ticket.created' as const,
@@ -677,6 +688,7 @@ export const EVENT_TYPES = {
   AI_AGENT_POLICY_CHANGED: 'ai.agent.policy_changed' as const,
   AI_AGENT_RUN_QUEUED: 'ai.agent.run.queued' as const,
   AI_AGENT_RUN_STARTED: 'ai.agent.run.started' as const,
+  AI_AGENT_RUN_PROGRESS: 'ai.agent.run.progress' as const,
   AI_AGENT_RUN_AWAITING_APPROVAL: 'ai.agent.run.awaiting_approval' as const,
   AI_AGENT_RUN_COMPLETED: 'ai.agent.run.completed' as const,
   AI_AGENT_RUN_FAILED: 'ai.agent.run.failed' as const,

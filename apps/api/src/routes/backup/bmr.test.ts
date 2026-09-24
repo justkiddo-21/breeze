@@ -20,7 +20,7 @@ vi.mock('../../services', () => ({}));
 
 function chainMock(resolvedValue: unknown = []) {
   const chain: Record<string, any> = {};
-  for (const method of ['from', 'where', 'limit', 'returning', 'values', 'set', 'onConflictDoNothing', 'orderBy', 'offset']) {
+  for (const method of ['from', 'where', 'limit', 'returning', 'values', 'set', 'onConflictDoNothing', 'orderBy', 'offset', 'leftJoin', 'innerJoin']) {
     chain[method] = vi.fn(() => Object.assign(Promise.resolve(resolvedValue), chain));
   }
   return Object.assign(Promise.resolve(resolvedValue), chain);
@@ -62,6 +62,24 @@ vi.mock('../../db', () => ({
 }));
 
 vi.mock('../../db/schema', () => ({
+  backupSnapshotOrigins: {
+    snapshotDbId: 'backup_snapshot_origins.snapshot_db_id',
+    originSnapshotId: 'backup_snapshot_origins.origin_snapshot_id',
+    originOrgId: 'backup_snapshot_origins.origin_org_id',
+    originDeviceId: 'backup_snapshot_origins.origin_device_id',
+    originStorageIdentity: 'backup_snapshot_origins.origin_storage_identity',
+  },
+  backupSnapshotFiles: {
+    id: 'backup_snapshot_files.id',
+    snapshotDbId: 'backup_snapshot_files.snapshot_db_id',
+    backupPath: 'backup_snapshot_files.backup_path',
+  },
+  backupSnapshotRetirements: {
+    orgId: 'backup_snapshot_retirements.org_id',
+    deviceId: 'backup_snapshot_retirements.device_id',
+    snapshotId: 'backup_snapshot_retirements.snapshot_id',
+    storageIdentity: 'backup_snapshot_retirements.storage_identity',
+  },
   bareMetalRecoveries: {
     id: 'bare_metal_recoveries.id',
     orgId: 'bare_metal_recoveries.org_id',
@@ -101,6 +119,9 @@ vi.mock('../../db/schema', () => ({
     fileCount: 'backup_snapshots.file_count',
     hardwareProfile: 'backup_snapshots.hardware_profile',
     systemStateManifest: 'backup_snapshots.system_state_manifest',
+    storageIdentity: 'backup_snapshots.storage_identity',
+    bareMetalRestorable: 'backup_snapshots.bare_metal_restorable',
+    bareMetalReasons: 'backup_snapshots.bare_metal_reasons',
   },
   restoreJobs: {
     id: 'restore_jobs.id',
@@ -110,6 +131,7 @@ vi.mock('../../db/schema', () => ({
   backupJobs: {
     id: 'backup_jobs.id',
     configId: 'backup_jobs.config_id',
+    referencedFiles: 'backup_jobs.referenced_files',
   },
   backupConfigs: {
     id: 'backup_configs.id',
@@ -179,6 +201,7 @@ vi.mock('../../db/schema', () => ({
     authenticatedAt: 'recovery_tokens.authenticated_at',
     completedAt: 'recovery_tokens.completed_at',
     usedAt: 'recovery_tokens.used_at',
+    negotiatedCapabilities: 'recovery_tokens.negotiated_capabilities',
   },
 }));
 
@@ -197,6 +220,7 @@ vi.mock('../../db/schema/recoveryTokens', () => ({
     authenticatedAt: 'recovery_tokens.authenticated_at',
     completedAt: 'recovery_tokens.completed_at',
     usedAt: 'recovery_tokens.used_at',
+    negotiatedCapabilities: 'recovery_tokens.negotiated_capabilities',
   },
 }));
 
@@ -253,6 +277,12 @@ vi.mock('../../services/recoveryAuthorizationSubject', () => ({
 
 vi.mock('../../jobs/recoveryMediaWorker', () => ({
   enqueueRecoveryMediaBuild: (...args: unknown[]) => enqueueRecoveryMediaBuildMock(...(args as [])),
+}));
+
+const enqueueSnapshotFileIndexHydrationMock = vi.fn(async (..._args: unknown[]) => 'job-1');
+
+vi.mock('../../jobs/backupSnapshotFileIndexWorker', () => ({
+  enqueueSnapshotFileIndexHydration: (...args: unknown[]) => enqueueSnapshotFileIndexHydrationMock(...(args as [])),
 }));
 
 const lookupReleaseManifestAssetForDisplayMock = vi.fn(
@@ -445,8 +475,146 @@ describe('bmr routes', () => {
     expect((await res.json()).data).toHaveLength(2);
   });
 
+  // W09 (#6464): this route mints a bare_metal token WITHOUT going through
+  // createBareMetalRecovery, so it carries the same preflight — a referenced
+  // snapshot with a KNOWN storage identity is now allowed (hydration is
+  // enqueued in the background instead of hard-refusing, replacing #6469).
+  it('POST /bmr/tokens bare_metal: referenced snapshot with a known storage identity enqueues hydration and succeeds', async () => {
+    selectMock.mockReturnValueOnce(chainMock([
+      { id: SNAPSHOT_ID, orgId: ORG_ID, deviceId: DEVICE_ID, referencedFiles: 98411, storageIdentity: 'local::/srv/backups', bareMetalRestorable: true },
+    ]));
+    insertMock.mockReturnValueOnce(chainMock([makeTokenSummary({ deviceId: DEVICE_ID })]));
+
+    const res = await app.request('/backup/bmr/tokens', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ snapshotId: SNAPSHOT_ID, restoreType: 'bare_metal', expiresInHours: 24 }),
+    });
+
+    expect(res.status).toBe(201);
+    expect(enqueueSnapshotFileIndexHydrationMock).toHaveBeenCalledWith(SNAPSHOT_ID, 'recovery_create');
+  });
+
+  it('POST /bmr/tokens bare_metal: referenced snapshot with UNKNOWN storage identity is still refused at creation (409 snapshot_storage_identity_unknown)', async () => {
+    selectMock.mockReturnValueOnce(chainMock([
+      { id: SNAPSHOT_ID, orgId: ORG_ID, deviceId: DEVICE_ID, referencedFiles: 98411, storageIdentity: null, bareMetalRestorable: true },
+    ]));
+
+    const res = await app.request('/backup/bmr/tokens', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ snapshotId: SNAPSHOT_ID, restoreType: 'bare_metal', expiresInHours: 24 }),
+    });
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('snapshot_storage_identity_unknown');
+    expect(insertMock).not.toHaveBeenCalled();
+  });
+
+  // #6470: this route mints a bare_metal token WITHOUT going through
+  // createBareMetalRecovery, so it never applied the restorability guard
+  // that createBareMetalRecovery (bareMetalRecoveryService.ts) enforces.
+  it('POST /bmr/tokens bare_metal: snapshot not bare-metal restorable is refused at creation (409 snapshot_not_bare_metal_restorable), no token minted', async () => {
+    selectMock.mockReturnValueOnce(chainMock([
+      {
+        id: SNAPSHOT_ID,
+        orgId: ORG_ID,
+        deviceId: DEVICE_ID,
+        referencedFiles: 0,
+        storageIdentity: 'local::/srv/backups',
+        bareMetalRestorable: false,
+        bareMetalReasons: ['unsupported disk layout: LVM'],
+      },
+    ]));
+
+    const res = await app.request('/backup/bmr/tokens', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ snapshotId: SNAPSHOT_ID, restoreType: 'bare_metal', expiresInHours: 24 }),
+    });
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toBe('snapshot_not_bare_metal_restorable');
+    expect(body.reasons).toEqual(['unsupported disk layout: LVM']);
+    expect(insertMock).not.toHaveBeenCalled();
+  });
+
+  // A never-assessed snapshot (bareMetalReasons null) falls back to a
+  // generic reason string, and the restorability guard runs BEFORE the
+  // referencedFiles/storageIdentity preflight — an unknown storage identity
+  // on a non-restorable snapshot must still surface the restorability
+  // refusal, not the (unreached) storage-identity one.
+  it('POST /bmr/tokens bare_metal: never-assessed snapshot with unknown storage identity is refused for restorability first, with the fallback reason', async () => {
+    selectMock.mockReturnValueOnce(chainMock([
+      {
+        id: SNAPSHOT_ID,
+        orgId: ORG_ID,
+        deviceId: DEVICE_ID,
+        referencedFiles: 98411,
+        storageIdentity: null,
+        bareMetalRestorable: false,
+        bareMetalReasons: null,
+      },
+    ]));
+
+    const res = await app.request('/backup/bmr/tokens', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ snapshotId: SNAPSHOT_ID, restoreType: 'bare_metal', expiresInHours: 24 }),
+    });
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toBe('snapshot_not_bare_metal_restorable');
+    expect(body.reasons).toEqual(['snapshot was not assessed for bare-metal restore']);
+    expect(insertMock).not.toHaveBeenCalled();
+  });
+
+  it('POST /bmr/tokens bare_metal: a restorable snapshot still mints a token', async () => {
+    selectMock.mockReturnValueOnce(chainMock([
+      {
+        id: SNAPSHOT_ID,
+        orgId: ORG_ID,
+        deviceId: DEVICE_ID,
+        referencedFiles: 0,
+        storageIdentity: 'local::/srv/backups',
+        bareMetalRestorable: true,
+        bareMetalReasons: null,
+      },
+    ]));
+    insertMock.mockReturnValueOnce(chainMock([makeTokenSummary({ deviceId: DEVICE_ID })]));
+
+    const res = await app.request('/backup/bmr/tokens', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ snapshotId: SNAPSHOT_ID, restoreType: 'bare_metal', expiresInHours: 24 }),
+    });
+
+    expect(res.status).toBe(201);
+    expect(insertMock).toHaveBeenCalled();
+  });
+
+  // A file-level token is unaffected: the restore path it drives resolves
+  // objects through the provider directly, with no single-prefix confinement.
+  it('still issues a non-bare_metal token for a snapshot that references older snapshots', async () => {
+    selectMock.mockReturnValueOnce(chainMock([{ id: SNAPSHOT_ID, orgId: ORG_ID, deviceId: DEVICE_ID, referencedFiles: 98411 }]));
+    insertMock.mockReturnValueOnce(chainMock([{
+      id: TOKEN_ID, orgId: ORG_ID, deviceId: DEVICE_ID, snapshotId: SNAPSHOT_ID, restoreType: 'full',
+      expiresAt: new Date('2026-03-30T00:00:00.000Z'), createdAt: new Date('2026-03-29T00:00:00.000Z'),
+    }]));
+
+    const res = await app.request('/backup/bmr/tokens', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ snapshotId: SNAPSHOT_ID, restoreType: 'full', expiresInHours: 24 }),
+    });
+
+    expect(res.status).toBe(201);
+  });
+
   it('creates a recovery token', async () => {
-    selectMock.mockReturnValueOnce(chainMock([{ id: SNAPSHOT_ID, orgId: ORG_ID, deviceId: DEVICE_ID }]));
+    selectMock.mockReturnValueOnce(chainMock([{ id: SNAPSHOT_ID, orgId: ORG_ID, deviceId: DEVICE_ID, bareMetalRestorable: true }]));
     insertMock.mockReturnValueOnce(chainMock([{
       id: TOKEN_ID,
       orgId: ORG_ID,
@@ -655,12 +823,88 @@ describe('bmr routes', () => {
     expect(body.bootstrap.snapshot).toMatchObject({
       id: SNAPSHOT_ID,
       snapshotId: 'snap-ext-001',
+      backupType: 'file', // #5412: the helper keys ExpectSystemState on this
       metadata: {
         providerType: 's3',
         storagePrefix: 's3://breeze-backups/org-001/dev-001/2026-03-29',
       },
     });
     expect(body.authenticatedAt).toBeTruthy();
+  });
+
+  it('authenticate: legacy client (no capabilities) on a referenced snapshot is refused before the status flips', async () => {
+    selectMock
+      .mockReturnValueOnce(chainMock([{
+        id: TOKEN_ID, orgId: ORG_ID, deviceId: DEVICE_ID, snapshotId: SNAPSHOT_ID,
+        restoreType: 'bare_metal', targetConfig: null, status: 'active',
+        createdAt: new Date('2026-03-29T00:00:00.000Z'), expiresAt: new Date('2099-04-01T00:00:00.000Z'),
+        authenticatedAt: null, completedAt: null, negotiatedCapabilities: null,
+      }]))
+      .mockReturnValueOnce(chainMock([{
+        id: SNAPSHOT_ID, orgId: ORG_ID, deviceId: DEVICE_ID, jobId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+        configId: null, snapshotId: 'snap-ext-001', label: 'Backup', location: null,
+        timestamp: new Date('2026-03-29T12:34:56.000Z'), size: 1234, fileCount: 12,
+        metadata: { providerType: 's3', providerConfig: { bucket: 'my-bucket' } },
+        backupType: 'file', isIncremental: true, hardwareProfile: null,
+        systemStateManifest: null, storageIdentity: 's3::::my-bucket',
+      }]))
+      .mockReturnValueOnce(chainMock([{ configId: null }]))
+      .mockReturnValueOnce(chainMock([{ id: DEVICE_ID, hostname: 'srv-01', osType: 'windows' }]))
+      // readSnapshotFileIndexState: snapshot row (status complete) + referencedFiles + origins
+      .mockReturnValueOnce(chainMock([{
+        status: 'complete', manifestSha256: 'a'.repeat(64), externalCount: 3, error: null,
+        jobId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', storageIdentity: 's3::::my-bucket',
+      }]))
+      .mockReturnValueOnce(chainMock([{ referencedFiles: 5 }]))
+      .mockReturnValueOnce(chainMock([{ originSnapshotId: 'older' }]));
+
+    const res = await app.request('/backup/bmr/recover/authenticate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: VALID_RECOVERY_TOKEN }),
+    });
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('client_capability_required');
+    expect(updateMock.mock.calls.some((c: any[]) => c[0]?.status === 'authenticated')).toBe(false);
+  });
+
+  it('authenticate: capable client on a complete index is granted and bootstrap.download.capabilities/bootstrap.snapshot.fileIndex are populated', async () => {
+    selectMock
+      .mockReturnValueOnce(chainMock([{
+        id: TOKEN_ID, orgId: ORG_ID, deviceId: DEVICE_ID, snapshotId: SNAPSHOT_ID,
+        restoreType: 'bare_metal', targetConfig: null, status: 'active',
+        createdAt: new Date('2026-03-29T00:00:00.000Z'), expiresAt: new Date('2099-04-01T00:00:00.000Z'),
+        authenticatedAt: null, completedAt: null, negotiatedCapabilities: null,
+      }]))
+      .mockReturnValueOnce(chainMock([{
+        id: SNAPSHOT_ID, orgId: ORG_ID, deviceId: DEVICE_ID, jobId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+        configId: null, snapshotId: 'snap-ext-001', label: 'Backup', location: null,
+        timestamp: new Date('2026-03-29T12:34:56.000Z'), size: 1234, fileCount: 12,
+        metadata: { providerType: 's3', providerConfig: { bucket: 'my-bucket' } },
+        backupType: 'file', isIncremental: true, hardwareProfile: null,
+        systemStateManifest: null, storageIdentity: 's3::::my-bucket',
+      }]))
+      .mockReturnValueOnce(chainMock([{ configId: null }]))
+      .mockReturnValueOnce(chainMock([{ id: DEVICE_ID, hostname: 'srv-01', osType: 'windows' }]))
+      .mockReturnValueOnce(chainMock([{
+        status: 'complete', manifestSha256: 'a'.repeat(64), externalCount: 3, error: null,
+        jobId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', storageIdentity: 's3::::my-bucket',
+      }]))
+      .mockReturnValueOnce(chainMock([{ referencedFiles: 5 }]))
+      .mockReturnValueOnce(chainMock([{ originSnapshotId: 'older' }]));
+    updateMock.mockReturnValueOnce(chainMock([]));
+
+    const res = await app.request('/backup/bmr/recover/authenticate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: VALID_RECOVERY_TOKEN, capabilities: ['snapshot-file-membership-v1'] }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.bootstrap.download.capabilities).toEqual(['snapshot-file-membership-v1']);
+    expect(body.bootstrap.snapshot.fileIndex.status).toBe('complete');
   });
 
   it('rejects an expired recovery token', async () => {
@@ -1369,6 +1613,56 @@ describe('bmr routes', () => {
     const updateChain = updateMock.mock.results.at(-1)!.value;
     expect(updateChain.set).toHaveBeenCalledWith(expect.objectContaining(replacement));
     expect(transactionMock).toHaveBeenCalledTimes(1);
+    expect(enqueueRecoveryMediaBuildMock).toHaveBeenCalledWith('media-artifact-1');
+  });
+
+  it('clears the stale metadata.error when rebuilding a previously-failed media artifact (#5411)', async () => {
+    updateMock.mockReturnValueOnce(chainMock([]));
+    selectMock
+      .mockReturnValueOnce(chainMock([]))
+      .mockReturnValueOnce(chainMock([{
+        id: TOKEN_ID,
+        orgId: ORG_ID,
+        deviceId: DEVICE_ID,
+        snapshotId: SNAPSHOT_ID,
+        restoreType: 'bare_metal',
+        status: 'active',
+      }]))
+      .mockReturnValueOnce(chainMock([{
+        id: 'media-artifact-1',
+        orgId: ORG_ID,
+        tokenId: TOKEN_ID,
+        snapshotId: SNAPSHOT_ID,
+        platform: 'linux',
+        architecture: 'amd64',
+        status: 'failed',
+        metadata: { error: 'ENOSPC: no space left on device' },
+        createdAt: new Date('2026-03-29T00:00:00.000Z'),
+        completedAt: new Date('2026-03-29T00:10:00.000Z'),
+      }]));
+    updateMock.mockReturnValueOnce(chainMock([{
+      id: 'media-artifact-1',
+      orgId: ORG_ID,
+      tokenId: TOKEN_ID,
+      snapshotId: SNAPSHOT_ID,
+      platform: 'linux',
+      architecture: 'amd64',
+      status: 'pending',
+      metadata: {},
+      createdAt: new Date('2026-03-29T00:00:00.000Z'),
+      completedAt: null,
+    }]));
+
+    const res = await app.request('/backup/bmr/media', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ tokenId: TOKEN_ID, platform: 'linux', architecture: 'amd64' }),
+    });
+
+    expect(res.status).toBe(202);
+    const updateChain = updateMock.mock.results.at(-1)!.value;
+    const setCall = updateChain.set.mock.calls.at(-1)![0];
+    expect(setCall.metadata).not.toHaveProperty('error');
     expect(enqueueRecoveryMediaBuildMock).toHaveBeenCalledWith('media-artifact-1');
   });
 

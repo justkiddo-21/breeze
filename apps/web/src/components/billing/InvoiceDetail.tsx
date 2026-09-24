@@ -21,6 +21,7 @@ import {
   lineTaxAmount,
   lineTitle,
   lineBlurb,
+  lineWorkedVsBilledNote,
   pctFromFraction,
   sellerLines,
   computeInvoiceProfit,
@@ -240,12 +241,14 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
     if (busy) return;
     setBusy(true);
     try {
-      await runAction({
+      const result = await runAction<{ quickbooksRecordUntouched?: boolean }>({
         request: () => fetchWithAuth(`/invoices/${invoice.id}/payments/${paymentId}`, { method: 'DELETE' }),
         errorFallback: t('invoiceDetail.payments.reverseError'),
-        successMessage: t('invoiceDetail.payments.reverseSuccess'),
         onUnauthorized: UNAUTHORIZED,
       });
+      showToast(result.quickbooksRecordUntouched
+        ? { type: 'warning', message: t('invoiceDetail.payments.reverseInQuickbooksToo') }
+        : { type: 'success', message: t('invoiceDetail.payments.reverseSuccess') });
       setReversePayment(null);
       refresh();
     } catch (err) {
@@ -411,6 +414,7 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
                 ) : (
                 visibleLines.map((l) => {
                   const tax = showTax ? lineTaxAmount(l.lineTotal, l.taxable, invoice.taxRate) : null;
+                  const workedVsBilledNote = lineWorkedVsBilledNote(l, t);
                   return (
                   <tr
                     key={l.id}
@@ -423,6 +427,11 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
                       </span>
                       {internalView && !l.customerVisible ? t('invoiceDetail.lines.hiddenMarker') : ''}
                       {lineBlurb(l) && <div className="text-xs text-muted-foreground">{lineBlurb(l)}</div>}
+                      {workedVsBilledNote && (
+                        <div className="text-xs text-muted-foreground" data-testid={`invoice-detail-line-worked-vs-billed-${l.id}`}>
+                          {workedVsBilledNote}
+                        </div>
+                      )}
                       <InvoiceLineDevices invoiceId={invoice.id} line={l} />
                     </td>
                     <td className="px-3 py-2 text-right">{l.quantity}</td>
@@ -670,14 +679,10 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
                         </span>
                       )}
                     </span>
-                    {/* Stripe payments are refunded through Stripe, never hand-voided.
-                        QuickBooks-pulled payments are the same story with a different
-                        system of record: reversing one here would not touch the books,
-                        and the next reconcile would pull it straight back in. */}
+                    {/* Stripe refunds belong in Stripe. The API decides whether a
+                        QuickBooks reversal is allowed based on current pull settings. */}
                     {p.source === 'stripe' ? (
                       <span className="whitespace-nowrap text-[11px] text-muted-foreground">{t('invoiceDetail.payments.viaStripe')}</span>
-                    ) : p.source === 'quickbooks' ? (
-                      <span className="whitespace-nowrap text-[11px] text-muted-foreground">{t('invoiceDetail.payments.viaQuickbooks')}</span>
                     ) : can('invoices', 'send') ? (
                       <button
                         type="button" onClick={() => setReversePayment(p)} disabled={busy || invoice.status === 'void'}

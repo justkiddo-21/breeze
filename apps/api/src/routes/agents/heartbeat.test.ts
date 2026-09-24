@@ -251,6 +251,15 @@ vi.mock('../../services/agentEditionAutoMigrate', () => ({
   shouldConsiderEditionMigration: vi.fn(() => true),
 }));
 
+const { loadTopologyFlagsMock, withResolvedTopologyFlagsMock } = vi.hoisted(() => ({
+  loadTopologyFlagsMock: vi.fn(),
+  withResolvedTopologyFlagsMock: vi.fn(),
+}));
+vi.mock('../../services/topology/flags', () => ({
+  loadTopologyFlags: (...args: unknown[]) => loadTopologyFlagsMock(...args),
+  withResolvedTopologyFlags: (...args: unknown[]) => withResolvedTopologyFlagsMock(...args),
+}));
+
 vi.mock('../../services/sentry', () => ({
   captureException: vi.fn(),
 }));
@@ -514,6 +523,64 @@ describe('POST /agents/:id/heartbeat — reachability ownership', () => {
     expect(orgCtx!.currentPartnerId).toBe('partner-1');
     // Read-only axis only — the write-capable partner AXIS stays empty.
     expect(orgCtx!.accessiblePartnerIds).toEqual([]);
+  });
+
+  // US 2026-09-22 pool deadlock: topology collection used to resolve its flags
+  // INSIDE the org transaction, after the IP-history write took the per-org
+  // partner-export advisory lock; the partner-axis read then waited on a
+  // second pooled connection that never came. The flags must be resolved in a
+  // short system context BEFORE the org transaction opens and handed to the
+  // topology call, so nothing inside the transaction reaches for the pool.
+  it('resolves topology flags in a system context before the org transaction and hands them to topology collection', async () => {
+    const flags = { materialization: true, ui: false, physical: false, interfaceHealth: false, diagnostics: false, ai: false };
+    loadTopologyFlagsMock.mockImplementation(async () => {
+      callOrder.push('topologyFlags:loaded');
+      return flags;
+    });
+    withResolvedTopologyFlagsMock.mockImplementation(async (_resolved: unknown, fn: () => Promise<unknown>) => {
+      callOrder.push('topologyFlags:wrapped');
+      return fn();
+    });
+    callOrder.length = 0;
+    selectMock.mockReturnValueOnce(selectChainResolving([pendingDevice]));
+    selectMock.mockReturnValue(selectChainResolving([]));
+    updateMock.mockReturnValue({ set: vi.fn(() => ({ where: vi.fn(() => whereResultWithReturning()) })) });
+    insertMock.mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) });
+
+    const response = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+
+    expect(response.status).toBe(200);
+    expect(loadTopologyFlagsMock).toHaveBeenCalledTimes(1);
+    expect(loadTopologyFlagsMock).toHaveBeenCalledWith({ scope: { orgId: 'org-1', siteId: 'site-1' } });
+    const loaded = callOrder.indexOf('topologyFlags:loaded');
+    const opened = callOrder.indexOf('dbContext:opened');
+    expect(loaded).toBeGreaterThan(-1);
+    expect(loaded).toBeLessThan(opened);
+    expect(callOrder.lastIndexOf('systemCtx:enter', loaded)).toBeGreaterThan(-1);
+    expect(callOrder.indexOf('systemCtx:exit', loaded)).toBeLessThan(opened);
+    expect(withResolvedTopologyFlagsMock).toHaveBeenCalledWith({ orgId: 'org-1', flags }, expect.any(Function));
+  });
+
+  it('skips topology collection without a nested flag read when the pre-transaction resolution fails', async () => {
+    loadTopologyFlagsMock.mockRejectedValueOnce(new Error('pool busy'));
+    selectMock.mockReturnValueOnce(selectChainResolving([pendingDevice]));
+    selectMock.mockReturnValue(selectChainResolving([]));
+    updateMock.mockReturnValue({ set: vi.fn(() => ({ where: vi.fn(() => whereResultWithReturning()) })) });
+    insertMock.mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) });
+
+    const response = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+
+    expect(response.status).toBe(200);
+    expect(loadTopologyFlagsMock).toHaveBeenCalledTimes(1);
+    expect(withResolvedTopologyFlagsMock).not.toHaveBeenCalled();
   });
 
   it('an authenticated main-agent heartbeat promotes pending to online and advances lastSeenAt', async () => {
@@ -2766,6 +2833,41 @@ describe('outboundNetworkPolicyVersion capability handshake (Wave 6)', () => {
     expect(updateArg.rollbackProtocolVersion).toBe(expectedRollback);
     expect(updateArg.pamLifetimeProtocolVersion).toBe(expectedPam);
   });
+
+  // SEC-038 W06 (#5537): desktopFenceProtocolVersion is recorded non-sticky on
+  // every beat exactly like revocationLeaseProtocolVersion — omitted, zero,
+  // unknown, fractional and string values all persist as 0 so an agent
+  // downgrade stops the fence gate trusting a stale claim.
+  it.each([
+    { name: 'recognized version 1', capabilities: { desktopFenceProtocolVersion: 1, revocationLeaseProtocolVersion: 1 }, expectedFence: 1, expectedLease: 1 },
+    { name: 'omitted capability object', capabilities: undefined, expectedFence: 0, expectedLease: 0 },
+    { name: 'omitted fence key (pre-W06 agent)', capabilities: { revocationLeaseProtocolVersion: 1 }, expectedFence: 0, expectedLease: 1 },
+    { name: 'explicit zero downgrade', capabilities: { desktopFenceProtocolVersion: 0, revocationLeaseProtocolVersion: 0 }, expectedFence: 0, expectedLease: 0 },
+    { name: 'unknown integer version', capabilities: { desktopFenceProtocolVersion: 2, revocationLeaseProtocolVersion: 1 }, expectedFence: 0, expectedLease: 1 },
+    { name: 'fractional version', capabilities: { desktopFenceProtocolVersion: 1.5, revocationLeaseProtocolVersion: 1 }, expectedFence: 0, expectedLease: 1 },
+    { name: 'string version', capabilities: { desktopFenceProtocolVersion: '1', revocationLeaseProtocolVersion: 1 }, expectedFence: 0, expectedLease: 1 },
+  ])('persists tolerant non-sticky desktop fence capability: $name', async ({
+    capabilities,
+    expectedFence,
+    expectedLease,
+  }) => {
+    const setSpy = vi.fn(() => ({ where: vi.fn(() => whereResultWithReturning()) }));
+    await setupMocks(setSpy);
+
+    const body = capabilities === undefined
+      ? minimalHeartbeatBody
+      : { ...minimalHeartbeatBody, securityCapabilities: capabilities };
+    const resp = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    expect(resp.status).toBe(200);
+    const updateArg = (setSpy.mock.calls as any[])[0]?.[0] as Record<string, unknown>;
+    expect(updateArg.desktopFenceProtocolVersion).toBe(expectedFence);
+    expect(updateArg.revocationLeaseProtocolVersion).toBe(expectedLease);
+  });
 });
 
 // ---------------------------------------------------------------------
@@ -3371,9 +3473,9 @@ describe('POST /agents/:id/heartbeat — uacInterceptionEnabled delivery', () =>
   // those already-delivered commands for no benefit, since every field this
   // block produces is re-resolved on the next heartbeat anyway. This test
   // pins the fail-safe: only the shared policy-config context is made to
-  // reject (targeted by call order — it is the 4th of 5 withSystemDbAccessContext
-  // calls per heartbeat: #2123 update-policy, policy-probe, onedrive, THIS
-  // ONE, then helper-settings), and the response must still be 200 with all
+  // reject (targeted by call order — it is the 5th of 6 withSystemDbAccessContext
+  // calls per heartbeat: #2123 update-policy, topology flags, policy-probe,
+  // onedrive, THIS ONE, then helper-settings), and the response must still be 200 with all
   // four policy config keys omitted and uacInterceptionEnabled defaulted to
   // false, with the failure reported to Sentry.
   it('returns 200 and omits all four policy config keys when the shared policy-config system context itself fails', async () => {
@@ -3381,6 +3483,7 @@ describe('POST /agents/:id/heartbeat — uacInterceptionEnabled delivery', () =>
 
     withSystemDbAccessContextMock
       .mockImplementationOnce(systemDbAccessContextPassthrough) // #2123 update-policy lookup
+      .mockImplementationOnce(systemDbAccessContextPassthrough) // topology flags (before the org block)
       .mockImplementationOnce(systemDbAccessContextPassthrough) // policy-probe config
       .mockImplementationOnce(systemDbAccessContextPassthrough) // onedrive settings
       .mockImplementationOnce(async () => {
@@ -5418,6 +5521,76 @@ describe('POST /agents/:id/heartbeat — device-remove uninstall drain (#3986)',
     const body = (await resp.json()) as Record<string, unknown>;
     expect(Object.keys(body)).toContain('configUpdate');
     expect(Object.keys(body)).toContain('manifestTrustKeys');
+  });
+
+  it('a TENANT drain does NOT get a rotateToken signal (#3997 — the mint route would refuse it)', async () => {
+    // `rotate-token` is off the tenant drain surface as of #3997, so asking
+    // for a rotation here would make every agent in the offboarding tenant
+    // attempt a mint it cannot complete on every beat for the whole 72h window.
+    // The device row is arranged to make the signal MAXIMALLY due (no watchdog
+    // token hash, which alone satisfies the rotateToken condition), so this
+    // asserts the drain suppression and not merely an unmet age threshold.
+    selectMock.mockReset();
+    selectMock.mockReturnValueOnce(
+      selectChainResolving([
+        {
+          id: 'device-1',
+          orgId: 'org-1',
+          siteId: 'site-1',
+          hostname: 'host-1',
+          osType: 'linux',
+          architecture: 'amd64',
+          agentVersion: '0.65.10',
+          agentTokenHash: 'hash',
+          watchdogTokenHash: null,
+          tokenIssuedAt: new Date(),
+        },
+      ]),
+    );
+    selectMock.mockReturnValue(selectChainResolving([]));
+
+    const resp = await buildDrainingApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as Record<string, unknown>;
+    expect(body.rotateToken).toBeUndefined();
+  });
+
+  it('an ACTIVE tenant with the same device row DOES get rotateToken (positive control for the suppression above)', async () => {
+    // Without this, the assertion above would also pass if `rotateToken` were
+    // simply never emitted — proving nothing about the drain condition.
+    selectMock.mockReset();
+    selectMock.mockReturnValueOnce(
+      selectChainResolving([
+        {
+          id: 'device-1',
+          orgId: 'org-1',
+          siteId: 'site-1',
+          hostname: 'host-1',
+          osType: 'linux',
+          architecture: 'amd64',
+          agentVersion: '0.65.10',
+          agentTokenHash: 'hash',
+          watchdogTokenHash: null,
+          tokenIssuedAt: new Date(),
+        },
+      ]),
+    );
+    selectMock.mockReturnValue(selectChainResolving([]));
+
+    const resp = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as Record<string, unknown>;
+    expect(body.rotateToken).toBe(true);
   });
 });
 

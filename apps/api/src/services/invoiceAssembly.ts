@@ -3,6 +3,7 @@ import { db } from '../db';
 import { timeEntries, ticketParts } from '../db/schema';
 import { computeLineTotal } from './invoiceMath';
 import type { InvoiceLineSourceType } from './invoiceTypes';
+import type { BillingStatus } from '@breeze/shared';
 
 export interface DraftLineSpec {
   sourceType: InvoiceLineSourceType;
@@ -17,6 +18,11 @@ export interface DraftLineSpec {
   customerVisible: boolean;
   lineTotal: string;
   isUnapprovedTime: boolean;
+  /** #6467: actual time worked (minutes), for the worked-vs-billed disclosure
+   *  note only — never for money. NULL for non-time-entry lines. Rendered at
+   *  display time, never baked into `description` (a description edit must
+   *  never erase the §3.5 disclosure). */
+  workedMinutes: number | null;
 }
 
 /** A billable time entry that has NO hourly rate (match-or-skip found no rate in
@@ -43,6 +49,18 @@ export interface AssemblyResult {
 
 /** Defensive bucket for a time entry with a null snapshot (impossible while the CHECK holds). */
 export const UNKNOWN_CURRENCY_KEY = 'UNKNOWN';
+
+/** True when a billable row has an unresolved rate that is a genuine assembly
+ *  gap — hours (or quantity) worked but nothing to bill it at — never a
+ *  fabricated $0.00 line (#6461). A `contract`/`no_charge` billing status
+ *  means the null rate is intentional (the work is covered or comped), so it
+ *  is a real zero, not a gap. Single source of truth for this rule: both
+ *  `partitionTimeEntries` below and `timeEntryService.listBillables` (which
+ *  sees every billing_status, unlike the `not_billed`-only queries here) call
+ *  through this instead of re-deriving the null check. */
+export function isMissingRateGap(rate: string | number | null, billingStatus: BillingStatus): boolean {
+  return rate == null && billingStatus !== 'contract' && billingStatus !== 'no_charge';
+}
 
 /** Split rows into header-currency specs and per-currency blocked groups. No conversion, ever:
  *  a mismatched row is reported under its own currency, never recomputed into the header's.
@@ -72,11 +90,22 @@ export function mergeAssembly(...parts: AssemblyResult[]): AssemblyResult {
 
 type TimeEntryRow = {
   id: string; ticketId: string | null; description: string | null;
-  durationMinutes: number | null; hourlyRate: string | null; isApproved: boolean;
+  durationMinutes: number | null;
+  /** Billed quantity after the card's minimum/rounding (#4628 §3.5). NULL on
+   *  pre-feature rows and rows with no card terms — then the duration bills. */
+  billableMinutes: number | null;
+  hourlyRate: string | null; isApproved: boolean;
   currencyCode?: string | null;
 };
 
-const entryHours = (r: TimeEntryRow) => ((r.durationMinutes ?? 0) / 60).toFixed(2);
+/** Billed quantity (§3.5): COALESCE(billable_minutes, duration_minutes), hours to 2 dp. */
+const entryHours = (r: TimeEntryRow) => (((r.billableMinutes ?? r.durationMinutes) ?? 0) / 60).toFixed(2);
+
+/** Base line description — never carries the worked-vs-billed disclosure
+ *  (#6467). The §3.5 "when they differ the invoice line says so" note is
+ *  carried as structured data (`DraftLineSpec.workedMinutes`) and rendered at
+ *  display time, in the viewer's locale — never baked into this string, so a
+ *  later edit to the description can never erase it. */
 const entryDescription = (r: TimeEntryRow) => r.description?.trim() || 'Labor';
 
 /** Labor rule (one rule, everywhere): hours rounded to 2dp first (the numeric(10,2) quantity
@@ -95,7 +124,11 @@ export function timeEntryToLineSpec(r: TimeEntryRow, currencyCode: string): Draf
     sourceType: 'time_entry', sourceId: r.id, catalogItemId: null, ticketId: r.ticketId,
     description: entryDescription(r),
     quantity: hours, unitPrice, costBasis: null, taxable: false, customerVisible: true,
-    lineTotal: computeLineTotal(hours, unitPrice, currencyCode), isUnapprovedTime: !r.isApproved
+    lineTotal: computeLineTotal(hours, unitPrice, currencyCode), isUnapprovedTime: !r.isApproved,
+    // #6467: always carry the worked minutes for a time_entry line — renderers
+    // decide whether to show the note (only when it differs from the billed
+    // quantity), the same condition the old description suffix used.
+    workedMinutes: r.durationMinutes ?? null
   };
 }
 
@@ -108,7 +141,10 @@ export function partitionTimeEntries(rows: TimeEntryRow[], headerCurrency: strin
   const rated: TimeEntryRow[] = [];
   const missingRate: MissingRateSpec[] = [];
   for (const r of rows) {
-    if (r.hourlyRate == null) {
+    // Callers of this function pre-filter to billing_status = 'not_billed'
+    // (see gatherOrgTimeEntries etc.), so the literal here is exact, not a
+    // guess — routed through isMissingRateGap for a single source of truth.
+    if (isMissingRateGap(r.hourlyRate, 'not_billed')) {
       missingRate.push({
         sourceType: 'time_entry', sourceId: r.id, ticketId: r.ticketId,
         description: entryDescription(r), quantity: entryHours(r), currencyCode: r.currencyCode ?? null
@@ -132,7 +168,8 @@ export function ticketPartToLineSpec(r: {
     description: r.description,
     quantity: r.quantity, unitPrice: r.unitPrice, costBasis: r.costBasis ?? null,
     taxable: true, customerVisible: true,
-    lineTotal: computeLineTotal(r.quantity, r.unitPrice, currencyCode), isUnapprovedTime: false
+    lineTotal: computeLineTotal(r.quantity, r.unitPrice, currencyCode), isUnapprovedTime: false,
+    workedMinutes: null
   };
 }
 
@@ -144,7 +181,7 @@ export function ticketPartToLineSpec(r: {
 export async function gatherOrgTimeEntries(orgId: string, from: Date, to: Date, headerCurrency: string): Promise<AssemblyResult> {
   const rows = await db.select({
     id: timeEntries.id, ticketId: timeEntries.ticketId, description: timeEntries.description,
-    durationMinutes: timeEntries.durationMinutes, hourlyRate: timeEntries.hourlyRate, isApproved: timeEntries.isApproved,
+    durationMinutes: timeEntries.durationMinutes, billableMinutes: timeEntries.billableMinutes, hourlyRate: timeEntries.hourlyRate, isApproved: timeEntries.isApproved,
     currencyCode: timeEntries.currencyCode
   }).from(timeEntries).where(and(
     eq(timeEntries.orgId, orgId),
@@ -185,7 +222,7 @@ export async function gatherOrgParts(orgId: string, from: Date, to: Date, header
 export async function gatherTicketBillables(ticketId: string, headerCurrency: string): Promise<AssemblyResult> {
   const te = await db.select({
     id: timeEntries.id, ticketId: timeEntries.ticketId, description: timeEntries.description,
-    durationMinutes: timeEntries.durationMinutes, hourlyRate: timeEntries.hourlyRate, isApproved: timeEntries.isApproved,
+    durationMinutes: timeEntries.durationMinutes, billableMinutes: timeEntries.billableMinutes, hourlyRate: timeEntries.hourlyRate, isApproved: timeEntries.isApproved,
     currencyCode: timeEntries.currencyCode
   }).from(timeEntries).where(and(
     eq(timeEntries.ticketId, ticketId), eq(timeEntries.isBillable, true), eq(timeEntries.billingStatus, 'not_billed'),

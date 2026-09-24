@@ -186,6 +186,7 @@
       "failedToAssignOrg": "Organisation konnte nicht zugewiesen werden",
       "organizations": "Organisationen",
       "thisPartnerLibraryPolicyAppliesOnlyTo": "Diese Partnerbibliotheksrichtlinie gilt nur für die von Ihnen ausgewählten Organisationen.",
+      "filtersApplyOnAssign": "Diese Filter gelten bei der Zuweisung unten. Leer bedeutet jede Rolle und jedes Betriebssystem. Um die Filter einer Zuweisung zu ändern, schalten Sie sie aus und wieder ein.",
       "allOrganizationsPartnerWide": "Alle Organisationen (partnerweit)",
       "allOrganizationsPartnerWide2": "Alle Organisationen (partnerweit)",
       "assigned": "Zugewiesen",
@@ -441,6 +442,7 @@
         "maxVersions": "Max-Versionen",
         "gFSRetention": "GFS-Aufbewahrung",
         "keepLongerRunningRestorePointsForGrandfather": "Wiederherstellungspunkte für die Großvater-Vater-Sohn-Aufbewahrung länger aufbewahren.",
+        "dailyRetentionBelowFloor": "Die tägliche Aufbewahrung ist auf {{gfsDays}} Tage eingestellt, kürzer als die Aufbewahrungsuntergrenze von {{effectiveDays}} Tagen. Der Ablauf dieses Snapshots ist auf {{effectiveDays}} Tage festgelegt, nicht auf {{gfsDays}} -- der Ablauf unterschreitet nie die Untergrenze. Ein separates Versionslimit kann ältere Snapshots dennoch früher entfernen.",
         "daily2": "Täglich",
         "weekly2": "Wöchentlich",
         "monthly2": "Monatlich",
@@ -844,7 +846,14 @@
         "inherited": "Geerbt",
         "overrideValue": "Überschreibungswert",
         "overridesLabel": "Überschreibungen:",
-        "failedToLoadMonitors": "Überwachungen konnten nicht geladen werden"
+        "failedToLoadMonitors": "Überwachungen konnten nicht geladen werden",
+        "createMonitor": "Monitor erstellen",
+        "monitorDeleted": "Monitor gelöscht",
+        "recommended": {
+          "title": "Empfohlene Monitore",
+          "body": "Breeze liefert integrierte Monitore für CPU, Arbeitsspeicher, Datenträger und Patch-Compliance. Keiner ist dieser Richtlinie bisher zugeordnet.",
+          "action": "Alle integrierten Monitore anhängen"
+        }
       },
       "pamTab": {
         "captureWindowsUACElevationPrompts": "Windows-UAC-Aufforderungen zur Rechteerhöhung erfassen",
@@ -1051,7 +1060,6 @@
         "fri": "Fr",
         "sat": "Sa",
         "sun": "So",
-        "realTimeProtection": "Echtzeitschutz",
         "scheduledScans": "Geplante Scans",
         "minute": "Minute",
         "hour": "Stunde",
@@ -1060,30 +1068,22 @@
         "exclusions": "Ausschlüsse",
         "skipTrustedLocationsDuringScans": "Überspringen Sie vertrauenswürdige Speicherorte bei Scans.",
         "addPathOrProcess": "Pfad oder Prozess hinzufügen",
-        "realTimeFileMonitoring": "Dateiüberwachung in Echtzeit",
-        "scanNewAndModifiedFilesContinuously": "Scannen Sie kontinuierlich neue und geänderte Dateien.",
-        "realTimeProtection2": "realTimeProtection",
-        "behavioralMonitoring": "Verhaltensüberwachung",
-        "detectSuspiciousProcessBehaviorAndScripts": "Erkennen Sie verdächtiges Prozessverhalten und verdächtige Skripte.",
-        "behavioralMonitoring2": "Verhaltensüberwachung",
-        "cloudThreatLookup": "Suche nach Cloud-Bedrohungen",
-        "useCloudReputationForNewIndicators": "Nutzen Sie die Cloud-Reputation für neue Indikatoren.",
-        "cloudLookup": "cloudLookup",
         "autoQuarantine": "Automatische Quarantäne",
         "moveThreatsToQuarantineImmediately": "Verschieben Sie Bedrohungen sofort in die Quarantäne.",
         "autoQuarantine2": "AutoQuarantäne",
-        "notifyUserOnDetection": "Benutzer bei Erkennung benachrichtigen",
-        "sendDeviceNotificationsWhenThreatsAreFound": "Senden Sie Gerätebenachrichtigungen, wenn Bedrohungen gefunden werden.",
-        "notifyUser": "notifyUser",
-        "blockUntrustedUSBDevices": "Blockieren Sie nicht vertrauenswürdige USB Geräte",
-        "preventUnknownRemovableMedia": "Verhindern Sie unbekannte Wechselmedien.",
-        "blockUntrustedUsb": "blockUntrustedUsb",
         "scheduledScans2": "geplante Scans",
         "scanMinute": "scanMinute",
         "scanHour": "scanStunde",
         "scanDayOfMonth": "scanDayOfMonth",
         "scanDayOfWeek": "scanDayOfWeek",
-        "enter": "Eingeben"
+        "enter": "Eingeben",
+        "scanSettings": "Scaneinstellungen",
+        "scanType": "Scantyp",
+        "quickScan": "Schneller Scan",
+        "fullScan": "Vollständiger Scan",
+        "maxFileSizeMb": "Maximale Dateigröße (MB)",
+        "scanTimeoutMinutes": "Scan-Zeitlimit (Minuten)",
+        "scanRunsServerSideDescription": "Breeze startet diesen Scan vom Server aus — das Gerät benötigt keinen lokalen Zeitplan."
       },
       "sensitiveDataTab": {
         "credentials": "Anmeldeinformationen",
@@ -1201,7 +1201,15 @@
         "save": "Speichern",
         "cancel": "Abbrechen",
         "none": "Keine Begründung hinterlegt."
-
+      },
+      "legacyFreeze": {
+        "title": "Neue Regeln werden als Monitore erstellt",
+        "body": "Bestehende Regeln bleiben hier bearbeitbar und werden im nächsten Release in Monitore umgewandelt.",
+        "link": "Monitore-Tab öffnen"
+      },
+      "duplicate": {
+        "title": "Geräte in dieser Richtlinie melden doppelt",
+        "body": "Diese Bedingungen existieren sowohl als angehängter Monitor als auch als Alt-Regel oder -Überwachung: {{names}}"
       }
     }
   },
@@ -1336,6 +1344,8 @@
       "readyToDeployStandalone": "Bereit zum Einsatz."
     },
     "complianceDashboard": {
+      "autoInstallArmed": "Automatische Installation aktiviert",
+      "complianceCheckQueued": "Konformitätsprüfung eingereiht",
       "failedToLoadSoftwarePolicyData": "Das Laden der Softwarerichtliniendaten ist fehlgeschlagen",
       "couldNotLoadLatestPolicyDetailsShowing": "Die neuesten Richtliniendetails konnten nicht geladen werden. Zwischengespeicherte Daten werden angezeigt.",
       "couldNotLoadPolicyDetailsShowingCached": "Richtliniendetails konnten nicht geladen werden. Zwischengespeicherte Daten werden angezeigt.",
@@ -1375,7 +1385,19 @@
       "failedToUpdatePolicy": "Die Richtlinie konnte nicht aktualisiert werden",
       "failedToCreatePolicy": "Richtlinie konnte nicht erstellt werden",
       "policyUpdated": "Richtlinie erfolgreich aktualisiert",
-      "policyCreated": "Richtlinie erfolgreich erstellt"
+      "policyCreated": "Richtlinie erfolgreich erstellt",
+      "armInstallRequiresMfa": "Die Aktivierung der automatischen Installation erfordert Multi-Faktor-Authentifizierung. Schließen Sie die MFA ab und versuchen Sie es erneut.",
+      "armInstallRequiresPermission": "Die Aktivierung der automatischen Installation erfordert die Berechtigung devices.execute. Bitten Sie einen Administrator, sie zu erteilen, und versuchen Sie es dann erneut.",
+      "installStatusPending": "Installation eingereiht",
+      "installStatusInProgress": "Wird installiert…",
+      "installStatusCompleted": "Installiert",
+      "installStatusFailed": "Installation fehlgeschlagen",
+      "installStatusGaveUp": "Nach wiederholten Fehlschlägen aufgegeben",
+      "installStatusSkipped": "Diesen Durchlauf übersprungen",
+      "installSkippedNoCatalog": "Eine erforderliche Regel hat keinen verknüpften Katalogeintrag, daher gibt es nichts zu installieren. Fügen Sie im Richtlinien-Editor eine Katalogverknüpfung hinzu, um dies zu beheben.",
+      "installSkippedCapOrPlatform": "Kein Fehler — entweder wurde die Installationsobergrenze pro Durchlauf erreicht, oder für die Plattform dieses Geräts gibt es keine Installationsmethode für die Software. Wird eventuell im nächsten Durchlauf erneut versucht.",
+      "installAttempts": "{{count}} Versuch(e)",
+      "installLastAttempt": "Letzter Installationsversuch: "
     },
     "deploymentList": {
       "running": "Wird ausgeführt",
@@ -1413,7 +1435,9 @@
       "noDeploymentsYet": "Es wurden noch keine Bereitstellungen erstellt.",
       "failedToCancelDeployment": "Bereitstellung konnte nicht abgebrochen werden",
       "deploymentCancelled": "Bereitstellung abgebrochen",
-      "pageOf": "Seite {{page}} von {{pages}}"
+      "pageOf": "Seite {{page}} von {{pages}}",
+      "policyOwned": "Richtliniengesteuert",
+      "policyOwnedTooltip": "Automatisch erstellt durch die Auto-Installations-Remediation einer Softwarerichtlinie"
     },
     "deploymentProgress": {
       "queued": "In der Warteschlange",
@@ -1597,6 +1621,9 @@
       "s": "s"
     },
     "policyForm": {
+      "dryRunUnassigned": "0 Geräte — meist, weil diese Richtlinie noch keinem Gerät zugewiesen ist; eine vollständig konforme Flotte oder eine leere Standort-Freigabeliste ergibt ebenfalls 0",
+      "manageAssignments": "Zuweisungen von Konfigurationsrichtlinien verwalten",
+      "gracePeriodHelp": "Wird beim nächsten Konformitätsprüflauf angewendet",
       "scope": "Umfang",
       "allOrganizations": "Alle Organisationen",
       "partnerWideTemplate": "(partnerweite Vorlage)",
@@ -1641,7 +1668,16 @@
       "autoUninstall2": "autoUninstall",
       "gracePeriod": "grace-period",
       "gracePeriod2": "Gnadenfrist",
-      "saving": "Speichern..."
+      "saving": "Speichern...",
+      "catalogLink": "Verknüpfter Katalogeintrag",
+      "catalogLinkNone": "Keiner — nicht verknüpft",
+      "autoInstall": "Fehlende Software automatisch installieren",
+      "autoInstallCatalogWarning": "{{count}} von {{total}} Regel(n) haben keinen verknüpften Katalogeintrag und werden als fehlend erkannt, aber nie installiert.",
+      "dryRunLoading": "Wird geprüft, wie viele Geräte betroffen sind...",
+      "dryRunResult": "Dies installiert fehlende Software auf etwa {{count}} Gerät(en).",
+      "dryRunUnavailable": "Die Geräteanzahl-Vorschau ist noch nicht verfügbar. Die Aktivierung wirkt trotzdem beim nächsten Compliance-Durchlauf.",
+      "dryRunNewPolicy": "Dies ist eine neue Richtlinie — die Auswirkung auf Geräte ist erst nach dem ersten Compliance-Durchlauf nach dem Speichern bekannt.",
+      "catalogUnavailable": "Der Softwarekatalog konnte nicht geladen werden, daher sind die Katalogverknüpfungs-Auswahlfelder unten leer. Das ist nicht dasselbe wie „keine Katalogeinträge vorhanden“ — laden Sie die Seite neu, bevor Sie annehmen, dass eine Regel nicht verknüpft werden kann."
     },
     "softwareCatalog": {
       "ready": "Bereit",

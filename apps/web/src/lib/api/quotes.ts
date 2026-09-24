@@ -19,6 +19,8 @@
 
 import { fetchWithAuth } from '../../stores/auth';
 import type {
+  AcceptQuoteOnBehalfInput,
+  DeclineQuoteOnBehalfInput,
   CreateQuoteInput,
   CreateQuoteOrderInput,
   UpdateQuoteInput,
@@ -378,6 +380,31 @@ export function resendQuote(id: string, opts: SendQuoteOptions = {}): Promise<Re
   });
 }
 
+/** Record a customer's acceptance on their behalf (POST
+ *  /quotes/:id/accept-on-behalf). Gated server-side on quotes:accept. This
+ *  runs the full conversion: the invoice is numbered and issued now, recurring
+ *  lines become draft contracts, and the partner's auto-email flag is honoured.
+ *  Callers MUST wrap this in `runAction` — see the module header. */
+export function acceptQuoteOnBehalf(id: string, body: AcceptQuoteOnBehalfInput): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/accept-on-behalf`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+/** Record a customer's decline on their behalf (POST
+ *  /quotes/:id/decline-on-behalf, #6634). Gated server-side on quotes:accept;
+ *  only a sent or viewed quote qualifies. Responds with `{ data: <quote> }`.
+ *  Callers MUST wrap this in `runAction` — see the module header. */
+export function declineQuoteOnBehalf(id: string, body: DeclineQuoteOnBehalfInput): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/decline-on-behalf`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
 /** Fetch a sent quote's customer-facing share link WITHOUT emailing anything
  *  (GET /quotes/:id/share-link) — for pasting into a chat or SMS by hand. Gated
  *  server-side on quotes:send (it hands out a live accept credential) and
@@ -413,4 +440,36 @@ export function addQuoteImageFromUrl(id: string, url: string): Promise<Response>
  *  The route serves the raw bytes; used as an `<img src>` for the editor preview. */
 export function quoteImageUrl(id: string, imageId: string): string {
   return `/api/v1/quotes/${id}/images/${imageId}`;
+}
+
+// ---- accept-on-behalf evidence (#6633) -------------------------------------
+
+/** Max evidence file size the API accepts, mirrored here so the web layer can
+ *  reject an oversized pick before ever sending it. */
+export const QUOTE_ACCEPTANCE_EVIDENCE_MAX_BYTES = 10 * 1024 * 1024;
+
+/** MIME types the API accepts for an acceptance-evidence upload. */
+export const QUOTE_ACCEPTANCE_EVIDENCE_ALLOWED_TYPES = ['application/pdf', 'image/png', 'image/jpeg'];
+
+/** Attach (or replace) the evidence file behind an on-behalf acceptance
+ *  (POST /quotes/:id/acceptance/evidence). Multipart FormData — `fetchWithAuth`
+ *  deliberately does NOT set a JSON Content-Type for FormData so the browser
+ *  appends the multipart boundary itself (see `uploadQuoteImage` above). Only
+ *  works when the quote's latest acceptance has origin `on_behalf`; a prior
+ *  file is replaced, not appended to. Gated server-side on quotes:accept.
+ *  Responds with `{ data: { acceptanceId, evidence: { filename, contentType,
+ *  sizeBytes, uploadedAt } } }`. Callers MUST wrap this in `runAction`. */
+export function uploadQuoteAcceptanceEvidence(id: string, file: File): Promise<Response> {
+  const form = new FormData();
+  form.append('file', file);
+  return fetchWithAuth(`/quotes/${id}/acceptance/evidence`, { method: 'POST', body: form });
+}
+
+/** Download an on-behalf acceptance's evidence file (GET
+ *  /quotes/:id/acceptance/evidence). The route streams the file back as an
+ *  attachment. Gated server-side on quotes:read. This is a read, not a
+ *  mutation — callers should NOT wrap it in `runAction`; turn the response
+ *  into a blob and drive a temporary `<a download>` instead. */
+export function downloadQuoteAcceptanceEvidence(id: string): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/acceptance/evidence`);
 }

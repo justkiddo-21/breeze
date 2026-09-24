@@ -27,7 +27,9 @@ import {
 } from '../services/aiAgent';
 import { runPreFlightChecks, abortActivePlan, settleBlockedTurnForNewMessage } from '../services/aiAgentSdk';
 import { sanitizeThrownToolError } from '../services/aiToolErrors';
+import { redactPersistedToolInput } from '../services/aiToolOutput';
 import { streamingSessionManager } from '../services/streamingSessionManager';
+import { drainPendingRunResults } from '../services/workspace/chatRunBridge';
 import {
   calculateCatalogCostCents,
   calculateCostCents,
@@ -38,7 +40,7 @@ import {
   type CatalogPricingSnapshot,
 } from '../services/aiCostTracker';
 import { createTicket, changeTicketStatus, TicketServiceError } from '../services/ticketService';
-import { createTimeEntry } from '../services/timeEntryService';
+import { createTimeEntry, TimeEntryServiceError } from '../services/timeEntryService';
 import { writeRouteAudit } from '../services/auditEvents';
 import { assertNotLocked } from '../services/effectiveSettings';
 import { normalizeAlertThresholds, evaluateAiBudgetThresholds } from '../services/aiBudgetAlerts';
@@ -164,7 +166,16 @@ async function releaseUnusedTurn(orgId: string, dispatch: AiTurnBudgetDispatch):
 
 export const aiRoutes = new Hono();
 const requireAiRead = requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action);
+// Org-level AI config (budget) and cross-owner moderation (flag/unflag) stay
+// organizations:write actions.
 const requireAiWrite = requirePermission(PERMISSIONS.ORGS_WRITE.resource, PERMISSIONS.ORGS_WRITE.action);
+// #6396: opening and driving your OWN chat session is a dedicated capability
+// (ai_sessions:use) held by Org Admin, Org Technician and Partner Technician — NOT
+// organizations:write, which no seeded org-scope role holds. Tool calls inside
+// the session are re-checked against TOOL_PERMISSIONS (route parity), so this
+// gate opens the conversation without widening what the role can do. Own-session
+// READS use it too: seeded org roles hold neither organizations:read nor :write.
+const requireAiUse = requirePermission(PERMISSIONS.AI_SESSIONS_USE.resource, PERMISSIONS.AI_SESSIONS_USE.action);
 // SR5-09: reading OTHER users' AI sessions (the admin audit dashboard) is a
 // dedicated, higher-trust capability — NOT organizations:read, which every
 // technician/viewer holds and which for ordinary AI routes only ever returns the
@@ -185,7 +196,7 @@ aiRoutes.use('*', authMiddleware);
 aiRoutes.post(
   '/sessions',
   requireScope('organization', 'partner', 'system'),
-  requireAiWrite,
+  requireAiUse,
   requireMfa(),
   zValidator('json', createAiSessionSchema),
   async (c) => {
@@ -220,7 +231,7 @@ aiRoutes.post(
 aiRoutes.get(
   '/sessions',
   requireScope('organization', 'partner', 'system'),
-  requireAiRead,
+  requireAiUse,
   zValidator('query', aiSessionQuerySchema),
   async (c) => {
     const auth = c.get('auth');
@@ -241,7 +252,7 @@ aiRoutes.get(
 aiRoutes.get(
   '/m365-connections',
   requireScope('organization', 'partner', 'system'),
-  requireAiRead,
+  requireAiUse,
   async (c) => {
     const auth = c.get('auth');
     const rows = await listM365Connections(auth);
@@ -254,7 +265,7 @@ aiRoutes.get(
 aiRoutes.get(
   '/sessions/search',
   requireScope('organization', 'partner', 'system'),
-  requireAiRead,
+  requireAiUse,
   async (c) => {
     const auth = c.get('auth');
     const query = c.req.query('q');
@@ -273,7 +284,7 @@ aiRoutes.get(
 aiRoutes.get(
   '/sessions/:id',
   requireScope('organization', 'partner', 'system'),
-  requireAiRead,
+  requireAiUse,
   async (c) => {
     const auth = c.get('auth');
     const sessionId = c.req.param('id')!;
@@ -291,7 +302,7 @@ aiRoutes.get(
 aiRoutes.delete(
   '/sessions/:id',
   requireScope('organization', 'partner', 'system'),
-  requireAiWrite,
+  requireAiUse,
   requireMfa(),
   async (c) => {
     const auth = c.get('auth');
@@ -323,7 +334,7 @@ aiRoutes.delete(
 aiRoutes.patch(
   '/sessions/:id',
   requireScope('organization', 'partner', 'system'),
-  requireAiWrite,
+  requireAiUse,
   requireMfa(),
   zValidator('json', z.object({ title: z.string().min(1).max(255) })),
   async (c) => {
@@ -622,22 +633,26 @@ aiRoutes.post(
     }
 
     let timeLogged = false;
+    let timeLogError: string | undefined;
     if (body.timeMinutes > 0 && (auth.scope === 'partner' || auth.scope === 'system')) {
       try {
         const endedAt = new Date();
         const startedAt = new Date(endedAt.getTime() - body.timeMinutes * 60_000);
         await createTimeEntry(
-          { ticketId: ticket.id, startedAt, endedAt, description: 'Logged from AI conversation', isBillable: body.billable },
+          { ticketId: ticket.id, startedAt, endedAt, description: 'Logged from AI conversation', ...(body.billable !== undefined ? { isBillable: body.billable } : {}) },
           timeActorFrom(c),
         );
         timeLogged = true;
       } catch (err) {
         console.error(`[AI] Ticket ${ticket.id} created but time entry failed:`, err);
+        timeLogError = err instanceof TimeEntryServiceError
+          ? err.message
+          : 'The time entry could not be logged. Please log it on the ticket.';
       }
     }
 
     writeRouteAudit(c, { orgId: session.orgId, action: 'ai.session.create_ticket', resourceType: 'ticket', resourceId: ticket.id });
-    return c.json({ data: ticket, resolved, timeLogged }, 201);
+    return c.json({ data: ticket, resolved, timeLogged, ...(timeLogError ? { timeLogError } : {}) }, 201);
   }
 );
 
@@ -649,7 +664,7 @@ aiRoutes.post(
 aiRoutes.post(
   '/sessions/:id/messages',
   requireScope('organization', 'partner', 'system'),
-  requireAiWrite,
+  requireAiUse,
   requireMfa(),
   zValidator('json', sendAiMessageSchema),
   async (c) => {
@@ -856,7 +871,7 @@ aiRoutes.post(
       throw err;
     }
 
-    if (!streamingSessionManager.tryTransitionToProcessing(activeSession)) {
+    if (!streamingSessionManager.tryTransitionToProcessing(activeSession, budgetDispatch.reservationId)) {
       await releaseUnusedTurn(dbSession.orgId, budgetDispatch);
       return c.json({ error: 'A message is already being processed for this session' }, 409);
     }
@@ -895,8 +910,17 @@ aiRoutes.post(
       }
     }
 
-    // Push message to the streaming input and start turn timeout
-    activeSession.inputController.pushMessage(sanitizedContent);
+    // Execution plane (spec §5.5): an `analysis` run associated with this
+    // session may have finished between turns (chat-initiated launch is
+    // currently disabled, #6086, but a preconfigured agent's run can still
+    // report back to a session this way). Its summary is prepended HERE
+    // rather than pushed when it arrived — pushing then would start a turn
+    // with no SSE subscriber, so the assistant's reply would never reach the
+    // browser.
+    const pendingRunResults = drainPendingRunResults(activeSession);
+    activeSession.inputController.pushMessage(
+      pendingRunResults ? `${pendingRunResults}\n\n${sanitizedContent}` : sanitizedContent,
+    );
     streamingSessionManager.startTurnTimeout(activeSession);
 
     const subscriptionId = crypto.randomUUID();
@@ -939,7 +963,7 @@ aiRoutes.post(
 aiRoutes.post(
   '/sessions/:id/interrupt',
   requireScope('organization', 'partner', 'system'),
-  requireAiWrite,
+  requireAiUse,
   requireMfa(),
   async (c) => {
     const auth = c.get('auth');
@@ -986,7 +1010,7 @@ aiRoutes.post(
 aiRoutes.post(
   '/sessions/:id/approve/:executionId',
   requireScope('organization', 'partner', 'system'),
-  requireAiWrite,
+  requireAiUse,
   requireMfa(),
   zValidator('json', approveToolSchema),
   async (c) => {
@@ -1040,7 +1064,7 @@ aiRoutes.post(
 aiRoutes.post(
   '/sessions/:id/pause',
   requireScope('organization', 'partner', 'system'),
-  requireAiWrite,
+  requireAiUse,
   requireMfa(),
   zValidator('json', pauseAiSchema),
   async (c) => {
@@ -1097,7 +1121,7 @@ aiRoutes.post(
 aiRoutes.post(
   '/sessions/:id/approve-plan',
   requireScope('organization', 'partner', 'system'),
-  requireAiWrite,
+  requireAiUse,
   requireMfa(),
   zValidator('json', approvePlanSchema),
   async (c) => {
@@ -1172,7 +1196,7 @@ aiRoutes.post(
 aiRoutes.post(
   '/sessions/:id/abort-plan',
   requireScope('organization', 'partner', 'system'),
-  requireAiWrite,
+  requireAiUse,
   requireMfa(),
   async (c) => {
     const auth = c.get('auth');
@@ -1224,7 +1248,7 @@ aiRoutes.post(
 aiRoutes.get(
   '/usage',
   requireScope('organization', 'partner', 'system'),
-  requireAiRead,
+  requireAiUse,
   async (c) => {
     const auth = c.get('auth');
     const orgId = c.req.query('orgId') || auth.orgId;
@@ -1354,7 +1378,7 @@ aiRoutes.get(
 aiRoutes.get(
   '/admin/security-events',
   requireScope('organization', 'partner', 'system'),
-  requireAiRead,
+  requireAiSessionsReadAll,
   async (c) => {
     const auth = c.get('auth');
     const orgId = c.req.query('orgId') || auth.orgId;
@@ -1411,7 +1435,7 @@ aiRoutes.get(
 aiRoutes.get(
   '/admin/tool-executions',
   requireScope('organization', 'partner', 'system'),
-  requireAiRead,
+  requireAiSessionsReadAll,
   async (c) => {
     const auth = c.get('auth');
     const orgId = c.req.query('orgId') || auth.orgId;
@@ -1556,7 +1580,10 @@ aiRoutes.get(
         failed: Number(row.failed),
         rejected: Number(row.rejected),
       })),
-      executions,
+      executions: executions.map((execution) => ({
+        ...execution,
+        toolInput: redactPersistedToolInput(execution.toolInput),
+      })),
     });
   }
 );

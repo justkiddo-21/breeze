@@ -72,6 +72,7 @@ vi.mock('../db/schema', () => ({
     storageIdentity: 'backupSnapshots.storageIdentity',
     parentSnapshotId: 'backupSnapshots.parentSnapshotId',
     isIncremental: 'backupSnapshots.isIncremental',
+    fileIndexStatus: 'backupSnapshots.fileIndexStatus',
   },
   backupSnapshotRetirements: {
     id: 'backupSnapshotRetirements.id',
@@ -129,6 +130,11 @@ vi.mock('../jobs/backupRetention', () => ({
 vi.mock('./backupSnapshotStorage', () => ({
   applyBackupSnapshotImmutability: vi.fn(),
   checkBackupProviderCapabilities: vi.fn(),
+}));
+
+const enqueueSnapshotFileIndexHydrationMock = vi.hoisted(() => vi.fn());
+vi.mock('../jobs/backupSnapshotFileIndexWorker', () => ({
+  enqueueSnapshotFileIndexHydration: (...args: unknown[]) => enqueueSnapshotFileIndexHydrationMock(...(args as [])),
 }));
 
 const resolveBackupProtectionForDeviceMock = vi.fn();
@@ -984,6 +990,57 @@ describe('backup result persistence', () => {
     expect(setArg.referencedFiles).toBe(17);
   });
 
+  it('finalizes transferredSize as uploaded bytes (bytesBackedUp minus referencedBytes) on completion (#5410)', async () => {
+    const updateChain = chainMock([{ id: 'job-1', orgId: 'org-1', configId: null, backupType: 'file' }]);
+    vi.mocked(db.update).mockReturnValue(updateChain as any);
+
+    await applyBackupCommandResultToJob({
+      jobId: 'job-1',
+      orgId: 'org-1',
+      deviceId: 'device-1',
+      resultStatus: 'completed',
+      result: { filesBackedUp: 10_047, bytesBackedUp: 185_000_000, referencedBytes: 185_000_000, referencedFiles: 10_047 },
+    });
+
+    const setArg = updateChain.set.mock.calls[0][0] as { totalSize: number; transferredSize: number };
+    // A fully-deduped incremental run protected the whole corpus but uploaded nothing.
+    expect(setArg.totalSize).toBe(185_000_000);
+    expect(setArg.transferredSize).toBe(0);
+  });
+
+  it('finalizes transferredSize as bytesBackedUp when the agent reports no dedup stats (full backup / old agent)', async () => {
+    const updateChain = chainMock([{ id: 'job-1', orgId: 'org-1', configId: null, backupType: 'file' }]);
+    vi.mocked(db.update).mockReturnValue(updateChain as any);
+
+    await applyBackupCommandResultToJob({
+      jobId: 'job-1',
+      orgId: 'org-1',
+      deviceId: 'device-1',
+      resultStatus: 'completed',
+      result: { filesBackedUp: 4, bytesBackedUp: 185_000_000 },
+    });
+
+    // The terminal result overwrites whatever mid-run counter an API restart left behind.
+    const setArg = updateChain.set.mock.calls[0][0] as { transferredSize: number };
+    expect(setArg.transferredSize).toBe(185_000_000);
+  });
+
+  it('leaves transferredSize untouched when the terminal result carries no byte count', async () => {
+    const updateChain = chainMock([{ id: 'job-1', orgId: 'org-1', configId: null, backupType: 'file' }]);
+    vi.mocked(db.update).mockReturnValue(updateChain as any);
+
+    await applyBackupCommandResultToJob({
+      jobId: 'job-1',
+      orgId: 'org-1',
+      deviceId: 'device-1',
+      resultStatus: 'completed',
+      result: { filesBackedUp: 4 },
+    });
+
+    const setArg = updateChain.set.mock.calls[0][0] as Record<string, unknown>;
+    expect(setArg).not.toHaveProperty('transferredSize');
+  });
+
   it('does not write referencedSize/referencedFiles when the agent result carries neither (old agent)', async () => {
     const updateChain = chainMock([{ id: 'job-1', orgId: 'org-1', configId: null, backupType: 'file' }]);
     vi.mocked(db.update).mockReturnValue(updateChain as any);
@@ -1212,6 +1269,180 @@ describe('backup result persistence', () => {
         backupPath: '',
       }),
     ]);
+  });
+
+  describe('W09 (#6464) server file index guard + hydration enqueue', () => {
+    it('skips the delete+reinsert when the snapshot already carries a complete server file index', async () => {
+      // Call order for source: 'agent' + a success result: (1) the late-result
+      // fence's tx.update (same spy as db.update, per this file's mock) writes
+      // the main job row; (2) the snapshot UPDATE branch (existingSnapshot
+      // found) returns the pre-existing row, including its already-complete
+      // fileIndexStatus.
+      vi.mocked(db.update)
+        .mockReturnValueOnce(
+          chainMock([{ id: 'job-1', orgId: 'org-1', configId: 'config-1', backupType: 'file', backupMode: 'file' }]) as any
+        )
+        .mockReturnValueOnce(
+          chainMock([{ id: 'snapshot-db-1', jobId: 'job-1', snapshotId: 'provider-snap-1', fileIndexStatus: 'complete' }]) as any
+        )
+        .mockReturnValue(chainMock([]) as any);
+      vi.mocked(db.select)
+        .mockReturnValueOnce(chainMock([{ id: 'snapshot-db-1' }]) as any) // existingSnapshot lookup -> update branch
+        .mockReturnValueOnce(
+          chainMock([{ featureLinkId: null, policyId: null, deviceId: 'device-1' }]) as any
+        );
+      vi.mocked(applyGfsTagsToSnapshot).mockResolvedValue({ daily: true });
+      vi.mocked(resolveGfsConfigForJob).mockResolvedValue(null);
+      vi.mocked(computeExpiresAt).mockReturnValue(null);
+
+      await applyBackupCommandResultToJob({
+        jobId: 'job-1',
+        orgId: 'org-1',
+        deviceId: 'device-1',
+        resultStatus: 'completed',
+        result: {
+          snapshot: {
+            id: 'provider-snap-1',
+            files: [{ sourcePath: '/a', backupPath: 'snapshots/provider-snap-1/files/a.gz', size: 1 }],
+          },
+        } as any,
+      });
+
+      expect(db.delete).not.toHaveBeenCalled();
+    });
+
+    it('stamps fileIndexStatus=agent when it writes rows from the agent-reported index', async () => {
+      vi.mocked(db.update)
+        .mockReturnValueOnce(
+          chainMock([{ id: 'job-1', orgId: 'org-1', configId: 'config-1', backupType: 'file', backupMode: 'file' }]) as any
+        )
+        .mockReturnValue(chainMock([]) as any);
+      vi.mocked(db.select)
+        .mockReturnValueOnce(chainMock([]) as any) // existingSnapshot lookup -> insert branch (new snapshot)
+        .mockReturnValueOnce(
+          chainMock([{ featureLinkId: null, policyId: null, deviceId: 'device-1' }]) as any
+        );
+      vi.mocked(db.insert)
+        .mockReturnValueOnce(
+          chainMock([{ id: 'snapshot-db-1', jobId: 'job-1', snapshotId: 'provider-snap-1' }]) as any
+        )
+        .mockReturnValueOnce(chainMock([]) as any);
+      vi.mocked(db.delete).mockReturnValueOnce(chainMock([]) as any);
+      vi.mocked(applyGfsTagsToSnapshot).mockResolvedValue({ daily: true });
+      vi.mocked(resolveGfsConfigForJob).mockResolvedValue(null);
+      vi.mocked(computeExpiresAt).mockReturnValue(null);
+
+      await applyBackupCommandResultToJob({
+        jobId: 'job-1',
+        orgId: 'org-1',
+        deviceId: 'device-1',
+        resultStatus: 'completed',
+        result: {
+          snapshot: {
+            id: 'provider-snap-1',
+            files: [{ sourcePath: '/a', backupPath: 'snapshots/provider-snap-1/files/a.gz', size: 1 }],
+          },
+        } as any,
+      });
+
+      const stampSet = vi.mocked(db.update).mock.results.at(-1)!.value?.set;
+      expect(stampSet).toHaveBeenCalledWith(expect.objectContaining({ fileIndexStatus: 'agent' }));
+    });
+
+    it('enqueues file-index hydration when referencedFiles > 0', async () => {
+      vi.mocked(db.update)
+        .mockReturnValueOnce(
+          chainMock([{ id: 'job-1', orgId: 'org-1', configId: 'config-1', backupType: 'file', backupMode: 'file' }]) as any
+        )
+        .mockReturnValue(chainMock([]) as any);
+      vi.mocked(db.select)
+        .mockReturnValueOnce(chainMock([]) as any)
+        .mockReturnValueOnce(
+          chainMock([{ featureLinkId: null, policyId: null, deviceId: 'device-1' }]) as any
+        );
+      vi.mocked(db.insert).mockReturnValueOnce(
+        chainMock([{ id: 'snapshot-db-1', jobId: 'job-1', snapshotId: 'provider-snap-1' }]) as any
+      );
+      vi.mocked(applyGfsTagsToSnapshot).mockResolvedValue({ daily: true });
+      vi.mocked(resolveGfsConfigForJob).mockResolvedValue(null);
+      vi.mocked(computeExpiresAt).mockReturnValue(null);
+
+      await applyBackupCommandResultToJob({
+        jobId: 'job-1',
+        orgId: 'org-1',
+        deviceId: 'device-1',
+        resultStatus: 'completed',
+        result: { snapshotId: 'provider-snap-1', filesBackedUp: 0, referencedFiles: 40 } as any,
+      });
+
+      expect(enqueueSnapshotFileIndexHydrationMock).toHaveBeenCalledWith('snapshot-db-1', 'result');
+    });
+
+    it('does not enqueue hydration when referencedFiles is NULL or 0', async () => {
+      vi.mocked(db.update)
+        .mockReturnValueOnce(
+          chainMock([{ id: 'job-1', orgId: 'org-1', configId: 'config-1', backupType: 'file', backupMode: 'file' }]) as any
+        )
+        .mockReturnValue(chainMock([]) as any);
+      vi.mocked(db.select)
+        .mockReturnValueOnce(chainMock([]) as any)
+        .mockReturnValueOnce(
+          chainMock([{ featureLinkId: null, policyId: null, deviceId: 'device-1' }]) as any
+        );
+      vi.mocked(db.insert).mockReturnValueOnce(
+        chainMock([{ id: 'snapshot-db-1', jobId: 'job-1', snapshotId: 'provider-snap-1' }]) as any
+      );
+      vi.mocked(applyGfsTagsToSnapshot).mockResolvedValue({ daily: true });
+      vi.mocked(resolveGfsConfigForJob).mockResolvedValue(null);
+      vi.mocked(computeExpiresAt).mockReturnValue(null);
+
+      await applyBackupCommandResultToJob({
+        jobId: 'job-1',
+        orgId: 'org-1',
+        deviceId: 'device-1',
+        resultStatus: 'completed',
+        result: { snapshotId: 'provider-snap-1', filesBackedUp: 1 } as any,
+      });
+
+      expect(enqueueSnapshotFileIndexHydrationMock).not.toHaveBeenCalled();
+    });
+
+    it('does not throw when the hydration enqueue rejects (e.g. Redis is down) — job/snapshot rows are already committed', async () => {
+      vi.mocked(db.update)
+        .mockReturnValueOnce(
+          chainMock([{ id: 'job-1', orgId: 'org-1', configId: 'config-1', backupType: 'file', backupMode: 'file' }]) as any
+        )
+        .mockReturnValue(chainMock([]) as any);
+      vi.mocked(db.select)
+        .mockReturnValueOnce(chainMock([]) as any)
+        .mockReturnValueOnce(
+          chainMock([{ featureLinkId: null, policyId: null, deviceId: 'device-1' }]) as any
+        );
+      vi.mocked(db.insert).mockReturnValueOnce(
+        chainMock([{ id: 'snapshot-db-1', jobId: 'job-1', snapshotId: 'provider-snap-1' }]) as any
+      );
+      vi.mocked(applyGfsTagsToSnapshot).mockResolvedValue({ daily: true });
+      vi.mocked(resolveGfsConfigForJob).mockResolvedValue(null);
+      vi.mocked(computeExpiresAt).mockReturnValue(null);
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      enqueueSnapshotFileIndexHydrationMock.mockRejectedValueOnce(new Error('ECONNREFUSED redis'));
+
+      await expect(
+        applyBackupCommandResultToJob({
+          jobId: 'job-1',
+          orgId: 'org-1',
+          deviceId: 'device-1',
+          resultStatus: 'completed',
+          result: { snapshotId: 'provider-snap-1', filesBackedUp: 0, referencedFiles: 40 } as any,
+        }),
+      ).resolves.not.toThrow();
+
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('snapshot-db-1'),
+        expect.any(Error),
+      );
+      consoleErrorSpy.mockRestore();
+    });
   });
 
   describe('D18 W01 -- lineage on write + late-result fence', () => {

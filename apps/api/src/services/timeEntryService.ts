@@ -1,9 +1,16 @@
 import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, or, sql, type AnyColumn, type SQL } from 'drizzle-orm';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { timeEntries, ticketParts, tickets, ticketCategories, organizations, partners, users, ticketComments } from '../db/schema';
+import { workTypes } from '../db/schema/workTypes';
 import { emitTimeEntryEvent } from './timeEntryEvents';
-import { getOrgBillingDefaults } from './ticketConfigService';
+import { loadCardsForOrg } from './billingProfileService';
+import { resolveBillingRule, type BillingRule } from './billingRuleResolver';
+import { getActiveWorkType } from './workTypeService';
+import { computeBillableMinutes, billableMinutesSql, BILLABLE_MINUTES_CHECK_NAME } from './billableMinutes';
+import { pgErrorCode, pgErrorConstraint } from '../utils/pgErrors';
+import { captureException } from './sentry';
 import { readOrgStampingDefaults } from './orgCurrencyCore';
+import { isMissingRateGap } from './invoiceAssembly';
 import { CURRENCY_CODES, isZeroDecimal, isRepresentableInCurrency, minorUnitExponent, roundToCurrency, multiplyToCurrency, toMinorUnits, fromMinorUnits } from '@breeze/shared';
 import type { CreateTimeEntryInput, UpdateTimeEntryInput, TicketPartInput, BillingStatus, TimeEntrySource } from '@breeze/shared';
 
@@ -43,7 +50,26 @@ export type TimeEntryServiceErrorCode =
   | 'ENDED_AT_REQUIRED'
   | 'RANGE_OUTSIDE_SIGNAL'
   | 'INVALID_TZ'
-  | 'ORG_DENIED';
+  | 'ORG_DENIED'
+  /** 400 — a caller-supplied work_type_id that is not an ACTIVE row of the acting partner. */
+  | 'WORK_TYPE_NOT_FOUND'
+  | 'RATE_REQUIRES_BILLABLE'
+  | 'MANAGE_BILLING_REQUIRED'
+  /** 409 — UPDATE ... RETURNING matched zero rows (entry re-pointed/deleted between the read and the write). */
+  | 'ENTRY_UPDATE_LOST'
+  /** 409 — UPDATE ... RETURNING matched zero rows (part re-pointed/deleted between the read and the write). */
+  | 'PART_UPDATE_LOST'
+  /** 409 — DELETE ... RETURNING matched zero rows (part re-pointed between the lock-read and the delete). */
+  | 'PART_DELETE_LOST'
+  /**
+   * 422 — `time_entries_billable_minutes_chk` rejected the write (#6463): the
+   * TypeScript `computeBillableMinutes()` and the SQL `billableMinutesSql()`
+   * disagree about this row's billed quantity. A server-side defect, not the
+   * caller's payload — but it is deterministic for the offending row, so it is
+   * reported as a verdict rather than a retryable fault (see
+   * {@link refuseBillableMinutesDrift}).
+   */
+  | 'BILLABLE_MINUTES_DRIFT';
 
 export class TimeEntryServiceError extends Error {
   constructor(
@@ -53,6 +79,107 @@ export class TimeEntryServiceError extends Error {
   ) {
     super(message);
     this.name = 'TimeEntryServiceError';
+  }
+}
+
+/**
+ * #6463 — the missing half of the #4628 W03 contract.
+ *
+ * W03's premise is that a disagreement between `computeBillableMinutes()` (TS)
+ * and `billableMinutesSql()` (SQL) becomes a `23514` on
+ * `time_entries_billable_minutes_chk` rather than a wrong invoice. That was
+ * honoured at the database and nowhere above it: `handleServiceError` rethrows
+ * anything that is not a `TimeEntryServiceError`, so the violation escaped as a
+ * bare postgres error — no report, no code, and nothing telling the technician
+ * their stop did not land while the timer kept running.
+ *
+ * Wraps a statement that writes `billable_minutes` and converts ONLY that
+ * constraint's 23514 into a typed refusal. Every other error (including a
+ * 23514 from a different CHECK on the same table) propagates untouched.
+ *
+ * Reporting is `captureException`, NOT console alone. `handleServiceError`
+ * answers a `TimeEntryServiceError` with `c.json(...)` instead of rethrowing,
+ * so this error never reaches Hono's `app.onError` — and `Sentry.init` here
+ * installs no `captureConsoleIntegration`, so a `console.error` would page
+ * nobody. Reporting from inside the catch is the only thing that makes a real
+ * drift visible without waiting for a technician to phone it in. The original
+ * error travels with it: postgres's own message/detail for a CHECK on a
+ * computed expression is the single most useful diagnostic here.
+ *
+ * Status is 422, deliberately, and not the 500 this class of defect would
+ * usually earn. The drift is deterministic for the offending row, and
+ * `apps/mobile/src/services/timeEntryQueue.ts` parks only
+ * `PERMANENT_STATUSES = {400, 404, 409, 422}` in needs-attention — a 5xx is
+ * read as transient and retried forever, wedging every write queued behind it
+ * and losing far more billable work than the one row.
+ *
+ * The CHECK is IMMEDIATE (see the 2026-10-24-210000 migration), so the error is
+ * raised by the offending statement itself rather than substituted at COMMIT.
+ */
+type BillableMinutesDriftContext = {
+  op: 'createTimeEntry' | 'stopRunningEntry' | 'updateTimeEntry';
+  entryId: string | null;
+  /** Tenant + actor identity: the first triage question on a multi-tenant drift. */
+  userId: string;
+  partnerId: string | null;
+  orgId: string | null;
+  /**
+   * `'computed-in-sql'` on the plain-stop path, where the minute count lives
+   * only inside the UPDATE's own expression (see `durationExpr`). `at` is
+   * logged alongside so that row is still findable without an id.
+   */
+  durationMinutes: number | 'computed-in-sql' | null;
+  minimumMinutes: number | null;
+  roundingIncrementMinutes: number | null;
+  at?: string;
+};
+
+/** Per-op wording: only `createTimeEntry`/`stopRunningEntry` lose the whole entry. */
+const BILLABLE_MINUTES_DRIFT_MESSAGE: Record<BillableMinutesDriftContext['op'], string> = {
+  createTimeEntry:
+    'This time entry could not be recorded — the billed-minutes calculation disagrees with the database. '
+    + 'Your work was not saved; report this to support.',
+  stopRunningEntry:
+    'Your timer could not be stopped — the billed-minutes calculation disagrees with the database. '
+    + 'The timer is still running; report this to support.',
+  updateTimeEntry:
+    'This change could not be saved — the billed-minutes calculation disagrees with the database. '
+    + 'The entry itself is unchanged; report this to support.',
+};
+
+async function refuseBillableMinutesDrift<T>(
+  context: BillableMinutesDriftContext,
+  write: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await write();
+  } catch (err) {
+    if (pgErrorCode(err) !== '23514' || pgErrorConstraint(err) !== BILLABLE_MINUTES_CHECK_NAME) throw err;
+    const detail = {
+      constraint: BILLABLE_MINUTES_CHECK_NAME,
+      op: context.op,
+      entryId: context.entryId,
+      userId: context.userId,
+      partnerId: context.partnerId,
+      orgId: context.orgId,
+      durationMinutes: context.durationMinutes,
+      minimumMinutes: context.minimumMinutes,
+      roundingIncrementMinutes: context.roundingIncrementMinutes,
+      ...(context.at === undefined ? {} : { at: context.at }),
+    };
+    console.error('[timeEntryService] BILLABLE_MINUTES_DRIFT', detail, err);
+    captureException(err, undefined, {
+      service: 'timeEntryService',
+      code: 'BILLABLE_MINUTES_DRIFT',
+      ...Object.fromEntries(
+        Object.entries(detail).map(([key, value]) => [key, value === null ? 'null' : String(value)]),
+      ),
+    });
+    throw new TimeEntryServiceError(
+      BILLABLE_MINUTES_DRIFT_MESSAGE[context.op],
+      422,
+      'BILLABLE_MINUTES_DRIFT',
+    );
   }
 }
 
@@ -74,6 +201,7 @@ export type TimeEntryAuditMutation = {
   orgId: string | null;
   /** W06 (#3900): the server-stamped provenance of the affected entry. */
   source?: TimeEntrySource;
+  workTypeId?: string | null;
 };
 
 export interface TimeEntryActor {
@@ -84,6 +212,8 @@ export interface TimeEntryActor {
   partnerId: string | null;
   /** wildcard-permission holders (computed in routes): may manage others' entries + approve */
   manageAll: boolean;
+  /** May change card-resolved billing terms; never granted to a system writer. */
+  manageBilling: boolean;
   /**
    * auth.accessibleOrgIds — the org-axis allowlist. `null` = system scope
    * (unrestricted). A partner user with orgAccess='selected' carries only the
@@ -99,13 +229,14 @@ export interface TimeEntryActor {
 function recordAuditMutation(
   actor: TimeEntryActor,
   action: TimeEntryAuditMutation['action'],
-  entry: { id: string; orgId?: string | null; source?: string | null },
+  entry: { id: string; orgId?: string | null; source?: string | null; workTypeId?: string | null },
 ): void {
   actor.recordAuditMutation?.({
     action,
     entryId: entry.id,
     orgId: entry.orgId ?? null,
     ...(entry.source ? { source: entry.source as TimeEntrySource } : {}),
+    ...(entry.workTypeId !== undefined ? { workTypeId: entry.workTypeId } : {}),
   });
 }
 
@@ -192,53 +323,129 @@ async function resolveTicketOrg(
   return { partnerId: ticket.partnerId ?? org.partnerId ?? null, currencyCode: org.currencyCode };
 }
 
-async function getCategoryDefaults(
-  categoryId: string
-): Promise<{ defaultBillable: boolean; defaultHourlyRate: string | null; rateCurrency: string | null } | null> {
+async function getCategoryDefaults(categoryId: string): Promise<{ defaultWorkTypeId: string | null } | null> {
   const rows = await runOutsideDbContext(() =>
-    withSystemDbAccessContext(() =>
-      db
-        .select({
-          id: ticketCategories.id,
-          partnerId: ticketCategories.partnerId,
-          defaultBillable: ticketCategories.defaultBillable,
-          defaultHourlyRate: ticketCategories.defaultHourlyRate,
-          rateCurrency: ticketCategories.rateCurrency
-        })
-        .from(ticketCategories)
-        .where(eq(ticketCategories.id, categoryId))
-        .limit(1)
-    )
+    withSystemDbAccessContext(() => db
+      .select({ defaultWorkTypeId: ticketCategories.defaultWorkTypeId })
+      .from(ticketCategories).where(eq(ticketCategories.id, categoryId)).limit(1))
   );
   return rows[0] ?? null;
 }
 
-/**
- * Validates a ticket link for the acting partner AND org axis, then resolves
- * billing defaults (spec D2: category default + manual override). Returns the
- * denormalization payload for the time-entry/part row.
- *
- * The ticket is read under system scope (see getTicketForTimeTracking), so the
- * request's org-axis RLS does NOT gate it. We therefore re-apply the caller's
- * org-axis allowlist here: a partner user with orgAccess='selected' can target
- * only tickets in granted orgs, never an arbitrary org under the same partner.
- * `accessibleOrgIds === null` is system scope (unrestricted) — behavior
- * unchanged. Mirrors getScopedTicketOr404 / auth.canAccessOrg semantics.
- */
-/** Spec §1.6 / §7 match-or-skip: a default rate applies only when it was
- *  entered under the org's currency. Never converts, never falls through to a
- *  wrong-currency number. */
-export function resolveDefaultRate(
-  orgCurrency: string,
-  org: { defaultHourlyRate: string | null; rateCurrency: string } | null,
-  category: { defaultHourlyRate: string | null; rateCurrency: string | null } | null
-): string | null {
-  if (org?.defaultHourlyRate != null && org.rateCurrency === orgCurrency) return org.defaultHourlyRate;
-  if (category?.defaultHourlyRate != null && category.rateCurrency === orgCurrency) return category.defaultHourlyRate;
-  return null;
+type BillingStamp = Omit<BillingRule, 'fellBackToNoCard' | 'billingStatus'> & { billingStatus: BillingStatus };
+
+function billingStampFromEntry(entry: typeof timeEntries.$inferSelect): BillingStamp {
+  return {
+    billingProfileId: entry.billingProfileId,
+    coverage: entry.coverage ?? (entry.isBillable ? 'billable' : 'non_billable'),
+    hourlyRate: entry.hourlyRate, minimumMinutes: entry.minimumMinutes,
+    roundingIncrementMinutes: entry.roundingIncrementMinutes,
+    isBillable: entry.isBillable, billingStatus: entry.billingStatus,
+  };
 }
 
-async function resolveTicketLink(ticketId: string, actor: TimeEntryActor) {
+async function resolveEntryBilling(
+  orgId: string | null, partnerId: string, currencyCode: string | null, workTypeId: string | null,
+): Promise<BillingStamp> {
+  const cards = orgId && currencyCode
+    ? await loadCardsForOrg(orgId, partnerId, currencyCode)
+    : { assignedCard: null, partnerDefaultCard: null };
+  const { fellBackToNoCard, ...stamp } = resolveBillingRule({
+    orgCurrency: orgId ? currencyCode : null, workTypeId, ...cards,
+  });
+  if (orgId && fellBackToNoCard) {
+    console.warn('[timeEntryService] no billing profile for organization', { orgId, partnerId, currencyCode });
+  }
+  // Standalone work has no org/card and stays unpriced and non-billable by default.
+  return orgId ? stamp : { ...stamp, isBillable: false, coverage: 'non_billable' };
+}
+
+function assertManageBilling(actor: TimeEntryActor): void {
+  if (!actor.manageBilling) {
+    throw new TimeEntryServiceError('Changing billing terms requires manage billing permission', 403, 'MANAGE_BILLING_REQUIRED');
+  }
+}
+
+/** Compare against the stamp being edited, so an ordinary edit never reloads
+ * configuration or silently turns a config change into a retroactive price. */
+function applyBillingInput(
+  base: BillingStamp, input: Pick<CreateTimeEntryInput, 'hourlyRate' | 'billingStatus' | 'isBillable' | 'minimumMinutes'>,
+  actor: TimeEntryActor, alreadyOverridden = false,
+): BillingStamp & { billingOverridden: boolean } {
+  const rate = input.hourlyRate !== undefined ? toRate(input.hourlyRate) : base.hourlyRate;
+  const rateDiffers = input.hourlyRate !== undefined && (rate === null || base.hourlyRate === null
+    ? rate !== base.hourlyRate : Number(rate) !== Number(base.hourlyRate));
+  // Explicit money is a request to bill even previously unpriced standalone
+  // work. Never accept that request and then silently discard its rate.
+  const pricesNonBillable = input.hourlyRate != null && !base.isBillable;
+  const billableDiffers = (input.isBillable !== undefined && input.isBillable !== base.isBillable)
+    || pricesNonBillable;
+  const deviates = rateDiffers || (input.billingStatus !== undefined && input.billingStatus !== base.billingStatus)
+    || (input.minimumMinutes !== undefined && input.minimumMinutes !== base.minimumMinutes) || billableDiffers;
+  if (deviates) assertManageBilling(actor);
+  if (input.hourlyRate != null && input.isBillable === false) {
+    throw new TimeEntryServiceError('An hourly rate requires a billable entry; omit the rate or mark it billable',
+      400, 'RATE_REQUIRES_BILLABLE');
+  }
+  const stamp = { ...base, hourlyRate: rate,
+    minimumMinutes: input.minimumMinutes !== undefined ? input.minimumMinutes : base.minimumMinutes,
+    billingStatus: input.billingStatus ?? base.billingStatus,
+    isBillable: input.isBillable ?? (pricesNonBillable ? true : base.isBillable),
+    billingOverridden: alreadyOverridden || deviates,
+  };
+  // A manager may price previously included work as out-of-scope labour.
+  // It ceases to be included; included stamps must never carry money.
+  if (base.coverage === 'included' && ((rateDiffers && rate !== null) ||
+    (input.billingStatus !== undefined && input.billingStatus !== 'contract'))) {
+    stamp.coverage = 'billable';
+    stamp.billingStatus = input.billingStatus ?? 'not_billed';
+  }
+  if (stamp.isBillable && stamp.coverage === 'non_billable') {
+    stamp.coverage = 'billable';
+    stamp.billingStatus = input.billingStatus ?? 'not_billed';
+  }
+  if (!stamp.isBillable) {
+    stamp.coverage = 'non_billable';
+    stamp.billingStatus = 'not_billed';
+    stamp.hourlyRate = null;
+    stamp.minimumMinutes = null;
+  }
+  if (stamp.billingStatus === 'contract') stamp.coverage = 'included';
+  if (stamp.coverage === 'included') {
+    stamp.hourlyRate = null;
+    stamp.minimumMinutes = null;
+  }
+  return stamp;
+}
+
+/**
+ * Refuse a caller-supplied work type that is not an ACTIVE row of the acting
+ * partner, BEFORE any write.
+ *
+ * `(work_type_id, partner_id) -> work_types(id, partner_id)` is a composite FK,
+ * so a foreign id raises 23503 — inside the request-long
+ * `withDbAccessContext` transaction, which that violation ABORTS. Mapping it
+ * afterwards is impossible (every follow-up statement fails with 25P02 and the
+ * driver substitutes the raw error back in at commit — exactly the #2189 trap
+ * startTimer documents), so the caller receives a raw 500. Hence: validate
+ * first, never catch 23503.
+ *
+ * Only a caller-supplied, non-null id is checked. `undefined` means "apply the
+ * server-side default" and an explicit `null` means "no work type" — neither
+ * references a row. The CATEGORY default is deliberately exempt too: spec §3.1
+ * keeps retired categories supplying their default, and that id is already
+ * partner-consistent by the category's own composite FK.
+ */
+async function assertWorkTypeUsable(
+  workTypeId: string | null | undefined,
+  partnerId: string,
+): Promise<void> {
+  if (workTypeId == null) return;
+  if (await getActiveWorkType(workTypeId, partnerId)) return;
+  throw new TimeEntryServiceError('Unknown work type', 400, 'WORK_TYPE_NOT_FOUND');
+}
+
+async function resolveTicketLink(ticketId: string, actor: TimeEntryActor, requestedWorkTypeId?: string | null) {
   const ticket = await getTicketForTimeTracking(ticketId);
   const org = await resolveTicketOrg(ticket);
   const ticketPartnerId = org?.partnerId ?? null;
@@ -252,26 +459,17 @@ async function resolveTicketLink(ticketId: string, actor: TimeEntryActor) {
   if (actor.accessibleOrgIds !== null && !actor.accessibleOrgIds.includes(ticket.orgId)) {
     throw new TimeEntryServiceError('Ticket not found', 404, 'TICKET_ORG_DENIED');
   }
-  const [orgSettings, category] = await Promise.all([
-    getOrgBillingDefaults(ticket.orgId),
-    ticket.categoryId ? getCategoryDefaults(ticket.categoryId) : Promise.resolve(null)
-  ]);
-  return {
-    ticket,
-    partnerId: ticketPartnerId,
-    // The currency every monetary value on this link is expressed in (spec §7).
-    currencyCode: org!.currencyCode,
-    // D6: per-entry explicit override (applied by callers) → org default → category default → false
-    defaultBillable: orgSettings?.defaultBillable ?? category?.defaultBillable ?? false,
-    // D6 + match-or-skip: a default rate is used only when entered in the org's currency.
-    defaultHourlyRate: resolveDefaultRate(org!.currencyCode, orgSettings, category)
-  };
+  const category = ticket.categoryId ? await getCategoryDefaults(ticket.categoryId) : null;
+  // Retired categories retain their converted work-type pricing. Only explicit
+  // picker input is active-validated; the persisted default is partner-safe by FK.
+  const workTypeId = requestedWorkTypeId !== undefined ? requestedWorkTypeId : category?.defaultWorkTypeId ?? null;
+  const billing = await resolveEntryBilling(ticket.orgId, ticketPartnerId, org!.currencyCode, workTypeId);
+  return { ticket, partnerId: ticketPartnerId, currencyCode: org!.currencyCode, workTypeId, billing };
 }
 
 /**
  * The billing defaults the server WOULD stamp on a new ticket-linked time entry
- * — the resolved match-or-skip rate, the org's locked currency, and the
- * billable default (#5321).
+ * — the resolved profile terms and the org currency (#5321).
  *
  * Read-only (no ticket lock): a UI prefill must not queue behind, or contend
  * with, a concurrent org move. The value is advisory — `createTimeEntry` always
@@ -285,12 +483,12 @@ async function resolveTicketLink(ticketId: string, actor: TimeEntryActor) {
 export async function getTicketTimeEntryDefaults(
   ticketId: string,
   actor: TimeEntryActor,
-): Promise<{ hourlyRate: string | null; currencyCode: string; isBillable: boolean }> {
+): Promise<BillingStamp & { currencyCode: string; workTypeId: string | null }> {
   const link = await resolveTicketLink(ticketId, actor);
   return {
-    hourlyRate: link.defaultHourlyRate,
+    ...link.billing,
     currencyCode: link.currencyCode,
-    isBillable: link.defaultBillable,
+    workTypeId: link.workTypeId,
   };
 }
 
@@ -318,8 +516,8 @@ async function lockTicketRow(ticketId: string): Promise<{ id: string; orgId: str
  * lock; if the ticket moved between the two, resolve once more under the lock
  * so the stamped currency is the org the row will actually land in.
  */
-async function resolveAndLockTicketLink(ticketId: string, actor: TimeEntryActor) {
-  let link = await resolveTicketLink(ticketId, actor);
+async function resolveAndLockTicketLink(ticketId: string, actor: TimeEntryActor, workTypeId?: string | null) {
+  let link = await resolveTicketLink(ticketId, actor, workTypeId);
   // Creation barrier (#3778), ticket-child protocol:
   //   organizations FOR SHARE -> tickets FOR UPDATE -> time/part INSERT.
   // resolveTicketLink's reads run in a SYSTEM context (a separate transaction),
@@ -336,12 +534,12 @@ async function resolveAndLockTicketLink(ticketId: string, actor: TimeEntryActor)
     // not conflict) and the only FOR UPDATE holder, changeOrgCurrency, locks
     // nothing else at all.
     org = await readOrgStampingDefaults(db, locked.orgId);
-    link = await resolveTicketLink(ticketId, actor);
+    link = await resolveTicketLink(ticketId, actor, workTypeId);
   }
   // The locked value is authoritative. A disagreement means a currency change
   // committed between the unlocked resolve and the barrier; re-resolve so the
   // stamp AND the match-or-skip default rate come from the new currency.
-  if (org.currencyCode !== link.currencyCode) link = await resolveTicketLink(ticketId, actor);
+  if (org.currencyCode !== link.currencyCode) link = await resolveTicketLink(ticketId, actor, workTypeId);
   return link;
 }
 
@@ -372,7 +570,8 @@ async function getPartnerCurrency(partnerId: string): Promise<string> {
 }
 
 /** Fields a `billed` row refuses to change (issueInvoice froze the money). */
-const BILLED_LOCKED_ENTRY_FIELDS = ['startedAt', 'endedAt', 'isBillable', 'hourlyRate', 'billingStatus', 'ticketId'] as const;
+const BILLED_LOCKED_ENTRY_FIELDS = ['startedAt', 'endedAt', 'isBillable', 'hourlyRate', 'billingStatus', 'ticketId',
+  'workTypeId', 'billingProfileId', 'coverage', 'minimumMinutes', 'roundingIncrementMinutes', 'billingOverridden', 'resetBilling'] as const;
 const BILLED_LOCKED_PART_FIELDS = ['quantity', 'unitPrice', 'costBasis', 'isBillable', 'billingStatus', 'catalogItemId'] as const;
 
 /** "45m", "1h 30m", "2h" — shared wording for feed comments. */
@@ -460,19 +659,19 @@ export async function createTimeEntry(
   assertRoutineBillingStatus(input.billingStatus);
   let partnerId = actor.partnerId;
   let orgId: string | null = null;
-  let defaultBillable = false;
-  let defaultRate: string | null = null;
+  let billing: BillingStamp | null = null;
+  let workTypeId = input.workTypeId ?? null;
   let currencyCode: string | null = null;
 
   if (input.ticketId) {
     // Lock order tickets → time_entries: the ticket row is held until request
     // commit, so a concurrent org-move cannot slip between stamping and insert.
-    const link = await resolveAndLockTicketLink(input.ticketId, actor);
+    const link = await resolveAndLockTicketLink(input.ticketId, actor, input.workTypeId);
     partnerId = link.partnerId;
     orgId = link.ticket.orgId;
     currencyCode = link.currencyCode;
-    defaultBillable = link.defaultBillable;
-    defaultRate = link.defaultHourlyRate;
+    billing = link.billing;
+    workTypeId = link.workTypeId;
   } else if (provenance.orgLink) {
     // W06 (#3900): no ticket, but the signal knows its org — stamp org and the
     // org's locked currency so time_entries_currency_required_when_org_chk holds.
@@ -494,30 +693,46 @@ export async function createTimeEntry(
     currencyCode = await getPartnerCurrency(partnerId);
   }
 
-  const hourlyRate = input.hourlyRate !== undefined ? toRate(input.hourlyRate) : defaultRate;
-  assertRepresentable(hourlyRate, currencyCode);
+  await assertWorkTypeUsable(input.workTypeId, partnerId);
+  billing ??= await resolveEntryBilling(orgId, partnerId, currencyCode, workTypeId);
+  const stamp = applyBillingInput(billing, input, actor);
+  assertRepresentable(stamp.hourlyRate, currencyCode);
 
-  const rows = await db
+  const rows = await refuseBillableMinutesDrift({
+    op: 'createTimeEntry',
+    entryId: null,
+    userId: actor.userId,
+    partnerId,
+    orgId,
+    durationMinutes: computeDurationMinutes(input.startedAt, input.endedAt),
+    minimumMinutes: stamp.minimumMinutes ?? null,
+    roundingIncrementMinutes: stamp.roundingIncrementMinutes ?? null,
+  }, () => db
     .insert(timeEntries)
     .values({
       partnerId,
       orgId,
       ticketId: input.ticketId ?? null,
+      workTypeId,
       userId: actor.userId,
       startedAt: input.startedAt,
       endedAt: input.endedAt,
       durationMinutes: computeDurationMinutes(input.startedAt, input.endedAt),
+      // Spec §3.5 — the billed quantity, from the SAME terms this row stamps
+      // (the applied stamp, so a manager's override drives it too).
+      billableMinutes: computeBillableMinutes({
+        durationMinutes: computeDurationMinutes(input.startedAt, input.endedAt),
+        minimumMinutes: stamp.minimumMinutes,
+        roundingIncrementMinutes: stamp.roundingIncrementMinutes,
+      }),
       description: input.description ?? null,
-      // D2: apply category defaults only when input omits the field
-      isBillable: input.isBillable !== undefined ? input.isBillable : defaultBillable,
-      hourlyRate,
+      ...stamp,
       // Snapshot (spec §7): null only for standalone, money-less entries; never restamped.
       currencyCode,
-      billingStatus: input.billingStatus ?? 'not_billed',
       // W06 (#3900): server-stamped provenance; no public schema accepts it.
       source: provenance.source
     })
-    .returning();
+    .returning());
   const entry = rows[0]!;
   recordAuditMutation(actor, 'time_entry.created', entry);
 
@@ -567,49 +782,87 @@ async function stopRunningEntry(
   overrides: { description?: string; isBillable?: boolean } = {}
 ) {
   const now = new Date();
+  let billingOverride: ReturnType<typeof applyBillingInput> | undefined;
+  let entryId: string | undefined;
+  if (overrides.isBillable !== undefined) {
+    // A billing edit needs the persisted stamp, not today's card. Serialize
+    // this branch with entry edits and pin the CAS to this timer so a concurrent
+    // start cannot receive the old timer's override. Plain stops stay one UPDATE.
+    const [entry] = await db.select().from(timeEntries)
+      .where(and(eq(timeEntries.userId, actor.userId), isNull(timeEntries.endedAt)))
+      .limit(1).for('update');
+    if (!entry) return null;
+    billingOverride = applyBillingInput(billingStampFromEntry(entry), overrides, actor, entry.billingOverridden);
+    entryId = entry.id;
+  }
   // CAS on ended_at IS NULL: two concurrent stops -> one winner, one no-op.
   // Duration computed in SQL from the row's own started_at (avoids a pre-select round-trip).
-  const rows = await db
+  // Built ONCE and inlined by billableMinutesSql in both of its branches: the
+  // column is being assigned in this same UPDATE, so a `duration_minutes`
+  // reference inside the fragment would read the OLD (NULL) value and the
+  // CHECK would reject the row (23514). For the same reason, a stop that also
+  // rewrites the terms must hand billableMinutesSql the NEW ones — SET reads
+  // the old row, the CHECK validates the new one.
+  const durationExpr = sql`FLOOR(EXTRACT(EPOCH FROM (${now.toISOString()}::timestamp - ${timeEntries.startedAt})) / 60)::int`;
+  const rows = await refuseBillableMinutesDrift({
+    op: 'stopRunningEntry',
+    // Undefined on the plain-stop path: the CAS is pinned to the actor, not to
+    // a pre-read row. `at` is the statement's own `now`, so the row this
+    // refused is still findable from the log.
+    entryId: entryId ?? null,
+    userId: actor.userId,
+    partnerId: actor.partnerId,
+    orgId: null,
+    // Computed by the statement itself (see durationExpr above), so the service
+    // never holds the value the CHECK disagreed about.
+    durationMinutes: 'computed-in-sql',
+    minimumMinutes: billingOverride?.minimumMinutes ?? null,
+    roundingIncrementMinutes: billingOverride?.roundingIncrementMinutes ?? null,
+    at: now.toISOString(),
+  }, () => db
     .update(timeEntries)
     .set({
       endedAt: now,
-      durationMinutes: sql`FLOOR(EXTRACT(EPOCH FROM (${now.toISOString()}::timestamp - ${timeEntries.startedAt})) / 60)::int`,
+      durationMinutes: durationExpr,
+      // Spec §3.5 — same arithmetic as computeBillableMinutes(), pinned by
+      // time_entries_billable_minutes_chk.
+      billableMinutes: billableMinutesSql(durationExpr, billingOverride
+        ? {
+          minimumMinutes: billingOverride.minimumMinutes,
+          roundingIncrementMinutes: billingOverride.roundingIncrementMinutes,
+        }
+        : {}),
       ...(overrides.description !== undefined ? { description: overrides.description } : {}),
-      ...(overrides.isBillable !== undefined ? { isBillable: overrides.isBillable } : {})
+      ...(billingOverride ?? {})
     })
-    .where(and(eq(timeEntries.userId, actor.userId), isNull(timeEntries.endedAt)))
-    .returning();
+    .where(and(eq(timeEntries.userId, actor.userId), isNull(timeEntries.endedAt),
+      entryId ? eq(timeEntries.id, entryId) : undefined))
+    .returning());
   return rows[0] ?? null;
 }
 
-export async function startTimer(input: { ticketId?: string; description?: string }, actor: TimeEntryActor) {
+export async function startTimer(input: { ticketId?: string; description?: string; workTypeId?: string | null }, actor: TimeEntryActor) {
   let partnerId = actor.partnerId;
   let orgId: string | null = null;
-  let defaultBillable = false;
-  let defaultRate: string | null = null;
+  let billing: BillingStamp | null = null;
+  let workTypeId = input.workTypeId ?? null;
   let currencyCode: string | null = null;
 
   if (input.ticketId) {
     // Same lock discipline as createTimeEntry (tickets → time_entries).
-    const link = await resolveAndLockTicketLink(input.ticketId, actor);
+    const link = await resolveAndLockTicketLink(input.ticketId, actor, input.workTypeId);
     partnerId = link.partnerId;
     orgId = link.ticket.orgId;
     currencyCode = link.currencyCode;
-    defaultBillable = link.defaultBillable;
-    defaultRate = link.defaultHourlyRate;
+    billing = link.billing;
+    workTypeId = link.workTypeId;
   }
   if (!partnerId) {
     throw new TimeEntryServiceError('Partner is unresolvable for this entry', 400, 'PARTNER_UNRESOLVABLE');
   }
-  if (!input.ticketId && defaultRate != null) {
-    currencyCode = await getPartnerCurrency(partnerId);
-  }
-  // Wave-6 review: startTimer persists a resolved DEFAULT rate, so it is a money
-  // write seam exactly like createTimeEntry — validate it against the snapshot
-  // currency the row is about to carry. A legacy fractional default in a
-  // zero-decimal currency is a 400 here, never a silently rounded time entry.
-  assertRepresentable(defaultRate, currencyCode);
-
+  await assertWorkTypeUsable(input.workTypeId, partnerId);
+  billing ??= await resolveEntryBilling(orgId, partnerId, currencyCode, workTypeId);
+  assertRepresentable(billing.hourlyRate, currencyCode);
   const attempt = async () => {
     // D3: auto-stop the previous timer, then start the new one. The partial
     // unique index time_entries_one_running_per_user_uq is the race backstop.
@@ -639,17 +892,19 @@ export async function startTimer(input: { ticketId?: string; description?: strin
         partnerId: partnerId!,
         orgId,
         ticketId: input.ticketId ?? null,
+        workTypeId,
         userId: actor.userId,
         startedAt: new Date(),
         endedAt: null,
         durationMinutes: null,
+        // A running timer has no billed quantity yet; stopRunningEntry lands it.
+        billableMinutes: null,
         description: input.description ?? null,
-        isBillable: defaultBillable,
-        hourlyRate: defaultRate,
+        ...billing,
+        billingOverridden: false,
         // Snapshot (spec §7): the ticket org's currency, or null for a
         // standalone timer (no rate yet); never restamped.
         currencyCode,
-        billingStatus: 'not_billed',
         // W06 (#3900): a timer-started entry is provenance 'timer'.
         source: 'timer'
       })
@@ -756,10 +1011,11 @@ function assertCanMutate(entry: { userId: string; isApproved: boolean }, actor: 
 export async function updateTimeEntry(id: string, input: UpdateTimeEntryInput, actor: TimeEntryActor) {
   assertRoutineBillingStatus(input.billingStatus);
   // Global lock order: the TARGET ticket (relink) before the entry row.
-  const link = typeof input.ticketId === 'string' ? await resolveAndLockTicketLink(input.ticketId, actor) : null;
+  const link = typeof input.ticketId === 'string' ? await resolveAndLockTicketLink(input.ticketId, actor, input.workTypeId) : null;
   const entry = await getEntryOr404(id, actor); // FOR UPDATE — re-read under lock
   assertCanMutate(entry, actor);
-  if (entry.billingStatus === 'billed' && BILLED_LOCKED_ENTRY_FIELDS.some((k) => input[k] !== undefined)) {
+  await assertWorkTypeUsable(input.workTypeId, entry.partnerId);
+  if (entry.billingStatus === 'billed' && BILLED_LOCKED_ENTRY_FIELDS.some((k) => (input as Record<string, unknown>)[k] !== undefined)) {
     throw new TimeEntryServiceError('This entry has been invoiced; only its description can change', 409, 'ENTRY_BILLED');
   }
 
@@ -771,12 +1027,11 @@ export async function updateTimeEntry(id: string, input: UpdateTimeEntryInput, a
 
   const set: Record<string, unknown> = {};
   const changed: string[] = [];
+  if (input.workTypeId !== undefined) { set.workTypeId = input.workTypeId; changed.push('workTypeId'); }
   if (input.startedAt !== undefined) { set.startedAt = input.startedAt; changed.push('startedAt'); }
   if (input.endedAt !== undefined) { set.endedAt = input.endedAt; changed.push('endedAt'); }
   if (input.description !== undefined) { set.description = input.description; changed.push('description'); }
   if (input.isBillable !== undefined) { set.isBillable = input.isBillable; changed.push('isBillable'); }
-  if (input.hourlyRate !== undefined) { set.hourlyRate = toRate(input.hourlyRate); changed.push('hourlyRate'); }
-  if (input.billingStatus !== undefined) { set.billingStatus = input.billingStatus; changed.push('billingStatus'); }
 
   if (input.ticketId !== undefined) {
     if (input.ticketId === null) {
@@ -801,6 +1056,34 @@ export async function updateTimeEntry(id: string, input: UpdateTimeEntryInput, a
     // Detach leaves currencyCode untouched (the snapshot outlives the link).
     changed.push('ticketId');
   }
+  if (input.resetBilling) assertManageBilling(actor);
+  const relinked = input.ticketId !== undefined && input.ticketId !== entry.ticketId;
+  const workTypeChanged = input.workTypeId !== undefined && input.workTypeId !== entry.workTypeId;
+  const reprice = input.resetBilling || (!entry.billingOverridden && (relinked || workTypeChanged));
+  let base = billingStampFromEntry(entry);
+  if (reprice) {
+    const nextWorkType = input.workTypeId !== undefined ? input.workTypeId
+      : relinked && link ? link.workTypeId : entry.workTypeId ?? null;
+    if (relinked && link) {
+      base = link.billing;
+      set.workTypeId = nextWorkType;
+    } else {
+      const nextOrgId = input.ticketId === null ? null : entry.orgId;
+      base = await resolveEntryBilling(nextOrgId, entry.partnerId, entry.currencyCode, nextWorkType);
+    }
+    Object.assign(set, base, { billingOverridden: false });
+    changed.push('billingProfileId', 'coverage', 'hourlyRate', 'minimumMinutes', 'roundingIncrementMinutes', 'billingStatus');
+  }
+  if (reprice || input.hourlyRate !== undefined || input.minimumMinutes !== undefined ||
+      input.billingStatus !== undefined || input.isBillable !== undefined) {
+    const stamp = applyBillingInput(base, input, actor, reprice ? false : entry.billingOverridden);
+    // Unchanged identity/config stamps remain intact on routine field edits.
+    const { billingProfileId: _profile, roundingIncrementMinutes: _rounding, ...editable } = stamp;
+    Object.assign(set, editable);
+    for (const key of ['hourlyRate', 'minimumMinutes', 'billingStatus'] as const) {
+      if (input[key] !== undefined && !changed.includes(key)) changed.push(key);
+    }
+  }
   // Standalone after this edit: either detached in the same call or never linked.
   const endsStandalone = input.ticketId === null || (input.ticketId === undefined && entry.ticketId == null);
   if (input.hourlyRate != null && endsStandalone && entry.currencyCode == null) {
@@ -811,6 +1094,34 @@ export async function updateTimeEntry(id: string, input: UpdateTimeEntryInput, a
   if ((input.startedAt !== undefined || input.endedAt !== undefined) && endedAt) {
     set.durationMinutes = computeDurationMinutes(startedAt, endedAt);
     changed.push('durationMinutes');
+  }
+  // Spec §3.5 — recompute the billed quantity whenever EITHER the duration or
+  // the card terms on this row move. Mobile replays a stop as PATCH { endedAt }
+  // (apps/mobile/src/services/timeEntryReplay.test.ts), so this branch — not
+  // just stopRunningEntry — is a real stop path. Placed after the re-price and
+  // override blocks so a re-price and a duration change in one PATCH both feed
+  // the same recompute.
+  // #6465: gate on a VALUE change, not key presence. applyBillingInput returns a
+  // full stamp, so `editable` re-writes minimumMinutes on every billing-ish PATCH
+  // — including a rate-only edit. Keying off presence restamped billable_minutes
+  // on legacy rows whose quantity was deliberately NULL, silently moving the
+  // invoice quantity when the technician only corrected a rate.
+  const nextMinimum = set.minimumMinutes !== undefined
+    ? (set.minimumMinutes as number | null) : entry.minimumMinutes;
+  const nextIncrement = set.roundingIncrementMinutes !== undefined
+    ? (set.roundingIncrementMinutes as number | null) : entry.roundingIncrementMinutes;
+  if (
+    set.durationMinutes !== undefined ||
+    nextMinimum !== entry.minimumMinutes ||
+    nextIncrement !== entry.roundingIncrementMinutes
+  ) {
+    const nextDuration = (set.durationMinutes as number | undefined) ?? entry.durationMinutes;
+    set.billableMinutes = computeBillableMinutes({
+      durationMinutes: nextDuration ?? null,
+      minimumMinutes: nextMinimum ?? null,
+      roundingIncrementMinutes: nextIncrement ?? null,
+    });
+    changed.push('billableMinutes');
   }
 
   // W6-G4-2: validate the rate against the currency this row will actually carry
@@ -828,22 +1139,41 @@ export async function updateTimeEntry(id: string, input: UpdateTimeEntryInput, a
   set.approvedBy = null;
   set.approvedAt = null;
 
-  const rows = await db.update(timeEntries).set(set).where(eq(timeEntries.id, id)).returning();
+  const rows = await refuseBillableMinutesDrift({
+    op: 'updateTimeEntry',
+    entryId: id,
+    userId: actor.userId,
+    partnerId: entry.partnerId,
+    orgId: entry.orgId,
+    durationMinutes: (set.durationMinutes as number | undefined) ?? entry.durationMinutes ?? null,
+    minimumMinutes: (set.minimumMinutes as number | null | undefined) ?? entry.minimumMinutes ?? null,
+    roundingIncrementMinutes:
+      (set.roundingIncrementMinutes as number | null | undefined) ?? entry.roundingIncrementMinutes ?? null,
+  }, () => db.update(timeEntries).set(set).where(eq(timeEntries.id, id)).returning());
   const mutated = rows[0];
-  const updated = mutated ?? entry;
-
-  if (mutated) {
-    recordAuditMutation(actor, 'time_entry.updated', mutated);
+  if (!mutated) {
+    // The row existed at the top of this call (getEntryOr404) but the UPDATE
+    // matched zero rows — it was re-pointed or deleted in between (org move,
+    // RLS context change, concurrent delete). Returning the stale pre-update
+    // row here would tell the caller (including mobile's stop-timer replay,
+    // see the recompute comment above) that the write succeeded when it did not.
+    throw new TimeEntryServiceError(
+      'Entry could not be updated — reload and retry',
+      409,
+      'ENTRY_UPDATE_LOST'
+    );
   }
+
+  recordAuditMutation(actor, 'time_entry.updated', mutated);
   await emitTimeEntryEvent({
     type: 'time_entry.updated',
     timeEntryId: id,
     partnerId: entry.partnerId,
-    ticketId: (updated as typeof entry).ticketId ?? entry.ticketId,
+    ticketId: mutated.ticketId ?? entry.ticketId,
     actorUserId: actor.userId,
     payload: { changed }
   });
-  return updated;
+  return mutated;
 }
 
 export async function deleteTimeEntry(id: string, actor: TimeEntryActor) {
@@ -985,7 +1315,7 @@ export async function addTicketPart(ticketId: string, input: TicketPartInput, ac
       quantity: input.quantity.toFixed(2),
       unitPrice: partUnitPrice,
       costBasis: partCostBasis,
-      isBillable: input.isBillable ?? link.defaultBillable,
+      isBillable: input.isBillable ?? link.billing.isBillable,
       billingStatus: input.billingStatus ?? 'not_billed',
       addedBy: actor.userId,
       notes: input.notes ?? null
@@ -1031,7 +1361,21 @@ export async function updateTicketPart(id: string, input: Partial<TicketPartInpu
   if (input.billingStatus !== undefined) set.billingStatus = input.billingStatus;
   if (input.notes !== undefined) set.notes = input.notes;
   const rows = await db.update(ticketParts).set(set).where(eq(ticketParts.id, id)).returning();
-  return rows[0] ?? part;
+  const mutated = rows[0];
+  if (!mutated) {
+    // The part existed at the top of this call (getPartOr404) but the UPDATE
+    // matched zero rows — it was re-pointed or deleted in between (org move,
+    // RLS context change, concurrent delete). Returning the stale pre-update
+    // part here would tell the caller the write succeeded when it did not,
+    // and unlike updateTimeEntry there's no audit/event call to skip either —
+    // the write loss would otherwise be purely silent.
+    throw new TimeEntryServiceError(
+      'Part could not be updated — reload and retry',
+      409,
+      'PART_UPDATE_LOST'
+    );
+  }
+  return mutated;
 }
 
 export async function deleteTicketPart(id: string, _actor: TimeEntryActor) {
@@ -1043,7 +1387,20 @@ export async function deleteTicketPart(id: string, _actor: TimeEntryActor) {
       'PART_BILLED',
     );
   }
-  await db.delete(ticketParts).where(eq(ticketParts.id, id));
+  const deleted = await db.delete(ticketParts).where(eq(ticketParts.id, id)).returning({ id: ticketParts.id });
+  if (deleted.length === 0) {
+    // The part existed at the top of this call (getPartOr404's FOR UPDATE
+    // re-read) but the DELETE matched zero rows — it was re-pointed out of
+    // this caller's visibility in between (org move, RLS context change).
+    // Reporting `{ deleted: true }` here would tell the caller the row is
+    // gone when it is not. Same race class as updateTicketPart (#6568/#6588),
+    // with its own code so callers can tell the two write paths apart.
+    throw new TimeEntryServiceError(
+      'Part could not be deleted — reload and retry',
+      409,
+      'PART_DELETE_LOST',
+    );
+  }
 }
 
 // ── Queries ──────────────────────────────────────────────────────────────
@@ -1086,6 +1443,23 @@ function entrySelection() {
     hourlyRate: timeEntries.hourlyRate,
     currencyCode: timeEntries.currencyCode,
     billingStatus: timeEntries.billingStatus,
+    workTypeId: timeEntries.workTypeId,
+    billingProfileId: timeEntries.billingProfileId,
+    coverage: timeEntries.coverage,
+    billingOverridden: timeEntries.billingOverridden,
+    minimumMinutes: timeEntries.minimumMinutes,
+    roundingIncrementMinutes: timeEntries.roundingIncrementMinutes,
+    // §3.5 billed quantity. Read by the timesheet money loop and by the web
+    // "worked vs billed" line; day totals deliberately stay on durationMinutes.
+    billableMinutes: timeEntries.billableMinutes,
+    // Keep archived labels on historical entries. The correlated read preserves
+    // entry cardinality and stays in the ambient partner RLS context.
+    workType: sql<{ id: string; name: string; isActive: boolean } | null>`(
+      SELECT json_build_object('id', ${workTypes.id}, 'name', ${workTypes.name}, 'isActive', ${workTypes.isActive})
+      FROM ${workTypes}
+      WHERE ${workTypes.id} = ${timeEntries.workTypeId}
+        AND ${workTypes.partnerId} = ${timeEntries.partnerId}
+    )`,
     // W06 (#3900): read-only provenance on GET /, /timesheet and the
     // per-ticket list. Never accepted on a write.
     source: timeEntries.source,
@@ -1200,7 +1574,10 @@ export async function getTimesheet(userId: string, weekStart: Date, accessibleOr
     day.entries.push(entry);
     const minutes = entry.durationMinutes ?? 0;
     day.totalMinutes += minutes;
-    if (entry.isBillable) day.billableMinutes += minutes;
+    // Billed quantity (§3.5): COALESCE(billable_minutes, duration_minutes),
+    // same rule as the money loop below — NOT actual duration. totalMinutes
+    // above deliberately stays on actual minutes (utilization).
+    if (entry.isBillable) day.billableMinutes += (entry.billableMinutes ?? entry.durationMinutes) ?? 0;
   }
   const allDays = [...days.values()];
   const money = new Map<string, number>();
@@ -1211,7 +1588,9 @@ export async function getTimesheet(userId: string, weekStart: Date, accessibleOr
     // rounded rows equals the invoice total (never "round the sum"). The product
     // is exact decimal (review #2: 0.02 × 7.25 = 0.145 → 0.15, same as the SQL
     // summary) and rows are summed as integer minor units, never as floats.
-    const hours = ((entry.durationMinutes ?? 0) / 60).toFixed(2);
+    // Only the minutes source moved to the billed quantity (§3.5). The day-total
+    // loop above deliberately keeps ACTUAL minutes — that figure is utilization.
+    const hours = (((entry.billableMinutes ?? entry.durationMinutes) ?? 0) / 60).toFixed(2);
     const amount = multiplyToCurrency(hours, entry.hourlyRate, entry.currencyCode);
     money.set(entry.currencyCode, (money.get(entry.currencyCode) ?? 0) + toMinorUnits(amount, entry.currencyCode));
   }
@@ -1233,8 +1612,18 @@ export async function getTimesheet(userId: string, weekStart: Date, accessibleOr
 export async function getTicketBillingSummary(ticketId: string) {
   const timeRows = await db
     .select({
+      // §3.4 contract-covered time, in ACTUAL minutes. The W03 plan proposed
+      // COALESCE here "for uniformity, not for effect", on the premise that an
+      // included row never carries card terms. It can: resolveBillingRule()
+      // stamps roundingIncrementMinutes from the card regardless of coverage,
+      // so COALESCE would have moved this number — and would then disagree with
+      // the portal's coveredByContract bucket, which §3.5 keeps on actual
+      // minutes. W02's timeEntryMoneyReaders.test.ts pins this form.
+      includedMinutes: sql<number>`COALESCE(SUM(${timeEntries.durationMinutes}) FILTER (WHERE ${timeEntries.coverage} = 'included'), 0)::int`,
+      // Utilization figure — ACTUAL minutes worked (§3.5). Not the billed quantity.
       totalMinutes: sql<number>`COALESCE(SUM(${timeEntries.durationMinutes}), 0)::int`,
-      billableMinutes: sql<number>`COALESCE(SUM(${timeEntries.durationMinutes}) FILTER (WHERE ${timeEntries.isBillable}), 0)::int`
+      // Billed quantity (§3.5): the minimum/rounding result when the row has one.
+      billableMinutes: sql<number>`COALESCE(SUM(COALESCE(${timeEntries.billableMinutes}, ${timeEntries.durationMinutes})) FILTER (WHERE ${timeEntries.isBillable}), 0)::int`
     })
     .from(timeEntries)
     .where(eq(timeEntries.ticketId, ticketId));
@@ -1243,9 +1632,10 @@ export async function getTicketBillingSummary(ticketId: string) {
   const timeMoney = await db
     .select({
       currencyCode: timeEntries.currencyCode,
-      // Labor rule: round hours to 2 dp first, then × rate, then ONE round per
-      // row at the currency's minor unit (the invoice-line figure) before summing.
-      amount: sql<string>`COALESCE(SUM(ROUND(ROUND(${timeEntries.durationMinutes}::numeric / 60, 2) * ${timeEntries.hourlyRate}, ${minorUnitScaleSql(timeEntries.currencyCode)})), 0)::numeric(12,2)`
+      // Labor rule unchanged: round hours to 2 dp first, then × rate, then ONE
+      // round per row at the currency's minor unit (the invoice-line figure)
+      // before summing. Only the MINUTES source changed (§3.5).
+      amount: sql<string>`COALESCE(SUM(ROUND(ROUND(COALESCE(${timeEntries.billableMinutes}, ${timeEntries.durationMinutes})::numeric / 60, 2) * ${timeEntries.hourlyRate}, ${minorUnitScaleSql(timeEntries.currencyCode)})), 0)::numeric(12,2)`
     })
     .from(timeEntries)
     .where(and(
@@ -1283,7 +1673,7 @@ export async function getTicketBillingSummary(ticketId: string) {
 
   return {
     time: {
-      ...(timeRows[0] ?? { totalMinutes: 0, billableMinutes: 0 }),
+      ...(timeRows[0] ?? { totalMinutes: 0, billableMinutes: 0, includedMinutes: 0 }),
       billableAmounts: toAmounts(timeMoney)
     },
     parts: {
@@ -1301,7 +1691,20 @@ interface BillableRowBase {
   technician: string | null;
   quantity: string;       // hours for time rows, qty for parts
   rate: string | null;    // hourly rate / unit price
-  amount: string;
+  /** Null when `missingRate` is true — an unresolved rate is reported as an
+   *  explicit gap, never a fabricated '0.00' line (#6461). */
+  amount: string | null;
+  /** True for a TIME row with no resolvable hourly rate, for ANY billing
+   *  status except `contract`/`no_charge` (those are an intentional zero,
+   *  never a gap) — see invoiceAssembly.isMissingRateGap, the same predicate
+   *  invoiceAssembly.partitionTimeEntries uses to route the identical
+   *  `not_billed` row to its `missingRate` bucket instead of a line. Unlike
+   *  partitionTimeEntries (which only ever sees `not_billed` rows), this
+   *  export sees every billing_status, so a `billed` row can be a gap too:
+   *  no resolvable rate means no amount to report or sum, regardless of
+   *  whether it was previously marked billed. Ticket parts have no gap
+   *  concept (`ticket_parts.unit_price` is NOT NULL) and are always false. */
+  missingRate: boolean;
   currencyCode: string | null;
   billingStatus: BillingStatus;
 }
@@ -1353,6 +1756,7 @@ export async function listBillables(
       description: timeEntries.description,
       technician: users.name,
       minutes: timeEntries.durationMinutes,
+      billableMinutes: timeEntries.billableMinutes,
       rate: timeEntries.hourlyRate,
       currencyCode: timeEntries.currencyCode,
       billingStatus: timeEntries.billingStatus,
@@ -1397,8 +1801,16 @@ export async function listBillables(
 
   const rows: BillableRow[] = [];
   for (const r of timeRows) {
-    const hours = ((r.minutes ?? 0) / 60).toFixed(2);
+    // Billed quantity (§3.5). NULL billable_minutes = pre-feature row or a row
+    // with no card terms — bill the actual duration.
+    const hours = (((r.billableMinutes ?? r.minutes) ?? 0) / 60).toFixed(2);
     const rate = toFinite(r.rate);
+    // A row with no resolvable rate is a genuine assembly gap (#6461),
+    // regardless of billing_status, EXCEPT `contract`/`no_charge` where a
+    // null rate is an intentional zero — includes `billed` rows: a
+    // previously-billed entry that has since lost its rate (or never had a
+    // resolvable one) still has no amount to report or sum.
+    const missingRate = isMissingRateGap(rate, r.billingStatus);
     rows.push({
       kind: 'time',
       date: r.date,
@@ -1411,10 +1823,14 @@ export async function listBillables(
       // Labor rule (one rule everywhere): hours to 2 dp first, then ONE exact
       // half-up round of the product at the snapshot currency's minor unit
       // (review #2 — never through a double). Standalone entries with no
-      // currency fall back to the 2-decimal exponent.
-      amount: rate != null
-        ? multiplyToCurrency(hours, rate, r.currencyCode ?? 'USD')
-        : '0.00',
+      // currency fall back to the 2-decimal exponent. Never a fabricated
+      // '0.00' for a missingRate gap — null instead (#6461).
+      amount: missingRate
+        ? null
+        : rate != null
+          ? multiplyToCurrency(hours, rate, r.currencyCode ?? 'USD')
+          : '0.00',
+      missingRate,
       currencyCode: r.currencyCode,
       billingStatus: r.billingStatus,
       isApproved: r.isApproved
@@ -1432,9 +1848,13 @@ export async function listBillables(
       technician: r.technician,
       quantity: r.quantity,
       rate: r.unitPrice,
+      // ticket_parts.unit_price/quantity are NOT NULL — this branch is only
+      // the corrupt-numeric-string defensive fallback (toFinite already
+      // logged it), never a real gap, so parts have no missingRate concept.
       amount: quantity != null && unitPrice != null
         ? multiplyToCurrency(quantity, unitPrice, r.currencyCode ?? 'USD')
         : '0.00',
+      missingRate: false,
       currencyCode: r.currencyCode,
       billingStatus: r.billingStatus,
       isApproved: null
@@ -1442,9 +1862,11 @@ export async function listBillables(
   }
   rows.sort((a, b) => a.date.getTime() - b.date.getTime());
   // Sum as integer minor units — never float-add 2-dp strings and re-round.
+  // A missingRate gap contributes no money at all, not even a zero entry
+  // under its currency (#6461) — it has no amount to sum.
   const totals = new Map<string, number>();
   for (const r of rows) {
-    if (r.currencyCode == null) continue;
+    if (r.currencyCode == null || r.missingRate || r.amount == null) continue;
     totals.set(r.currencyCode, (totals.get(r.currencyCode) ?? 0) + toMinorUnits(r.amount, r.currencyCode));
   }
   const totalsByCurrency: CurrencyAmount[] = [...totals].map(([currencyCode, minor]) => ({

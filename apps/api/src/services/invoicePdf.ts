@@ -16,26 +16,32 @@
 
 import { createHash } from 'node:crypto';
 import PDFDocument from 'pdfkit';
-import { and, asc, count, eq, ne, sql } from 'drizzle-orm';
+import { and, asc, count, eq, getTableColumns, isNull, ne, sql } from 'drizzle-orm';
 import { db } from '../db';
-import { invoices, invoiceLineDevices, invoiceLines, invoiceDocuments, organizations, partners, portalBranding } from '../db/schema';
+import { invoices, invoiceLineDevices, invoiceLines, invoiceDocuments, organizations, partners, portalBranding, tickets, ticketCategories } from '../db/schema';
 import { stripeConnectAccounts } from '../db/schema/stripePayments';
 import { getOrMintInvoiceLink, buildPublicInvoiceUrl } from './invoiceLinkToken';
 import { escapeHtml } from './emailLayout';
 import { getEmailService, buildInvoiceTemplate } from './email';
+import { partnerEmailCustomFromSettings } from './emailTemplates/renderPartnerEmail';
 import { emitInvoiceEvent } from './invoiceEvents';
 import { portalBase } from './portalUrl';
 import { InvoiceServiceError } from './invoiceTypes';
 import type { InvoiceActor } from './invoiceTypes';
 import type { BillToAddress } from './sellerSnapshot';
 import { buildSellerSnapshot, sellerAddressLines, type SellerSnapshot } from './sellerSnapshot';
-import { computeChargeNow, formatMoney } from '@breeze/shared';
+import { computeChargeNow, formatMoney, isSupportedLocale } from '@breeze/shared';
 import { formatMoneyForPdf } from './pdfMoney';
 import { fitFontSize } from './pdfFitText';
 import { resolvePartnerDocumentLocale } from './documentLocale';
+import { tApi } from '../i18n';
 
 type InvoiceRow = typeof invoices.$inferSelect;
-type InvoiceLineRow = typeof invoiceLines.$inferSelect;
+type InvoiceLineRow = typeof invoiceLines.$inferSelect & {
+  ticketNumber?: string | null;
+  ticketSubject?: string | null;
+  ticketCategory?: string | null;
+};
 
 export interface InvoiceBranding {
   partnerName: string;
@@ -51,6 +57,12 @@ export interface InvoiceBranding {
    *  for drafts (no link exists) and when minting fails — the PDF renders
    *  without the line rather than failing. */
   payOnlineUrl?: string | null;
+  /** DRAFT-ONLY display fallback for the BILL TO block (sweep paper cut #16),
+   *  set by loadInvoiceForRender via resolveDraftBillTo — the org's billing
+   *  contact email, shown only when the invoice's own billToName was blank
+   *  and a fallback name/email were resolved. Never set for an issued
+   *  invoice, so this is a no-op there. */
+  billToEmailFallback?: string | null;
 }
 
 export const APPENDIX_ROW_CAP = 2000;
@@ -108,6 +120,20 @@ function lineBlurb(l: { name: string | null; description: string | null }): stri
   return l.name ? (l.description ?? '').trim() : '';
 }
 
+/** #6467: worked-vs-billed disclosure (§3.5), rendered from structured data
+ *  (never from `description`, which a customer-visible line's editor can
+ *  freely change) in the document's render locale. Empty when the line isn't
+ *  a time_entry line, or when the worked and billed quantities agree —
+ *  mirroring the old description-suffix condition exactly. */
+function lineNote(l: { quantity: string; workedMinutes: number | null }, locale: string): string {
+  if (l.workedMinutes == null) return '';
+  const worked = (l.workedMinutes / 60).toFixed(2);
+  const billed = Number(l.quantity).toFixed(2);
+  if (worked === billed) return '';
+  const safeLocale = isSupportedLocale(locale) ? locale : 'en';
+  return tApi(safeLocale, 'pdf:invoice.billedVsWorked', { worked, billed });
+}
+
 function addressLines(addr: BillToAddress | null | undefined): string[] {
   if (!addr) return [];
   const cityLine = [addr.city, addr.region, addr.postalCode].filter(Boolean).join(', ');
@@ -116,7 +142,16 @@ function addressLines(addr: BillToAddress | null | undefined): string[] {
 
 // Group customer-visible lines by ticket so the customer view reads as
 // "work for ticket X" blocks; null-ticket lines fall into a default group.
-interface RenderGroup { key: string; ticketId: string | null; lines: InvoiceLineRow[]; }
+// Group customer-visible lines by ticket so the customer view reads as
+// "work for ticket X" blocks; null-ticket lines fall into a default group.
+interface RenderGroup {
+  key: string;
+  ticketId: string | null;
+  ticketNumber?: string | null;
+  ticketSubject?: string | null;
+  ticketCategory?: string | null;
+  lines: InvoiceLineRow[];
+}
 
 function groupVisibleLinesByTicket(lines: InvoiceLineRow[]): RenderGroup[] {
   const visible = lines.filter((l) => l.customerVisible);
@@ -125,7 +160,18 @@ function groupVisibleLinesByTicket(lines: InvoiceLineRow[]): RenderGroup[] {
   for (const l of visible) {
     const key = l.ticketId ?? '__none__';
     let g = byKey.get(key);
-    if (!g) { g = { key, ticketId: l.ticketId, lines: [] }; byKey.set(key, g); groups.push(g); }
+    if (!g) {
+      g = {
+        key,
+        ticketId: l.ticketId,
+        ticketNumber: l.ticketNumber ?? null,
+        ticketSubject: l.ticketSubject ?? null,
+        ticketCategory: l.ticketCategory ?? null,
+        lines: []
+      };
+      byKey.set(key, g);
+      groups.push(g);
+    }
     g.lines.push(l);
   }
   return groups;
@@ -155,17 +201,22 @@ export function renderInvoiceHtml(invoice: InvoiceRow, lines: InvoiceLineRow[], 
     : `<div style="font-size:22px;font-weight:700;color:${primary};">${escapeHtml(branding.partnerName)}</div>`;
 
   const rowsHtml = groups.map((g) => {
-    const header = g.ticketId
-      ? `<tr><td colspan="${showTax ? 4 : 3}" style="padding:10px 8px 4px;font-size:12px;font-weight:600;color:#6b7280;border-top:1px solid #e5e7eb;">Ticket work</td></tr>`
-      : '';
+    let header = '';
+    if (g.ticketId) {
+      const ticketNum = g.ticketNumber ? `Ticket #${escapeHtml(g.ticketNumber)}` : 'Ticket work';
+      const subject = g.ticketSubject ? `: ${escapeHtml(g.ticketSubject)}` : '';
+      const catBadge = g.ticketCategory ? ` <span style="font-size:11px;font-weight:normal;color:#6b7280;background:#f3f4f6;padding:1px 6px;border-radius:4px;margin-left:6px;">${escapeHtml(g.ticketCategory)}</span>` : '';
+      header = `<tr><td colspan="${showTax ? 4 : 3}" style="padding:10px 8px 4px;font-size:12px;font-weight:600;color:#374151;border-top:1px solid #e5e7eb;background-color:#f9fafb;">${ticketNum}${subject}${catBadge}</td></tr>`;
+    }
     const lineRows = g.lines.map((l) => {
       const t = showTax ? lineTax(l.lineTotal, l.taxable, taxRate) : null;
       const taxCell = showTax
         ? `<td style="padding:6px 8px;font-size:13px;color:#6b7280;text-align:right;white-space:nowrap;">${t === null ? '&mdash;' : escapeHtml(formatMoney(t, currency, locale))}</td>`
         : '';
+      const note = lineNote(l, locale);
       return `
       <tr>
-        <td style="padding:6px 8px;font-size:13px;color:#1f2937;">${escapeHtml(lineTitle(l))}${lineBlurb(l) ? `<div style="font-size:11px;color:#6b7280;margin-top:2px;">${escapeHtml(lineBlurb(l))}</div>` : ''}</td>
+        <td style="padding:6px 8px;font-size:13px;color:#1f2937;">${escapeHtml(lineTitle(l))}${lineBlurb(l) ? `<div style="font-size:11px;color:#6b7280;margin-top:2px;">${escapeHtml(lineBlurb(l))}</div>` : ''}${note ? `<div style="font-size:11px;color:#6b7280;margin-top:2px;">${escapeHtml(note)}</div>` : ''}</td>
         <td style="padding:6px 8px;font-size:13px;color:#1f2937;text-align:right;white-space:nowrap;">${escapeHtml(String(Number(l.quantity)))}</td>
         ${taxCell}
         <td style="padding:6px 8px;font-size:13px;color:#1f2937;text-align:right;white-space:nowrap;">${escapeHtml(formatMoney(l.lineTotal, currency, locale))}</td>
@@ -200,6 +251,7 @@ export function renderInvoiceHtml(invoice: InvoiceRow, lines: InvoiceLineRow[], 
           <div style="font-size:14px;font-weight:600;color:#111827;margin-top:4px;">${escapeHtml(invoice.billToName ?? '')}</div>
           ${billTo.map((l) => `<div style="font-size:13px;color:#4b5563;">${escapeHtml(l)}</div>`).join('')}
           ${invoice.billToTaxId ? `<div style="font-size:12px;color:#6b7280;margin-top:4px;">Tax ID: ${escapeHtml(invoice.billToTaxId)}</div>` : ''}
+          ${branding.billToEmailFallback ? `<div style="font-size:12px;color:#6b7280;margin-top:4px;">${escapeHtml(branding.billToEmailFallback)}</div>` : ''}
         </div>
         <div style="text-align:right;font-size:13px;color:#4b5563;">
           ${invoice.issueDate ? `<div>Issued: ${escapeHtml(formatDate(invoice.issueDate))}</div>` : ''}
@@ -366,6 +418,7 @@ export function renderInvoicePdfBuffer(
       doc.fillColor('#4b5563').fontSize(10).font('Helvetica');
       for (const aline of addressLines(invoice.billToAddress as BillToAddress | null)) { doc.text(aline, rightX, billY, { width: rightW }); billY += 13; }
       if (invoice.billToTaxId) { doc.fillColor('#6b7280').fontSize(9).text(`Tax ID: ${invoice.billToTaxId}`, rightX, billY, { width: rightW }); billY += 13; }
+      if (branding.billToEmailFallback) { doc.fillColor('#6b7280').fontSize(9).text(branding.billToEmailFallback, rightX, billY, { width: rightW }); billY += 13; }
       doc.fillColor('#4b5563').fontSize(10).font('Helvetica');
       if (invoice.issueDate) { doc.text(`Issued: ${formatDate(invoice.issueDate)}`, rightX, billY, { width: rightW }); billY += 14; }
       if (invoice.dueDate) { doc.text(`Due: ${formatDate(invoice.dueDate)}`, rightX, billY, { width: rightW }); billY += 14; }
@@ -388,19 +441,36 @@ export function renderInvoicePdfBuffer(
 
       for (const group of groupVisibleLinesByTicket(lines)) {
         if (group.ticketId) {
-          doc.fillColor('#6b7280').fontSize(9).font('Helvetica-Bold').text('Ticket work', left, y); y += 14;
+          if (y > doc.page.height - 140) { doc.addPage(); y = 50; }
+          const ticketNum = group.ticketNumber ? `Ticket #${group.ticketNumber}` : 'Ticket work';
+          const subject = group.ticketSubject ? `: ${group.ticketSubject}` : '';
+          const fullHeader = `${ticketNum}${subject}`;
+          doc.fillColor('#1f2937').fontSize(9.5).font('Helvetica-Bold').text(fullHeader, left, y, { width: colDescW });
+          const hHead = doc.heightOfString(fullHeader, { width: colDescW });
+          if (group.ticketCategory) {
+            doc.fillColor('#6b7280').fontSize(8.5).font('Helvetica').text(`Category: ${group.ticketCategory}`, left, y + hHead + 1, { width: colDescW });
+            y += hHead + 14;
+          } else {
+            y += hHead + 4;
+          }
         }
         for (const l of group.lines) {
           if (y > doc.page.height - 140) { doc.addPage(); y = 50; }
           doc.fillColor('#1f2937').fontSize(10).font('Helvetica');
           const title = lineTitle(l);
           const blurb = lineBlurb(l);
+          const note = lineNote(l, locale);
           const titleHeight = doc.heightOfString(title, { width: colDescW });
           const blurbHeight = blurb ? doc.heightOfString(blurb, { width: colDescW }) + 2 : 0;
-          const descHeight = titleHeight + blurbHeight;
+          const noteHeight = note ? doc.heightOfString(note, { width: colDescW }) + 2 : 0;
+          const descHeight = titleHeight + blurbHeight + noteHeight;
           doc.font('Helvetica-Bold').text(title, left, y, { width: colDescW });
           if (blurb) {
             doc.fillColor('#6b7280').fontSize(8.5).font('Helvetica').text(blurb, left, y + titleHeight + 2, { width: colDescW });
+            doc.fillColor('#1f2937').fontSize(10);
+          }
+          if (note) {
+            doc.fillColor('#6b7280').fontSize(8.5).font('Helvetica').text(note, left, y + titleHeight + blurbHeight + 2, { width: colDescW });
             doc.fillColor('#1f2937').fontSize(10);
           }
           doc.font('Helvetica').text(String(Number(l.quantity)), colQtyX, y, { width: colNumW, align: 'right' });
@@ -579,6 +649,54 @@ async function loadDeviceAppendix(invoiceId: string): Promise<InvoiceDeviceAppen
 }
 
 /** Load the invoice, its lines, and branding (partner name + portal logo/colors). */
+/**
+ * The ONE footer/terms resolver (settings audit rule 5, finding 22).
+ * `invoiceTerms` is the invoice's own stamped `terms` column (set once, at
+ * issue — see invoiceService.issueInvoice); `partnerFooter` is
+ * `partners.invoiceFooter`; `brandingFooter` is `portal_branding.footerText`
+ * for the invoice's org.
+ *
+ * Pure — no DB access — so both DB-backed readers (this file's
+ * `loadInvoiceForRender` and `invoiceService.issueInvoice`, which runs inside
+ * its own locked system transaction) can share it without either opening a
+ * transaction on the other's behalf. Precedence matches the render-time chain
+ * that already existed at `loadInvoiceForRender` before this extraction —
+ * issue time is the side being brought into line with it.
+ */
+export function resolveInvoiceFooter(input: {
+  invoiceTerms: string | null;
+  partnerFooter: string | null;
+  brandingFooter: string | null;
+}): string | null {
+  return input.invoiceTerms ?? input.partnerFooter ?? input.brandingFooter ?? null;
+}
+
+/**
+ * DRAFT-ONLY bill-to display fallback (sweep paper cut #16). A draft invoice
+ * has no bill-to snapshot yet — billToName/billToAddress/billToTaxId are
+ * stamped only at issue (invoiceService.issueInvoice) — so before issue the
+ * BILL TO block would otherwise render completely blank, not even the
+ * organization name (which the quote PDF's equivalent draft fallback prints —
+ * see quoteService's draft billTo resolution). This resolves a DISPLAY-only
+ * name + email for that case; it never writes anything back to the invoices
+ * row, and an already-issued invoice's own frozen billToName (even when null)
+ * is always returned untouched — the "one snapshot moment" rule.
+ *
+ * Pure — no DB access — so loadInvoiceForRender (which does the org read) can
+ * be exercised without a database, mirroring resolveInvoiceFooter above.
+ */
+export function resolveDraftBillTo(input: {
+  status: string;
+  billToName: string | null;
+  orgName: string | null;
+  orgBillingContact: unknown;
+}): { billToName: string | null; billToEmail: string | null } {
+  if (input.status !== 'draft' || input.billToName?.trim()) {
+    return { billToName: input.billToName, billToEmail: null };
+  }
+  return { billToName: input.orgName ?? null, billToEmail: resolveBillingEmail(input.orgBillingContact) };
+}
+
 async function loadInvoiceForRender(invoiceId: string): Promise<{
   invoice: InvoiceRow;
   lines: InvoiceLineRow[];
@@ -587,7 +705,20 @@ async function loadInvoiceForRender(invoiceId: string): Promise<{
 } | null> {
   const [invoice] = await db.select().from(invoices).where(eq(invoices.id, invoiceId)).limit(1);
   if (!invoice) return null;
-  const lines = await db.select().from(invoiceLines).where(eq(invoiceLines.invoiceId, invoiceId)).orderBy(invoiceLines.sortOrder);
+  const lines = await db.select({
+    ...getTableColumns(invoiceLines),
+    ticketNumber: sql<string | null>`COALESCE(${tickets.ticketNumber}, ${tickets.internalNumber})`,
+    ticketSubject: tickets.subject,
+    ticketCategory: sql<string | null>`COALESCE(${ticketCategories.name}, ${tickets.category})`,
+  }).from(invoiceLines)
+    .leftJoin(tickets, and(
+      eq(invoiceLines.ticketId, tickets.id),
+      eq(tickets.orgId, invoice.orgId),
+      isNull(tickets.deletedAt),
+    ))
+    .leftJoin(ticketCategories, eq(tickets.categoryId, ticketCategories.id))
+    .where(eq(invoiceLines.invoiceId, invoiceId))
+    .orderBy(invoiceLines.sortOrder);
   const [partner] = await db.select().from(partners).where(eq(partners.id, invoice.partnerId)).limit(1);
   // #3205 W07 decision 14a: the renderer reads the STAMP, never the partner row —
   // a change to the partner default cannot alter what an issued invoice renders.
@@ -604,6 +735,23 @@ async function loadInvoiceForRender(invoiceId: string): Promise<{
   // the From block still renders (issued docs use the frozen column).
   if (!invoice.sellerSnapshot && partner) {
     (invoice as { sellerSnapshot: unknown }).sellerSnapshot = buildSellerSnapshot(partner);
+  }
+  // Draft BILL TO fallback (sweep paper cut #16) — same rationale as the
+  // sellerSnapshot synthesis just above: only reached pre-issue, and mutates
+  // only this in-memory object, never the invoices row. resolveDraftBillTo is
+  // a no-op once issued (status !== 'draft'), so the extra org read below is
+  // skipped entirely for every already-issued invoice.
+  let billToEmailFallback: string | null = null;
+  if (invoice.status === 'draft' && !invoice.billToName?.trim()) {
+    const [org] = await db
+      .select({ name: organizations.name, billingContact: organizations.billingContact })
+      .from(organizations).where(eq(organizations.id, invoice.orgId)).limit(1);
+    const resolved = resolveDraftBillTo({
+      status: invoice.status, billToName: invoice.billToName,
+      orgName: org?.name ?? null, orgBillingContact: org?.billingContact ?? null,
+    });
+    (invoice as { billToName: string | null }).billToName = resolved.billToName;
+    billToEmailFallback = resolved.billToEmail;
   }
   return {
     invoice,
@@ -623,11 +771,16 @@ async function loadInvoiceForRender(invoiceId: string): Promise<{
       partnerName: partner?.name || (invoice.sellerSnapshot as SellerSnapshot | null)?.name || 'Invoice',
       logoUrl: branding?.logoUrl ?? null,
       primaryColor: branding?.primaryColor ?? null,
-      footerText: invoice.terms ?? partner?.invoiceFooter ?? branding?.footerText ?? null,
+      footerText: resolveInvoiceFooter({
+        invoiceTerms: invoice.terms,
+        partnerFooter: partner?.invoiceFooter ?? null,
+        brandingFooter: branding?.footerText ?? null,
+      }),
       currencyCode: invoice.currencyCode ?? partner?.currencyCode ?? 'USD',
       // Stamped snapshot wins; unstamped (draft/legacy) rows follow the
       // partner's current language.
       locale: invoice.documentLocale ?? resolvePartnerDocumentLocale(partner),
+      billToEmailFallback,
     },
   };
 }
@@ -885,15 +1038,19 @@ async function deliverInvoiceEmail(
     pdfAttached: includePdf && pdf != null,
     signature: partner?.emailSignature ?? undefined,
     payEnabled,
+    custom: partnerEmailCustomFromSettings(partner?.settings, 'invoice_send'),
   });
   try {
     await emailService.sendEmail({
       to: recipients,
       cc: cc.length > 0 ? cc : undefined,
-      // MSP-branded envelope, mirroring the quote send path: display name
-      // "<Partner> via Breeze" on the platform address (SPF/DKIM stays
-      // aligned), replies routed to the MSP's billing inbox.
-      from: partner?.name ? emailService.fromWithDisplayName(`${partner.name} via Breeze`) : undefined,
+      // MSP-branded envelope, mirroring the quote send path: the registry's
+      // `partner_display_name` fallback renders "<Partner> via Breeze" on the
+      // platform address (SPF/DKIM stays aligned), replies routed to the MSP's
+      // billing inbox. Both values come from rows read above (spec §8.1).
+      purpose: 'invoice.sent',
+      partnerId: invoice.partnerId,
+      partnerName: partner?.name ?? null,
       replyTo: partner?.billingEmail?.trim() || undefined,
       subject: template.subject,
       html: template.html,

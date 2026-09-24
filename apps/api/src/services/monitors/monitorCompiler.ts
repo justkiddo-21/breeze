@@ -4,6 +4,7 @@ import { db } from '../../db';
 import { alertTemplates, alertRules } from '../../db/schema/alerts';
 import { automations } from '../../db/schema/automations';
 import { monitorDefinitions } from '../../db/schema/monitorDefinitions';
+import { networkMonitors } from '../../db/schema/monitors';
 import type { MonitorDefinitionRow } from '../../db/schema/monitorDefinitions';
 import { getMonitorKindSpec } from './kinds';
 import {
@@ -11,7 +12,7 @@ import {
   resolveAutomationReferencesForOwner,
 } from '../automationRuntime';
 import type { AutomationAction } from '../automationRuntime';
-import type { AlertCondition } from '../alertConditions/types';
+import type { RootCondition } from '../alertConditions/types';
 
 /**
  * The monitor COMPILER (#5287 W02).
@@ -29,7 +30,8 @@ import type { AlertCondition } from '../alertConditions/types';
  */
 
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
-type DbExecutor = typeof db | DbTx;
+export type DbExecutor = typeof db | DbTx;
+export type CompileOptions = Record<string, never>;
 
 export interface CompiledRefs {
   alertTemplateId: string;
@@ -91,11 +93,39 @@ export function computeCompiledHash(def: MonitorDefinitionRow): string {
   return createHash('sha256').update(canonical(picked)).digest('hex');
 }
 
+/**
+ * The diagnostic script a `script` monitor probes with, expressed as a
+ * `run_script` action purely so it joins the RESPONSE actions in the ownership
+ * resolution below (#5291 W04).
+ *
+ * Before W04 the diagnostic script was bound by nothing: only response actions
+ * went through `resolveAutomationReferencesForOwner`, so a PARTNER-WIDE monitor
+ * could name an ORG-OWNED script and compile happily — and then fail at 3am
+ * inside the dispatch worker, for every org except the one that owns the
+ * script. Including it here turns that into an
+ * `AutomationReferenceAuthorizationError` at AUTHORING time, surfaced as a 400
+ * by the route. This is the mitigation the spec's §Risks bullet names.
+ *
+ * It is NOT added to the compiled automation's `actions`: the probe is
+ * dispatched by monitorScriptWorker on its own interval, not by the automation
+ * worker on alert.triggered. Only the ownership check is shared.
+ */
+export function buildDiagnosticScriptReferences(
+  def: MonitorDefinitionRow,
+): AutomationAction[] {
+  if (def.kind !== 'script') return [];
+  const scriptId = (def.condition as { scriptId?: unknown } | null)?.scriptId;
+  if (typeof scriptId !== 'string' || scriptId.length === 0) return [];
+  return [{ type: 'run_script', scriptId, whenOffline: 'queue' } as AutomationAction];
+}
+
 /** The condition the alertConditions registry will evaluate for this monitor. */
-export function buildCompiledCondition(def: MonitorDefinitionRow): AlertCondition {
+export function buildCompiledCondition(def: MonitorDefinitionRow): RootCondition {
   const spec = getMonitorKindSpec(def.kind);
   const condition = spec.conditionSchema.parse(def.condition);
-  return spec.toAlertCondition(condition);
+  // W04: `script` and `network_check` read their evidence back through a row
+  // stamped with the monitor's own id, so the compile context carries it.
+  return spec.toAlertCondition(condition, { monitorId: def.id });
 }
 
 export function buildCompiledTemplate(
@@ -107,7 +137,7 @@ export function buildCompiledTemplate(
     partnerId: def.partnerId,
     name: `[monitor] ${def.name}`,
     description: def.description,
-    category: 'monitor',
+    category: spec.alertCategory ?? 'monitor',
     // A SINGLE root condition object, never an array: `validateConditions`
     // accepts both, but the sweep's override path replaces this wholesale from
     // the kind spec, which only ever produces one root node.
@@ -180,9 +210,63 @@ export function buildCompiledAutomation(
   };
 }
 
+/**
+ * The managed `network_monitors` row a `network_check` monitor compiles to
+ * (#5291 W04). Pure, like the other three builders, so `verifyCompiled` can
+ * re-derive it. Ownership axes come from the DEFINITION: a partner-wide
+ * definition produces a partner-wide check, which `monitorWorker` then fans out
+ * one job per org under the partner.
+ */
+export function buildCompiledNetworkMonitor(
+  def: MonitorDefinitionRow,
+): typeof networkMonitors.$inferInsert {
+  const spec = getMonitorKindSpec(def.kind);
+  const c = spec.conditionSchema.parse(def.condition) as {
+    checkType: 'icmp_ping' | 'tcp_port' | 'http_check' | 'dns_check';
+    target: string;
+    port?: number;
+    expectStatus?: number;
+    followRedirects?: boolean;
+    pollingIntervalSeconds: number;
+    timeoutSeconds: number;
+  };
+  return {
+    orgId: def.orgId,
+    partnerId: def.partnerId,
+    name: `[monitor] ${def.name}`,
+    // `checkType` IS the monitor_type pgEnum vocabulary — nothing is mapped.
+    monitorType: c.checkType,
+    target: c.target,
+    // `buildMonitorCommand` (`services/monitorCommands.ts`) spreads this
+    // `config` verbatim into the agent command payload — there is no
+    // translation layer downstream. So every key written here must already be
+    // the exact key `agent/internal/heartbeat/handlers_monitor.go` reads for
+    // that checkType, even where it differs from the kind's own condition
+    // schema field name (`expectStatus` here vs. the agent's `expectedStatus`,
+    // #6352). `port` already matches the agent key and needs no translation.
+    config: {
+      ...(c.port != null ? { port: c.port } : {}),
+      ...(c.expectStatus != null ? { expectedStatus: c.expectStatus } : {}),
+      // #6510: the agent follows redirects by default (`handlers_monitor.go`),
+      // so an http_check that EXPECTS a 3xx status can never go healthy unless
+      // the check stops at that hop — the final hop's status is what gets
+      // compared otherwise. Only write the key when it disagrees with the
+      // agent's own default (true), i.e. an explicit `false`, or an implicit
+      // `false` from a 3xx expectation the caller didn't override.
+      ...((c.followRedirects ?? !(c.expectStatus != null && c.expectStatus >= 300 && c.expectStatus < 400))
+        ? {}
+        : { followRedirects: false }),
+    },
+    pollingInterval: c.pollingIntervalSeconds,
+    timeout: c.timeoutSeconds,
+    isActive: def.enabled,
+    managedByMonitorId: def.id,
+  };
+}
+
 async function upsertManaged<T extends { id: string }>(
   tx: DbTx,
-  table: typeof alertTemplates | typeof alertRules | typeof automations,
+  table: typeof alertTemplates | typeof alertRules | typeof automations | typeof networkMonitors,
   monitorId: string,
   values: Record<string, unknown>,
 ): Promise<T> {
@@ -221,6 +305,7 @@ async function upsertManaged<T extends { id: string }>(
 export async function compileMonitorInTx(
   tx: DbTx,
   def: MonitorDefinitionRow,
+  _options: CompileOptions = {},
 ): Promise<CompiledRefs> {
   const now = new Date();
 
@@ -233,6 +318,17 @@ export async function compileMonitorInTx(
   const automation = buildCompiledAutomation(def, r.id);
   const a = await upsertManaged(tx, automations, def.id, { ...automation, updatedAt: now });
 
+  // A `network_check` compiles to a FOURTH managed row. Idempotent through the
+  // same read-then-write upsert, keyed on the partial unique index over
+  // `managed_by_monitor_id`, so a recompile keeps the row id and therefore its
+  // whole result history.
+  if (def.kind === 'network_check') {
+    await upsertManaged(tx, networkMonitors, def.id, {
+      ...buildCompiledNetworkMonitor(def),
+      updatedAt: now,
+    });
+  }
+
   // Resource bindings are the durable ownership snapshot the automation worker
   // re-checks at admission time. Without them a compiled automation's
   // run_script action would be refused at execution with no explanation.
@@ -240,7 +336,10 @@ export async function compileMonitorInTx(
   const resolved = await resolveAutomationReferencesForOwner(
     tx,
     owner,
-    automation.actions as AutomationAction[],
+    [
+      ...(automation.actions as AutomationAction[]),
+      ...buildDiagnosticScriptReferences(def),
+    ],
   );
   await replaceAutomationResourceBindings(tx, a.id, owner, resolved);
 
@@ -316,6 +415,27 @@ export async function verifyCompiled(
     const expected = canonical(expectedAutomation[key]);
     const actual = canonical((automation as Record<string, unknown>)[key as string]);
     if (expected !== actual) diff.push(`automations.${String(key)}: ${actual} !== ${expected}`);
+  }
+
+  // The fourth managed row (#5291 W04). Same key-by-key comparison, so a hand
+  // edit to the managed check's target shows up as drift here rather than as a
+  // probe quietly aimed somewhere else.
+  if (def.kind === 'network_check') {
+    const [check] = await executor
+      .select()
+      .from(networkMonitors)
+      .where(eq(networkMonitors.managedByMonitorId, def.id))
+      .limit(1);
+    if (!check) {
+      diff.push('network_monitors: missing');
+    } else {
+      const expectedCheck = buildCompiledNetworkMonitor(def);
+      for (const key of Object.keys(expectedCheck) as Array<keyof typeof expectedCheck>) {
+        const expected = canonical(expectedCheck[key]);
+        const actual = canonical((check as Record<string, unknown>)[key as string]);
+        if (expected !== actual) diff.push(`network_monitors.${String(key)}: ${actual} !== ${expected}`);
+      }
+    }
   }
 
   if (def.compiledHash !== computeCompiledHash(def)) diff.push('monitor_definitions.compiled_hash');

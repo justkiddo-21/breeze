@@ -60,6 +60,14 @@ Line items can come from several sources: catalog items, bundles, tracked time e
   If your catalog is empty, the editor links straight to **Product Catalog** so you can add the items you sell.
 </Aside>
 
+### Line grouping by ticket and category
+
+Wherever an invoice is rendered -- the web editor and document view, the generated PDF, the authenticated customer portal, and the public invoice link -- line items are grouped under the ticket they came from, then by category within that ticket (Labour, Materials, Recurring, and so on), instead of a flat list. This makes it clear to the customer which charges belong to which piece of work. Lines with no ticket are grouped together at the top.
+
+<Aside type="caution" title="Known gap">
+  The customer portal's **logged-in** invoice view groups lines by ticket but does not yet show the ticket's category label next to the group heading. The web editor/document view, the generated PDF, and the public (non-portal) invoice link all show the category label correctly. This is tracked for a follow-up fix.
+</Aside>
+
 ## Issuing and Sending
 
 **Issuing** an invoice finalizes it: it assigns the next sequential invoice number (using your partner prefix and the current year), sets the issue and due dates, and generates the PDF. **Sending** emails the invoice to the customer.
@@ -71,6 +79,8 @@ Line items can come from several sources: catalog items, bundles, tracked time e
 </Steps>
 
 **Send** opens a composer prefilled from the organization's billing contact: recipients, Cc, subject, a personal message, and whether to attach the PDF. The email and the PDF both carry a **Pay online** link.
+
+Partners edit the invoice email under **Settings → Partner → Email templates** (Invoice) -- subject, heading, button label, and HTML body. Merge variables: `{{invoice_number}}`, `{{partner_name}}`, `{{total}}`, `{{due_date}}`, and `{{portal_url}}`. The pay/view button always uses the server invoice link; partners cannot point it somewhere else. A personal message, the PDF note, amount due, and your email signature still appear around that body. Leave it on the default to keep the built-in wording. This does not change the email card's accent bar or pull colors from the Branding tab.
 
 An invoice that has already been issued can be **re-sent** without changing anything about it -- its number, dates, amounts, and "sent" timestamp all stay as they were, so a reminder never looks like a second invoice. A paid invoice can be re-sent too, as a receipt. Drafts and voided invoices can't be sent this way.
 

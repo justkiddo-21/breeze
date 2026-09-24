@@ -202,6 +202,22 @@ export const taskCheckpointSchema = z.object({
   lastOperationKey: z.string().max(200).nullable().default(null),
   /** The fix watch opened for the alert half of the criterion, if any. */
   fixWatchId: z.string().uuid().nullable().default(null),
+  /**
+   * When a `wait` step may resume (recipe spec §6.1's `wait` row, §6.3's
+   * `wait_cutoff`). ISO-8601. Written by the step that transitions INTO the
+   * wait, read by the coordinator's generic `advanceWait`.
+   */
+  waitUntil: z.string().datetime().optional(),
+  /**
+   * The step key the coordinator moves to when the current `wait` or
+   * `human_work` step settles.
+   *
+   * NOT derivable from `permittedNextSteps`: that map says what the MODEL may
+   * propose, and a human-work or timed wait has no model output at all. The
+   * recipe's spine owns the successor, so the step that enters the wait states
+   * it. Absent is a recipe bug and is refused loudly, never guessed.
+   */
+  resumeStepKey: z.string().min(1).max(128).optional(),
 }).strict();
 export type TaskCheckpoint = z.infer<typeof taskCheckpointSchema>;
 
@@ -233,7 +249,14 @@ export type OperatorTaskSourceKind = (typeof OPERATOR_TASK_SOURCE_KINDS)[number]
  */
 export const createOperatorTaskSchema = z.object({
   mode: z.literal('live'),
-  recipeKey: z.literal('service_recovery'),
+  /**
+   * The workflow the client is admitting. NOT a literal: the server validates
+   * it against the recipe registry so an unknown key is refused with a 400
+   * that names the supported workflows, which a zod literal mismatch cannot
+   * do. `apps/api` owns the registry; `packages/shared` cannot import it.
+   * The 128 cap mirrors `ai_operator_tasks_workflow_key_len_chk`.
+   */
+  recipeKey: z.string().min(1).max(128),
   /**
    * The recipe version the CLIENT reviewed. Checked against the server's
    * released version and refused (422) on mismatch rather than silently

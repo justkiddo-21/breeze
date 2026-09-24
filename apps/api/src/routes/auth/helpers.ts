@@ -1,5 +1,5 @@
 import type { Context } from 'hono';
-import type { AuditResult } from '@breeze/shared';
+import { ERROR_CODES, type AuditResult } from '@breeze/shared';
 import { and, eq, isNull, sql } from 'drizzle-orm';
 import * as dbModule from '../../db';
 import { users, partnerUsers, organizationUsers, organizations, userPasskeys } from '../../db/schema';
@@ -216,6 +216,19 @@ export const MFA_CODE_INVALID = 'mfa_code_invalid';
 export const MFA_PROOF_INVALID = 'mfa_proof_invalid';
 /** A step-up / enrollment credential (password, SSO re-auth grant) was rejected. */
 export const INVALID_CREDENTIALS_CODE = 'invalid_credentials';
+/**
+ * #4050: the `enroll_first_factor` SSO re-auth grant failed to validate or
+ * consume in {@link resolveEnrollmentStepUp} — most commonly its TTL
+ * (`TTL_SECONDS` in `services/mfaStepUpGrant.ts`) elapsed during a slow
+ * scan-QR-then-type-the-code flow, but this also covers a stale, mismatched,
+ * or already-consumed grant. Deliberately distinct from
+ * `INVALID_CREDENTIALS_CODE`: unlike the road-selection checks earlier in
+ * that function (which must stay opaque to avoid a password/passwordless
+ * oracle), this branch only runs once the caller has already committed to
+ * the SSO road by presenting a `ssoReauthGrantId` — naming the failure here
+ * discloses nothing they don't already know from having reached this point.
+ */
+export const ENROLLMENT_GRANT_EXPIRED_CODE = 'enrollment_grant_expired';
 
 /** The status a rejected body-supplied proof answers with. */
 export type ProofRejectionStatus = 400 | 401;
@@ -658,7 +671,18 @@ export async function resolveEnrollmentStepUp(
     ? await consumeStepUpGrant(input.ssoReauthGrantId, bind)
     : await validateStepUpGrant(input.ssoReauthGrantId, bind);
   if (!ok) {
-    return rejectProof(c, 'Invalid credentials', INVALID_CREDENTIALS_CODE, rejectionStatus);
+    // #4050: distinct code+message from the opaque `Invalid credentials`
+    // above — see ENROLLMENT_GRANT_EXPIRED_CODE's doc comment for why that's
+    // safe here. `reauthUrl` mirrors the `enrollment_proof_required`
+    // affordance above so the client can offer the one action that resolves
+    // it: starting the SSO re-authentication over.
+    return rejectProof(
+      c,
+      'Your identity verification has expired. Please verify with your identity provider again.',
+      ENROLLMENT_GRANT_EXPIRED_CODE,
+      rejectionStatus,
+      { reauthUrl: '/sso/reauth/start' },
+    );
   }
 
   return null;
@@ -1436,7 +1460,7 @@ export function inviteUserRedisKey(userId: string): string {
 // ============================================
 
 export function genericAuthError() {
-  return { error: 'Invalid email or password' };
+  return { error: 'Invalid email or password', code: ERROR_CODES.INVALID_CREDENTIALS };
 }
 
 export function registrationDisabledResponse(c: Context): Response {

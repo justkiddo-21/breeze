@@ -10,11 +10,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { findDueOfflineEffects, persistOfflineTransition, pruneOfflineEffects } from '../services/offlineEffectsStore';
 import { processOfflineEffect } from '../services/offlineTransitionEffects';
 import * as dbModule from '../db';
-import { devices, alertRules, alertTemplates, alerts } from '../db/schema';
-import { eq, and, lt, gt, asc, inArray, or, isNull, notInArray } from 'drizzle-orm';
+import { devices, alerts } from '../db/schema';
+import { eq, and, lt, gt, asc, inArray, or, isNull, notInArray, sql } from 'drizzle-orm';
 import { getBullMQConnection } from '../services/redis';
-import { createAlert, evaluateDeviceAlertsFromPolicy, alertRuleOwnershipConditionForOrg } from '../services/alertService';
-import { interpolateTemplate } from '../services/alertConditions';
+import { evaluateDeviceAlertsFromPolicy } from '../services/alertService';
 import { resolveReevalHorizonMinutes } from '../services/alertConditions/offlineDuration';
 import { isReusableState } from '../services/bullmqUtils';
 import { attachWorkerObservability } from './workerObservability';
@@ -22,11 +21,37 @@ import { envInt } from '../utils/envInt';
 import { createAuditLogAsync } from '../services/auditService';
 import { ANONYMOUS_ACTOR_ID } from '../services/auditEvents';
 import { DEFAULT_OFFLINE_THRESHOLD_MINUTES } from '../services/deviceLiveness';
+import { captureMessage } from '../services/sentry';
+import { throttledReporter } from '../services/sentryThrottle';
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
   const withSystem = dbModule.withSystemDbAccessContext;
   return typeof withSystem === 'function' ? withSystem(fn) : fn();
+};
+
+// #6503 follow-up: unlike processMarkOffline (a BullMQ job with no ambient
+// context to begin with), transitionDeviceOffline is also called from inside
+// the agent WS handlers' already-open ORG-scoped withDbAccessContext. A bare
+// nested withSystemDbAccessContext would silently no-op there (withDbAccessContext
+// refuses to nest — see its doc comment) and the offline_transition_effects
+// insert would run under the org-scoped RLS context instead, which denies it
+// (that table's policy does not grant agent-connection-scoped writes) — the
+// exact heartbeat probe-config pattern from #1105 (see
+// routes/agents/heartbeat.ts's maybeDispatchEditionMigration call). Exiting
+// the ambient context first genuinely opens a fresh system-scoped transaction,
+// so a failure in here cannot poison the caller's (still-open) org transaction
+// either. Cost: for the duration of this call the process briefly holds TWO
+// pooled connections (the caller's still-open org transaction plus this one) —
+// the same #1105-class tradeoff already accepted for the other short
+// ambient-context wraps in routes/agentWs.ts (monitor-result / discovery-
+// result / orphaned-command branches). Acceptable here because the nested
+// work is DB-only and short-lived (no Redis round-trip inside the system
+// context).
+const runSystemDbAccessOutsideAmbientContext = async <T>(fn: () => Promise<T>): Promise<T> => {
+  const runOutside = dbModule.runOutsideDbContext;
+  const runInSystemContext = () => runWithSystemDbAccess(fn);
+  return typeof runOutside === 'function' ? runOutside(runInSystemContext) : runInSystemContext();
 };
 
 // Queue name
@@ -133,6 +158,25 @@ function canonicalTimestamp(value: string, name: string): string {
 function sha256(parts: readonly string[]): string {
   return createHash('sha256').update(parts.join('\0')).digest('hex');
 }
+
+// Skipped-device-row reporting (#5867). A row with an invalid id/orgId/
+// lastSeenAt is re-selected and re-skipped every ~30s sweep until someone
+// fixes it by hand — permanent, not transient — so console.error alone (the
+// file's other benign-and-self-healing paths, e.g. the config-policy-tables
+// warning below) isn't durable signal on its own: no BullMQ job is ever
+// created for the row, so it never reaches attachWorkerObservability's
+// 'failed' handler either. Throttled (like the filterPreviewTimeout /
+// softwareInventoryObservations call sites) so one permanently-bad row
+// doesn't turn into an event per sweep.
+const reportSkippedDeviceRow = throttledReporter(5 * 60 * 1000, (suppressed) => {
+  captureMessage('offlineDetector skipped a device row with an invalid id/orgId/lastSeenAt', {
+    eventCode: 'offline_detector_invalid_device_row',
+    level: 'warning',
+  });
+  if (suppressed > 0) {
+    console.warn(`[OfflineDetector] ${suppressed} further invalid device rows suppressed since the last Sentry report`);
+  }
+});
 
 export function offlineTransitionId(
   orgId: string,
@@ -271,6 +315,7 @@ export function createOfflineWorker(): Worker<OfflineJobData> {
  */
 export async function processDetectOffline(data: DetectOfflineJobData): Promise<{
   detected: number;
+  skipped: number;
   durationMs: number;
 }> {
   const startTime = Date.now();
@@ -287,6 +332,7 @@ export async function processDetectOffline(data: DetectOfflineJobData): Promise<
 
   const queue = getOfflineQueue();
   let totalDetected = 0;
+  let totalSkipped = 0;
   let cursor: string | null = data.cursor ? requireUuid(data.cursor, 'cursor') : null;
 
   while (true) {
@@ -332,34 +378,53 @@ export async function processDetectOffline(data: DetectOfflineJobData): Promise<
 
     if (chunk.length === 0) break;
 
-    const jobs = chunk.map(device => {
-      const observedLastSeenAt = canonicalTimestamp(
-        device.lastSeenAt?.toISOString() || '',
-        'observedLastSeenAt',
-      );
-      const transitionId = offlineTransitionId(device.orgId, device.id, observedLastSeenAt);
-      return {
-        name: 'mark-offline',
-        data: {
-          type: 'mark-offline' as const,
-          transitionId,
-          deviceId: device.id,
-          orgId: device.orgId,
-          observedLastSeenAt,
-        },
-        opts: {
-          jobId: transitionId,
-          removeOnComplete: { count: 10_000 },
-          // Failed deterministic IDs must not block the next sweep forever.
-          // Brief retries absorb transient DB errors; exhausted jobs release
-          // their ID so an unchanged stale observation can be admitted again.
-          attempts: 3,
-          backoff: { type: 'exponential', delay: 1_000 },
-          removeOnFail: true,
-        },
-      };
-    });
+    // A single malformed row (e.g. a non-v4 UUID inserted outside the API,
+    // which only ever mints v4) must not abort the whole page: requireUuid /
+    // canonicalTimestamp throwing inside a bare .map() would lose every OTHER
+    // device in this chunk too, and since the job retries from the same
+    // cursor, the bad row would fail the sweep every 30s forever (#5867).
+    // Skip-and-log the offending row instead so its siblings still get
+    // enqueued.
+    const jobs = chunk
+      .map(device => {
+        try {
+          const observedLastSeenAt = canonicalTimestamp(
+            device.lastSeenAt?.toISOString() || '',
+            'observedLastSeenAt',
+          );
+          const transitionId = offlineTransitionId(device.orgId, device.id, observedLastSeenAt);
+          return {
+            name: 'mark-offline',
+            data: {
+              type: 'mark-offline' as const,
+              transitionId,
+              deviceId: device.id,
+              orgId: device.orgId,
+              observedLastSeenAt,
+            },
+            opts: {
+              jobId: transitionId,
+              removeOnComplete: { count: 10_000 },
+              // Failed deterministic IDs must not block the next sweep forever.
+              // Brief retries absorb transient DB errors; exhausted jobs release
+              // their ID so an unchanged stale observation can be admitted again.
+              attempts: 3,
+              backoff: { type: 'exponential', delay: 1_000 },
+              removeOnFail: true,
+            },
+          };
+        } catch (error) {
+          console.error(
+            `[OfflineDetector] Skipping device ${device.id} (org ${device.orgId}) — invalid identifiers or lastSeenAt:`,
+            error,
+          );
+          reportSkippedDeviceRow();
+          return null;
+        }
+      })
+      .filter((job): job is NonNullable<typeof job> => job !== null);
 
+    totalSkipped += chunk.length - jobs.length;
     await queue.addBulk(jobs);
     totalDetected += jobs.length;
     cursor = chunk[chunk.length - 1]!.id;
@@ -370,9 +435,13 @@ export async function processDetectOffline(data: DetectOfflineJobData): Promise<
   if (totalDetected > 0) {
     console.log(`[OfflineDetector] Detected ${totalDetected} stale devices`);
   }
+  if (totalSkipped > 0) {
+    console.warn(`[OfflineDetector] Skipped ${totalSkipped} device row(s) with invalid identifiers or lastSeenAt`);
+  }
 
   return {
     detected: totalDetected,
+    skipped: totalSkipped,
     durationMs: Date.now() - startTime
   };
 }
@@ -395,7 +464,9 @@ export async function processMarkOffline(data: MarkOfflineJobData): Promise<{
     const [device] = await db.update(devices).set({ status: 'offline' }).where(and(
       eq(devices.id, data.deviceId), eq(devices.orgId, data.orgId),
       inArray(devices.status, ['online', 'updating']),
-      eq(devices.lastSeenAt, new Date(observedLastSeenAt)),
+      // The observation and transition ID have JS millisecond precision, while
+      // SQL-side writes (e.g. now()) can leave microseconds in last_seen_at.
+      sql`date_trunc('milliseconds', ${devices.lastSeenAt}) = ${observedLastSeenAt}`,
     )).returning();
     if (!device) return [];
     return persistOfflineTransition(device, data.transitionId, observedLastSeenAt);
@@ -406,6 +477,91 @@ export async function processMarkOffline(data: MarkOfflineJobData): Promise<{
   await enqueueOfflineEffects(effectIds);
   return { transitioned: true, alertCreated: false };
 
+}
+
+/**
+ * Atomically transition a device from `online` (or `updating`, if the caller
+ * opts in) to `offline` and persist the same durable
+ * `offline_transition_effects` rows the sweep-driven `processMarkOffline`
+ * produces — including the ones that fan out to compiled monitor rules via
+ * `expandOfflineAlertPlan`.
+ *
+ * #6503: the agent WebSocket close/error handlers used to call a bare
+ * `updateDeviceStatus(agentId, 'offline')` that set BOTH `status='offline'`
+ * AND `last_seen_at=now()` directly, with no transition-effects row. That
+ * simultaneously falsified both predicates the sweep's detect query relies on
+ * (`status IN ('online','updating') AND last_seen_at < threshold`), so the
+ * sweep never saw the device as a transition candidate — offline-kind monitor
+ * rules never fired for an agent that closed its WebSocket, clean or dirty.
+ * This function reuses the sweep's own CAS + `persistOfflineTransition`
+ * pairing instead, and deliberately leaves `last_seen_at` untouched (it
+ * already holds the last real heartbeat, which the CAS's
+ * `date_trunc('milliseconds', ...)` guard keys off of) so the transition
+ * effects are keyed identically whether the offline observation ends up
+ * being noticed by the sweep or by a live WS disconnect.
+ *
+ * Like `processMarkOffline`, this opens its OWN system DB access context —
+ * but unlike it, callers (currently only the agent WS handlers) may already
+ * be running inside an ambient ORG-scoped `withDbAccessContext` for the
+ * device's own org. A bare nested `withSystemDbAccessContext` would silently
+ * no-op there (`withDbAccessContext` refuses to nest), running the
+ * `offline_transition_effects` insert under org-scoped RLS instead of system
+ * scope — which that table's policy denies, surfacing as `42501` from
+ * Postgres and then poisoning the rest of the caller's transaction ("current
+ * transaction is aborted"). This function instead exits the ambient context
+ * first via `runOutsideDbContext`, exactly like the heartbeat probe-config /
+ * edition-migration dispatch pattern from #1105 (`routes/agents/heartbeat.ts`),
+ * so it always opens a genuinely fresh system transaction — a failure inside
+ * it cannot poison whatever transaction the caller had open.
+ *
+ * `fromStatuses` intentionally does NOT default to every non-terminal status
+ * the old `updateDeviceStatus(agentId, 'offline')` used to write over
+ * (`maintenance`, `pending`). This function's whole point is to make the WS
+ * disconnect path produce a REAL offline-transition effect — firing
+ * offline-kind monitor rules — so silently widening it to `maintenance` would
+ * newly alert on a device an operator deliberately parked in maintenance
+ * mode, which is worse than the pre-#6503 status quo. It matches the sweep's
+ * own scope (`processDetectOffline` only ever selects `online`/`updating`)
+ * rather than the old WS-only carve-out.
+ */
+export async function transitionDeviceOffline(
+  agentId: string,
+  fromStatuses: readonly ('online' | 'updating')[] = ['online'],
+): Promise<{ transitioned: boolean }> {
+  // The SELECT, the CAS UPDATE, and persistOfflineTransition's
+  // offline_transition_effects INSERT all share this one system-scoped
+  // transaction — see the doc comment above for why a bare ambient (org-scoped)
+  // context would deny the insert under RLS.
+  const effectIds = await runSystemDbAccessOutsideAmbientContext(async () => {
+    const [current] = await db
+      .select()
+      .from(devices)
+      .where(and(eq(devices.agentId, agentId), inArray(devices.status, fromStatuses)))
+      .limit(1);
+    if (!current) return [];
+
+    const observedLastSeenAt = canonicalTimestamp(current.lastSeenAt?.toISOString() || '', 'observedLastSeenAt');
+    const transitionId = offlineTransitionId(current.orgId, current.id, observedLastSeenAt);
+
+    const [device] = await db.update(devices).set({ status: 'offline', updatedAt: new Date() }).where(and(
+      eq(devices.id, current.id), eq(devices.orgId, current.orgId),
+      inArray(devices.status, fromStatuses),
+      // Same ms-precision CAS guard as processMarkOffline (#6024): the write
+      // must be against the exact heartbeat observation just read.
+      sql`date_trunc('milliseconds', ${devices.lastSeenAt}) = ${observedLastSeenAt}`,
+    )).returning();
+    if (!device) return [];
+
+    return persistOfflineTransition(device, transitionId, observedLastSeenAt);
+  });
+  if (!effectIds.length) return { transitioned: false };
+
+  // The database has already admitted the work durably (same as
+  // processMarkOffline) — fan-out happens outside the DB context since
+  // getOfflineQueue()/addBulk talks to Redis, not Postgres, and a failed
+  // immediate enqueue is retried by the independent periodic recovery scan.
+  await enqueueOfflineEffects(effectIds);
+  return { transitioned: true };
 }
 
 async function enqueueOfflineEffects(ids: string[]): Promise<void> {
@@ -472,145 +628,6 @@ async function triggerConfigPolicyOfflineAlerts(
     console.error(`[OfflineDetector] Error evaluating config policy offline alerts for device ${device.id}:`, error);
     return { created: false, fatalError: error };
   }
-}
-
-/**
- * Find and trigger offline-type alert rules for a device.
- *
- * Evaluates BOTH rule sources:
- *  - legacy standalone `alertRules` (template-based) below, and
- *  - configuration-policy alert rules via evaluateDeviceAlertsFromPolicy().
- *
- * Config-policy offline rules must be evaluated here because the periodic
- * alertWorker sweep only queues devices that are still `online` with a recent
- * heartbeat (alertWorker.ts), so a device offline long enough to trip an
- * offline threshold is never evaluated by that path (issue #1857).
- */
-export async function triggerOfflineAlerts(
-  device: typeof devices.$inferSelect
-): Promise<boolean> {
-  const configPolicyResult = await triggerConfigPolicyOfflineAlerts(device);
-  let alertCreated = configPolicyResult.created;
-
-  // Find legacy standalone alert rules that have offline conditions
-  // We need to find rules where the template conditions include type: 'offline'
-
-  // Get all active rules for this device's org, plus its partner's
-  // partner-wide rules (#2128).
-  const ownershipCondition = await alertRuleOwnershipConditionForOrg(device.orgId);
-  const rules = await db
-    .select()
-    .from(alertRules)
-    .where(
-      and(
-        ownershipCondition,
-        eq(alertRules.isActive, true),
-        or(
-          eq(alertRules.targetType, 'all'),
-          and(eq(alertRules.targetType, 'org'), eq(alertRules.targetId, device.orgId)),
-          and(eq(alertRules.targetType, 'site'), eq(alertRules.targetId, device.siteId)),
-          and(eq(alertRules.targetType, 'device'), eq(alertRules.targetId, device.id))
-        )
-      )
-    );
-
-  if (rules.length === 0) {
-    // No legacy rules — surface any config-policy failure before returning so
-    // the BullMQ job fails and retries (consistent with alertWorker).
-    if (configPolicyResult.fatalError) throw configPolicyResult.fatalError;
-    return alertCreated;
-  }
-
-  // Get templates for all rules
-  const templateIds = [...new Set(rules.map(r => r.templateId))];
-  const templates = await db
-    .select()
-    .from(alertTemplates)
-    .where(inArray(alertTemplates.id, templateIds));
-
-  const templateMap = new Map(templates.map(t => [t.id, t]));
-
-  for (const rule of rules) {
-    const template = templateMap.get(rule.templateId);
-    if (!template) continue;
-
-    // Check if conditions include offline type
-    const overrides = rule.overrideSettings as Record<string, unknown> | null;
-    const conditions = (overrides?.conditions ?? template.conditions) as unknown;
-
-    if (!hasOfflineCondition(conditions)) {
-      continue;
-    }
-
-    // Build template context
-    const context: Record<string, unknown> = {
-      deviceName: device.displayName || device.hostname,
-      hostname: device.hostname,
-      osType: device.osType,
-      osVersion: device.osVersion,
-      ruleName: rule.name,
-      severity: (overrides?.severity as string) ?? template.severity,
-      lastSeenAt: device.lastSeenAt?.toISOString()
-    };
-
-    // Interpolate title and message
-    const title = interpolateTemplate(template.titleTemplate, context);
-    const message = interpolateTemplate(template.messageTemplate, context);
-    const severity = (overrides?.severity as 'critical' | 'high' | 'medium' | 'low' | 'info') ?? template.severity;
-
-    // Create alert
-    const alertId = await createAlert({
-      ruleId: rule.id,
-      deviceId: device.id,
-      orgId: device.orgId,
-      severity,
-      title,
-      message,
-      context: {
-        ...context,
-        conditionsMet: ['Device offline'],
-        templateId: template.id
-      }
-    });
-
-    if (alertId) {
-      alertCreated = true;
-      console.log(`[OfflineDetector] Created offline alert ${alertId} for device ${device.id}`);
-    }
-  }
-
-  // Legacy path ran successfully; now surface any config-policy failure so the
-  // BullMQ job fails and retries (consistent with alertWorker).
-  if (configPolicyResult.fatalError) throw configPolicyResult.fatalError;
-
-  return alertCreated;
-}
-
-/**
- * Check if conditions include an offline type condition
- */
-function hasOfflineCondition(conditions: unknown): boolean {
-  if (!conditions) return false;
-
-  if (Array.isArray(conditions)) {
-    return conditions.some(c => hasOfflineCondition(c));
-  }
-
-  if (typeof conditions === 'object') {
-    const c = conditions as Record<string, unknown>;
-
-    // Check if this is an offline condition
-    if (c.type === 'offline') {
-      return true;
-    }
-
-    // Check nested conditions in a group
-    if ('conditions' in c && Array.isArray(c.conditions)) {
-      return c.conditions.some((sub: unknown) => hasOfflineCondition(sub));
-    }
-  }
-
-  return false;
 }
 
 /**

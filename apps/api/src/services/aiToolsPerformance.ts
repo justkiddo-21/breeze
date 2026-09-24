@@ -15,7 +15,7 @@ import { devices, deviceMetrics, deviceSessions, deviceBootMetrics, metricRollup
 import { eq, and, desc, gte, inArray, SQL, sql } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
-import { SITE_SCOPE_EMPTY_NOTE } from './aiToolsSiteScope';
+import { SITE_SCOPE_EMPTY_NOTE , runFrozenDeviceIds, deviceScopeCondition } from './aiToolsSiteScope';
 import {
   mergeBootRecords,
   parseCollectorBootMetricsFromCommandResult,
@@ -24,6 +24,7 @@ import {
   normalizeStartupItems,
   resolveStartupItem,
 } from './startupItems';
+import { aiExecuteCommand } from './aiDispatch';
 
 type AiToolTier = 1 | 2 | 3 | 4;
 type MetricPoint = {
@@ -74,6 +75,9 @@ async function verifyDeviceAccess(
   auth: AuthContext,
   requireOnline = false
 ): Promise<{ device: typeof devices.$inferSelect } | { error: string }> {
+  if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) {
+    return { error: 'Device not found or access denied' };
+  }
   const conditions: SQL[] = [eq(devices.id, deviceId)];
   const orgCond = auth.orgCondition(devices.orgId);
   if (orgCond) conditions.push(orgCond);
@@ -88,12 +92,6 @@ async function verifyDeviceAccess(
       error: `Device ${device.hostname} is not online (status: ${device.status}). This tool needs a live connection; to run when the device reconnects use the Run Script / deployment tools instead.`,
     };
   return { device };
-}
-
-let _commandQueue: typeof import('./commandQueue') | null = null;
-async function getCommandQueue() {
-  if (!_commandQueue) _commandQueue = await import('./commandQueue');
-  return _commandQueue;
 }
 
 function computeStats(values: number[]): { min: number; max: number; avg: number; current: number } {
@@ -227,6 +225,8 @@ export function registerPerformanceTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'device CPU, RAM, disk and network metrics over time, time ranges and aggregation',
     deviceArgs: ['deviceId'],
     definition: {
       name: 'analyze_metrics',
@@ -333,9 +333,11 @@ export function registerPerformanceTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'fleet CPU, RAM and disk trends, per-device averages, peaks and ranked resource usage',
     definition: {
       name: 'analyze_fleet_metrics',
-      description: 'Aggregate a metric (CPU/RAM/disk percent) across the fleet from pre-computed rollups: per-device avg / peak-p95 / max over a time window, ranked by peak p95 descending, plus a fleet-wide summary. The fleet summary\'s p95 (p95ApproxAvgOfDevicePeaks) is an approximation — the average of each device\'s peak per-bucket p95, not a true recomputed fleet-wide percentile. Read-only.',
+      description: "Return fleet CPU/RAM/disk rollup averages, peak-p95 and maxima, ranked by device peak p95. Fleet p95ApproxAvgOfDevicePeaks is an approximation averaging device peak bucket p95s, not a true fleet percentile. Read-only.",
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -397,6 +399,10 @@ export function registerPerformanceTools(aiTools: Map<string, AiTool>): void {
       // Site is an app-layer authz axis only (RLS does not cover it) — join
       // devices and narrow by siteId for a site-restricted caller.
       if (isSiteRestricted) conditions.push(inArray(devices.siteId, auth.allowedSiteIds!));
+      // W04 (#5715): the device-LESS analysis run's frozen set — it has no site
+      // axis, so the narrowing above does nothing for it.
+      const frozenDeviceIds = runFrozenDeviceIds(auth);
+      if (frozenDeviceIds) conditions.push(inArray(devices.id, frozenDeviceIds));
 
       // The per-device fold runs in Postgres, not here. Selecting raw rollup
       // rows materialized (org devices) x (buckets in window) — a 168h window
@@ -495,6 +501,8 @@ export function registerPerformanceTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'active user sessions, logged-in users and reboot safety on a device or across the fleet',
     deviceArgs: ['deviceId'],
     definition: {
       name: 'get_active_users',
@@ -535,6 +543,12 @@ export function registerPerformanceTools(aiTools: Map<string, AiTool>): void {
       if (orgCondition) conditions.push(orgCondition);
       if (deviceId) conditions.push(eq(deviceSessions.deviceId, deviceId));
       if (allowedSiteIds) conditions.push(inArray(devices.siteId, allowedSiteIds));
+      // Exact-device axis (#6086): the fleet form (no deviceId) is otherwise
+      // org-wide, so a device-bound run reads sibling devices' sessions. It is
+      // independent of the site ceiling above — a device-less analysis run has
+      // `allowedDeviceIds` and no `allowedSiteIds` at all.
+      const deviceScope = deviceScopeCondition(auth, deviceSessions.deviceId);
+      if (deviceScope) conditions.push(deviceScope);
 
       const rows = await db
         .select({
@@ -614,6 +628,8 @@ export function registerPerformanceTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'user experience, login performance and session behavior trends by device or user',
     deviceArgs: ['deviceId'],
     definition: {
       name: 'get_user_experience_metrics',
@@ -657,6 +673,10 @@ export function registerPerformanceTools(aiTools: Map<string, AiTool>): void {
       if (deviceId) conditions.push(eq(deviceSessions.deviceId, deviceId));
       if (username) conditions.push(eq(deviceSessions.username, username));
       if (allowedSiteIds) conditions.push(inArray(devices.siteId, allowedSiteIds));
+      // Exact-device axis (#6086) — see get_active_users above; the site axis
+      // alone does not constrain a device-less analysis run.
+      const deviceScope = deviceScopeCondition(auth, deviceSessions.deviceId);
+      if (deviceScope) conditions.push(deviceScope);
 
       const rows = await db
         .select({
@@ -745,6 +765,8 @@ export function registerPerformanceTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'slow boot, startup impact, boot time history and optimization recommendations',
     deviceArgs: ['deviceId'],
     definition: {
       name: 'analyze_boot_performance',
@@ -772,9 +794,8 @@ export function registerPerformanceTools(aiTools: Map<string, AiTool>): void {
       let collectionFailed = false;
       let freshBootRecord: ReturnType<typeof parseCollectorBootMetricsFromCommandResult> = null;
       if (triggerCollection && device.status === 'online') {
-        const { executeCommand } = await getCommandQueue();
         try {
-          const commandResult = await executeCommand(deviceId, 'collect_boot_performance', {}, {
+          const commandResult = await aiExecuteCommand(auth, 'analyze_boot_performance', deviceId, 'collect_boot_performance', {}, {
             userId: auth.user.id,
             timeoutMs: 15000,
           });
@@ -889,10 +910,12 @@ export function registerPerformanceTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 3 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'device startup items: disable, enable',
     deviceArgs: ['deviceId'],
     definition: {
       name: 'manage_startup_items',
-      description: 'Disable or enable startup items on a device. Device must be online. Item must exist in the most recent boot performance record. Requires user approval. Use analyze_boot_performance first to identify high-impact items.',
+      description: 'Disable or enable startup items on a device. Device must be online. Item must exist in the most recent boot performance record. Requires user approval. Use analyze_boot_performance first to identify high-impact items. Actions: disable, enable.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -972,8 +995,9 @@ export function registerPerformanceTools(aiTools: Map<string, AiTool>): void {
       // an error in this case.
 
       // Send command to agent
-      const { executeCommand } = await getCommandQueue();
-      const result = await executeCommand(
+      const result = await aiExecuteCommand(
+        auth,
+        'manage_startup_items',
         deviceId,
         'manage_startup_item',
         { itemName: item.name, itemType: item.type, itemPath: item.path, itemId: item.itemId, action, reason },

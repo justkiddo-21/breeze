@@ -59,6 +59,7 @@ import { sql, type SQL } from 'drizzle-orm';
 import * as dbModule from '../db';
 import { extractRowCount } from '../db/rowCount';
 import { buildRepoint, keyExpr } from './orgMergeExecutors';
+import { moveBindings, resolveBindingMerge } from './callerVerification/merge';
 
 export interface MergeTableOutcome {
   moved: number;
@@ -186,7 +187,6 @@ function describeRehomed(rehomed: Array<{ table: string; count: number }>): stri
 // discovered_assets' dedupe key is `ip_address` (discovered_assets_org_ip_unique).
 const DISCOVERED_ASSET_KEY = ['ip_address'] as const;
 const DISCOVERED_ASSET_CHILDREN: readonly ChildRef[] = [
-  { table: 'network_monitors', column: 'asset_id' },
   { table: 'snmp_devices', column: 'asset_id' },
   { table: 'unifi_clients', column: 'discovered_asset_id' },
   { table: 'unifi_devices', column: 'discovered_asset_id' },
@@ -205,6 +205,12 @@ const DISCOVERED_ASSET_CHILDREN: readonly ChildRef[] = [
  * hundreds of tables earlier. See `MergePolicyPhase` in orgMerge.ts.
  */
 const resolveDiscoveredAssets: CustomMergeExecutor = async (loser, survivor) => {
+  // Same-IP collision is not same-site identity. Disable/detach before deleting
+  // the source asset; retain monitor IDs, source-site history and canonical nodes.
+  await dbModule.db.execute(sql`SELECT breeze_detach_topology_monitor_authority('asset',a.id,a.org_id,a.site_id,'asset_merge_collision')
+    FROM discovered_assets a WHERE a.org_id=${uuid(loser)} AND EXISTS
+    (SELECT 1 FROM discovered_assets b WHERE b.org_id=${uuid(survivor)} AND b.ip_address=a.ip_address)`);
+
   const { dropped, rehomed } = await rehomeChildrenThenDelete(
     'discovered_assets',
     DISCOVERED_ASSET_KEY,
@@ -343,6 +349,69 @@ const fenceAiOperatorTasks: CustomMergeExecutor = async (loser) => {
      WHERE org_id = ${uuid(loser)}
        AND device_id IS NOT NULL`);
 
+  // Recipe library E2 (#6167). THREE target pointers to sever, all in the
+  // RESOLVE phase and all for the same reason the task's device detach above
+  // is here: the move phase repoints `devices`, `tickets` and `contacts` to the
+  // survivor while these targets stay with the loser. For contact_id that is
+  // not merely untidy — ai_operator_task_targets_contact_org_fk is a COMPOSITE
+  // (contact_id, org_id) FK, so a contact repointed to the survivor leaves the
+  // pair unresolvable and the merge aborts at COMMIT with 23503.
+  //
+  // Deliberately NOT restricted to live tasks: a terminal task's target is
+  // leaving the tenant too, and its evidence should say so. Stamping
+  // 'org_merged' here first also means the device-move trigger's
+  // COALESCE(detached_reason, 'device_moved') preserves the REAL reason when
+  // `devices` repoints later in the move phase. All three pointers and the
+  // stamp go in ONE statement: ai_operator_task_targets_one_pointer_chk
+  // requires the stamp the moment the last pointer is null.
+  const targetsDetached = await run(sql`
+    UPDATE ai_operator_task_targets
+       SET device_id = NULL,
+           ticket_id = NULL,
+           contact_id = NULL,
+           detached_at = COALESCE(detached_at, now()),
+           detached_reason = COALESCE(detached_reason, 'org_merged'),
+           state = 'detached',
+           updated_at = now()
+     WHERE org_id = ${uuid(loser)}
+       AND (device_id IS NOT NULL OR ticket_id IS NOT NULL OR contact_id IS NOT NULL)`);
+
+  // The frozen provider identity survives — external_id and principal_label are
+  // the evidence of WHO the task was about — but the connection pointers must
+  // go: m365_connections repoint-dedupes to the survivor and
+  // google_workspace_connections keeps the survivor's row, and both FKs here
+  // are composite (connection_id, org_id).
+  const accountsDetached = await run(sql`
+    UPDATE ai_operator_task_target_accounts
+       SET m365_connection_id = NULL,
+           google_connection_id = NULL,
+           updated_at = now()
+     WHERE org_id = ${uuid(loser)}
+       AND (m365_connection_id IS NOT NULL OR google_connection_id IS NOT NULL)`);
+
+  // Human-work links (recipe library E3, #6168). Org merge re-points the loser
+  // org's tickets — and therefore its checklist items — at the survivor, while
+  // task and step `org_id` stay on the loser. E2 recorded the same finding for
+  // contacts, and drew the same conclusion: the fence must detach in the
+  // RESOLVE phase, before the move phase re-points anything, or the pointer
+  // spans two orgs for as long as the fenced task exists. The link FK is plain
+  // and single-column (migration 2026-10-26-170100 header note A), so nothing
+  // would raise if this were missing — the statement IS the contract.
+  //
+  // One statement rather than a per-ticket loop through the request-path
+  // helper: a merge can carry thousands of tickets, and the per-row event and
+  // outbox writes are the point of the request path, not of a bulk merge. The
+  // fence above already stops every one of these tasks from advancing, so the
+  // wake the request path would enqueue would be a no-op here anyway. Only
+  // UNSETTLED steps: a settled step's pointer is history and may stay.
+  const humanWorkDetached = await run(sql`
+    UPDATE ai_operator_task_steps
+       SET checklist_item_id = NULL,
+           updated_at = now()
+     WHERE org_id = ${uuid(loser)}
+       AND checklist_item_id IS NOT NULL
+       AND settled_at IS NULL`);
+
   return {
     moved: 0,
     dropped: 0,
@@ -364,6 +433,28 @@ const fenceAiOperatorTasks: CustomMergeExecutor = async (loser) => {
             + 'task keeps its frozen target label as evidence but no longer points at the device.',
           ]
         : []),
+      ...(targetsDetached > 0
+        ? [
+            `ai_operator_task_targets: detached ${targetsDetached} AI Operator task target(s) from their device, `
+            + 'ticket or contact — those records move to the surviving organization while the task history '
+            + 'stays behind, so each target keeps its frozen label as evidence but no longer points at a live record.',
+          ]
+        : []),
+      ...(accountsDetached > 0
+        ? [
+            `ai_operator_task_target_accounts: cleared the provider connection pointer on ${accountsDetached} `
+            + 'frozen account(s); the immutable external identifier and principal label are retained as '
+            + 'evidence of who the task was about.',
+          ]
+        : []),
+      ...(humanWorkDetached > 0
+        ? [
+            `ai_operator_task_steps: detached ${humanWorkDetached} live human-work step(s) from their ticket `
+            + 'checklist item — the ticket moves to the surviving organization while the task history stays '
+            + 'behind; the checklist item keeps its Operator provenance, and the fenced task will hand off '
+            + 'rather than wait on a row in another organization.',
+          ]
+        : []),
     ],
   };
 };
@@ -374,6 +465,86 @@ const fenceAiOperatorTasks: CustomMergeExecutor = async (loser) => {
  * which is why there is nothing left to do here.
  */
 const moveAiOperatorTasks: CustomMergeExecutor = async () => ({ moved: 0, dropped: 0, notes: [] });
+
+/**
+ * ai_run_artifacts (execution-plane W01) — a SPLIT disposition, because the two
+ * anchors a row can have move in opposite directions.
+ *
+ *   RUN-anchored (`run_id IS NOT NULL`): stays with the loser shell and is
+ *     erased with it. `ai_agent_runs` is `leave-for-erasure` and its `org_id`
+ *     is trigger-immutable, and this table's composite
+ *     `(run_id, org_id) -> ai_agent_runs(id, org_id)` FK binds while `run_id`
+ *     is set — so re-pointing one of these rows would 23503 at COMMIT even
+ *     under SET CONSTRAINTS ALL DEFERRED. Run history does not follow a merge
+ *     (2026-08-23 owner decision), and neither does its evidence.
+ *
+ *   SESSION-anchored (`run_id IS NULL`): REPOINTED to the survivor, because
+ *     `ai_sessions` is itself in REPOINT_TABLES. Leaving these behind was the
+ *     original W01 classification and it was wrong in both directions: the
+ *     chat session moves to the survivor while its captured artifacts stay
+ *     pinned to the loser's `org_id`, so RLS (which reads
+ *     `ai_run_artifacts.org_id`, never the session's) hides them from the
+ *     surviving org, and the loser shell's later erasure deletes the rows and
+ *     their blobs out from under a session that is still live. The composite
+ *     run FK is MATCH SIMPLE — unchecked while `run_id` is NULL — so these
+ *     rows re-point with nothing to violate, and the table carries no unique
+ *     constraint, so there is no collision to dedupe.
+ */
+const moveAiRunArtifacts: CustomMergeExecutor = async (loser, survivor) => {
+  const moved = await run(sql`
+    UPDATE ai_run_artifacts
+       SET org_id = ${uuid(survivor)}
+     WHERE org_id = ${uuid(loser)}
+       AND run_id IS NULL`);
+
+  return {
+    moved,
+    dropped: 0,
+    notes: [
+      `ai_run_artifacts: re-tenanted ${moved} chat-session artifact(s) to the surviving organization, `
+      + 'following their ai_sessions rows. Run-anchored artifacts are NOT re-tenanted — agent-run '
+      + 'evidence stays with the source org and is erased with its shell, same rule as the runs '
+      + 'themselves. Download anything still needed before erasing the loser shell.',
+    ],
+  };
+};
+
+/**
+ * script_executions, MOVE half (#5022 W01).
+ *
+ * One statement so the row is never briefly inconsistent: org_id advances to
+ * the survivor and both AI origin pointers are severed together.
+ *
+ * Only `ai_agent_run_id` is genuinely at risk — `ai_sessions` is in
+ * REPOINT_TABLES and follows the merge, while `ai_agent_runs` is
+ * `leave-for-erasure` with a trigger-immutable org_id, so a repointed
+ * execution would hold a pointer into the loser shell that is about to be
+ * erased. `ai_session_id` is nulled anyway so merge and device move obey the
+ * same single rule ("the fact survives, the pointer does not"); the asymmetry
+ * is recorded here so a later reader does not "simplify" it away.
+ *
+ * `ai_initiator_kind` is RETAINED: the surviving org still gets to see that an
+ * AI did this work.
+ */
+const moveScriptExecutionsDetachingAiOrigin: CustomMergeExecutor = async (loser, survivor) => {
+  const moved = await run(sql`
+    UPDATE script_executions
+       SET org_id = ${uuid(survivor)},
+           ai_session_id = NULL,
+           ai_agent_run_id = NULL
+     WHERE org_id = ${uuid(loser)}`);
+
+  return {
+    moved,
+    dropped: 0,
+    notes: [
+      `script_executions: re-tenanted ${moved} execution(s) to the surviving organization and `
+      + 'detached their AI origin pointers. The originating agent run stays with the source org '
+      + 'and is erased with its shell, so the pointer would have crossed tenants; the '
+      + 'ai_initiator_kind marker is kept.',
+    ],
+  };
+};
 
 /** ticket_drafts, MOVE half — a no-op: resolve already leaves zero rows behind. */
 const moveTicketDrafts: CustomMergeExecutor = async () => ({ moved: 0, dropped: 0, notes: [] });
@@ -851,6 +1022,46 @@ const mergeServiceDeliverables: CustomMergeExecutor = async (loser, survivor) =>
 };
 
 // ---------------------------------------------------------------------------
+// ticket_checklist_templates — `ticket_checklist_templates_org_name_uq
+// (org_id, name) WHERE org_id IS NOT NULL` (2026-10-16-191300, spec #5783
+// §4.2). A repoint-dedupe DELETE would be worse here than for a template set:
+// a checklist template is LIVE-REFERENCED by
+// service_deliverables.checklist_template_id and
+// deliverable_template_items.checklist_template_id (#5783 W03), both ON DELETE
+// SET NULL — so dropping a colliding loser would silently NULL those pointers
+// and empty every future occurrence's checklist, with no error and no signal.
+// Rename on collision instead, the service_deliverables move: the suffix is
+// deterministic, fires only on an actual collision, and `left(name, 182)` keeps
+// the result inside varchar(200).
+//
+// Partner-wide templates carry org_id NULL and are never merge participants;
+// the partial index's own `WHERE org_id IS NOT NULL` is mirrored by both
+// equality predicates below, which can never match a NULL org_id row.
+// ---------------------------------------------------------------------------
+const mergeTicketChecklistTemplates: CustomMergeExecutor = async (loser, survivor) => {
+  const renamed = await run(sql`
+    UPDATE ticket_checklist_templates AS t
+       SET name = left(t.name, 182) || ' (merged ' || left(${uuid(loser)}::text, 8) || ')',
+           updated_at = now()
+     WHERE t.org_id = ${uuid(loser)}
+       AND EXISTS (
+         SELECT 1 FROM ticket_checklist_templates AS s
+          WHERE s.org_id = ${uuid(survivor)}
+            AND s.name = t.name
+       )`);
+  const moved = await run(buildRepoint('ticket_checklist_templates', loser, survivor));
+  return {
+    moved,
+    dropped: 0,
+    notes: renamed > 0
+      ? [
+        `ticket_checklist_templates: renamed ${renamed} checklist template from the merged-away org whose name already existed under the survivor (suffixed with the merged org id; nothing deleted, so no deliverable's checklist_template_id is orphaned)`,
+      ]
+      : [],
+  };
+};
+
+// ---------------------------------------------------------------------------
 // api_keys / enrollment_keys — the design doc is explicit that the loser's
 // org-bound capabilities are "revoked, not repointed" (controller ruling R2).
 // Repointing alone would hand the survivor a live credential that the merged
@@ -1151,13 +1362,15 @@ const mergeOrganizationUsers: CustomMergeExecutor = async (loser, survivor) => {
 // Fleet Design definition per org. A plain repoint collides on 23505 and
 // aborts the merge.
 //
-// `report_runs.report_id` is NOT NULL with a NO ACTION FK (verified against
-// pg_constraint), so a dedupe DELETE would raise 23503 instead — and even if it
-// did not, the runs are the customer's generated report artifacts, so dropping
-// them is not on the table. The survivor's definition for the same schedule is
-// the same weekly narrative under a different id, so the loser's run history
-// simply continues there. `ai_agent_runs.report_run_id` keeps pointing at the
-// same (untouched) report_runs rows, so run traces stay linked.
+// `report_runs.report_id` is ON DELETE CASCADE since migration
+// 2026-10-27-130100 (it was a NOT NULL / NO ACTION FK before that), so a
+// dedupe DELETE would silently cascade the loser's runs rather than raise
+// 23503 — and the runs are the customer's generated report artifacts, so
+// dropping them is not on the table. The survivor's definition for the same
+// schedule is the same weekly narrative under a different id, so the loser's
+// run history simply continues there. `ai_agent_runs.report_run_id` keeps
+// pointing at the same (untouched) report_runs rows, so run traces stay
+// linked.
 //
 // The narrative key deliberately carries no keyWhere: `keyMatch` compares with a plain
 // `=`, which is NULL-blind, so ordinary reports (NULL
@@ -1305,16 +1518,90 @@ const mergeAutomationResourceBindings: CustomMergeExecutor = async (loser, survi
   notes: [],
 });
 
+// ---------------------------------------------------------------------------
+// tool_sources / tool_source_tools — Tool catalog W01 (#5215 / #5216).
+//
+// `tool_sources_org_slug_uq (org_id, slug) WHERE org_id IS NOT NULL` lets two
+// orgs each own a source with the same slug, so a plain repoint aborts the
+// whole merge on 23505. Dropping the loser's registration instead would
+// silently delete a working integration and every tool enabled on it, with no
+// error and no signal (the same reasoning as ticket_checklist_templates), so
+// this renames on collision.
+//
+// The suffix must itself satisfy `tool_sources_slug_chk`
+// (^[a-z][a-z0-9]{1,23}$): no underscore, no hyphen, 24 chars max. Hence
+// `left(slug, 20) || 'm' || <3 hex chars of the loser id>` — deterministic,
+// in-grammar, and fired only on an actual collision.
+//
+// A renamed slug invalidates every child's `qualified_name` (`<slug>__<name>`,
+// the name chat and MCP address the tool by), so the second statement rewrites
+// them from the parent. A rewrite that would exceed varchar(64) is recorded
+// the same way discovery records an unusable name — disabled, flagged for
+// review, `last_error = 'name_not_addressable'` — rather than truncated into a
+// name that no longer splits back to a real source.
+// ---------------------------------------------------------------------------
+const mergeToolSources: CustomMergeExecutor = async (loser, survivor) => {
+  const renamed = await run(sql`
+    UPDATE tool_sources AS t
+       SET slug = left(t.slug, 20) || 'm' || substr(replace(${uuid(loser)}::text, '-', ''), 1, 3),
+           updated_at = now()
+     WHERE t.org_id = ${uuid(loser)}
+       AND EXISTS (
+         SELECT 1 FROM tool_sources AS s
+          WHERE s.org_id = ${uuid(survivor)}
+            AND s.slug = t.slug
+       )`);
+  await run(sql`
+    UPDATE tool_source_tools AS t
+       SET qualified_name = left(s.slug || '__' || t.name, 64),
+           enabled = CASE WHEN length(s.slug || '__' || t.name) > 64 THEN false ELSE t.enabled END,
+           review_needed = CASE WHEN length(s.slug || '__' || t.name) > 64 THEN true ELSE t.review_needed END,
+           last_error = CASE WHEN length(s.slug || '__' || t.name) > 64 THEN 'name_not_addressable' ELSE t.last_error END,
+           updated_at = now()
+      FROM tool_sources AS s
+     WHERE s.id = t.source_id
+       AND t.org_id = ${uuid(loser)}
+       AND t.qualified_name IS DISTINCT FROM s.slug || '__' || t.name`);
+  const moved = await run(buildRepoint('tool_sources', loser, survivor));
+  return {
+    moved,
+    dropped: 0,
+    notes: renamed > 0
+      ? [
+        `tool_sources: renamed ${renamed} external tool source from the merged-away org whose slug already existed under the survivor (suffixed with the merged org id; nothing deleted, and every affected tool's qualified name was rewritten to match)`,
+      ]
+      : [],
+  };
+};
+
+// The child owner is denormalised from the parent and kept in step by the
+// DEFERRABLE INITIALLY IMMEDIATE trigger `tool_source_tools_owner_guard_trg`.
+// The merge runs under SET CONSTRAINTS ALL DEFERRED, so parent and child may
+// move in separate statements as long as both land in the same transaction.
+const mergeToolSourceTools: CustomMergeExecutor = async (loser, survivor) => ({
+  moved: await run(sql`
+    UPDATE tool_source_tools
+       SET org_id = ${uuid(survivor)},
+           updated_at = now()
+     WHERE org_id = ${uuid(loser)}`),
+  dropped: 0,
+  notes: [],
+});
+
 /**
  * The `move`-phase half of every `custom` table (which, for all but one of
  * them, is the whole executor).
  */
 export const CUSTOM_EXECUTORS: Readonly<Record<string, CustomMergeExecutor>> = {
+  caller_verification_subject_bindings: moveBindings,
   automation_resource_bindings: mergeAutomationResourceBindings,
+  tool_sources: mergeToolSources,
+  tool_source_tools: mergeToolSourceTools,
   contacts: mergeContacts,
   backup_configs: mergeBackupConfigs,
   audit_baselines: mergeAuditBaselines,
   service_deliverables: mergeServiceDeliverables,
+  ticket_checklist_templates: mergeTicketChecklistTemplates,
   pax8_orders: mergePax8Orders,
   fleet_findings: mergeFleetFindings,
   ai_agents: mergeAiAgents,
@@ -1330,6 +1617,8 @@ export const CUSTOM_EXECUTORS: Readonly<Record<string, CustomMergeExecutor>> = {
   reports: mergeReports,
   ticket_drafts: moveTicketDrafts,
   ai_operator_tasks: moveAiOperatorTasks,
+  ai_run_artifacts: moveAiRunArtifacts,
+  script_executions: moveScriptExecutionsDetachingAiOrigin,
   script_proposals: moveScriptProposals,
   m365_sync_state: moveM365SnapshotTable,
   m365_users: moveM365SnapshotTable,
@@ -1353,6 +1642,9 @@ export const CUSTOM_EXECUTORS: Readonly<Record<string, CustomMergeExecutor>> = {
  * contract test asserts that.
  */
 export const CUSTOM_RESOLVE_EXECUTORS: Readonly<Record<string, CustomMergeExecutor>> = {
+  // Must run in resolve: both colliding identities are revoked before the
+  // move pass repoints, so the canonical partial unique indexes cannot 23505.
+  caller_verification_subject_bindings: resolveBindingMerge,
   discovered_assets: resolveDiscoveredAssets,
   ticket_drafts: resolveTicketDrafts,
   // Must run in resolve, not move: ai_agents is a PARENT of ai_operator_tasks

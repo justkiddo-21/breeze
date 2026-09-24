@@ -35,8 +35,14 @@ type Deps struct {
 	MediaSources func() ([]string, error)
 	Rebuild      func(ctx context.Context, opts rebuild.Options) (*rebuild.Result, error)
 	Provider     func(ctx context.Context, server, token string, bs *bmr.BootstrapResponse) (providers.BackupProvider, error)
-	Progress     func(ctx context.Context, server, token string, u bmr.ProgressUpdate) error
-	Power        func(action string) error // "reboot" | "poweroff"
+	// WidenScope (W09, #6464) runs once after Provider and BEFORE the
+	// DryRun: it downloads the manifest, verifies the server's file index
+	// and widens the provider's admissible set with the exact external
+	// keys — or returns *bmr.ScopeRefusalError, which the console posts
+	// as `refused` before any target write. nil = no scope gate (tests).
+	WidenScope func(ctx context.Context, provider providers.BackupProvider, bs *bmr.BootstrapResponse) error
+	Progress   func(ctx context.Context, server, token string, u bmr.ProgressUpdate) error
+	Power      func(action string) error // "reboot" | "poweroff"
 	// Shell drops the operator into a root shell (the "[s]hell" failure
 	// option). Not part of the plan's published Deps table (it lists only
 	// the seams the console_test.go table exercises), but a real Console
@@ -78,9 +84,49 @@ type Console struct {
 	// is asked with no default.
 	DefaultServer string
 	AllowHost     bool
+
+	// pendingWaitElapsed accumulates the total time spent waiting on
+	// snapshot_index_pending retries across one promptCodeAndExchange
+	// call, so waitAndRetryPending can bound it to 20 minutes overall
+	// rather than per-attempt.
+	pendingWaitElapsed time.Duration
+	// sleep is the time seam waitAndRetryPending uses instead of calling
+	// time.After directly, so tests can make a "30 second" wait resolve
+	// instantly. nil (the zero value, used by every real build) falls
+	// back to a real time.After.
+	sleep func(time.Duration) <-chan time.Time
 }
 
 const rebootCountdown = 10 * time.Second
+
+// holdAfterPower blocks forever. Run calls it immediately after a
+// successful-or-not c.power(action), so that a console that has committed
+// to powering the machine down never returns to process exit while the
+// kernel is still coming down.
+//
+// That matters because the recovery-console lock's mutual-exclusion
+// primitive is the HOLDER'S PID, not the file: the losing instance polls
+// the lock file and reclaims it as stale the moment the recorded PID stops
+// being alive (acquireRecoveryConsoleLock, cmd/breeze-backup/
+// recovery_console_cmd.go — deliberately, so an OOM-killed holder can't
+// wedge the media forever). `systemctl poweroff` is asynchronous and
+// returns in milliseconds, so simply never RELEASING the lock
+// (powerAndHold, below) is not enough: the winner's process exited, its
+// PID died, and inside the multi-second real shutdown window the loser's
+// next poll saw a dead PID, reclaimed the lock, and ran a whole second
+// recovery attempt — issue #5890's trailing extra "media_booted" in the
+// QEMU e2e's progress.json.
+//
+// A sleep loop rather than `select {}`: the runtime's all-goroutines-
+// asleep deadlock panic would otherwise be reachable on a build where
+// nothing else is running, and a panic here would exit the process — the
+// exact thing this must not do. A var so tests can stub it
+// (stubHoldAfterPower in console_test.go).
+var holdAfterPower = func() {
+	for {
+		time.Sleep(time.Hour)
+	}
+}
 
 // Run executes the console end to end. It returns a non-nil error only for
 // conditions that should make the process itself exit non-zero (the media
@@ -114,10 +160,41 @@ func (c *Console) Run(ctx context.Context) error {
 	// the next real boot's stale-PID reclaim (recovery_console_cmd.go)
 	// finds this PID dead and reclaims it same as any other abandoned
 	// lock.
+	//
+	// "Hold" is literal as of issue #5890: after c.power(action) returns
+	// (asynchronously, long before the kernel halts) this BLOCKS FOREVER
+	// instead of returning, so this process — and therefore the PID
+	// stamped into the lock file — stays alive for the whole shutdown.
+	// Suppressing the release alone left the loser free to reclaim the
+	// lock as stale the instant this process exited. See holdAfterPower.
 	releaseLock := func() {}
 	powerAndHold := func(action string) error {
 		releaseLock = func() {}
-		return c.power(action)
+		err := c.power(action)
+		if err != nil {
+			// The hold below means this error never reaches cobra's
+			// error printer and never becomes a non-zero exit any
+			// more, so print it here or it is lost entirely — an
+			// operator at a bare-metal console would otherwise just
+			// see the console stop responding. Same norm as
+			// postProgress: print the non-fatal error, don't swallow
+			// it. Holding anyway is still right; a second recovery
+			// attempt is exactly as unsafe when the machine has
+			// failed to go down.
+			c.IO.Print("Power %s failed: %v — the machine may not shut down; power it off manually.\n", action, err)
+		}
+		if c.Deps.Power != nil {
+			// Only hold when something really was asked to power the
+			// machine down. A Deps with no Power seam never asked for
+			// anything (c.power is a no-op then), so blocking forever
+			// would wedge the process for no reason. The real binary
+			// always sets Power — see recovery_console_cmd.go, which
+			// wires it unconditionally, --allow-host included — so this
+			// guard exists for embedders and tests, not for any
+			// production path.
+			holdAfterPower()
+		}
+		return err
 	}
 	if c.Deps.AcquireLock != nil {
 		release, err := c.Deps.AcquireLock(ctx)
@@ -166,6 +243,24 @@ func (c *Console) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("configure backup provider: %w", err)
 	}
+	if c.Deps.WidenScope != nil {
+		if err := c.Deps.WidenScope(ctx, provider, bs); err != nil {
+			var scopeErr *bmr.ScopeRefusalError
+			if errors.As(err, &scopeErr) {
+				c.postProgress(ctx, server, token, bmr.ProgressUpdate{Status: "refused", Reason: scopeErr.Error()})
+				c.IO.Print("Recovery cannot proceed: %s\n", scopeErr.Error())
+				action, err := c.offerFailureOptions(ci)
+				if err != nil {
+					return err
+				}
+				if action == "poweroff" {
+					return powerAndHold("poweroff")
+				}
+				return scopeErr
+			}
+			return fmt.Errorf("verify download scope: %w", err)
+		}
+	}
 
 	baseOpts := rebuild.Options{
 		SnapshotID:          snapshotID,
@@ -174,6 +269,10 @@ func (c *Console) Run(ctx context.Context) error {
 		Identity:            identity,
 		Marker:              marker,
 		RegenerateInitramfs: true,
+		// #5412: a system_image snapshot (or one advertising a state
+		// manifest) must apply its OS state; the engine refuses at
+		// preflight when it is missing rather than completing files-only.
+		ExpectSystemState: bmr.SnapshotExpectsSystemState(bs.Snapshot),
 	}
 
 	for {
@@ -361,8 +460,16 @@ func (c *Console) promptServer(ci bool, answers Answers) (string, error) {
 const maxCodeAttempts = 3
 
 func (c *Console) promptCodeAndExchange(ctx context.Context, ci bool, answers Answers, server string) (string, *bmr.BootstrapResponse, error) {
+	// pendingWaitElapsed's own doc comment says the 20-minute
+	// snapshot_index_pending budget is scoped to "one promptCodeAndExchange
+	// call" — but it is a Console field, not a local, so without this reset
+	// a Console instance reused for a second call (e.g. after the operator
+	// mistyped a code once) would silently inherit whatever budget the
+	// FIRST call had already spent (review finding #5).
+	c.pendingWaitElapsed = 0
+
 	if ci {
-		token, bs, err := c.Deps.Exchange(ctx, server, answers.Code)
+		token, bs, err := c.exchangeWithNegotiation(ctx, answers.Code, server)
 		if err != nil {
 			return "", nil, fmt.Errorf("exchange recovery code: %w", err)
 		}
@@ -374,9 +481,17 @@ func (c *Console) promptCodeAndExchange(ctx context.Context, ci bool, answers An
 		if err != nil {
 			return "", nil, err
 		}
-		token, bs, exErr := c.Deps.Exchange(ctx, server, strings.TrimSpace(code))
+		token, bs, exErr := c.exchangeWithNegotiation(ctx, strings.TrimSpace(code), server)
 		if exErr == nil {
 			return token, bs, nil
+		}
+		var negErr *bmr.RecoveryNegotiationError
+		if errors.As(exErr, &negErr) {
+			// A terminal negotiation refusal (message already printed by
+			// exchangeWithNegotiation) is not a wrong code — re-prompting
+			// for another code would never help, so stop here instead of
+			// spending one of the operator's three attempts on it.
+			return "", nil, fmt.Errorf("recovery refused: %w", exErr)
 		}
 		c.IO.Print("That code did not work: %v\n", exErr)
 		if attempt == maxCodeAttempts {
@@ -384,6 +499,55 @@ func (c *Console) promptCodeAndExchange(ctx context.Context, ci bool, answers An
 		}
 	}
 	return "", nil, errors.New("unreachable")
+}
+
+// exchangeWithNegotiation calls Deps.Exchange with code, transparently
+// retrying on a 409 snapshot_index_pending (up to waitAndRetryPending's 20
+// minute bound) and surfacing every other bmr.RecoveryNegotiationError to
+// the operator verbatim before returning it to the caller.
+func (c *Console) exchangeWithNegotiation(ctx context.Context, code, server string) (string, *bmr.BootstrapResponse, error) {
+	for {
+		token, bs, err := c.Deps.Exchange(ctx, server, code)
+		if err == nil {
+			return token, bs, nil
+		}
+		var negErr *bmr.RecoveryNegotiationError
+		if errors.As(err, &negErr) {
+			c.IO.Print("%s\n", negErr.Message)
+			if negErr.Code == "snapshot_index_pending" {
+				if c.waitAndRetryPending(ctx, negErr.RetryAfterSeconds) {
+					continue
+				}
+				return "", nil, fmt.Errorf("recovery code exchange timed out waiting for the file index: %w", err)
+			}
+		}
+		return "", nil, err
+	}
+}
+
+// waitAndRetryPending sleeps for retryAfterSeconds (or 30s if unset) and
+// reports true if the caller should retry the exchange; it gives up after
+// 20 minutes of total waiting across one promptCodeAndExchange call.
+func (c *Console) waitAndRetryPending(ctx context.Context, retryAfterSeconds int) bool {
+	const maxWait = 20 * time.Minute
+	delay := time.Duration(retryAfterSeconds) * time.Second
+	if delay <= 0 {
+		delay = 30 * time.Second
+	}
+	if c.pendingWaitElapsed+delay > maxWait {
+		return false
+	}
+	c.pendingWaitElapsed += delay
+	sleep := c.sleep
+	if sleep == nil {
+		sleep = func(d time.Duration) <-chan time.Time { return time.After(d) }
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-sleep(delay):
+		return true
+	}
 }
 
 func (c *Console) chooseDisk(ctx context.Context, ci bool, answers Answers) (DiskChoice, error) {

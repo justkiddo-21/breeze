@@ -194,6 +194,59 @@ func TestRun_DryRunProducesPlanWithoutWrites(t *testing.T) {
 	}
 }
 
+// admittingMemProvider wraps memProvider (embedded by pointer so its
+// Upload/Download/List/Delete methods are promoted) and adds Admits, so it
+// satisfies both providers.BackupProvider and ObjectAdmission — exercising
+// preflight's belt-to-bmr.ApplyManifestScope's-braces sweep.
+type admittingMemProvider struct {
+	*memProvider
+	admitted map[string]struct{}
+}
+
+func (p *admittingMemProvider) Admits(key string) bool { _, ok := p.admitted[key]; return ok }
+
+// TestRun_PreflightRefusesWhenManifestEntryNotAdmitted proves preflight's
+// ObjectAdmission sweep: a manifest content entry the provider does not
+// admit must refuse before provision — sgdisk/mkfs/mount must never run.
+func TestRun_PreflightRefusesWhenManifestEntryNotAdmitted(t *testing.T) {
+	dir := t.TempDir()
+	sys := newFakeSystem(dir, 100*GiB)
+	lay := testLayout()
+	base := seedSnapshot(t, "snap-1", lay)
+
+	// Admit every content object EXCEPT one, so preflight has exactly one
+	// unadmitted entry to refuse on.
+	admitted := map[string]struct{}{}
+	var withheld string
+	for k := range base.files {
+		if !strings.Contains(k, "/files/") {
+			admitted[k] = struct{}{}
+			continue
+		}
+		if withheld == "" {
+			withheld = k
+			continue
+		}
+		admitted[k] = struct{}{}
+	}
+	if withheld == "" {
+		t.Fatal("seedSnapshot fixture has no content file under /files/ to withhold")
+	}
+	prov := &admittingMemProvider{memProvider: base, admitted: admitted}
+
+	res, err := Run(context.Background(), Options{SnapshotID: "snap-1", Provider: prov, Target: Target{Kind: TargetDisk, Path: "/dev/sdb"}, Identity: IdentityNew, StateDir: dir, StagingRoot: filepath.Join(dir, "mnt"), System: sys})
+	var refusal *RefusalError
+	if !errors.As(err, &refusal) {
+		t.Fatalf("expected *RefusalError, got err=%v res=%+v", err, res)
+	}
+	if res == nil || res.Status != "refused" {
+		t.Fatalf("res = %+v", res)
+	}
+	if sys.has("sgdisk") || sys.has("mkfs") || sys.has("mount") {
+		t.Fatalf("provision must never run once preflight refuses: %s", sys.dump())
+	}
+}
+
 func TestRun_PreflightRefusals(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -290,7 +343,7 @@ func TestRun_FullLinuxFlowOnFakeSystem(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err=%v\n%s", err, sys.dump())
 	}
-	if res.Status != "completed" || res.PhaseReached != PhaseValidate || len(res.Phases) != 7 {
+	if res.Status != "completed" || res.PhaseReached != PhaseConvert || len(res.Phases) != 8 {
 		t.Fatalf("res = %+v\n%s", res, sys.dump())
 	}
 	// Provision: zap, three partitions with type GUIDs + partition GUIDs, rescan, formats with UUIDs.
@@ -355,7 +408,7 @@ func TestRun_FullLinuxFlowOnFakeSystem(t *testing.T) {
 	if res.FilesRestored < 11 || len(res.Warnings) != 0 {
 		t.Errorf("files=%d warnings=%v", res.FilesRestored, res.Warnings)
 	}
-	if strings.Join(phaseNames(phases), ",") != "preflight,provision,restore,boot,identity,encryption,validate" {
+	if strings.Join(phaseNames(phases), ",") != "preflight,provision,restore,boot,identity,encryption,validate,convert" {
 		t.Errorf("progress phases = %v", phases)
 	}
 }
@@ -564,5 +617,74 @@ func TestRun_ResumeReusesRestoreProgress(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "work")); !os.IsNotExist(err) {
 		t.Fatalf("work root must be removed after a completed run (err=%v)", err)
+	}
+}
+
+// TestRun_VhdxTargetRunsAllEightPhases proves the W05a vhdx target end to
+// end on the fake system: the engine stages a raw image at <Path>.raw,
+// attaches THAT (not the .vhdx path) as the loop device, runs the seven
+// W03 phases against it, and then an explicit eighth phase converts the
+// raw file with qemu-img and deletes it.
+func TestRun_VhdxTargetRunsAllEightPhases(t *testing.T) {
+	skipUnlessLinuxSystemState(t)
+	resetBmrCalls()
+	dir := t.TempDir()
+	sys := newFakeSystem(dir, 100*GiB)
+	p := seedSnapshot(t, "snap-1", testLayout())
+	out := filepath.Join(dir, "t.vhdx")
+	var phases []Phase
+	res, err := Run(context.Background(), Options{
+		SnapshotID: "snap-1", Provider: p, Target: Target{Kind: TargetVHDX, Path: out, ImageSizeBytes: 100 * GiB},
+		Identity: IdentityNew, StateDir: dir, StagingRoot: filepath.Join(dir, "mnt"), System: sys, SkipBoot: true,
+		Progress: func(ph Phase, _ string, _, _ int64) {
+			if len(phases) == 0 || phases[len(phases)-1] != ph {
+				phases = append(phases, ph)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("err=%v\n%s", err, sys.dump())
+	}
+	if res.Status != "completed" || res.PhaseReached != PhaseConvert || len(res.Phases) != 8 {
+		t.Fatalf("res = %+v\n%s", res, sys.dump())
+	}
+	if res.Phases[7].Phase != PhaseConvert || res.Phases[7].Status != PhaseCompleted {
+		t.Fatalf("phase 8 = %+v", res.Phases[7])
+	}
+	if !sys.has("losetup --find --show --partscan " + out + ".raw") {
+		t.Fatalf("loop device must be attached on the raw staging file\n%s", sys.dump())
+	}
+	if !sys.has("qemu-img convert -f raw -O vhdx -o subformat=dynamic " + out + ".raw " + out) {
+		t.Fatalf("missing qemu-img convert\n%s", sys.dump())
+	}
+	if sys.indexOf("qemu-img") < sys.indexOf("losetup -d /dev/loop7") {
+		t.Fatalf("convert must run after the loop device is detached\n%s", sys.dump())
+	}
+	if strings.Join(phaseNames(phases), ",") != "preflight,provision,restore,boot,identity,encryption,validate,convert" {
+		t.Errorf("progress phases = %v", phases)
+	}
+	if res.Target.Kind != TargetVHDX || res.Target.Path != out {
+		t.Errorf("result target = %+v", res.Target)
+	}
+}
+
+// TestRun_DiskTargetRecordsConvertSkipped: the phase table is fixed-length
+// for every caller, so a non-vhdx run still reports the eighth phase — as
+// skipped, never as completed.
+func TestRun_DiskTargetRecordsConvertSkipped(t *testing.T) {
+	skipUnlessLinuxSystemState(t)
+	resetBmrCalls()
+	dir := t.TempDir()
+	sys := newFakeSystem(dir, 100*GiB)
+	p := seedSnapshot(t, "snap-1", testLayout())
+	res, err := Run(context.Background(), Options{SnapshotID: "snap-1", Provider: p, Target: Target{Kind: TargetDisk, Path: "/dev/sdb"}, Identity: IdentityNew, StateDir: dir, StagingRoot: filepath.Join(dir, "mnt"), System: sys, SkipBoot: true})
+	if err != nil {
+		t.Fatalf("err=%v\n%s", err, sys.dump())
+	}
+	if len(res.Phases) != 8 || res.Phases[7].Phase != PhaseConvert || res.Phases[7].Status != PhaseSkipped {
+		t.Fatalf("phases = %+v", res.Phases)
+	}
+	if sys.has("qemu-img") {
+		t.Fatalf("disk target must never run qemu-img\n%s", sys.dump())
 	}
 }

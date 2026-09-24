@@ -60,20 +60,6 @@ const ROOT_ALLOWLIST: Record<string, string> = {
   BREEZE_EXTERNAL_PROXY_CIDRS: 'guided-setup copies this into TRUSTED_PROXY_CIDRS (which IS mapped)',
   COMPOSE_PROFILES: 'read by the `docker compose` CLI itself to select profiles — host-level, never a container env',
 
-  // AI execution plane (spec §8): hosted-only. `aiWorkspaceEnabled()` is
-  // isHosted() && BREEZE_AI_AGENTS_ENABLED && BREEZE_AI_WORKSPACE_ENABLED, and
-  // production boot REFUSES BREEZE_AI_WORKSPACE_ENABLED=true without
-  // IS_HOSTED=true, so none of these can ever do anything in the self-host
-  // stack. Documented in .env.example so hosted operators can find them.
-  BREEZE_AI_WORKSPACE_ENABLED: 'hosted-only AI execution plane (execution plane W02): the sandbox backend is gated on IS_HOSTED and never runs in the self-host Docker stack, so mapping it into compose would manufacture a knob that does nothing',
-  AI_WORKSPACE_BACKEND: 'hosted-only AI execution plane (execution plane W02): the sandbox backend is gated on IS_HOSTED and never runs in the self-host Docker stack, so mapping it into compose would manufacture a knob that does nothing',
-  VERCEL_SANDBOX_TOKEN: 'hosted-only AI execution plane (execution plane W02): the sandbox backend is gated on IS_HOSTED and never runs in the self-host Docker stack, so mapping it into compose would manufacture a knob that does nothing',
-  VERCEL_TEAM_ID: 'hosted-only AI execution plane (execution plane W02): the sandbox backend is gated on IS_HOSTED and never runs in the self-host Docker stack, so mapping it into compose would manufacture a knob that does nothing',
-  VERCEL_PROJECT_ID: 'hosted-only AI execution plane (execution plane W02): the sandbox backend is gated on IS_HOSTED and never runs in the self-host Docker stack, so mapping it into compose would manufacture a knob that does nothing',
-  VERCEL_SANDBOX_REGION_EU: 'hosted-only AI execution plane (execution plane W02): the sandbox backend is gated on IS_HOSTED and never runs in the self-host Docker stack, so mapping it into compose would manufacture a knob that does nothing',
-  VERCEL_SANDBOX_REGION_US: 'hosted-only AI execution plane (execution plane W02): the sandbox backend is gated on IS_HOSTED and never runs in the self-host Docker stack, so mapping it into compose would manufacture a knob that does nothing',
-  AI_COMPUTE_PRICE_MULTIPLIER: 'hosted-only AI execution plane (execution plane W02): the sandbox backend is gated on IS_HOSTED and never runs in the self-host Docker stack, so mapping it into compose would manufacture a knob that does nothing',
-
   // REDIS_URL is not consumed by the API container (it derives its connection
   // from REDIS_HOST/REDIS_PORT + the file-backed redis_password secret).
   // REDIS_PASSWORD is NOT here: it sources the redis_password secret via
@@ -299,6 +285,67 @@ describe('QuickBooks QBO_* env plumbing (finding I)', () => {
   });
 });
 
+/**
+ * Partner sending domains (spec 2026-09-17 §11). Pinned on all four axes for
+ * the same reason QBO_* is: a variable that validate.ts accepts but that no
+ * compose file maps is a silent no-op — setting it in .env does nothing and the
+ * feature just stays dark, which is indistinguishable from "not configured yet".
+ */
+describe('EMAIL_DOMAINS_* env plumbing (partner sending domains W02)', () => {
+  const ROOT_COMPOSE = readFileSync(path.join(REPO_ROOT, 'docker-compose.yml'), 'utf8');
+  const PROD_COMPOSE = readFileSync(path.join(REPO_ROOT, 'deploy/docker-compose.prod.yml'), 'utf8');
+  const EMAIL_DOMAINS_VARS = [
+    'EMAIL_DOMAINS_PROVIDER',
+    'EMAIL_DOMAINS_STATIC_ALLOWED',
+    'EMAIL_DOMAINS_RESEND_API_KEY',
+    'EMAIL_DOMAINS_RESEND_SENDING_KEY',
+    'EMAIL_DOMAINS_REGION',
+    'EMAIL_DOMAINS_MAX_PER_PARTNER',
+    'EMAIL_DOMAINS_DAILY_SEND_CAP',
+    'EMAIL_DOMAINS_PARTNER_ALLOWLIST',
+    'EMAIL_DOMAINS_DENYLIST',
+    'EMAIL_DOMAINS_WEBHOOK_SECRET',
+    'EMAIL_DOMAINS_AUTOSUSPEND_BOUNCE_RATE',
+    'EMAIL_DOMAINS_AUTOSUSPEND_MIN_MESSAGES',
+    'EMAIL_DOMAINS_AUTOSUSPEND_COMPLAINTS',
+  ] as const;
+
+  it.each(EMAIL_DOMAINS_VARS)('%s is declared in the validate.ts schema', (name) => {
+    expect(ENV_SCHEMA_KEYS).toContain(name);
+  });
+
+  // The three thresholds must ship COMMENTED OUT (or empty). readAutoSuspendConfig
+  // treats any non-empty value as "the operator configured this", which turns
+  // auto-suspension ON for a self-hoster who merely copied the example file —
+  // the exact opposite of the off-by-default guarantee the same comment block
+  // promises them.
+  it.each([
+    ['.env.example'],
+    ['deploy/.env.example'],
+  ])('%s does not ship an ACTIVE auto-suspend threshold', (relPath) => {
+    const text = readFileSync(path.join(REPO_ROOT, relPath), 'utf8');
+    const active = text.split('\n').filter((line) =>
+      /^\s*EMAIL_DOMAINS_AUTOSUSPEND_[A-Z_]+=\s*\S/.test(line));
+    expect(active, `active auto-suspend assignments in ${relPath}`).toEqual([]);
+  });
+
+  it.each(EMAIL_DOMAINS_VARS)('%s is documented in the root .env.example', (name) => {
+    expect(documentedEnvExampleVars('.env.example')).toContain(name);
+  });
+
+  it.each(EMAIL_DOMAINS_VARS)('%s is documented in deploy/.env.example', (name) => {
+    expect(documentedEnvExampleVars('deploy/.env.example')).toContain(name);
+  });
+
+  it.each(EMAIL_DOMAINS_VARS)('%s reaches the api container in docker-compose.yml', (name) => {
+    expect(isReferencedInCompose(name, ROOT_COMPOSE)).toBe(true);
+  });
+
+  it.each(EMAIL_DOMAINS_VARS)('%s reaches the api container in deploy/docker-compose.prod.yml', (name) => {
+    expect(isReferencedInCompose(name, PROD_COMPOSE)).toBe(true);
+  });
+});
+
 describe('parseDocumentedVars — what counts as a documented variable (#3239)', () => {
   it('collects commented-out assignments, the form used for optional knobs', () => {
     expect(parseDocumentedVars('# MCP_REQUIRE_EXECUTE_ADMIN=true')).toEqual([
@@ -333,5 +380,39 @@ describe('parseDocumentedVars — what counts as a documented variable (#3239)',
     // assertions — which is exactly how ~39 documented knobs stayed unmapped.
     const optionalKnobsOnly = '# A_KNOB=1\n# B_KNOB=2\n# C_KNOB=3';
     expect(parseDocumentedVars(optionalKnobsOnly)).toEqual(['A_KNOB', 'B_KNOB', 'C_KNOB']);
+  });
+});
+
+/**
+ * E2E_MODE plumbing (#6447).
+ *
+ * Deliberately NOT documented in `.env.example` — it is a dev/CI-only flag that
+ * stands down the rate limiters (and lengthens token TTLs), never an operator
+ * knob, and `validate.ts` hard-refuses it under NODE_ENV production. That
+ * exemption is exactly why the parity suite above cannot see it: it only walks
+ * vars documented in `.env.example`.
+ *
+ * It still has to REACH the container, and the dev stack now depends on that.
+ * `scripts/dev/wt-stack/env.ts` pins `E2E_MODE=true` into `.env.stack` because
+ * every Playwright context replays one storageState — hence one refresh-token
+ * family — and `apps/web` spends one `POST /auth/refresh` per navigation, which
+ * blows the 60/60s per-family budget and 429s the run. If an edit to the
+ * `x-api-env` anchor ever drops the `E2E_MODE` line, that pin becomes a silent
+ * no-op and `portal-dev-e2e` starts intermittently reddening again with nothing
+ * pointing back at the missing mapping. Pin the one axis that can regress.
+ */
+describe('E2E_MODE env plumbing (#6447)', () => {
+  const ROOT_COMPOSE = readFileSync(path.join(REPO_ROOT, 'docker-compose.yml'), 'utf8');
+
+  it('is declared in the validate.ts schema', () => {
+    expect(ENV_SCHEMA_KEYS).toContain('E2E_MODE');
+  });
+
+  it('reaches the api container in docker-compose.yml', () => {
+    expect(isReferencedInCompose('E2E_MODE', ROOT_COMPOSE)).toBe(true);
+  });
+
+  it('stays out of .env.example — it is not a self-host operator knob', () => {
+    expect(documentedEnvExampleVars('.env.example')).not.toContain('E2E_MODE');
   });
 });

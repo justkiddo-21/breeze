@@ -33,16 +33,48 @@ const FIXTURE_ROOT = resolve(__dirname, 'fixtures/no-silent-mutations/src');
 // WS-A "targeted set": files that have ADOPTED runAction and must not regress
 // to silent mutations. Grows as more handlers migrate (see the backlog).
 const TARGET_GLOBS = [
-  'src/components/alerts/NotificationChannelsPage.tsx',
+  // Disk Cleanup v2 W01: scan and cleanup-preview failures must surface.
+  'src/components/devices/DeviceFilesystemTab.tsx',
+  // Disk Cleanup v2 W03: cleanup-execute moved into this panel.
+  'src/components/devices/filesystem/CleanupPanel.tsx',
+  // Disk Cleanup v2 W04: both native-cleanup mutations (queue the catalog,
+  // queue the run) go through runAction. This file is in the targeted set
+  // from birth rather than added to the migration backlog — a silent failure
+  // here is a tech believing a 90-minute DISM run started when it never did.
+  'src/components/devices/filesystem/SystemCleanupPanel.tsx',
+  // Network device "Check now" (#5988 W05): the probe reads liveness outside
+  // W04's settings writer and must surface every mutation outcome.
+  'src/components/devices/networkDevice/useAssetProbe.ts',
+  'src/components/alerts/delivery/deliveryActions.ts',
   'src/components/alerts/AlertsPage.tsx',
   'src/components/alerts/AlertDetailPage.tsx',
   // Alert verdict feedback (P2-1 Task 15): submitVerdictFeedback is the one
   // runAction-wrapped POST both the list row and the detail page call — a
   // future bare mutation added here would ship unguarded to both.
   'src/components/alerts/AlertVerdictBadge.tsx',
+  // Work types (#4628 W01): create/rename/archive all mutate partner-wide
+  // billing configuration, and archiving also rewrites ticket-category
+  // defaults -- a silent failure here leaves the tech believing a work type is
+  // gone when it is still being stamped.
+  'src/components/settings/WorkTypesCard.tsx',
   'src/components/settings/PartnerSettingsPage.tsx',
   'src/components/settings/PartnerAiProviderTab.tsx',
   'src/components/settings/OrgSettingsPage.tsx',
+  // Tool catalog W01 PR C (#5216): the Tool Sources surface authors the
+  // credentials and risk tiers that decide what the assistant may call on a
+  // customer's systems — a silent failure here is a tech believing a tool is
+  // disabled when it is not. The API client is listed alongside the two
+  // components because it is where the mutating fetches live.
+  'src/components/toolSources/api.ts',
+  'src/components/toolSources/ToolSourceForm.tsx',
+  'src/components/toolSources/DiscoveredToolsTable.tsx',
+  'src/components/toolSources/ToolSourceDetail.tsx',
+  'src/components/toolSources/ToolTestDrawer.tsx',
+  // Execution plane W05 (#5716) — the per-org AI external-processing consent
+  // switch and the attach-artifact-to-ticket control. Both mutate through
+  // runAction; the count assertion below was bumped by exactly these two.
+  'src/components/settings/OrgAiProcessingToggle.tsx',
+  'src/components/aiAgents/AttachArtifactToTicket.tsx',
   // Account board (W02): org create and restore go through runAction in the
   // page; the drag/arrow-key reorder PATCH lives in its own hook. Both are
   // listed because TARGET_GLOBS is a literal file list, not directory-wide.
@@ -106,6 +138,8 @@ const TARGET_GLOBS = [
   'src/components/settings/TicketStatusesTab.tsx',
   'src/components/settings/TicketPrioritiesTab.tsx',
   'src/components/settings/InboundEmailCard.tsx',
+  'src/components/settings/EmailTemplatesTab.tsx',
+  'src/components/settings/EmailTemplateEditor.tsx',
   'src/components/settings/M365MailboxCard.tsx',
   'src/components/settings/OrgPortalSettingsEditor.tsx',
   'src/components/settings/OrgTicketSettingsEditor.tsx',
@@ -120,6 +154,7 @@ const TARGET_GLOBS = [
   'src/components/clientAi/SessionsTab.tsx',
   'src/components/clientAi/TemplatesTab.tsx',
   'src/components/settings/CatalogItemsTab.tsx',
+  'src/components/settings/CatalogDefaultsCard.tsx',
   'src/components/billing/InvoicesPage.tsx',
   'src/components/billing/InvoiceEditor.tsx',
   'src/components/billing/InvoiceDetail.tsx',
@@ -128,7 +163,9 @@ const TARGET_GLOBS = [
   // the books stay short an invoice, so this file is in the guarded set from
   // its first commit rather than after the first regression.
   'src/components/billing/AccountingSyncCard.tsx',
-  'src/components/billing/PartnerBillingSettings.tsx',
+  'src/components/billing/PartnerBillingSettingsPage.tsx',
+  'src/components/billing/BillingRatesTab.tsx',
+  'src/components/billing/OrgBillingProfile.tsx',
   'src/components/billing/OrgBillingSettings.tsx',
   'src/components/contracts/ContractEditor.tsx',
   'src/components/contracts/ContractDetail.tsx',
@@ -168,12 +205,29 @@ const TARGET_GLOBS = [
   // routes through runAction (or a typed API wrapper), but these files were
   // never guarded, so a future bare mutation would ship with no CI signal.
   'src/components/billing/quotes/QuoteActions.tsx',
+  // Accept on behalf (spec 2026-09-21): the dialog lives in its own file
+  // because QuoteActions.tsx is already 1551 lines. It issues an invoice — a
+  // silent failure here is a tech who believes a deal is closed and is not.
+  'src/components/billing/quotes/AcceptOnBehalfDialog.tsx',
+  // Decline on behalf (#6634): a silent failure leaves the quote open while the
+  // tech believes the customer's "no" is on record.
+  'src/components/billing/quotes/DeclineOnBehalfDialog.tsx',
+  // Evidence attach/replace for an on-behalf acceptance (#6633): its own
+  // upload mutation, guarded from birth alongside its sibling dialog.
+  'src/components/billing/quotes/AcceptanceEvidenceControl.tsx',
   'src/components/billing/quotes/QuoteDocument.tsx',
-  'src/components/contracts/TemplateEditor.tsx',
-  'src/components/contracts/DocumentsTab.tsx',
-  'src/components/contracts/ContractDocumentsSection.tsx',
-  'src/components/contracts/TemplatesTab.tsx',
+  // W03 moved these three into the /agreements area; ContractDocumentsSection
+  // was deleted (contract detail now embeds SignedAgreementsPage).
+  'src/components/agreements/AgreementTemplateEditor.tsx',
+  'src/components/agreements/SignedAgreementsPage.tsx',
+  'src/components/agreements/TemplatesPage.tsx',
   'src/components/settings/PartnerCompanyTab.tsx',
+  // DR plan create/edit + BMR token create (#6495): the DR plan editor's
+  // multi-request save (plan write + per-group writes/removals) and the BMR
+  // recovery token create both closed silently on success and toasted nothing
+  // on failure beyond an inline banner the operator could miss.
+  'src/components/dr/DRPlanEditor.tsx',
+  'src/components/backup/RecoveryBootstrapTab.tsx',
   // Invoice/quote money-moment hosts (issue / send / delete / title / line
   // mutations): every mutation already routes through runAction, but the files
   // sat outside the guarded set — a future bare mutation on the highest-stakes
@@ -291,6 +345,50 @@ const TARGET_GLOBS = [
   // fleet — a silent failure here reads as "applied" while nothing landed.
   'src/components/fleetDesign/FleetDesignPage.tsx',
   'src/components/fleetDesign/ApplyDrawer.tsx',
+  // Monitor Activity tab (#5287 W03 / #5290): the escalation Reset button is
+  // this file's only mutation, and a silent failure here would leave a tech
+  // believing responses resumed and the recurrence counter cleared when they
+  // did not.
+  'src/components/monitoring/MonitorActivityTab.tsx',
+  // Network device page truth W04 (#5992): single writer for asset-scoped mutations.
+  'src/components/devices/networkDevice/settings/useNetworkAssetMutations.ts',
+  // Monitor editor + deploy dialog (sweep G1-4): save/delete already routed
+  // through runAction, but attach/detach were bare fetchWithAuth calls — a
+  // failed detach was silent and a successful one gave no feedback.
+  'src/components/monitoring/MonitorEditor.tsx',
+  'src/components/monitoring/DeployMonitorDialog.tsx',
+  // #4050 (deferred from #4018 / PR #4041): the account-security surface — MFA
+  // enable/disable, recovery-code rotation, passkey register/rename/delete, SSO
+  // re-auth, password and avatar changes. Every mutation here already reports
+  // its outcome, but through section-scoped inline banners rather than
+  // runAction, so each existing call site carries a reasoned
+  // `runaction-exempt:` marker. The point of guarding the file is the NEXT
+  // mutation: without an entry here, a bare fetchWithAuth added beside them
+  // ships with zero CI signal on the one page where a silently-failed
+  // "Disable MFA" or "Delete passkey" is a security-posture lie.
+  'src/components/settings/ProfilePage.tsx',
+  // Partner sending domains W05: the client module holds every mutation for the
+  // custom-sender-address surface (add / check / remove / identity upsert and
+  // clear / test send), each already wrapped in runAction. Guarding the file is
+  // about the NEXT mutation — a bare fetchWithAuth added beside them would
+  // silently fail on the surface that decides what address a partner's
+  // customers see mail from, and would also un-guard every caller, because
+  // isMutatingApiWrapper only clears a caller while the wrapper stays wrapped.
+  'src/lib/api/sendingDomains.ts',
+  // The tab itself has no fetchWithAuth today — it goes through the client
+  // above — and is listed so a future direct mutation cannot be added here
+  // without CI noticing. TARGET_GLOBS is a literal file list, not directory-wide.
+  'src/components/settings/PartnerSendingDomainTab.tsx',
+  // Restore-as-VM wizard (bare-metal W05a): the one POST now fans out to three
+  // engines (Hyper-V full, instant boot, Linux rebuild → VHDX) through
+  // runAction; a bare fetchWithAuth added for a fourth would silently swallow
+  // a restore that never started.
+  'src/components/backup/VMRestoreWizard.tsx',
+  // #6263 W01: these three were built but mounted on no page. /security/scans
+  // makes them reachable, so their mutations join the adopted set.
+  'src/components/security/SecurityScanManager.tsx',
+  'src/components/security/ThreatList.tsx',
+  'src/components/security/ThreatDetail.tsx',
 ];
 
 const absoluteFiles: string[] = TARGET_GLOBS.map((rel) => resolve(WEB_ROOT, '..', rel));
@@ -620,7 +718,37 @@ describe('no silent mutations in targeted set', () => {
     // fleetDesign/ApplyDrawer.tsx, so the count was 130. Account board (W02,
     // #5723) replaces the deleted OrganizationsPage.tsx entry with two files
     // (OrganizationsBoardPage.tsx, useManualOrder.ts), so the count is now 131.
-    expect(absoluteFiles.length).toBe(131);
+    // Monitor Activity tab (#5287 W03 / #5290) adds MonitorActivityTab.tsx, so
+    // the count is now 132. Agreements W03 (#5825) moves three contracts files
+    // into components/agreements/ and DELETES ContractDocumentsSection.tsx
+    // (contract detail embeds the shared list instead), so the count is 131.
+    // Execution plane W05 (#5716) adds two adopters (AiRunCard attach-to-ticket
+    // and the per-org external-processing switch), so the count is 133.
+    // Tool catalog W01 PR C (#5216) took the count to 138; sweep G1-4 added
+    // MonitorEditor.tsx and DeployMonitorDialog.tsx (140); network device page
+    // truth W04 (#5992) adds the network asset single writer: 140 → 141.
+    // Network device page truth W05 adds the probe hook: 141 → 142.
+    // #4050 adds settings/ProfilePage.tsx (account security): 142 → 143.
+    // Partner sending domains W05 adds lib/api/sendingDomains.ts and
+    // settings/PartnerSendingDomainTab.tsx: 143 → 145.
+    // W01 settings consolidation (#6224): PartnerBillingSettings.tsx ->
+    // PartnerBillingSettingsPage.tsx (net 0) then + CatalogDefaultsCard.tsx:
+    // 145 → 146.
+    // Bare-metal W05a adds backup/VMRestoreWizard.tsx (rebuild engine): 146 → 147.
+    // Outbound email templates (PR1 settings UI) add EmailTemplatesTab.tsx
+    // and EmailTemplateEditor.tsx: 147 → 149.
+    // Disk Cleanup v2 W01 adds DeviceFilesystemTab.tsx: 149 → 150.
+    // Work types (#4628 W01) add WorkTypesCard.tsx: 150 → 151.
+    // Disk Cleanup v2 W03 adds filesystem/CleanupPanel.tsx: 151 → 152.
+    // Disk Cleanup v2 W04 adds filesystem/SystemCleanupPanel.tsx: 152 → 153.
+    // Billing profiles W02 adds Rates and the org assignment writer: 153 → 155.
+    // DR plan / BMR token create (#6495) adds DRPlanEditor.tsx and
+    // RecoveryBootstrapTab.tsx: 155 → 157.
+    // #6263 W01 adds SecurityScanManager.tsx, ThreatList.tsx, ThreatDetail.tsx: 157 → 160.
+    // Accept on behalf adds quotes/AcceptOnBehalfDialog.tsx: 160 → 161.
+    // Decline on behalf (#6634) adds quotes/DeclineOnBehalfDialog.tsx: 161 → 162.
+    // Accept-on-behalf evidence (#6633) adds quotes/AcceptanceEvidenceControl.tsx: 162 → 163.
+    expect(absoluteFiles.length).toBe(163);
     for (const f of absoluteFiles) {
       expect(() => statSync(f)).not.toThrow();
     }

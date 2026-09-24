@@ -148,23 +148,37 @@ describe('orgTicketSettingsSchema', () => {
   it('rejects an empty object', () => {
     expect(orgTicketSettingsSchema.safeParse({}).success).toBe(false);
   });
-  it('accepts defaultHourlyRate null', () => {
-    expect(orgTicketSettingsSchema.safeParse({ defaultHourlyRate: null }).success).toBe(true);
+  // #6472: the retired pricing fields were silently discarded in the W02 cut-over
+  // (200 + no write). A meaningful write must fail loudly and name its replacement.
+  it.each([
+    { defaultHourlyRate: null }, { defaultHourlyRate: -1 },
+    { defaultHourlyRate: 10.001 }, { defaultHourlyRate: 150 }, { defaultBillable: true },
+    { defaultBillable: 'ignored' }, { rateCurrency: 'EUR' },
+  ])('rejects retired pricing field with an actionable message: %j', (input) => {
+    const [field] = Object.keys(input);
+    const result = orgTicketSettingsSchema.safeParse(input);
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    const issue = result.error.issues.find((i) => i.path[0] === field);
+    expect(issue?.message).toContain(field);
+    expect(issue?.message).toContain('billing profile');
   });
-  it('rejects a negative rate', () => {
-    expect(orgTicketSettingsSchema.safeParse({ defaultHourlyRate: -1 }).success).toBe(false);
+  it('names the release that first rejects the field (v0.116; v0.115 still ignored it)', () => {
+    const result = orgTicketSettingsSchema.safeParse({ defaultHourlyRate: 150 });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.issues[0]?.message).toMatch(/^defaultHourlyRate was retired in v0\.116: /);
   });
-  it('rejects a 3-decimal rate (multipleOf 0.01)', () => {
-    expect(orgTicketSettingsSchema.safeParse({ defaultHourlyRate: 10.001 }).success).toBe(false);
-    expect(orgTicketSettingsSchema.safeParse({ defaultHourlyRate: 10.5 }).success).toBe(true);
+  it('rejects the whole request when a retired field accompanies a valid SLA override', () => {
+    const slaOverrides = { normal: { resolutionMinutes: 480 } };
+    expect(orgTicketSettingsSchema.safeParse({ slaOverrides, defaultHourlyRate: 10 }).success).toBe(false);
   });
-  it('accepts defaultBillable boolean and slaOverrides', () => {
-    expect(orgTicketSettingsSchema.safeParse({ defaultBillable: true }).success).toBe(true);
-    expect(orgTicketSettingsSchema.safeParse({ slaOverrides: { normal: { resolutionMinutes: 480 } } }).success).toBe(true);
+  it('preserves SLA overrides while stripping unknown fields', () => {
+    const slaOverrides = { normal: { resolutionMinutes: 480 } };
+    expect(orgTicketSettingsSchema.parse({ slaOverrides, extra: true })).toEqual({ slaOverrides });
   });
-  it('strips a client-supplied rateCurrency', () => {
-    const parsed = orgTicketSettingsSchema.parse({ defaultHourlyRate: 10, rateCurrency: 'EUR' });
-    expect(parsed).not.toHaveProperty('rateCurrency');
+  it('rejects unknown-only patches', () => {
+    expect(orgTicketSettingsSchema.safeParse({ extra: true }).success).toBe(false);
   });
 });
 

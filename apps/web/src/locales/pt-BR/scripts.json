@@ -206,6 +206,7 @@
     }
   },
   "automationList": {
+    "elevated": "Privilégios elevados",
     "relativeTime": {
       "justNow": "Agora mesmo",
       "minutesAgo": "há {{count}} min",
@@ -1342,6 +1343,11 @@
       "confirmSuffix": "Esta ação não pode ser desfeita."
     },
     "library": {
+      "target": "Importar em",
+      "allOrgs": "Todas as organizações do parceiro",
+      "chooseOrg": "Escolha uma organização",
+      "partnerPermission": "Você não pode importar scripts para todas as organizações. Escolha uma organização.",
+      "importSuccess": "“{{name}}” importado",
       "title": "Biblioteca de scripts do sistema",
       "description": "Importe scripts para sua organização",
       "searchPlaceholder": "Pesquisar scripts do sistema...",
@@ -1383,11 +1389,19 @@
     "tagLegacy": "Marcar como importação legada",
     "tagLegacyHint": "Adiciona a tag legacy-import para que um Fleet Design possa inventariar para que esses scripts serviam.",
     "partnerWide": "Disponibilizar para todas as organizações (em todo o parceiro)",
-    "importCommit": "Importar {{count}} scripts",
+    "importCommit_one": "Importar {{count}} script",
+    "importCommit_other": "Importar {{count}} scripts",
     "resultSummary": "{{imported}} importados, {{renamed}} renomeados, {{versioned}} versionados, {{skipped}} ignorados, {{failed}} com falha",
     "scriptCount": "{{count}} scripts no pacote",
     "statusInvalid": "Inválido",
-    "exportLimit": "Você pode exportar até {{max}} scripts por pacote."
+    "exportLimit": "Você pode exportar até {{max}} scripts por pacote.",
+    "importDoneTitle": "Importação concluída",
+    "importDoneNothing": "Nada foi importado",
+    "importDoneOpen": "Abrir script",
+    "resultActionImported": "Importado",
+    "resultActionRenamed": "Renomeado de {{name}}",
+    "resultActionVersioned": "Adicionado como nova versão",
+    "resultOpen": "Abrir"
   },
   "testRunner": {
     "title": "Execução de teste",

@@ -25,6 +25,15 @@ import {
   buildContractHashParts,
   createExecutedDocuments,
 } from './contractDocumentService';
+// One-way import: quoteLifecycle does NOT import this module, so there is no
+// cycle (verify with `grep -n quoteAcceptService services/quoteLifecycle.ts`).
+import {
+  assertQuoteSendGates,
+  claimQuoteSent,
+  resolveParentToSupersede,
+  type QuoteSupersedeResult,
+} from './quoteLifecycle';
+import type { QuoteLineForMath } from './quoteMath';
 
 export interface AcceptQuoteParams {
   quoteId: string;
@@ -34,6 +43,20 @@ export interface AcceptQuoteParams {
   userAgent?: string | null;
   acceptanceTokenJti?: string | null;
   actorUserId?: string | null;
+  /** Who produced this acceptance. 'customer' (the default) is a portal or
+   *  public-link click; 'on_behalf' is an MSP tech recording an agreement
+   *  reached elsewhere (spec 2026-09-21). The two differ in exactly three
+   *  places: the eligible statuses, whether a draft is claimed inline, and
+   *  whether the acceptance provider runs. Everything after the acceptance
+   *  insert is identical. */
+  origin?: 'customer' | 'on_behalf';
+  /** on_behalf: the request enum (verbal|email|signed_document|
+   *  purchase_order|other). Ignored on the customer path, which takes the
+   *  provider's own method. */
+  method?: string | null;
+  /** on_behalf only: where a dispute reviewer would find the agreement.
+   *  Required by the route schema; the DB CHECK is the backstop. */
+  reference?: string | null;
   // Pre-fetched contract-block render data (pinned template versions), resolved
   // by the route handler OUTSIDE this transaction — the dual-axis template rows
   // are invisible to an org-scoped RLS context (see contractTemplateRender's
@@ -49,11 +72,18 @@ export interface AcceptQuoteResult {
   acceptanceId: string;
   invoiceId: string;
   invoiceIssued: boolean;
+  /** The number allocated when the accept auto-issued the invoice; null when
+   *  nothing was issued. The on-behalf audit entry records it (Task 8) without
+   *  re-reading the invoice row. */
+  invoiceNumber: string | null;
   contractIds: string[];
   pax8OrderId: string | null;
   // Executed contract_documents snapshot ids created for this accept (one per
   // contract block); empty when the quote embeds no contract blocks.
   contractDocumentIds: string[];
+  /** Set when an on-behalf accept claimed a DRAFT revision and so retired its
+   *  parent, so the route can audit it exactly as `/send` does. */
+  superseded?: QuoteSupersedeResult;
 }
 
 /**
@@ -170,7 +200,24 @@ export async function acceptQuote(
   if (quote.status === 'superseded' || quote.publicLinkRevokedAt != null) {
     throw new QuoteServiceError('This quote has been replaced by a newer version', 410, 'QUOTE_SUPERSEDED');
   }
-  if (quote.status !== 'sent' && quote.status !== 'viewed') {
+  const origin = params.origin ?? 'customer';
+  // The on-behalf path may accept a DRAFT: the tech closed the deal before the
+  // proposal ever went out, and making them send it first would email the
+  // customer a live accept link for something already agreed. It is claimed to
+  // 'sent' below — frozen and customer-bound, with no link minted.
+  const acceptableStatuses = origin === 'on_behalf'
+    ? ['draft', 'sent', 'viewed']
+    : ['sent', 'viewed'];
+  if (!acceptableStatuses.includes(quote.status)) {
+    // 'expired' and 'declined' are terminal for this action and Revise is the
+    // path forward — say so, rather than reporting a bare INVALID_STATE the
+    // tech cannot act on. Everything else keeps the pre-existing code.
+    if (origin === 'on_behalf' && (quote.status === 'expired' || quote.status === 'declined')) {
+      throw new QuoteServiceError(
+        `This quote is ${quote.status} and can no longer be accepted — use Revise to issue a new version.`,
+        409, 'QUOTE_NOT_ACCEPTABLE',
+      );
+    }
     throw new QuoteServiceError(`Cannot accept a quote in status ${quote.status}`, 409, 'INVALID_STATE');
   }
   // Read-time expiry guard (Phase 3): a quote past its expiry_date can't be accepted
@@ -180,6 +227,18 @@ export async function acceptQuote(
     throw new QuoteServiceError('This quote has expired and can no longer be accepted', 410, 'QUOTE_EXPIRED');
   }
 
+  // Accept date, resolved ONCE so the draft claim below, the acceptance
+  // timestamps, the Phase-4 contract start date, the {{dates.effective}} auto
+  // variable, and the executed-document snapshot all agree. Date-only UTC for
+  // the contract/variable use.
+  const now = new Date();
+  const effectiveDate = now.toISOString().slice(0, 10);
+
+  // Content reads. The quote row has been held FOR UPDATE since the top and
+  // every draft edit path takes that same lock, so no concurrent edit can land
+  // between these reads and the claim below; the claim itself writes only the
+  // quotes row. That is what lets the send-time gates below inspect the real
+  // blocks and lines BEFORE anything is written.
   const blocks = await db
     .select()
     .from(quoteBlocks)
@@ -191,11 +250,41 @@ export async function acceptQuote(
     .where(eq(quoteLines.quoteId, quote.id))
     .orderBy(quoteLines.sortOrder);
 
-  // Accept date, resolved ONCE so the acceptance timestamps, the Phase-4 contract
-  // start date, the {{dates.effective}} auto variable, and the executed-document
-  // snapshot all agree. Date-only UTC for the contract/variable use.
-  const now = new Date();
-  const effectiveDate = now.toISOString().slice(0, 10);
+  // Draft claim (spec §5). Inside the caller's transaction, so a later failure
+  // rolls the claim back with everything else.
+  let supersededByClaim: QuoteSupersedeResult | undefined;
+  if (origin === 'on_behalf' && quote.status === 'draft') {
+    // This path claims the draft to 'sent' with sendQuote's own helper, so it
+    // owes sendQuote's own send-time gates — and they run BEFORE the claim so a
+    // refusal writes nothing. Without them an on-behalf accept could execute a
+    // contract document whose declared variables are unresolved (the renderer
+    // substitutes '' and reports an "unreachable" Sentry capture), or convert a
+    // quote whose deposit terms became unsatisfiable while it was drafted.
+    assertQuoteSendGates(quote, blocks, lines as QuoteLineForMath[], params.contractRenderData ?? [], 'accept');
+    // Same helper, same lock order as sendQuote. On a revision the parent is
+    // retired, so a customer still holding the PARENT's link cannot accept it
+    // after the tech accepted the child.
+    const parentToSupersede = await resolveParentToSupersede(quote, 'accepted');
+    // No acceptTokenColumns: nothing the customer could act on is minted.
+    const claim = await claimQuoteSent(quote, { now, parentToSupersede });
+    supersededByClaim = claim.superseded;
+    // The in-memory row predates the freeze; overlay the committed values so
+    // the content hash, the contract variables and the issued invoice all see
+    // the same customer/seller identity a later re-read would.
+    Object.assign(quote, {
+      status: 'sent',
+      quoteNumber: claim.quoteNumber,
+      issueDate: claim.issueDate,
+      billToName: claim.billToName,
+      billToAddress: claim.billToAddress,
+      billToTaxId: claim.billToTaxId,
+      sellerSnapshot: claim.sellerSnapshot,
+      presentationSnapshot: claim.presentationSnapshot,
+      documentLocale: claim.documentLocale,
+      termsAndConditions: claim.termsAndConditions,
+      terms: claim.terms,
+    });
+  }
 
   // Contract legal snapshot (Task 15): a quote that embeds contract blocks must
   // carry its pre-fetched render data. Guard BEFORE computing the hash / recording
@@ -266,14 +355,42 @@ export async function acceptQuote(
   const contractParts = buildContractHashParts(blocks, contractRenderData, quote, effectiveDate, renderLocale);
 
   const quoteSha256 = computeQuoteSha256(quote as any, blocks as any, lines as any, contractParts, 2);
-  const captured = await getAcceptanceProvider().capture({
-    quoteId: quote.id,
-    signerName: params.signerName,
-    signerEmail: params.signerEmail,
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
-    acceptanceTokenJti: params.acceptanceTokenJti,
-  });
+  // The on-behalf path builds the capture result directly rather than routing
+  // through getAcceptanceProvider(). The provider abstraction represents HOW
+  // THE CUSTOMER SIGNED; an MSP-recorded acceptance is not a signature, and
+  // labelling it 'typed-signature' would put a claim the customer never made
+  // into the permanent record.
+  let captured: { signerName: string; signerEmail: string | null; method: string };
+  if (origin === 'on_behalf') {
+    // The route schema validates this too, but it must not be the ONLY guard:
+    // the acceptance row is a permanent legal record and a blank signer names
+    // nobody as having agreed. TypedSignatureProvider refuses exactly this on
+    // the customer path, so the direct capture cannot be laxer. A
+    // QuoteServiceError (not the provider's bare Error) so the route reports a
+    // 400 rather than a 500. Inside the transaction, so a draft claimed just
+    // above rolls back with it and stays a draft.
+    const signerName = params.signerName.trim();
+    if (!signerName) {
+      throw new QuoteServiceError(
+        'A signer name is required to record an acceptance', 400, 'INVALID_SIGNER_NAME',
+      );
+    }
+    const signerEmail = params.signerEmail?.trim();
+    captured = {
+      signerName,
+      signerEmail: signerEmail && signerEmail.length > 0 ? signerEmail : null,
+      method: params.method ?? 'other',
+    };
+  } else {
+    captured = await getAcceptanceProvider().capture({
+      quoteId: quote.id,
+      signerName: params.signerName,
+      signerEmail: params.signerEmail,
+      ipAddress: params.ipAddress,
+      userAgent: params.userAgent,
+      acceptanceTokenJti: params.acceptanceTokenJti,
+    });
+  }
 
   // 1. Record the acceptance.
   const [acceptance] = await db
@@ -285,13 +402,18 @@ export async function acceptQuote(
       signerEmail: captured.signerEmail,
       // Defense-in-depth: routes already resolve a single validated client IP,
       // but ip_address is varchar(64) — clamp so a stray long value can never
-      // overflow and roll back the whole accept (C1).
+      // overflow and roll back the whole accept (C1). On the on-behalf path
+      // this is the TECH's IP and user agent, not the customer's.
       ipAddress: params.ipAddress ? params.ipAddress.slice(0, 64) : null,
       userAgent: params.userAgent ?? null,
       quoteSha256,
       hashVersion: 2,
       acceptanceTokenJti: params.acceptanceTokenJti ?? null,
       renderLocale,
+      origin,
+      method: captured.method,
+      reference: origin === 'on_behalf' ? (params.reference ?? null) : null,
+      recordedByUserId: origin === 'on_behalf' ? (params.actorUserId ?? null) : null,
     })
     .returning({ id: quoteAcceptances.id });
 
@@ -410,8 +532,10 @@ export async function acceptQuote(
     issueFields.termsAndConditions = quote.termsAndConditions ?? null;
     issueFields.terms = quote.terms ?? null;
     // Deposit terms travel from the signed quote onto the issued invoice.
-    // depositAmount was validated < dueOnAcceptanceTotal at send and the quote
-    // is locked since, so it is safe to snapshot verbatim. Guard on a POSITIVE
+    // depositAmount was validated < dueOnAcceptanceTotal by assertQuoteSendGates
+    // — at send for a quote that was sent, and inline above (before the claim)
+    // for a draft accepted on behalf — and the quote row has been locked since,
+    // so it is safe to snapshot verbatim. Guard on a POSITIVE
     // amount, not just non-null: a $0.00 deposit is "no deposit" and must never
     // be snapshotted. (computeQuoteTotals now persists null for a zero deposit;
     // this is belt-and-suspenders against any legacy/foreign write that stored "0.00".)
@@ -552,9 +676,11 @@ export async function acceptQuote(
     acceptanceId: acceptance!.id,
     invoiceId: invoice!.id,
     invoiceIssued: oneTime.length > 0,
+    invoiceNumber: issueFields.invoiceNumber ?? null,
     contractIds,
     pax8OrderId: pax8Staged.orderId,
     contractDocumentIds,
+    superseded: supersededByClaim,
   };
 }
 

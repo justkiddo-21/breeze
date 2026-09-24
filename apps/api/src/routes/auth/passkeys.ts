@@ -30,6 +30,7 @@ import {
 } from '../../services';
 import {
   PasskeyChallengeError,
+  PasskeyVerificationError,
   authenticationInfoToPasskeyUpdateFields,
   generatePasskeyAuthenticationOptions,
   generatePasskeyRegistrationOptions,
@@ -276,6 +277,26 @@ passkeyRoutes.post('/passkeys/register/verify', authMiddleware, zValidator('json
       // keeps the user signed in where 401 did not.
       return rejectProof(c, err.message, MFA_PROOF_INVALID, PASSKEY_PROOF_REJECTION_STATUS);
     }
+    if (err instanceof PasskeyVerificationError) {
+      // #6499: @simplewebauthn rejects an origin / RP-ID / challenge / signature
+      // mismatch by throwing, and its message embeds THIS server's configured
+      // expected origin and RP ID. That escaped as a 500 that handed the caller
+      // our WebAuthn configuration. It is a rejected proof like any other, so
+      // it takes the same 400 + `mfa_proof_invalid` contract; the library
+      // detail is logged server-side by the service and reported to Sentry
+      // here, never returned in the body.
+      captureException(err, c);
+      writeAuthAudit(c, {
+        orgId: auth.orgId ?? undefined,
+        action: 'auth.mfa.passkey.register.failed',
+        result: 'failure',
+        reason: 'passkey_verification_rejected',
+        userId: auth.user.id,
+        email: auth.user.email,
+        details: { method: 'passkey' }
+      });
+      return rejectProof(c, 'Passkey registration failed', MFA_PROOF_INVALID, PASSKEY_PROOF_REJECTION_STATUS);
+    }
     throw err;
   }
 
@@ -376,6 +397,7 @@ passkeyRoutes.post('/passkeys/register/verify', authMiddleware, zValidator('json
           partnerId: auth.partnerId ?? null,
           scope: auth.scope,
           mfa: true,
+          mfaSrc: 'factor',
           mobileDeviceId: readMobileDeviceId(c) ?? undefined,
         },
         capability,
@@ -446,6 +468,7 @@ passkeyRoutes.post('/passkeys/register/verify', authMiddleware, zValidator('json
           // endpoint's step-up gate proves an existing factor, not that the
           // session itself was MFA-assured.
           mfa: auth.token?.mfa === true,
+          mfaSrc: auth.token?.mfa === true ? auth.token.mfa_src : undefined,
           // SR-001: a RE-MINT takes its device binding from the previously
           // signed `mdid` claim, never the forgeable request header.
           mobileDeviceId: carryForwardBinding(auth.token ?? {}),
@@ -571,6 +594,16 @@ export async function verifyStepUpPasskeyAssertion(userId: string, credential: {
     });
   } catch (err) {
     if (err instanceof PasskeyChallengeError) return false;
+    if (err instanceof PasskeyVerificationError) {
+      // #6499: a rejected assertion (origin/RP-ID/challenge/signature mismatch)
+      // is a failed step-up proof, not a server fault. Report it anyway — the
+      // caller collapses this to a generic `invalid_factor` audit reason, so
+      // without this an unexpected throw (corrupt stored credential, library
+      // bug) would be indistinguishable from routine wrong-device noise. No
+      // Hono context is available here; `captureException` accepts that.
+      captureException(err);
+      return false;
+    }
     throw err;
   }
   if (!verification.verified) return false;
@@ -743,6 +776,13 @@ passkeyRoutes.post('/mfa/passkey/verify', zValidator('json', passkeyMfaVerifySch
     if (err instanceof PasskeyChallengeError) {
       return c.json({ error: err.message }, 401);
     }
+    if (err instanceof PasskeyVerificationError) {
+      // #6499: same rejection class as above — generic body, detail logged
+      // server-side only. This route's clients key on 401 for a rejected
+      // login proof, matching the `verification.verified === false` branch.
+      captureException(err, c);
+      return c.json({ error: 'Passkey verification failed' }, 401);
+    }
     throw err;
   }
 
@@ -858,6 +898,7 @@ passkeyRoutes.post('/mfa/passkey/verify', zValidator('json', passkeyMfaVerifySch
     partnerId: context.partnerId,
     scope: context.scope,
     mfa: true,
+    mfaSrc: 'factor',
     mobileDeviceId: readMobileDeviceId(c) ?? undefined,
   };
 
@@ -1028,6 +1069,7 @@ passkeyRoutes.delete('/passkeys/:id', authMiddleware, zValidator('json', deleteP
         partnerId: auth.partnerId ?? null,
         scope: auth.scope,
         mfa: auth.token?.mfa === true,
+        mfaSrc: auth.token?.mfa === true ? auth.token.mfa_src : undefined,
         mobileDeviceId: carryForwardBinding(auth.token ?? {}),
       },
       capability,

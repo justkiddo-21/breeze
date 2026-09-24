@@ -27,6 +27,7 @@ async function resolveBrandingByDomain(domain: string) {
         primaryColor: portalBranding.primaryColor,
         secondaryColor: portalBranding.secondaryColor,
         accentColor: portalBranding.accentColor,
+        chromeAccent: portalBranding.chromeAccent,
         customDomain: portalBranding.customDomain,
         domainVerified: portalBranding.domainVerified,
         welcomeMessage: portalBranding.welcomeMessage,
@@ -95,6 +96,7 @@ brandingRoutes.get('/branding', async (c) => {
       primaryColor: portalBranding.primaryColor,
       secondaryColor: portalBranding.secondaryColor,
       accentColor: portalBranding.accentColor,
+      chromeAccent: portalBranding.chromeAccent,
       customDomain: portalBranding.customDomain,
       domainVerified: portalBranding.domainVerified,
       welcomeMessage: portalBranding.welcomeMessage,
@@ -104,6 +106,7 @@ brandingRoutes.get('/branding', async (c) => {
       customCss: portalBranding.customCss,
       enableTickets: portalBranding.enableTickets,
       enableAssetCheckout: portalBranding.enableAssetCheckout,
+      enableDevices: portalBranding.enableDevices,
       enableSelfService: portalBranding.enableSelfService,
       enablePasswordReset: portalBranding.enablePasswordReset,
       enableDashboard: portalBranding.enableDashboard,
@@ -112,7 +115,9 @@ brandingRoutes.get('/branding', async (c) => {
       enableReports: portalBranding.enableReports,
       enableSupportUsage: portalBranding.enableSupportUsage,
       enableService: portalBranding.enableService,
-      enableDocuments: portalBranding.enableDocuments
+      enableDocuments: portalBranding.enableDocuments,
+      enableLifecycle: portalBranding.enableLifecycle,
+      enableNetworkVisibility: portalBranding.enableNetworkVisibility
     })
     .from(portalBranding)
     .where(eq(portalBranding.orgId, auth.user.orgId))

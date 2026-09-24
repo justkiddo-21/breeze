@@ -162,8 +162,19 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
     `$osv=[System.Environment]::OSVersion.Version; ` +
     `if($osv.Major -lt 10)` +
     `{throw "Breeze: Windows 10 or Windows Server 2016 or later is required (detected $($osv.Major).$($osv.Minor))"}`;
+  // Download into a private temp directory, never the shell's working
+  // directory. An elevated PowerShell starts in C:\Windows\system32, so a
+  // relative -OutFile lands the agent INSIDE System32; `service install` then
+  // copies it from there into Program Files and Defender's ASR rule "Block use
+  // of copied or impersonated system tools" (C0033C00-...) denies every open
+  // of that copy, even to SYSTEM - the service is registered but can never
+  // start (#5898).
+  const winStageDir =
+    `$d=Join-Path $env:TEMP 'breeze-install'; ` +
+    `New-Item -ItemType Directory -Force -Path $d | Out-Null; ` +
+    `$exe=Join-Path $d 'breeze-agent.exe'`;
   const winMzCheck =
-    `$b=[IO.File]::ReadAllBytes("$pwd\\breeze-agent.exe"); ` +
+    `$b=[IO.File]::ReadAllBytes($exe); ` +
     `if($b.Length -lt 2 -or $b[0] -ne 0x4D -or $b[1] -ne 0x5A)` +
     `{throw "Breeze: downloaded file is not a Windows executable - a captive portal or web filter may be intercepting this network"}`;
   // Older Windows PowerShell 5.1 hosts (e.g. Windows Server 2016) can default
@@ -183,9 +194,12 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
     : '';
   // Downloaded as a sibling next to breeze-agent.exe BEFORE `service install`,
   // so the agent's locateSiblingWatchdog finds it and skips its LanternOps
-  // GitHub-download fallback entirely.
+  // GitHub-download fallback entirely. Staged into $d (winStageDir) alongside
+  // the agent exe — `service install` copies both from there into Program
+  // Files, and Defender's ASR rule (#5898) applies to that copy regardless of
+  // filename, not just breeze-agent.exe, so it needs the same safe cwd.
   const winWatchdog = watchdogUrl
-    ? `Invoke-WebRequest -Uri "${watchdogUrl}" -OutFile breeze-watchdog.exe; ` +
+    ? `Invoke-WebRequest -Uri "${watchdogUrl}" -OutFile (Join-Path $d 'breeze-watchdog.exe'); ` +
       `if($LASTEXITCODE){throw "Breeze: downloading the watchdog failed (exit code $LASTEXITCODE)"}; `
     : '';
   // Placed after `service install` succeeds, since that's what creates
@@ -198,14 +212,18 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
     `$ErrorActionPreference='Stop'; ` +
     `${winOsFloorCheck}; ` +
     `${winTlsCheck}; ` +
-    `Invoke-WebRequest -Uri "${ghBase}/breeze-agent-windows-amd64.exe" -OutFile breeze-agent.exe; ` +
+    `${winStageDir}; ` +
+    // Fork: our signed GitHub release, not upstream's API-route download (see
+    // ghBase's doc comment) — everything else adopts upstream's safe stage-dir
+    // fix (#5898) so this never runs from a Defender-ASR-blocked cwd.
+    `Invoke-WebRequest -Uri "${ghBase}/breeze-agent-windows-amd64.exe" -OutFile $exe; ` +
     `${winMzCheck}; ` +
     `${winTrustCert}` +
     `${winWatchdog}` +
-    `.\\breeze-agent.exe service install; ${winThrow('service install')}; ` +
+    `& $exe service install; ${winThrow('service install')}; ` +
     `${winUserHelper}` +
-    `.\\breeze-agent.exe enroll "${token}" --server "${apiUrl}"${winSecretFlag}; ${winThrow('enrollment')}; ` +
-    `.\\breeze-agent.exe service start; ${winThrow('service start')}`;
+    `& $exe enroll "${token}" --server "${apiUrl}"${winSecretFlag}; ${winThrow('enrollment')}; ` +
+    `& $exe service start; ${winThrow('service start')}`;
 
   return { windows, macos: unixCmd, linux: linuxBinaryUrl ? linuxUserCmd : unixCmd };
 }

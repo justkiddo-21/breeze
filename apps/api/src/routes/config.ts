@@ -1,11 +1,12 @@
 import { Hono } from 'hono';
 import { zValidator } from '../lib/validation';
 import { z } from 'zod';
-import { aiOperatorServiceRecoveryEnabled, aiOperatorTasksEnabled, cfAccessTrustEnabled } from '../config/env';
+import { aiOperatorServiceRecoveryEnabled, aiOperatorTasksEnabled, cfAccessTrustEnabled, sweepActEnabled, toolSourcesEnabled } from '../config/env';
 import { envFlag } from '../utils/envFlag';
 import { isS3Configured } from '../services/s3Storage';
 import { authMiddleware, requireScope, type AuthContext } from '../middleware/auth';
 import { resolveAllMlFeatureFlagsForOrg } from '../services/mlFeatureFlags';
+import { isCallerVerificationEnabled } from '../services/callerVerification/gate';
 
 export const configRoutes = new Hono();
 
@@ -26,6 +27,12 @@ configRoutes.get('/', (c) => {
       // `AI_OPERATOR_TASKS_ENABLED` and `AI_OPERATOR_RECIPE_SERVICE_RECOVERY_ENABLED`,
       // both default off (decision D2: internal/test orgs only).
       aiOperatorTasks: aiOperatorTasksEnabled() && aiOperatorServiceRecoveryEnabled(),
+      // Task A7 (tool-catalog W1) — platform kill switch for tool sources.
+      toolSources: toolSourcesEnabled(),
+      aiAgentsSweepAct: sweepActEnabled(),
+      // Caller verification (#6354): W04's UI reads this before showing any
+      // verification surface. Exact-'true' contract via the real getter.
+      callerVerification: isCallerVerificationEnabled(),
     },
     cfAccessLogin: {
       enabled: cfAccessTrustEnabled(),

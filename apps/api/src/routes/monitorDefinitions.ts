@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { monitorConversionRoutes } from './monitorDefinitions.conversion';
 import { z } from 'zod';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { zValidator } from '../lib/validation';
@@ -21,6 +22,7 @@ import {
   deleteMonitorDefinition,
   getMonitorDefinition,
   listMonitorDefinitions,
+  MonitorHasDependentsError,
   MonitorNotFoundError,
   MonitorOwnershipError,
   MonitorValidationError,
@@ -32,6 +34,12 @@ import { resolveMonitorsForDevice } from '../services/monitors/monitorResolver';
 import { isMonitorAttachableToPolicy } from '../services/monitors/monitorAttachability';
 import { canManagePartnerWidePolicies, PARTNER_WIDE_WRITE_DENIED_MESSAGE } from '../services/partnerWideAccess';
 import { convertRuleToMonitor } from '../services/monitors/ruleConversionService';
+import {
+  listMonitorDeviceActivity,
+  listMonitorEpisodes,
+} from '../services/monitors/episodeQueries';
+import { resetMonitorEscalation } from '../services/monitors/episodeReset';
+import { getDeviceWithOrgAndSiteCheck, SITE_ACCESS_DENIED } from './devices/helpers';
 import {
   addFeatureLink,
   assignPolicy,
@@ -67,11 +75,27 @@ monitorDefinitionRoutes.use('*', authMiddleware);
 const requireAlertRead = requirePermission(PERMISSIONS.ALERTS_READ.resource, PERMISSIONS.ALERTS_READ.action);
 const requireAlertWrite = requirePermission(PERMISSIONS.ALERTS_WRITE.resource, PERMISSIONS.ALERTS_WRITE.action);
 
-function errorResponse(error: unknown): { body: Record<string, unknown>; status: 400 | 403 | 404 } | null {
+function errorResponse(error: unknown): { body: Record<string, unknown>; status: 400 | 403 | 404 | 409 } | null {
   if (error instanceof MonitorOwnershipError) return { body: { error: error.message }, status: 403 };
   if (error instanceof MonitorNotFoundError) return { body: { error: 'Monitor not found' }, status: 404 };
   if (error instanceof MonitorValidationError) {
     return { body: { error: 'INVALID_MONITOR', details: error.message }, status: 400 };
+  }
+  if (error instanceof MonitorHasDependentsError) {
+    // #6509 — a clean, non-leaking 409 in place of the raw postgres FK
+    // constraint-violation text this used to fall through and surface as a 500.
+    // This is expected to be unreachable in the ordinary case (the known
+    // alerts.rule_id cascade is fixed at the DB level, migration
+    // 2026-10-25-130200) — it's a belt-and-braces map for any other/future FK
+    // the cascade hits, so the message stays generic rather than naming the
+    // specific (now-fixed) alerts case.
+    return {
+      body: {
+        error: 'MONITOR_HAS_DEPENDENTS',
+        details: 'This monitor still has rows referencing it that cannot be automatically cleared. Try again or contact support.',
+      },
+      status: 409,
+    };
   }
   return null;
 }
@@ -163,6 +187,9 @@ monitorDefinitionRoutes.post(
     }
   },
 );
+
+// Literal conversion resource must be registered before parameterized ids.
+monitorDefinitionRoutes.route('/conversion', monitorConversionRoutes);
 
 // GET /monitors/:id
 monitorDefinitionRoutes.get('/:id', requireScope('organization', 'partner', 'system'), requireAlertRead, async (c) => {
@@ -613,11 +640,25 @@ monitorDefinitionRoutes.get(
       )
       .limit(1000);
 
+    // #5290 — one indexed read of the operational state for the whole monitor,
+    // merged onto the resolved devices below. A pair with no state row has
+    // simply never been evaluated; it reports lastState 'unknown'.
+    const activity = await listMonitorDeviceActivity(monitor.id, auth);
+    const activityByDevice = new Map(activity.map((row) => [row.deviceId, row]));
+
     const data: Array<Record<string, unknown>> = [];
     for (const device of candidates) {
-      const effective = await resolveMonitorsForDevice(device.id);
-      const match = effective.find((m) => m.monitorId === monitor.id);
+      // A device that vanished between the candidate query above and here
+      // (raced a delete) resolves as `device_missing`, not a fabricated
+      // "zero monitors apply" — either way it drops out of this listing,
+      // but the two must stay distinguishable at the resolver (#5677).
+      const resolution = await resolveMonitorsForDevice(device.id);
+      const match =
+        resolution.kind === 'resolved'
+          ? resolution.monitors.find((m) => m.monitorId === monitor.id)
+          : undefined;
       if (!match) continue;
+      const state = activityByDevice.get(device.id);
       data.push({
         deviceId: device.id,
         deviceName: device.displayName || device.hostname,
@@ -625,10 +666,82 @@ monitorDefinitionRoutes.get(
         overrides: match.overrides,
         sourcePolicyId: match.sourcePolicyId,
         sourceLevel: match.sourceLevel,
+        lastState: state?.lastState ?? 'unknown',
+        lastEvaluatedAt: state?.lastEvaluatedAt ?? null,
+        currentEpisodeId: state?.currentEpisodeId ?? null,
+        openSince: state?.openSince ?? null,
+        episodesInWindow: state?.episodesInWindow ?? 0,
+        windowStartedAt: state?.windowStartedAt ?? null,
+        escalatedAt: state?.escalatedAt ?? null,
+        escalationAlertId: state?.escalationAlertId ?? null,
+        responsesPaused: state?.responsesPaused ?? false,
+        resetAt: state?.resetAt ?? null,
+        resetBy: state?.resetBy ?? null,
       });
     }
 
     return c.json({ data });
+  },
+);
+
+// GET /monitor-definitions/:id/episodes — breach history, newest first (#5290).
+monitorDefinitionRoutes.get(
+  '/:id/episodes',
+  requireScope('organization', 'partner', 'system'),
+  requireAlertRead,
+  async (c) => {
+    const auth = c.get('auth');
+    const monitor = await getMonitorDefinition(c.req.param('id')!, auth);
+    if (!monitor) return c.json({ error: 'Monitor not found' }, 404);
+
+    const rawLimit = Number.parseInt(c.req.query('limit') ?? '', 10);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 200) : 50;
+    const deviceId = c.req.query('deviceId');
+    const cursor = c.req.query('cursor');
+
+    const { episodes, nextCursor } = await listMonitorEpisodes(monitor.id, auth, {
+      ...(deviceId ? { deviceId } : {}),
+      limit,
+      ...(cursor ? { cursor } : {}),
+    });
+    return c.json({ data: episodes, nextCursor });
+  },
+);
+
+// POST /monitor-definitions/:id/devices/:deviceId/reset — clear a recurrence
+// escalation for one pair (#5290). Does NOT close the open episode and does NOT
+// resolve or acknowledge the requires-human alert.
+monitorDefinitionRoutes.post(
+  '/:id/devices/:deviceId/reset',
+  requireScope('organization', 'partner', 'system'),
+  requireAlertWrite,
+  requireMfa(),
+  async (c) => {
+    const auth = c.get('auth');
+    const id = c.req.param('id')!;
+    const deviceId = c.req.param('deviceId')!;
+    const monitor = await getMonitorDefinition(id, auth);
+    if (!monitor) return c.json({ error: 'Monitor not found' }, 404);
+
+    // Site is an app-layer axis only — RLS does not defend it — so the device
+    // must pass the canonical org + site gate before its per-device episode
+    // state is touched (site-scope coverage contract).
+    const device = await getDeviceWithOrgAndSiteCheck(c, deviceId, auth);
+    if (device === SITE_ACCESS_DENIED) return c.json({ error: 'Access to this site denied' }, 403);
+    if (!device) return c.json({ error: 'Device not found' }, 404);
+
+    const result = await resetMonitorEscalation({ monitorId: monitor.id, deviceId: device.id, auth });
+
+    writeRouteAudit(c, {
+      orgId: monitor.orgId ?? undefined,
+      action: 'monitor.escalation.reset',
+      resourceType: 'monitor_definition',
+      resourceId: monitor.id,
+      resourceName: monitor.name,
+      details: { monitorId: monitor.id, deviceId, reset: result.reset },
+    });
+
+    return c.json(result);
   },
 );
 

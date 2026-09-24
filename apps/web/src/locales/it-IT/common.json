@@ -1,4 +1,13 @@
 {
+  "aiInitiator": {
+    "assistant": "Assistente IA",
+    "agent": "Agente IA",
+    "originUnavailable": "Origine non disponibile",
+    "openSession": "Apri conversazione",
+    "openAgentRun": "Apri esecuzione dell'agente",
+    "tool": "Strumento: {{name}}",
+    "occurredAt": "Avvenuto il {{time}}"
+  },
   "lists": {
     "separator": ", "
   },
@@ -35,6 +44,7 @@
     "quotes": "Preventivi",
     "invoices": "Fatture",
     "contracts": "Contratti",
+    "agreements": "Accordi",
     "timesheets": "Fogli ore",
     "productCatalog": "Catalogo prodotti",
     "deviceGroups": "Gruppi di dispositivi",
@@ -49,8 +59,9 @@
     "partner": "Partner",
     "billing": "Fatturazione",
     "organizations": "Organizzazioni",
-    "aiUsageBudget": "Utilizzo e budget AI",
+    "aiUsage": "Utilizzo AI",
     "scriptAuthoring": "Creazione di script",
+    "toolSources": "Fonti degli strumenti",
     "aiAgents": "Agenti AI",
     "aiAgentRuns": "Esecuzioni agenti IA",
     "aiImpact": "Impatto IA",
@@ -85,7 +96,10 @@
     "aiRisk": "Rischio IA",
     "deviceBackup": "Backup dispositivi",
     "sectionServiceDesk": "Service desk",
-    "serviceManagement": "Gestione servizi"
+    "serviceManagement": "Gestione servizi",
+    "ticketing": "Ticket",
+    "deliverableTemplates": "Modelli di consegna",
+    "securityScans": "Scansioni IOC"
   },
   "documentTitles": {
     "dashboard": "Dashboard",
@@ -946,7 +960,8 @@
         "fallbackTitle": "Monitor",
         "fields": {
           "interval": "Intervallo (s)",
-          "timeout": "Timeout (s)"
+          "timeout": "Timeout (s)",
+          "target": "URL di destinazione"
         },
         "labels": {
           "lastChecked": "Ultimo controllo: {{time}}",
@@ -974,6 +989,20 @@
           "httpCheck": "Controllo HTTP",
           "icmpPing": "ICMP Ping",
           "tcpPort": "TCP Porta"
+        },
+        "targetResetNote": "La modifica dell’URL reimposta l’osservazione TLS.",
+        "saved": "Monitor aggiornato",
+        "certificate": {
+          "title": "Certificato",
+          "issuer": "Emittente",
+          "expires": "Scadenza",
+          "observedHost": "Host osservato",
+          "state": "Stato",
+          "states": {
+            "observed": "Osservato",
+            "handshakeFailed": "Negoziazione TLS non riuscita",
+            "notTls": "Senza TLS"
+          }
         }
       },
       "NetworkMonitorList": {
@@ -1685,7 +1714,8 @@
         "running": "in esecuzione",
         "editEntry": "Modifica voce {{id}}",
         "total": "Totale: {{duration}}",
-        "billableTotal": "Fatturabile: {{duration}}"
+        "billableTotal": "Fatturabile: {{duration}}",
+        "billedVsWorked": "{{worked}} h lavorate · {{billed}} h fatturate"
       },
       "sourceBadge": {
         "timer": "Timer",
@@ -1824,7 +1854,9 @@
         "assetsDescription": "Visualizzazione unificata del polling SNMP e dei controlli di rete per risorsa rilevata.",
         "table": {
           "asset": "Risorsa",
-          "overall": "Stato complessivo"
+          "overall": "Stato complessivo",
+          "reachability": "Raggiungibilità",
+          "collection": "Raccolta"
         },
         "ip": "IP",
         "snmp": "SNMP",
@@ -1876,7 +1908,29 @@
         "disabling": "Disabilitazione...",
         "yesDisable": "Sì, disabilita",
         "monitoringNotActive": "Il monitoraggio non è attivo per questa risorsa.",
-        "saving": "Salvataggio..."
+        "saving": "Salvataggio...",
+        "openSettings": "Impostazioni…",
+        "reachability": {
+          "responding": "Risponde",
+          "notResponding": "Non risponde",
+          "unverified": "Non verificato",
+          "sources": {
+            "networkCheck": "controllo di rete",
+            "probe": "controlla ora",
+            "scan": "scansione",
+            "unifi": "controller UniFi",
+            "snmp": "interrogazione SNMP"
+          }
+        },
+        "collectionState": {
+          "collecting": "Raccolta in corso",
+          "partial": "Parziale",
+          "no_template": "Nessun modello",
+          "failing": "Non riuscita",
+          "paused": "In pausa",
+          "never_polled": "Mai interrogato",
+          "not_configured": "Non configurato"
+        }
       },
       "MonitoringPage": {
         "tabs": {
@@ -2482,5 +2536,16 @@
     "message": "Il tuo ruolo richiederà l'autenticazione a due fattori. Configurala entro il {{date}}.",
     "cta": "Configura 2FA",
     "dismiss": "Ignora il promemoria per l'autenticazione a due fattori"
+  },
+  "mfaPolicyOffBanner": {
+    "message": "L'autenticazione a più fattori non è obbligatoria per il tuo team. Le sessioni con sola password possono eseguire script, spostare dispositivi e modificare i criteri.",
+    "cta": "Richiedi MFA",
+    "dismiss": "Ignora per oggi il promemoria sui criteri MFA"
+  },
+  "inheritedField": {
+    "inheritsFrom": "Eredita da {{source}}",
+    "noneConfigured": "Nessun {{source}} configurato",
+    "overriding": "Sovrascrive {{source}}",
+    "overridingWithValue": "Sovrascrive {{source}} ({{value}})"
   }
 }

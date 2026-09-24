@@ -19,7 +19,7 @@ import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
 import { checkPlaybookRequiredPermissions } from './playbookPermissions';
 import { sanitizeThrownToolError } from './aiToolErrors';
-import { SITE_SCOPE_EMPTY_NOTE } from './aiToolsSiteScope';
+import { SITE_SCOPE_EMPTY_NOTE, deviceScopeCondition, runFrozenDeviceIds } from './aiToolsSiteScope';
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
@@ -28,6 +28,9 @@ async function verifyDeviceAccess(
   auth: AuthContext,
   requireOnline = false
 ): Promise<{ device: typeof devices.$inferSelect } | { error: string }> {
+  if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) {
+    return { error: 'Device not found or access denied' };
+  }
   const conditions: SQL[] = [eq(devices.id, deviceId)];
   const orgCond = auth.orgCondition(devices.orgId);
   if (orgCond) conditions.push(orgCond);
@@ -55,6 +58,8 @@ export function registerPlaybookTools(aiTools: Map<string, AiTool>): void {
 
 registerTool({
   tier: 1,
+  domain: 'scripts',
+  searchHint: 'self-healing playbooks, remediation templates and verification loops',
   definition: {
     name: 'list_playbooks',
     description: 'List available self-healing playbooks. Playbooks are multi-step remediation templates with verification loops.',
@@ -111,10 +116,12 @@ registerTool({
 
 registerTool({
   tier: 3,
+  domain: 'scripts',
+  searchHint: 'self-healing playbook execution record and audit trail for a device',
   deviceArgs: ['deviceId'],
   definition: {
     name: 'execute_playbook',
-    description: 'Create a self-healing playbook execution record for a device. This creates the audit trail; execute steps manually and update status as you progress.',
+    description: 'Create a self-healing playbook execution record for a device. Requires user approval. This creates the audit trail; execute steps manually and update status as you progress.',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -270,6 +277,8 @@ registerTool({
 
 registerTool({
   tier: 1,
+  domain: 'scripts',
+  searchHint: 'playbook execution history, remediation auditing and trends',
   deviceArgs: ['deviceId'],
   definition: {
     name: 'get_playbook_history',
@@ -297,8 +306,17 @@ registerTool({
       // execution's current device, so restrict the joined device in SQL
       // before ordering/LIMIT. `undefined` means unrestricted; a defined-empty
       // ceiling denies every device and therefore every execution.
+      //
+      // The EXACT-DEVICE axis is independent: a device-less analysis run carries
+      // `allowedDeviceIds` with NO `allowedSiteIds`, so the site branch below
+      // silently no-ops for it and the query stayed org-wide — every sibling
+      // device's playbook history. Push the frozen device set as its own
+      // condition (#6086 finding 7). An execution with a NULL device_id is
+      // excluded for such a caller by construction, which is the fail-closed
+      // direction.
       const allowedSiteIds = auth.allowedSiteIds;
-      if (allowedSiteIds?.length === 0) {
+      const frozenDeviceIds = runFrozenDeviceIds(auth);
+      if (allowedSiteIds?.length === 0 || frozenDeviceIds?.length === 0) {
         return JSON.stringify({ executions: [], count: 0, scopeNote: SITE_SCOPE_EMPTY_NOTE });
       }
 
@@ -316,6 +334,8 @@ registerTool({
         conditions.push(eq(playbookExecutions.status, input.status as typeof playbookExecutions.status.enumValues[number]));
       }
       if (allowedSiteIds) conditions.push(inArray(devices.siteId, allowedSiteIds));
+      const deviceCond = deviceScopeCondition(auth, playbookExecutions.deviceId);
+      if (deviceCond) conditions.push(deviceCond);
 
       const limit = Math.min(Math.max(1, Number(input.limit) || 20), 100);
 

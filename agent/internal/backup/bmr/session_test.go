@@ -3,11 +3,13 @@ package bmr
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -22,12 +24,12 @@ func TestAuthenticateRecoverySession(t *testing.T) {
 			http.Error(w, "unexpected request", http.StatusBadRequest)
 			return
 		}
-		var body map[string]string
+		var body map[string]json.RawMessage
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		gotToken = body["token"]
+		_ = json.Unmarshal(body["token"], &gotToken)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"bootstrap": BootstrapResponse{
 				Version:      BootstrapResponseVersion,
@@ -470,5 +472,187 @@ func TestRunRecoveryWithToken_ExpectSystemStateFalseWithoutManifest(t *testing.T
 	}
 	if gotExpectSystemState {
 		t.Fatal("expected ExpectSystemState=false when the bootstrap's snapshot has no SystemStateManifest")
+	}
+}
+
+func TestExchangeRecoveryCode_SendsClientCapabilities(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		writeTestBootstrapEnvelope(t, w, "gen-1", true)
+	}))
+	defer server.Close()
+
+	_, _, err := ExchangeRecoveryCode(context.Background(), server.URL, "ABC-DEF-GHJ")
+	if err != nil {
+		t.Fatalf("ExchangeRecoveryCode: %v", err)
+	}
+
+	caps, ok := gotBody["capabilities"].([]any)
+	if !ok {
+		t.Fatalf("request body missing capabilities: %v", gotBody)
+	}
+	if !containsAny(caps, CapabilitySnapshotFileMembershipV1) {
+		t.Fatalf("capabilities = %v, want to contain %q", caps, CapabilitySnapshotFileMembershipV1)
+	}
+}
+
+func TestAuthenticateRecoverySession_SendsClientCapabilities(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		writeTestBootstrapEnvelope(t, w, "gen-1", false)
+	}))
+	defer server.Close()
+
+	_, err := AuthenticateRecoverySession(context.Background(), server.URL, "token-1")
+	if err != nil {
+		t.Fatalf("AuthenticateRecoverySession: %v", err)
+	}
+
+	caps, ok := gotBody["capabilities"].([]any)
+	if !ok {
+		t.Fatalf("request body missing capabilities: %v", gotBody)
+	}
+	if !containsAny(caps, CapabilitySnapshotFileMembershipV1) {
+		t.Fatalf("capabilities = %v, want to contain %q", caps, CapabilitySnapshotFileMembershipV1)
+	}
+}
+
+func TestBootstrapResponse_RoundTripsFileIndexAndDownloadCapabilities(t *testing.T) {
+	raw := []byte(`{
+		"version": 1,
+		"snapshot": {"id": "s1", "snapshotId": "gen-2", "backupType": "system_image",
+			"fileIndex": {"status": "complete", "manifestSha256": "` + strings.Repeat("a", 64) + `",
+				"externalCount": 3, "originSnapshotIds": ["gen-1"]}},
+		"download": {"type": "breeze_proxy", "url": "https://example.invalid/download",
+			"pathQueryParam": "path", "pathPrefix": "snapshots/gen-2",
+			"capabilities": ["snapshot-file-membership-v1"]}
+	}`)
+	var bs BootstrapResponse
+	if err := json.Unmarshal(raw, &bs); err != nil {
+		t.Fatalf("unmarshal bootstrap response: %v", err)
+	}
+	if bs.Snapshot.FileIndex == nil {
+		t.Fatal("Snapshot.FileIndex = nil, want non-nil")
+	}
+	if bs.Snapshot.FileIndex.Status != "complete" {
+		t.Fatalf("FileIndex.Status = %q, want complete", bs.Snapshot.FileIndex.Status)
+	}
+	if len(bs.Snapshot.FileIndex.OriginSnapshotIDs) != 1 || bs.Snapshot.FileIndex.OriginSnapshotIDs[0] != "gen-1" {
+		t.Fatalf("FileIndex.OriginSnapshotIDs = %v, want [gen-1]", bs.Snapshot.FileIndex.OriginSnapshotIDs)
+	}
+	if len(bs.Download.Capabilities) != 1 || bs.Download.Capabilities[0] != CapabilitySnapshotFileMembershipV1 {
+		t.Fatalf("Download.Capabilities = %v, want [%s]", bs.Download.Capabilities, CapabilitySnapshotFileMembershipV1)
+	}
+}
+
+// containsAny reports whether list (decoded from JSON as []any, so each
+// element is a string) contains s.
+func containsAny(list []any, s string) bool {
+	for _, v := range list {
+		if str, ok := v.(string); ok && str == s {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAuthenticateRecoverySession_NonJSON409DegradesToUnknownNegotiationError
+// is the regression test for review finding #4: a 409 response whose body
+// is not JSON (or is JSON but has no non-empty "error" field) fell through
+// authenticateRecoverySessionContext's dedicated StatusConflict branch
+// entirely (json.Unmarshal failed or body.Error was empty) into the
+// generic `resp.StatusCode < 200 || >= 300` branch, returning a bare
+// *authenticateStatusError instead of a *RecoveryNegotiationError. A
+// caller that errors.As's for *RecoveryNegotiationError (the recovery
+// console's classification, refreshAfterUnauthorized's terminal-refusal
+// switch) never recognizes it as a negotiation refusal and burns a full
+// reactive-refresh attempt cycle on it. The fix must still surface it as a
+// *RecoveryNegotiationError (Code "unknown") so those callers behave
+// correctly even against a malformed or non-conforming 409.
+func TestAuthenticateRecoverySession_NonJSON409DegradesToUnknownNegotiationError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, "<html>upstream proxy error</html>")
+	}))
+	defer server.Close()
+
+	_, err := authenticateRecoverySessionContext(context.Background(), server.URL, "brz_rec_test")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	var negErr *RecoveryNegotiationError
+	if !errors.As(err, &negErr) {
+		t.Fatalf("expected errors.As to find a *RecoveryNegotiationError, got %T: %v", err, err)
+	}
+	if negErr.Code != "unknown" {
+		t.Fatalf("negErr.Code = %q, want %q", negErr.Code, "unknown")
+	}
+	if !strings.Contains(negErr.Message, "upstream proxy error") {
+		t.Fatalf("negErr.Message = %q, want it to carry the response body", negErr.Message)
+	}
+}
+
+// TestExchangeRecoveryCode_NonJSON409DegradesToUnknownNegotiationError is
+// TestAuthenticateRecoverySession_NonJSON409DegradesToUnknownNegotiationError's
+// counterpart for POST /bmr/recover/exchange — the same fallthrough bug
+// exists in ExchangeRecoveryCode's own StatusConflict branch (review
+// finding #4).
+func TestExchangeRecoveryCode_NonJSON409DegradesToUnknownNegotiationError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, "<html>upstream proxy error</html>")
+	}))
+	defer server.Close()
+
+	_, _, err := ExchangeRecoveryCode(context.Background(), server.URL, "some-code")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	var negErr *RecoveryNegotiationError
+	if !errors.As(err, &negErr) {
+		t.Fatalf("expected errors.As to find a *RecoveryNegotiationError, got %T: %v", err, err)
+	}
+	if negErr.Code != "unknown" {
+		t.Fatalf("negErr.Code = %q, want %q", negErr.Code, "unknown")
+	}
+	if !strings.Contains(negErr.Message, "upstream proxy error") {
+		t.Fatalf("negErr.Message = %q, want it to carry the response body", negErr.Message)
+	}
+}
+
+// writeTestBootstrapEnvelope writes a response body shaped like the server's
+// real /bmr/recover/exchange or /bmr/recover/authenticate response. Before
+// relying on this in a real PR, grep session.go for the decode target next
+// to authenticateRecoverySessionContext (~line 260-288) and ExchangeRecoveryCode
+// (~line 180-201) and confirm the envelope field names/nesting match exactly —
+// this helper was written from the exchange envelope confirmed in this
+// research pass (`struct{ Token string; Bootstrap json.RawMessage }`); the
+// authenticate envelope was not independently re-verified byte-for-byte.
+func writeTestBootstrapEnvelope(t *testing.T, w http.ResponseWriter, snapshotID string, withToken bool) {
+	t.Helper()
+	bootstrap := map[string]any{
+		"version": 1,
+		"snapshot": map[string]any{
+			"id": "s1", "snapshotId": snapshotID, "backupType": "file",
+		},
+		"download": map[string]any{
+			"type": "breeze_proxy", "url": "https://example.invalid/download",
+			"pathQueryParam": "path", "pathPrefix": "snapshots/" + snapshotID,
+		},
+	}
+	body := map[string]any{"bootstrap": bootstrap}
+	if withToken {
+		body["token"] = "recv-token-1"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		t.Fatalf("encode bootstrap envelope: %v", err)
 	}
 }

@@ -14,8 +14,15 @@ import { certExpiryKind } from './certExpiry';
 import { bandwidthKind } from './bandwidth';
 import { diskIoKind } from './diskIo';
 import { networkErrorsKind } from './networkErrors';
+// W04 coverage (#5287 / #5291).
+import { antivirusKind } from './antivirus';
+import { softwarePresenceKind } from './softwarePresence';
+import { backupContinuityKind } from './backupContinuity';
+import { scriptKind } from './script';
+import { networkCheckKind } from './networkCheck';
+import { compositeKind } from './composite';
 
-export type { MonitorKindSpec } from './types';
+export type { MonitorKindSpec, MonitorCompileContext } from './types';
 export { MonitorValidationError } from './types';
 
 /**
@@ -44,6 +51,13 @@ export const MONITOR_KIND_SPECS: Record<MonitorKind, MonitorKindSpec<any>> = {
   bandwidth: bandwidthKind,
   disk_io: diskIoKind,
   network_errors: networkErrorsKind,
+  antivirus: antivirusKind,
+  software_presence: softwarePresenceKind,
+  backup_continuity: backupContinuityKind,
+  script: scriptKind,
+  network_check: networkCheckKind,
+  // Defer the circular import read when composite.ts is the entry module.
+  get composite() { return compositeKind; },
 };
 
 export function getMonitorKindSpec(kind: string): MonitorKindSpec {

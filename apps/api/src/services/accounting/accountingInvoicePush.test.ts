@@ -141,6 +141,9 @@ interface LineRow {
   id: string; invoiceId: string; catalogItemId: string | null; name: string | null; description: string | null;
   quantity: string; unitPrice: string; lineTotal: string; taxable: boolean; sortOrder: number;
   customerVisible: boolean;
+  /** #6467: worked minutes for a time_entry line — optional so existing
+   *  fixtures (all non-time-entry) are unaffected. */
+  workedMinutes?: number | null;
 }
 interface MappingRow {
   id: string; integrationId: string; partnerId: string; breezeEntityType: string; breezeEntityId: string;
@@ -843,6 +846,36 @@ describe('pushInvoiceToAccounting', () => {
     expect(outcome).toMatchObject({ remoteEntityId: 'qb-inv-1', syncStatus: 'synced', taxVarianceCents: null });
   });
 
+  // #6467: the worked-vs-billed disclosure (§3.5) used to reach the accounting
+  // push BY ACCIDENT (baked into `description`). Now that it lives in
+  // `workedMinutes` (structured data), the push must append it explicitly or
+  // the accounting copy of the invoice silently loses the disclosure.
+  it('appends the worked-vs-billed disclosure to a time_entry line pushed to accounting', async () => {
+    setup({
+      lines: [
+        { id: 'line-1', name: 'On-site', quantity: '1.00', lineTotal: '225.00', workedMinutes: 30 },
+      ],
+    });
+
+    await pushInvoiceToAccounting(INVOICE, PARTNER, runCtx);
+
+    const [, payload] = pushInvoiceMock.mock.calls[0]!;
+    expect(payload.lines[0].description).toBe('On-site — 0.50 h worked, 1.00 h billed');
+  });
+
+  it('omits the disclosure when worked minutes equal the billed quantity', async () => {
+    setup({
+      lines: [
+        { id: 'line-1', name: 'Remote', quantity: '1.00', lineTotal: '150.00', workedMinutes: 60 },
+      ],
+    });
+
+    await pushInvoiceToAccounting(INVOICE, PARTNER, runCtx);
+
+    const [, payload] = pushInvoiceMock.mock.calls[0]!;
+    expect(payload.lines[0].description).toBe('Remote');
+  });
+
   it('flags synced_with_tax_variance when remoteTaxTotal differs from invoice taxTotal by more than 1 cent', async () => {
     pushInvoiceMock.mockResolvedValue({ id: 'qb-inv-1', syncToken: '0', docNumber: null, remoteTaxTotal: '7.02', remoteTotal: '107.02' });
 
@@ -1085,6 +1118,13 @@ describe('pushInvoiceToAccounting', () => {
 
       expect(caught?.code).toBe('quickbooks_error');
       expect(caught?.status).toBe(502);
+      expect(pushInvoiceMock).not.toHaveBeenCalled();
+    });
+
+    it('keeps concurrent mapping sync contention retryable for invoice jobs', async () => {
+      setup({ mappings: [orgMappingRow({ linkStatus: 'create_new', remoteEntityId: null, syncStatus: 'pending' })] });
+      syncMappedEntityMock.mockRejectedValueOnce(new AccountingMappingError('sync_in_progress', 409, 'Mapping sync is already in progress'));
+      await expect(pushInvoiceToAccounting(INVOICE, PARTNER, runCtx)).rejects.toMatchObject({ code: 'quickbooks_error', status: 502 });
       expect(pushInvoiceMock).not.toHaveBeenCalled();
     });
 

@@ -232,7 +232,7 @@ MFA verification is rate-limited separately from login.
   { "error": "Invalid or expired MFA session" }
   ```
 
-  Branch on the status code, and on `code` when you need the specific reason. `401` from these endpoints means "re-authenticate"; it never means "you mistyped a digit". The codes in use are `mfa_code_invalid` (wrong TOTP/SMS/recovery code), `mfa_proof_invalid` (a rejected `POST /auth/mfa/step-up` factor proof), and `invalid_credentials` (a rejected step-up password or enrollment grant). Never branch on the human-readable `error`/`message` text — it is not part of the contract.
+  Branch on the status code, and on `code` when you need the specific reason. `401` from these endpoints means "re-authenticate"; it never means "you mistyped a digit". The codes in use are `mfa_code_invalid` (wrong TOTP/SMS/recovery code), `mfa_proof_invalid` (a rejected `POST /auth/mfa/step-up` factor proof), `invalid_credentials` (a rejected step-up password or enrollment grant), and `enrollment_grant_expired` (the SSO re-authentication grant a passwordless account used to authorise first-factor enrollment has expired, been replayed, or no longer matches the session — it carries `reauthUrl` so a client can offer the one action that resolves it, restarting `POST /sso/reauth/start`). Never branch on the human-readable `error`/`message` text — it is not part of the contract.
 
   This applies to `/auth/mfa/*` and `/auth/phone/*`, and to the two other endpoints that verify a password supplied in the request body: `POST /auth/change-password` and `POST /auth/account-deletion-request`. Both answer a rejected password with `400` and `code: "invalid_credentials"`. Earlier releases answered `401` for both cases, which is why a client that auto-refreshes on `401` could sign the user out mid-enrollment for a mistyped digit — or, on those two endpoints, mid-flow for a mistyped password.
 </Aside>
@@ -378,7 +378,7 @@ Permissions are stored as `resource:action` pairs in the `permissions` table. Ro
 | `reports` | Reporting and analytics |
 | `billing` | Subscriptions, invoicing, and payment methods |
 | `vulnerabilities` | Vulnerability risk-acceptance governance |
-| `ai_sessions` | Cross-user AI session audit (admin dashboard) |
+| `ai_sessions` | Using AI chat (`use`) and cross-user session audit (`read_all`) |
 | `ai_agents` | AI agent configuration and runs |
 | `approvals` | Deciding pending action-intent approvals |
 
@@ -400,13 +400,19 @@ The authoritative list of assignable permissions is also available at runtime vi
 | `access` | Start a remote access session |
 | `export` | Export data (audit logs, reports, invoices) |
 | `send` | Send an invoice or quote to a customer |
+| `accept` | Record a customer's acceptance on their behalf (phone, email, signed PO) and convert the quote to an invoice. Granted automatically to every role that already held `send` when upgrading; revoke it if you want acceptance narrower than sending. |
 | `fulfill` | Mark a quote fulfilled |
 | `admin` | Full administration of a resource (SSO, ticket mailbox) |
 | `accept_risk` | Accept a vulnerability finding's risk |
 | `read_all` | Read another user's data (AI session audit) |
+| `use` | Use a capability without managing it (AI chat, external tools) |
 | `decide` | Approve or deny a pending action-intent approval |
 
 There is no `view` or `update` action -- read access is `read`, and a write/create/update is `write` (or `create` for the one resource, `agent_rollback`, that uses it). Additionally, the wildcard permission `*:*` grants full administrative access.
+
+<Aside type="note">
+  Opening and using the AI assistant (chat sessions, your own session history, the org's AI usage figures) requires `ai_sessions:use`. It is granted by default to **Org Admin**, **Org Technician** and **Partner Technician**; Partner Admin holds it through `*:*`. Viewer and billing roles do not get it, and the assistant button, the **AI Assistant** navigation entry and the `/workspace` page are all hidden for them. The permission only opens the conversation: every tool the assistant calls is checked against the same permission its HTTP route requires, so it cannot do anything the user could not do by hand. Setting the org's AI budget and flagging another user's session still need `organizations:write`. **Upgrading:** built-in roles receive the new key automatically; a custom role that was given `organizations:write` specifically so its users could open the assistant must be granted `ai_sessions:use` under **Settings → Users & Roles**, or its users lose chat.
+</Aside>
 
 <Aside type="note">
   `ai_agents:read` and `ai_agents:write` are deliberately separate from `organizations:write`. Authoring an agent policy is what will eventually authorize autonomous action on customer machines, so it is not bundled into a permission every organisation admin already holds. See [AI Agents](/features/ai-agents/).
@@ -461,6 +467,7 @@ The following named permission constants (`packages/shared/src/constants/permiss
 | `QUOTES_READ` | `quotes` | `read` |
 | `QUOTES_WRITE` | `quotes` | `write` |
 | `QUOTES_SEND` | `quotes` | `send` |
+| `QUOTES_ACCEPT` | `quotes` | `accept` |
 | `QUOTES_FULFILL` | `quotes` | `fulfill` |
 | `TIME_ENTRIES_READ` | `time_entries` | `read` |
 | `TIME_ENTRIES_WRITE` | `time_entries` | `write` |
@@ -489,6 +496,7 @@ The following named permission constants (`packages/shared/src/constants/permiss
 | `BILLING_MANAGE` | `billing` | `manage` |
 | `VULN_RISK_ACCEPT` | `vulnerabilities` | `accept_risk` |
 | `AI_SESSIONS_READ_ALL` | `ai_sessions` | `read_all` |
+| `AI_SESSIONS_USE` | `ai_sessions` | `use` |
 | `AI_AGENTS_READ` | `ai_agents` | `read` |
 | `AI_AGENTS_WRITE` | `ai_agents` | `write` |
 | `APPROVALS_DECIDE` | `approvals` | `decide` |

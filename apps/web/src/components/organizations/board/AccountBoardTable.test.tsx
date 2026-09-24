@@ -20,6 +20,7 @@ function row(id: string, name: string, extra: Partial<BoardRow> = {}, org: Parti
     },
     state: 'ready',
     chips: { setup: [{ key: 'noSite', tone: 'warning', target: 'sites', href: `/organizations/${id}#sites` }], account: [], accountApplicable: true },
+    badges: null,
     ...extra,
   };
 }
@@ -121,6 +122,33 @@ describe('AccountBoardTable', () => {
     fireEvent.click(desktop().getByTestId(`org-board-more-${B_ID}`));
     expect(onOpenRecord).toHaveBeenCalledTimes(1);
     expect(screen.getByRole('menuitem', { name: 'Open Beta Ltd' })).toHaveAttribute('href', `/organizations/${B_ID}`);
+  });
+
+  it('plain left-click on the name opens the record instead of navigating', () => {
+    const { onOpenRecord } = renderTable();
+    const nameLink = desktop().getByTestId(`org-board-name-${A_ID}`);
+    const event = fireEvent.click(nameLink);
+    expect(onOpenRecord).toHaveBeenCalledWith(expect.objectContaining({ id: A_ID }));
+    expect(onOpenRecord).toHaveBeenCalledTimes(1);
+    // preventDefault should have been called, so jsdom reports the click as not "handled" by navigation
+    expect(event).toBe(false);
+  });
+
+  it('modifier/middle-click on the name does not intercept navigation', () => {
+    const { onOpenRecord } = renderTable();
+    const nameLink = desktop().getByTestId(`org-board-name-${A_ID}`);
+    fireEvent.click(nameLink, { metaKey: true });
+    fireEvent.click(nameLink, { ctrlKey: true });
+    fireEvent.click(nameLink, { shiftKey: true });
+    fireEvent.click(nameLink, { altKey: true });
+    fireEvent.click(nameLink, { button: 1 });
+    expect(onOpenRecord).not.toHaveBeenCalled();
+  });
+
+  it('plain left-click on the card surface name also opens the record (shared renderName)', () => {
+    const { onOpenRecord } = renderTable();
+    fireEvent.click(cards().getByTestId(`org-board-card-name-${A_ID}`));
+    expect(onOpenRecord).toHaveBeenCalledWith(expect.objectContaining({ id: A_ID }));
   });
 
   it('renders the meta line: exception-only status pill, workspace marker, device and site counts', () => {

@@ -12,6 +12,7 @@ import ScriptPickerModal, {
   type ScriptRunAsSelection,
 } from "./ScriptPickerModal";
 import MaintenanceModeDialog from "./MaintenanceModeDialog";
+import MoveDeviceOrgDialog from "./MoveDeviceOrgDialog";
 import { isInMaintenance } from "../../lib/maintenanceResource";
 import type { Device, DeviceStatus, OSType } from "./DeviceList";
 import type { DeviceActionOptions } from "./DeviceActions";
@@ -65,6 +66,7 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
   const [changeSiteOpen, setChangeSiteOpen] = useState(false);
   const [scriptPickerOpen, setScriptPickerOpen] = useState(false);
   const [maintenanceDialogOpen, setMaintenanceDialogOpen] = useState(false);
+  const [moveOrgDialogOpen, setMoveOrgDialogOpen] = useState(false);
 
   // Track every in-flight wake watcher so that navigating away aborts the
   // long-running poll loop. Without this, watchWakeOutcome keeps polling
@@ -98,6 +100,32 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
       }
 
       const data = await response.json();
+
+      // #6501: a 200 response is not on its own proof this was a device row.
+      // `/devices/:id` shares its path prefix with several STATIC list
+      // routes (e.g. `GET /devices/network`, the network-asset list), and
+      // Hono resolves those ahead of the `/:id` matcher — so a page URL like
+      // `/devices/network` (no further segment; `pages/devices/[id].astro`
+      // captures "network" as id) fetches a `{ data: [...], pagination }`
+      // list envelope instead of a device. Every field the transform below
+      // reads off that envelope is `undefined`, so it silently renders a
+      // "device" made entirely of placeholder defaults ("Unknown" / offline)
+      // — complete with live Wake / Run Script / Connect buttons — for a
+      // device that was never actually fetched. A real device row always
+      // carries its own `id`; treat anything else as not-found.
+      if (typeof data?.id !== "string" || data.id.length === 0) {
+        // Log which shape we actually got: a list envelope (the #6501 route
+        // collision) looks different from a genuinely malformed device row,
+        // and both would otherwise render an identical "Device not found"
+        // with nothing in the console to tell a future regression apart
+        // from an expected reserved-path collision.
+        console.error(
+          `[DeviceDetailPage] GET /devices/${deviceId} returned 200 with no device id`,
+          { looksLikeListEnvelope: Array.isArray(data?.data), keys: data && typeof data === "object" ? Object.keys(data) : typeof data },
+        );
+        useRecentsStore.getState().forgetDevice(deviceId);
+        throw new Error("Device not found");
+      }
 
       // Get latest metrics from recentMetrics array
       const latestMetrics = data.recentMetrics?.[0];
@@ -458,6 +486,13 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
           setChangeSiteOpen(true);
           return;
 
+        case "move-org":
+          // Spec 2026-09-18 device-move-org D5: the move needs a target org,
+          // a target site and possibly a step-up factor, so it opens a dialog
+          // instead of firing a request here.
+          setMoveOrgDialogOpen(true);
+          return;
+
         case "install-homebrew": {
           // Opt-in, per-device package-manager bootstrap. The pinned installer
           // URL + sha256 live server-side (services/homebrewBootstrap.ts) — the
@@ -759,6 +794,20 @@ export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
             type: "success",
             message: `${device.hostname} ${t("deviceDetailPage.putInto")} maintenance mode`,
           });
+          void fetchDevice();
+        }}
+      />
+      <MoveDeviceOrgDialog
+        open={moveOrgDialogOpen}
+        device={{ id: device.id, hostname: device.hostname, orgId: device.orgId, orgName: device.orgName }}
+        onClose={() => setMoveOrgDialogOpen(false)}
+        onCompleted={({ targetOrgName }) => {
+          showToast({
+            type: "success",
+            message: t("deviceDetailPage.movedToOrg", { hostname: device.hostname, orgName: targetOrgName }),
+          });
+          // Refetch rather than trust the echoed row: the route disconnects
+          // the agent after commit, so status and org fields settle server-side.
           void fetchDevice();
         }}
       />

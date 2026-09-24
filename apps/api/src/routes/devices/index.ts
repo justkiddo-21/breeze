@@ -10,11 +10,14 @@ import { anomaliesRoutes } from './anomalies';
 import { groupsRoutes } from './groups';
 import { patchesRoutes } from './patches';
 import { scriptsRoutes } from './scripts';
+import { deviceAiOriginRoutes } from './aiOrigin';
 import { eventsRoutes } from './events';
 import { eventLogsRoutes } from './eventlogs';
+import { filesystemSystemCleanupRoutes } from './filesystemSystemCleanup';
 import { filesystemRoutes } from './filesystem';
 import { sessionsRoutes } from './sessions';
 import { diagnosticLogsRoutes } from './diagnosticLogs';
+import { tabCountsRoutes } from './tabCounts';
 import { watchdogLogsRoutes } from './watchdogLogs';
 import { bootMetricsRoutes } from './bootMetrics';
 import { diagnoseRoutes } from './diagnose';
@@ -77,6 +80,7 @@ deviceRoutes.route('/', diagnoseRoutes);
 deviceRoutes.route('/', groupsRoutes);
 
 // Mount filesystem routes before core routes so /:id/filesystem resolves cleanly.
+deviceRoutes.route('/', filesystemSystemCleanupRoutes);
 deviceRoutes.route('/', filesystemRoutes);
 
 // Mount move-org BEFORE core routes — its POST /:id/move-org would collide
@@ -144,11 +148,17 @@ deviceRoutes.route('/', alertsRoutes);
 deviceRoutes.route('/', anomaliesRoutes);
 deviceRoutes.route('/', patchesRoutes);
 deviceRoutes.route('/', scriptsRoutes);
+// #5022 W02: GET /:id/ai-origin, GET /:id/ai-activity. :id-prefixed, so
+// mounting order relative to coreRoutes is immaterial (only STATIC paths
+// need to precede coreRoutes' /:id matcher) — placed beside scriptsRoutes
+// since both surfaces read AI-dispatched script/command history.
+deviceRoutes.route('/', deviceAiOriginRoutes);
 deviceRoutes.route('/', eventsRoutes);
 deviceRoutes.route('/', eventLogsRoutes);
 deviceRoutes.route('/', sessionsRoutes);
 deviceRoutes.route('/', diagnosticLogsRoutes);
 deviceRoutes.route('/', watchdogLogsRoutes);
+deviceRoutes.route('/', tabCountsRoutes);
 deviceRoutes.route('/', warrantyRoutes);
 // #3205 W06: GET /:id/billing. :id-prefixed, so it cannot be shadowed by core's
 // /:id matcher — mounted here with the other sub-resources, and pinned by

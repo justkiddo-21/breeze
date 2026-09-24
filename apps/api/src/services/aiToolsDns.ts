@@ -20,7 +20,12 @@ import { eq, and, desc, sql, gte, lte, inArray, SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
 import { schedulePolicySync } from '../jobs/dnsSyncJob';
-import { resolveSiteAllowedDeviceIds, SITE_SCOPE_EMPTY_NOTE } from './aiToolsSiteScope';
+import {
+  deviceScopeCondition,
+  resolveSiteAllowedDeviceIds,
+  runFrozenDeviceIds,
+  SITE_SCOPE_EMPTY_NOTE
+} from './aiToolsSiteScope';
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
@@ -63,9 +68,11 @@ export function registerDnsTools(aiTools: Map<string, AiTool>): void {
   registerTool({
     tier: 1,
     deviceArgs: ['deviceId'],
+    domain: 'network',
+    searchHint: 'DNS security statistics, blocked domains, threat categories and top offending devices',
     definition: {
       name: 'get_dns_security',
-      description: 'Get DNS security statistics including blocked domains, threat categories, and top offending devices.',
+      description: 'Get DNS security statistics including blocked domains, threat categories, and top offending devices. Actions: blocked, allowed, redirected.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -157,6 +164,12 @@ export function registerDnsTools(aiTools: Map<string, AiTool>): void {
         conditions.push(inArray(dnsSecurityEvents.deviceId, siteAllowedDeviceIds));
       }
 
+      // Exact-device axis, applied independently of the site axis: a device-LESS
+      // analysis run carries `allowedDeviceIds` with NO `allowedSiteIds`, so the
+      // branch above no-ops for it and the summary covered the whole org (#6086).
+      const eventDeviceCondition = deviceScopeCondition(auth, dnsSecurityEvents.deviceId);
+      if (eventDeviceCondition) conditions.push(eventDeviceCondition);
+
       const topN = Math.min(Math.max(1, Number(input.topN) || 10), 100);
       const where = and(...conditions);
 
@@ -178,6 +191,9 @@ export function registerDnsTools(aiTools: Map<string, AiTool>): void {
         if (siteAllowedDeviceIds) {
           aggConditions.push(inArray(dnsEventAggregations.deviceId, siteAllowedDeviceIds));
         }
+        // Exact-device axis for the aggregated path, independent of the site axis (#6086).
+        const aggDeviceCondition = deviceScopeCondition(auth, dnsEventAggregations.deviceId);
+        if (aggDeviceCondition) aggConditions.push(aggDeviceCondition);
 
         const aggWhere = and(...aggConditions);
         const [aggCountRow] = await db
@@ -376,9 +392,11 @@ export function registerDnsTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 2,
+    domain: 'network',
+    searchHint: 'DNS domain blocklist and allowlist: add, remove, synchronize provider',
     definition: {
       name: 'manage_dns_policy',
-      description: 'Add or remove domains from DNS blocklist/allowlist and schedule provider synchronization.',
+      description: 'Add or remove domains from DNS blocklist/allowlist and schedule provider synchronization. Actions: add_block, remove_block, add_allow, remove_allow.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -397,7 +415,11 @@ export function registerDnsTools(aiTools: Map<string, AiTool>): void {
       // letting a site-restricted caller write org-wide policy (unlike every
       // sibling write tool, this handler has no per-row site check to fall
       // back on).
-      if (auth.allowedSiteIds && auth.canAccessSite) {
+      // A device-restricted run (device-bound OR device-less analysis) is even
+      // narrower than a site-restricted caller and has no per-row site check to
+      // fall back on either — `runFrozenDeviceIds` is the axis the site flag
+      // misses entirely for the device-less shape (#6086).
+      if ((auth.allowedSiteIds && auth.canAccessSite) || runFrozenDeviceIds(auth)) {
         return JSON.stringify({ error: 'DNS policy management requires full-organization access' });
       }
 

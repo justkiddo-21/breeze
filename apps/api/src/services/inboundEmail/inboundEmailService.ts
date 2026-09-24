@@ -8,27 +8,32 @@ import {
   partners,
   ticketMailboxConnections,
 } from '../../db/schema';
-import { createTicket } from '../ticketService';
+import { changeTicketStatus, createTicket, type TicketActor } from '../ticketService';
 import { resolvePartnerByRecipient } from './resolvePartner';
 import { resolveOrgBySenderDomain, resolveEmailRequester, loadPartnerInboundPolicy } from './resolveOrg';
 import { maybeSendAutoresponse } from './autoresponder';
 import { insertEmailAuthoredComment } from './emailComments';
+import { hasStoredAttachments, persistInboundAttachments, withInboundAttachmentNote } from './inboundAttachments';
 import { captureException, captureMessage } from '../sentry';
 import { getConfig } from '../../config/validate';
 import type { NormalizedInboundEmail, InboundParseStatus } from './types';
 import type { M365MailboxGenerationContext } from '../inboundEmailQueue';
 import { TICKET_TOKEN_RE, findTicketInPartner, findClosedTicketInPartner, type SenderResolver } from './threadMatcher';
 import { claimMessageLink, findLinkByMessageId, normalizeMessageId } from '../ticketEmailLinks';
+import { ownOutboundReason, ticketCreationLoopReason } from './loopPrevention';
 
-// Synthetic actor for the inbound pipeline. Only ever written to audit_logs.actor_id
-// (NOT NULL, but no FK to users — same pattern as auditEvents.ANONYMOUS_ACTOR_ID /
-// notificationDispatcher). createTicket does NOT write actor.userId to any tickets FK
-// column. The resolved-ticket reopen is performed as a direct partner-scoped UPDATE here
-// (NOT via changeTicketStatus) precisely because changeTicketStatus inserts a
-// ticket_comments row with user_id = actor.userId, and ticket_comments.user_id IS FK'd to
-// users(id) — a synthetic id would FK-violate at runtime. The direct UPDATE keeps the
-// reopen FK-safe while honoring the partner re-assertion guard.
-const SYSTEM_ACTOR = { userId: '00000000-0000-0000-0000-000000000000', name: 'Inbound Email' };
+// Synthetic actor for the inbound pipeline. Its userId is only ever written to
+// audit_logs.actor_id (NOT NULL, but no FK to users — same pattern as
+// auditEvents.ANONYMOUS_ACTOR_ID / notificationDispatcher). createTicket does NOT write
+// actor.userId to any tickets FK column. `principalKind: 'system'` makes
+// changeTicketStatus write null (not this synthetic id) into the columns that ARE FK'd
+// to users(id) — ticket_comments.user_id, tickets.closed_by — so the resolved-ticket
+// reopen can go through the service's status-change path (#6689).
+const SYSTEM_ACTOR: TicketActor = {
+  userId: '00000000-0000-0000-0000-000000000000',
+  name: 'Inbound Email',
+  principalKind: 'system'
+};
 
 // Per-partner ticket display number, e.g. T-2026-0001.
 const TOKEN_RE = TICKET_TOKEN_RE;
@@ -175,6 +180,28 @@ export async function processInboundEmail(
       return;
     }
 
+    // (1a.5) Idempotency — provider retries / at-least-once delivery, scoped to the
+    // partner. Runs BEFORE the suppression/audit checks below (partner-status,
+    // self-loop, own-outbound, loop/bounce) so a REDELIVERY of an already-logged
+    // message returns here instead of re-running one of those checks and issuing a
+    // SECOND logInbound insert — which would collide with the
+    // `(partner_id, provider_message_id)` unique index (23505) and fail the job into
+    // a retry storm. This SELECT alone is NOT the exactly-once guarantee: under
+    // CONCURRENT delivery two workers can both miss here and race to insert;
+    // exactly-once is enforced by that same unique index inside the surrounding
+    // `withSystemDbAccessContext` transaction — the losing insert hits 23505, its
+    // transaction rolls back, BullMQ retries, and the retry's dedup SELECT then finds
+    // the committed row. This SELECT is the fast path; the index is the lock.
+    const dup = await db
+      .select({ id: ticketEmailInbound.id })
+      .from(ticketEmailInbound)
+      .where(and(
+        eq(ticketEmailInbound.partnerId, partnerId),
+        eq(ticketEmailInbound.providerMessageId, n.providerMessageId)
+      ))
+      .limit(1);
+    if (dup[0]) return;
+
     // (1b) Gate ingestion on partner status = active. A suspended/pending/churned
     // partner must not generate or mutate tickets, but we STILL log the inbound row
     // (parse_status: 'skipped') to preserve the audit trail.
@@ -204,24 +231,44 @@ export async function processInboundEmail(
       return;
     }
 
-    // (2) Idempotency — provider retries / at-least-once delivery. Scoped to the partner.
-    // This SELECT alone is NOT the exactly-once guarantee: under CONCURRENT delivery two
-    // workers can both miss the dup here and race to insert. Exactly-once is enforced by the
-    // `(partner_id, provider_message_id)` UNIQUE index combined with the surrounding
-    // `withSystemDbAccessContext` transaction — the losing insert hits 23505, its transaction
-    // rolls back, BullMQ retries the job, and the retry's dedup SELECT then finds the row the
-    // winner committed and returns early. This SELECT is the fast path; the index is the lock.
-    const dup = await db
-      .select({ id: ticketEmailInbound.id })
-      .from(ticketEmailInbound)
-      .where(and(
-        eq(ticketEmailInbound.partnerId, partnerId),
-        eq(ticketEmailInbound.providerMessageId, n.providerMessageId)
-      ))
-      .limit(1);
-    if (dup[0]) return;
+    // (1d) OUR OWN OUTBOUND, LOOPING BACK (spec §8.5). The self-loop rule above
+    // keys on the SENDER being on TICKETS_INBOUND_DOMAIN, which a partner-lane
+    // message is not: its From is the partner's own domain. So a notification
+    // that comes back — a contact address forwarding to the partner's support
+    // mailbox, which forwards into Breeze — would sail past it and open a
+    // ticket from our own mail.
+    //
+    // Two message-level signals instead of a sender guess: the X-Breeze-Outbound
+    // header every partner-lane message carries, and a Message-ID that
+    // outboundThreading.ts minted. Both are about the MESSAGE, so a technician
+    // writing in from the partner's support address is unaffected — which is
+    // the case suppressing by sending domain would have broken.
+    const ownOutbound = ownOutboundReason(n, inboundDomain);
+    if (ownOutbound) {
+      await logInbound(n, partnerId, 'ignored', null, `own outbound mail: ${ownOutbound}`);
+      return;
+    }
 
-    // (2b) Master switch (#3597). `settings.ticketing.inbound.enabled` used to be
+    // (1e) MAIL LOOP / BOUNCE. Suppress ticket creation for the two unambiguous
+    // loop/bounce signals — Auto-Submitted: auto-replied and a null Return-Path
+    // (`<>`) — so an auto-responder war or a bounce storm cannot manufacture
+    // tickets. Deliberately NARROW: a device notification (`Auto-Submitted:
+    // auto-generated`, no-reply@ copier/monitoring) is NOT suppressed here — those
+    // are legitimate tickets. X-Loop is NOT a creation-suppression signal (we never
+    // set X-Loop outbound, so it does not evidence a Breeze loop) — it, together with
+    // Precedence/system-sender, suppresses only the auto-REPLY
+    // (autoresponseSuppressionReason), not the ticket. X-Auto-Response-Suppress and
+    // List-Id are not parsed or acted on at all (types.ts): they mark "do not
+    // auto-reply"/list mail that legitimate device and distribution-list senders set,
+    // so keying anything off them would drop real support mail. Logged 'ignored' with
+    // the reason for the audit trail.
+    const loopReason = ticketCreationLoopReason(n);
+    if (loopReason) {
+      await logInbound(n, partnerId, 'ignored', null, `loop/bounce suppressed: ${loopReason}`);
+      return;
+    }
+
+    // (2) Master switch (#3597). `settings.ticketing.inbound.enabled` used to be
     // display-only: the card persisted and re-rendered it while nothing in this
     // pipeline read it, so a partner who turned the feature OFF kept getting tickets
     // (and autoresponses) with no in-product way to stop it. Gate here — after the
@@ -346,6 +393,7 @@ export async function processInboundEmail(
 
       // Append a public inbound comment, then reopen if resolved.
       const commentId = await appendInboundComment(matched.id, n, partnerId, senderResolver);
+      await persistInboundAttachments(n, { ticketId: matched.id, orgId: matched.orgId, commentId });
       if (matched.status === 'resolved') {
         await reopenResolvedTicket(matched.id, partnerId);
       }
@@ -613,7 +661,8 @@ async function createFromEmail(
     .limit(1);
   if (!orgOk[0]) throw new Error(`org ${orgId} not in partner ${partnerId}`);
 
-  const description = priorNumber ? `Re: ${priorNumber} (continued)\n\n${n.text}` : n.text;
+  const body = withInboundAttachmentNote(n.text, n);
+  const description = priorNumber ? `Re: ${priorNumber} (continued)\n\n${body}` : body;
   const ticket = await createTicket(
     {
       orgId,
@@ -683,6 +732,22 @@ async function createFromEmail(
       emailMessageId: n.messageId ?? null,
     })
     .where(eq(tickets.id, ticket.id));
+
+  // Email attachments (#6688). ticket_attachments rows hang off a COMMENT — a
+  // comment-less row is a pending upload (reaped at 24h, readable only by its
+  // uploader) — so a new ticket's files ride on one public email-authored
+  // comment. No ticket.commented event: ticket.created already announced it.
+  if (hasStoredAttachments(n)) {
+    const { commentId } = await insertEmailAuthoredComment({
+      ticketId: ticket.id,
+      orgId,
+      senderPortalUserId: requester?.kind === 'portal' ? requester.portalUserId : null,
+      authorName: n.fromName ?? n.from,
+      content: 'Attachments from the original email.',
+      emitEvent: false,
+    });
+    await persistInboundAttachments(n, { ticketId: ticket.id, orgId, commentId });
+  }
 
   // One-time autoresponse — ONLY for an accepted known sender on a FRESH ticket.
   //
@@ -781,7 +846,7 @@ async function appendInboundComment(
     orgId: '', // existing wart, preserved — see EmailCommentInput
     senderPortalUserId: sender?.id ?? null,
     authorName,
-    content: n.text
+    content: withInboundAttachmentNote(n.text, n)
   });
   // This stamp is also the optimistic move fence. The subject-token matcher
   // holds the ticket row lock through this write; a concurrent cross-org move
@@ -793,11 +858,22 @@ async function appendInboundComment(
   return commentId;
 }
 
-// Reopen a resolved ticket via a direct partner-scoped UPDATE (FK-safe — see SYSTEM_ACTOR note).
-// The partner_id predicate is a defense-in-depth re-assertion: even though the matched ticket
-// was already partner-checked, the write itself is bounded to the resolved partner.
+// Reopen a resolved ticket through the ticket service's status-change path (#6689), so the
+// `ticket.status_changed` outbox row, the SLA pause ledger, the status-change feed entry,
+// statusId re-pointing and the audit row all run exactly as for a technician reopen.
+//
+// The partner-scoped, row-locked re-read is the defense-in-depth re-assertion that used
+// to live in the raw UPDATE's WHERE: even though the matched ticket was already
+// partner-checked, the reopen only proceeds for a ticket of the resolved partner that is
+// STILL resolved. Runs in the ingest transaction (changeTicketStatus uses the ambient
+// `db`), so a rollback discards the status change with the comment.
 async function reopenResolvedTicket(ticketId: string, partnerId: string): Promise<void> {
-  await db.update(tickets)
-    .set({ status: 'open', resolvedAt: null, updatedAt: new Date() })
-    .where(and(eq(tickets.id, ticketId), eq(tickets.partnerId, partnerId), eq(tickets.status, 'resolved')));
+  const [current] = await db
+    .select({ status: tickets.status })
+    .from(tickets)
+    .where(and(eq(tickets.id, ticketId), eq(tickets.partnerId, partnerId)))
+    .for('update')
+    .limit(1);
+  if (current?.status !== 'resolved') return;
+  await changeTicketStatus(ticketId, { status: 'open' }, {}, SYSTEM_ACTOR);
 }

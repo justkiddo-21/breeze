@@ -21,8 +21,9 @@ pnpm test:report   # show last HTML report
 ```
 e2e-tests/
 ├── playwright.config.ts   # standard @playwright/test config
-├── global-setup.ts        # seeds DB + logs in once + saves storageState
-├── fixtures.ts            # authedPage (storageState load) + cleanPage (no auth)
+├── global-setup.ts        # seeds DB + probe login (fail fast on bad credentials)
+├── auth-state.ts          # per-worker login + storageState persistence
+├── fixtures.ts            # workerStorageState (login per worker) + authedPage + cleanPage
 ├── seed-fixtures.sql      # required test data
 ├── pages/                 # Page Object Models — one per surface
 │   └── BasePage.ts
@@ -121,8 +122,22 @@ e2e-tests/
 ```ts
 import { test, expect } from '../fixtures';
 
-// Logged in (storageState loaded from globalSetup) — for 99% of tests.
+// Logged in — for 99% of tests. Each Playwright WORKER logs in once and owns
+// its own refresh-token family; `authedPage` seeds a fresh context from that
+// worker's storageState and writes the rotated cookies back on teardown.
+// (One family shared across workers trips the API's refresh reuse-detection
+// and logs the whole run out — #6447.)
 test('something authed', async ({ authedPage }) => { ... });
+
+// One context for a whole serial file: take the worker state in beforeAll and
+// persist it in afterAll so the next file on this worker continues the chain.
+test.beforeAll(async ({ browser, workerStorageState }) => {
+  ctx = await browser.newContext({ storageState: workerStorageState });
+});
+test.afterAll(async ({ workerStorageState }) => {
+  await persistStorageState(ctx, workerStorageState); // from '../auth-state'
+  await ctx.close();
+});
 
 // Fresh browser context, no auth — for testing real login/logout/redirect flows.
 test('login round-trip', async ({ cleanPage }) => { ... });
@@ -173,6 +188,13 @@ The flag suppresses **only** the role-force component; an org's or partner's
 working. Nothing here changes the stored `force_mfa` flag — the Partner Admin
 posture is intact, and `globalSetup` fails fast with the remedy above rather
 than timing out if it ever lands on `/auth/mfa/setup`.
+
+Separately, new partners now default to the *settings-level* **Require MFA**
+(`security.requireMfa = true`, since 2026-09-18). That axis ignores
+`MFA_FORCE_FOR_PARTNER_ADMIN`. The seeded Default Partner opts out of it
+explicitly in `apps/api/src/db/seed.ts` (`DEV_SEED_DEFAULT_PARTNER_SETTINGS`),
+which is why seeded admins can still log in password-only. A partner created
+through the UI during a run gets the default and its users must enrol.
 
 ### WebAuthn specs need `PUBLIC_APP_URL` to match the browser origin
 

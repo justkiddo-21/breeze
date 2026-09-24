@@ -138,11 +138,13 @@ var serviceInstallCmd = &cobra.Command{
 					fmt.Fprintf(os.Stderr, "Warning: could not stage local watchdog into the protected dir: %v\n", err)
 				}
 			}
+			serverURL := persistedServerURLForInstall()
 			err := bootstrapWatchdog(bootstrapOptions{
 				agentPath: serviceExePath,
 				version:   version,
 				goos:      runtime.GOOS,
 				goarch:    runtime.GOARCH,
+				serverURL: serverURL,
 			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr,
@@ -154,7 +156,7 @@ var serviceInstallCmd = &cobra.Command{
 						"     then run `breeze-watchdog.exe service install`.\n"+
 						"  3. To skip the watchdog entirely, use `--no-watchdog`.\n",
 					err, outcome.Summary(windowsServiceName),
-					watchdogDownloadURL(version, runtime.GOOS, runtime.GOARCH))
+					watchdogManualDownloadURL(version, runtime.GOOS, runtime.GOARCH, serverURL))
 			}
 		}
 

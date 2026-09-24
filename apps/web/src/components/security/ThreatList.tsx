@@ -12,6 +12,8 @@ import { cn, friendlyFetchError } from "@/lib/utils";
 import { errorKindOf, throwIfNotOk, type LoadErrorKind } from "@/lib/httpError";
 import { fetchWithAuth } from "@/stores/auth";
 import { formatDateTime } from "@/lib/dateTimeFormat";
+import { runAction, ActionError } from "@/lib/runAction";
+import { showToast } from "../shared/Toast";
 import AccessDenied from "../shared/AccessDenied";
 import {
   ResponsiveTable,
@@ -49,8 +51,16 @@ function formatDetectedAt(value: string, timezone?: string): string {
 }
 interface ThreatListProps {
   timezone?: string;
+  /**
+   * Selects a threat for the detail view (#MSA-3 — `ThreatDetail` shipped in
+   * #6573 but was never mounted, so a quarantined threat had no UI path to
+   * restore). The whole row is a mouse target; keyboard and screen-reader
+   * users get a real <button> on the threat name, so the row keeps its
+   * table-row role and the select checkbox keeps Space.
+   */
+  onSelectThreat?: (threatId: string) => void;
 }
-export default function ThreatList({ timezone }: ThreatListProps) {
+export default function ThreatList({ timezone, onSelectThreat }: ThreatListProps) {
   const { t } = useTranslation("security");
   const [query, setQuery] = useState("");
   const [severityFilter, setSeverityFilter] = useState<string>("all");
@@ -133,20 +143,38 @@ export default function ThreatList({ timezone }: ThreatListProps) {
     else next.delete(id);
     setSelectedIds(next);
   };
+  // Sequential runAction per id (rather than Promise.all + one throw) so each
+  // failure surfaces its own toast instead of one call silently masking the
+  // rest, and a single aggregate success toast fires once at the end instead
+  // of N toasts for an N-device bulk action.
   const handleBulkAction = async (action: "quarantine" | "remove") => {
     if (selectedIds.size === 0) return;
     setActing(true);
     setError(undefined);
+    const ids = Array.from(selectedIds);
+    let succeeded = 0;
     try {
-      const requests = Array.from(selectedIds).map((id) =>
-        fetchWithAuth(`/security/threats/${id}/${action}`, { method: "POST" }),
-      );
-      const responses = await Promise.all(requests);
-      const failed = responses.find((response) => !response.ok);
-      if (failed) throwIfNotOk(failed);
+      for (const id of ids) {
+        try {
+          await runAction({
+            request: () =>
+              fetchWithAuth(`/security/threats/${id}/${action}`, { method: "POST" }),
+            errorFallback: t("securityThreatList.actionFailed"),
+          });
+          succeeded += 1;
+        } catch (err) {
+          if (err instanceof ActionError && err.status === 401) return; // let the auth redirect handle it
+          // Non-401 ActionErrors were already toasted by runAction; keep going
+          // so one failing device doesn't block the rest of the batch.
+        }
+      }
+      if (succeeded > 0) {
+        showToast({
+          message: t("securityThreatList.actionQueuedCount", { count: succeeded }),
+          type: "success",
+        });
+      }
       await fetchThreats();
-    } catch (err) {
-      setError(friendlyFetchError(err));
     } finally {
       setActing(false);
     }
@@ -169,11 +197,39 @@ export default function ThreatList({ timezone }: ThreatListProps) {
   const renderSelectCheckbox = (threat: Threat) => (
     <input
       type="checkbox"
+      data-testid={`threat-row-select-${threat.id}`}
       checked={selectedIds.has(threat.id)}
       onChange={(event) => handleSelectOne(threat.id, event.target.checked)}
+      onClick={(event) => event.stopPropagation()}
       className="h-4 w-4 rounded border-border"
     />
   );
+  const handleRowActivate = (threat: Threat) => {
+    onSelectThreat?.(threat.id);
+  };
+  const rowInteractionProps = (threat: Threat) =>
+    onSelectThreat
+      ? {
+          "data-testid": `threat-row-${threat.id}`,
+          onClick: () => handleRowActivate(threat),
+        }
+      : {};
+  const renderThreatName = (threat: Threat) =>
+    onSelectThreat ? (
+      <button
+        type="button"
+        data-testid={`threat-open-${threat.id}`}
+        onClick={(event) => {
+          event.stopPropagation();
+          handleRowActivate(threat);
+        }}
+        className="text-left font-medium text-primary hover:underline focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring rounded-sm"
+      >
+        {threat.name}
+      </button>
+    ) : (
+      threat.name
+    );
   const renderSeverityBadge = (threat: Threat) => (
     <span
       className={cn(
@@ -298,6 +354,7 @@ export default function ThreatList({ timezone }: ThreatListProps) {
           </span>
           <button
             type="button"
+            data-testid="threat-bulk-quarantine"
             onClick={() => handleBulkAction("quarantine")}
             disabled={acting}
             className="flex items-center gap-2 rounded-md border bg-background px-3 py-1.5 text-sm font-medium hover:bg-muted disabled:opacity-60"
@@ -311,6 +368,7 @@ export default function ThreatList({ timezone }: ThreatListProps) {
           </button>
           <button
             type="button"
+            data-testid="threat-bulk-remove"
             onClick={() => handleBulkAction("remove")}
             disabled={acting}
             className="flex items-center gap-2 rounded-md border bg-background px-3 py-1.5 text-sm font-medium hover:bg-muted disabled:opacity-60"
@@ -382,14 +440,21 @@ export default function ThreatList({ timezone }: ThreatListProps) {
                 </tr>
               ) : (
                 threats.map((threat) => (
-                  <tr key={threat.id} className="text-sm">
+                  <tr
+                    key={threat.id}
+                    className={cn(
+                      "text-sm",
+                      onSelectThreat && "cursor-pointer hover:bg-muted/40",
+                    )}
+                    {...rowInteractionProps(threat)}
+                  >
                     <td className="px-4 py-3">
                       {renderSelectCheckbox(threat)}
                     </td>
                     <td className="px-4 py-3 font-medium">
                       {threat.deviceName}
                     </td>
-                    <td className="px-4 py-3">{threat.name}</td>
+                    <td className="px-4 py-3">{renderThreatName(threat)}</td>
                     <td className="px-4 py-3 capitalize text-muted-foreground">
                       {threat.category}
                     </td>
@@ -420,7 +485,10 @@ export default function ThreatList({ timezone }: ThreatListProps) {
             </DataCard>
           ) : (
             threats.map((threat) => (
-              <DataCard key={threat.id}>
+              <DataCard
+                key={threat.id}
+                onClick={onSelectThreat ? () => handleRowActivate(threat) : undefined}
+              >
                 <div className="flex items-start gap-3">
                   <div className="mt-0.5 shrink-0">
                     {renderSelectCheckbox(threat)}
@@ -429,7 +497,7 @@ export default function ThreatList({ timezone }: ThreatListProps) {
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <div className="truncate font-semibold">
-                          {threat.name}
+                          {renderThreatName(threat)}
                         </div>
                         <div className="truncate text-xs capitalize text-muted-foreground">
                           {threat.category}

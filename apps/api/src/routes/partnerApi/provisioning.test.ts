@@ -1,3 +1,5 @@
+const { ensureDefaultProfile } = vi.hoisted(() => ({ ensureDefaultProfile: vi.fn(async () => ({ id: 'default-profile' })) }));
+vi.mock('../../services/billingProfileService', () => ({ ensureDefaultProfile }));
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { createHash } from 'node:crypto';
@@ -288,6 +290,7 @@ describe('POST /organizations', () => {
     expect(body.data).toMatchObject({ id: ORG_ID, orgId: ORG_ID, name: 'Acme', slug: 'acme', type: 'customer' });
     expect(body.data.revision).toMatch(/^[a-f0-9]{64}$/);
     expect(mocks.systemContextOpens).toBe(1);
+    expect(ensureDefaultProfile).toHaveBeenCalledWith(PARTNER_ID, 'CAD', expect.anything());
     expect(insertedValues[0]).toMatchObject({ partnerId: PARTNER_ID, currencyCode: 'CAD', name: 'Acme', slug: 'acme' });
   });
 
@@ -392,7 +395,12 @@ describe('POST /organizations', () => {
 
 describe('POST /sites', () => {
   function primeSuccess() {
-    insertResults = [[siteRow]];
+    // Two inserts now, in order: the site row, then the contacts mirror's
+    // insert (`applyToContactRow` reads back `created!.id` from `.returning()`
+    // to record caller-verification destination provenance, #6354) — priming
+    // only the site row leaves that second insert's `.returning()` empty and
+    // `created` undefined.
+    insertResults = [[siteRow], [{ id: 'contact-1' }]];
     // Two reads now, in order: the contacts mirror's existing-primary lookup
     // (none — the site was just created), then the partner-export stamp
     // re-read. Priming only the stamp would feed its row to the mirror, which

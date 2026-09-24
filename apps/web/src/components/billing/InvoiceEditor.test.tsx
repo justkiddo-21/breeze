@@ -81,6 +81,23 @@ describe('InvoiceEditor', () => {
     expect(link).toHaveTextContent('Globex Inc');
   });
 
+  // Sweep paper cut #16: the API falls back invoice.billToName to the org's
+  // name for a draft with no bill-to name of its own, and surfaces the org's
+  // billing contact email alongside it (billToEmail) — the card must show
+  // both, not just the name link.
+  it('shows the fallback billing-contact email under the Bill To name (sweep paper cut #16)', async () => {
+    const detail = draft([manualLine], { orgId: 'org-9', billToName: 'Sweep Org B' });
+    render(<InvoiceEditor detail={{ ...detail, billToEmail: 'ap@sweeporgb.example' }} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-editor')).toBeInTheDocument());
+    expect(screen.getByTestId('invoice-bill-to')).toHaveTextContent('ap@sweeporgb.example');
+  });
+
+  it('does not show a billing-contact email line when billToEmail is absent', async () => {
+    render(<InvoiceEditor detail={draft([manualLine], { orgId: 'org-9', billToName: 'Globex Inc' })} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-editor')).toBeInTheDocument());
+    expect(screen.queryByTestId('invoice-bill-to-email')).not.toBeInTheDocument();
+  });
+
   it('characterizes a contract overage sibling as editable while a bundle child is read-only (#3205 W04)', async () => {
     const overage = {
       ...manualLine, id: 'over', sourceType: 'contract' as const, parentLineId: null,
@@ -109,6 +126,113 @@ describe('InvoiceEditor', () => {
     // Once a real rate exists the hint disappears (and the Tax row shows the percent).
     rerender(<InvoiceEditor detail={draft([taxable], { taxRate: '0.07', taxTotal: '7.00' })} onChanged={vi.fn()} />);
     expect(screen.queryByTestId('invoice-tax-rate-hint')).not.toBeInTheDocument();
+  });
+
+  it('says the inherited rate will apply at issue instead of falsely claiming none is set (#6338)', async () => {
+    // Draft carries no committed rate of its own, but the API resolved a 7.5%
+    // partner default that issueInvoice WILL apply — the old copy told the
+    // tech "no tax rate is set" and the $100.00 total they approved issued at
+    // $107.50.
+    const taxable = { ...manualLine, taxable: true };
+    const detail = { ...draft([taxable], { subtotal: '100.00' }), effectiveTaxRate: '0.07500' };
+    render(<InvoiceEditor detail={detail} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-editor')).toBeInTheDocument());
+
+    expect(screen.queryByTestId('invoice-tax-rate-hint')).not.toBeInTheDocument();
+    const hint = screen.getByTestId('invoice-tax-inherited-hint');
+    expect(hint).toHaveTextContent('7.50%');
+    // Estimated tax on the $100.00 taxable basis, and the total it issues at.
+    expect(hint).toHaveTextContent('$7.50');
+    expect(hint).toHaveTextContent('$107.50');
+  });
+
+  it('excludes internal (non customer-visible) taxable lines from the preview (#6338)', async () => {
+    const visible = { ...manualLine, id: 'vis', taxable: true };
+    const internal = { ...manualLine, id: 'int', taxable: true, customerVisible: false, lineTotal: '40.00' };
+    render(
+      <InvoiceEditor
+        detail={{ ...draft([visible, internal], { subtotal: '100.00' }), effectiveTaxRate: '0.07500' }}
+        onChanged={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId('invoice-editor')).toBeInTheDocument());
+    const hint = screen.getByTestId('invoice-tax-inherited-hint');
+    // 7.5% of the $100.00 CUSTOMER-VISIBLE basis only — never $140.00 ($10.50).
+    expect(hint).toHaveTextContent('$7.50');
+    expect(hint).not.toHaveTextContent('$10.50');
+  });
+
+  it('still warns when neither the invoice nor the inherited rate has one (#6338)', async () => {
+    const taxable = { ...manualLine, taxable: true };
+    render(<InvoiceEditor detail={{ ...draft([taxable]), effectiveTaxRate: null }} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-editor')).toBeInTheDocument());
+    expect(screen.getByTestId('invoice-tax-rate-hint')).toHaveTextContent('no tax rate is set');
+    expect(screen.queryByTestId('invoice-tax-inherited-hint')).not.toBeInTheDocument();
+  });
+
+  it('shows neither hint when no line is taxable, inherited rate or not (#6338)', async () => {
+    render(<InvoiceEditor detail={{ ...draft([manualLine]), effectiveTaxRate: '0.07500' }} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-editor')).toBeInTheDocument());
+    expect(screen.queryByTestId('invoice-tax-inherited-hint')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-tax-rate-hint')).not.toBeInTheDocument();
+  });
+
+  it('previews a line deletion at the CURRENCY\'s minor unit, not always at cents (#6441)', async () => {
+    // The delete preview must reproduce computeInvoiceTotals (services/invoiceMath.ts)
+    // for the same inputs: each figure rounded at the currency's minor unit, and the
+    // total built from the ROUNDED subtotal + tax. JPY is zero-decimal, so a
+    // 2-decimal-only toCents/fromCents preview double-rounds the total one yen low.
+    // `line_total` is numeric(_,2) whatever the currency, so a sub-yen lineTotal is
+    // representable and the editor must not assume its inputs are already whole yen.
+    const doomed = { ...manualLine, id: 'doomed', taxable: true, lineTotal: '1000.00' };
+    const taxed = { ...manualLine, id: 'taxed', taxable: true, lineTotal: '100.00' };
+    const subYen = { ...manualLine, id: 'subyen', taxable: false, lineTotal: '0.50' };
+    render(
+      <InvoiceEditor
+        detail={draft([doomed, taxed, subYen], {
+          currencyCode: 'JPY', taxRate: '0.10500',
+          subtotal: '1100.50', taxTotal: '116.00', total: '1216.00',
+        })}
+        onChanged={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId('invoice-editor')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId('invoice-line-remove-doomed'));
+
+    // Remaining: ¥100.00 taxable + ¥0.50 untaxed. Server recompute →
+    // subtotal ¥101, tax ROUND(¥10.50) = ¥11, total ¥101 + ¥11 = ¥112.
+    await waitFor(() => expect(screen.getByTestId('invoice-subtotal')).toHaveTextContent('¥101'));
+    expect(screen.getByTestId('invoice-tax')).toHaveTextContent('¥11');
+    // Subtotal and Tax above are context, NOT the discriminator: Intl renders JPY
+    // with no fraction digits, so '100.50'/'10.50' and '101.00'/'11.00' both read
+    // ¥101/¥11. The total is where the bug surfaced — the cents-only path summed
+    // 10050¢ + 1050¢ = 11100¢ and rendered ¥111, one yen short of what the very
+    // next GET returns.
+    expect(screen.getByTestId('invoice-total')).toHaveTextContent('¥112');
+  });
+
+  it('leaves the 2-decimal delete preview byte-identical (#6441 regression guard)', async () => {
+    // Same fixture as the JPY case, in USD: `roundToCurrency(x / 100, 'USD')` must
+    // stay exactly what `fromCents(x)` gave, so the #6441 fix cannot move the
+    // common case. Without this, a future change to roundToCurrency or to the
+    // subtotal+tax composition could break every 2-decimal invoice unnoticed.
+    const doomed = { ...manualLine, id: 'doomed', taxable: true, lineTotal: '1000.00' };
+    const taxed = { ...manualLine, id: 'taxed', taxable: true, lineTotal: '100.00' };
+    const cents = { ...manualLine, id: 'cents', taxable: false, lineTotal: '0.50' };
+    render(
+      <InvoiceEditor
+        detail={draft([doomed, taxed, cents], { taxRate: '0.10500' })}
+        onChanged={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId('invoice-editor')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId('invoice-line-remove-doomed'));
+
+    await waitFor(() => expect(screen.getByTestId('invoice-subtotal')).toHaveTextContent('$100.50'));
+    expect(screen.getByTestId('invoice-tax')).toHaveTextContent('$10.50');
+    expect(screen.getByTestId('invoice-total')).toHaveTextContent('$111.00');
   });
 
   it('adds a manual line and triggers a reload (onChanged)', async () => {

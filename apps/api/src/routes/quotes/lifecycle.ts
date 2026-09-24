@@ -2,16 +2,24 @@ import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
 import { zValidator } from '../../lib/validation';
+import { acceptQuoteOnBehalfSchema, declineQuoteOnBehalfSchema } from '@breeze/shared';
 import { sendComposerSchema as sendBodySchema, parseComposerBody } from '../../lib/sendComposer';
 import { requireScope, requirePermission, withAuthDbAccessContext, type AuthContext } from '../../middleware/auth';
 import { PERMISSIONS } from '../../services/permissions';
-import { sendQuote, resendQuote, getQuoteShareLink } from '../../services/quoteLifecycle';
+import { sendQuote, resendQuote, getQuoteShareLink, declineQuoteByActor } from '../../services/quoteLifecycle';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { supersededAuditEvent } from '../../services/quoteSupersedeAudit';
 import { scheduleQuoteSend, cancelQuoteSend } from '../../jobs/quoteSendQueue';
 import { getQuote } from '../../services/quoteService';
 import { writeQuoteImage, readQuoteImage, sniffImageMime, MAX_QUOTE_IMAGE_SIZE_BYTES, fetchRemoteImage, RemoteImageError, QUOTE_IMAGE_WEBP_REJECTED_MESSAGE, type RemoteImageFailureReason } from '../../services/quoteImageStorage';
 import { loadContractBlockRenderData } from '../../services/contractTemplateRender';
+import { runOutsideDbContext, withSystemDbAccessContext } from '../../db';
+import { acceptQuote, emitAcceptInvoiceIssued, resolveAcceptInvoiceUrl, autoEmailAcceptedInvoice } from '../../services/quoteAcceptService';
+import { notifyQuoteOutcome } from '../../services/quoteOutcomeNotify';
+import { notifyCustomerOfOnBehalfAcceptance } from '../../services/quoteOnBehalfNotify';
+import { acceptedOnBehalfAuditEvent } from '../../services/quoteAcceptOnBehalfAudit';
+import { declinedOnBehalfAuditEvent } from '../../services/quoteDeclineOnBehalfAudit';
+import { getTrustedClientIpOrUndefined } from '../../services/clientIp';
 import { quoteActorFrom, handleServiceError } from './quotes';
 
 export const quoteLifecycleRoutes = new Hono();
@@ -19,6 +27,7 @@ const scopes = requireScope('partner', 'system');
 const readPerm = requirePermission(PERMISSIONS.QUOTES_READ.resource, PERMISSIONS.QUOTES_READ.action);
 const writePerm = requirePermission(PERMISSIONS.QUOTES_WRITE.resource, PERMISSIONS.QUOTES_WRITE.action);
 const sendPerm = requirePermission(PERMISSIONS.QUOTES_SEND.resource, PERMISSIONS.QUOTES_SEND.action);
+const acceptPerm = requirePermission(PERMISSIONS.QUOTES_ACCEPT.resource, PERMISSIONS.QUOTES_ACCEPT.action);
 const idParam = z.object({ id: z.string().guid() });
 const imageParam = z.object({ id: z.string().guid(), imageId: z.string().guid() });
 const contractFileParam = z.object({ id: z.string().guid(), blockId: z.string().guid() });
@@ -99,6 +108,177 @@ quoteLifecycleRoutes.post('/:id/send', scopes, sendPerm, zValidator('param', idP
     } });
   } catch (err) { return handleServiceError(c, err); }
 });
+
+// POST /:id/accept-on-behalf — the tech closed the deal on the phone, by email
+// or on a signed PO, and records the customer's acceptance in-app. Runs the
+// EXACT conversion pipeline a customer click runs (invoice numbered + issued at
+// the quote's frozen totals and tax, recurring lines drafted as contracts, Pax8
+// staged); the only differences are the eligible statuses, the inline draft
+// claim, and the provenance stored on the acceptance row.
+//
+// Gated on quotes:accept, NOT quotes:send: this is the money-committing act,
+// and an MSP may want it narrower than sending. Org access is enforced by the
+// auth scope plus the org-scoped getQuote below, BEFORE the handler enters
+// system context.
+//
+// Registered in SELF_MANAGED_DB_CONTEXT_ROUTES, so the auth middleware opens no
+// ambient transaction: the lookup runs in a short withAuthDbAccessContext and
+// the accept in its own system context. partner_invoice_sequences is
+// partner-axis, invisible to an org-scoped context (#1375), and the whole
+// accept must be ONE transaction — the same reason routes/portal/quotes.ts
+// wraps its accept this way.
+quoteLifecycleRoutes.post('/:id/accept-on-behalf',
+  scopes, acceptPerm,
+  zValidator('param', idParam), zValidator('json', acceptQuoteOnBehalfSchema),
+  async (c) => {
+    const id = c.req.valid('param').id;
+    const body = c.req.valid('json');
+    const auth = c.get('auth') as AuthContext;
+    const actorUserId = auth.user?.id ?? null;
+    try {
+      // Org-access 404 + the pre-accept status, in the request's own scope.
+      // Read the status HERE: acceptQuote mutates the quote row it returns, so
+      // `res.quote.status` is already 'converted' by the time we audit.
+      const { quote, blocks } = await withAuthDbAccessContext(auth, () => getQuote(id, quoteActorFrom(c)));
+      const wasDraft = quote.status === 'draft';
+      // Contract-block render data is pre-fetched OUTSIDE the accept
+      // transaction: loadContractBlockRenderData resolves pinned template
+      // versions under a SYSTEM context (the dual-axis template rows are
+      // invisible to an org scope), and acceptQuote hard-fails if a contract
+      // block is missing from the set.
+      const contractRenderData = await loadContractBlockRenderData(blocks, { includeFileData: true });
+
+      const res = await runOutsideDbContext(() => withSystemDbAccessContext(() => acceptQuote({
+        quoteId: id,
+        signerName: body.signerName,
+        signerEmail: body.signerEmail ?? null,
+        // Never the raw header: getTrustedClientIpOrUndefined applies the
+        // trusted-proxy policy. Clamped to the column width.
+        ipAddress: getTrustedClientIpOrUndefined(c)?.slice(0, 64) ?? null,
+        userAgent: c.req.header('user-agent') ?? null,
+        actorUserId,
+        origin: 'on_behalf',
+        method: body.method,
+        reference: body.reference,
+        contractRenderData,
+      })));
+
+      // #6638: audit FIRST, immediately after the accept transaction commits —
+      // this feature's whole point is the audit record, so it must land even if
+      // a later post-commit side effect throws. Both helpers below are
+      // documented as non-throwing today (internal try/catch, return null on
+      // error), but a future regression in either must not silently drop the
+      // acceptance's own audit trail.
+      writeRouteAudit(c, acceptedOnBehalfAuditEvent({
+        quoteId: id,
+        orgId: res.quote.orgId,
+        method: body.method,
+        reference: body.reference,
+        signerName: body.signerName,
+        signerEmail: body.signerEmail ?? null,
+        invoiceId: res.invoiceId,
+        // The number the accept ALLOCATED, not res.quote.quoteNumber — that is
+        // the quote's own number and would name the wrong document.
+        invoiceNumber: res.invoiceNumber,
+        contractIds: res.contractIds,
+        wasDraft,
+      }));
+      // Retiring a revision's parent is a separate, independently-auditable act
+      // — the same rule /send follows.
+      if (res.superseded) {
+        writeRouteAudit(c, supersededAuditEvent({
+          childQuoteId: id,
+          orgId: res.quote.orgId,
+          parentQuoteId: res.superseded.parentQuoteId,
+          previousStatus: res.superseded.previousStatus,
+          revisionNumber: res.quote.revisionNumber,
+          emailed: false,
+        }));
+      }
+
+      // Post-commit, outside the DB context — identical to the portal accept.
+      await emitAcceptInvoiceIssued(res, actorUserId);
+      const payUrl = await resolveAcceptInvoiceUrl(res);
+      // Both end in SMTP round trips and must never delay the response; both
+      // swallow their own errors. source 'msp' emits the bus event and sends NO
+      // creator email — the tech who did this already knows.
+      void autoEmailAcceptedInvoice(res);
+      void notifyQuoteOutcome({
+        quoteId: id, outcome: 'accepted', source: 'msp',
+        signerName: body.signerName, origin: 'on_behalf', actorUserId,
+      });
+      // #6635: optional customer notice ("your provider recorded your
+      // acceptance"), partner opt-in, default OFF. Same post-commit,
+      // never-delay-the-response, swallows-its-own-errors contract.
+      void notifyCustomerOfOnBehalfAcceptance({ ...res, origin: 'on_behalf' });
+
+      return c.json({ data: {
+        quote: res.quote,
+        invoiceId: res.invoiceId,
+        invoiceIssued: res.invoiceIssued,
+        // The number the accept ALLOCATED — same value the audit event carries,
+        // and the only number the UI may put in "Invoice … issued". Without it
+        // the web toast reached for res.quote.quoteNumber and named the quote's
+        // own number, i.e. a document that does not exist. null when no number
+        // was allocated (a recurring-only quote leaves the invoice in draft),
+        // which the caller must word differently rather than print as blank.
+        invoiceNumber: res.invoiceNumber,
+        contractIds: res.contractIds,
+        payUrl,
+      } });
+    } catch (err) { return handleServiceError(c, err); }
+  });
+
+// POST /:id/decline-on-behalf (#6634) — the customer said no by phone, email or
+// letter, and the tech records it in-app. The decline twin of accept-on-behalf,
+// minus the pipeline: the quote moves to `declined` via the SAME service the
+// portal, the public link and the AI tool use (declineQuoteByActor), which owns
+// the CAS status write and the 410 on an expired quote.
+//
+// Gated on quotes:accept, like accept-on-behalf: recording the customer's
+// response is one authority, whichever way they answered. Only `sent` and
+// `viewed` qualify — a draft the customer never saw is deleted, not declined,
+// and every other status is already settled — and the route says so with its
+// own code before the service is reached, so no audit row is written for a
+// refusal.
+//
+// NOT in SELF_MANAGED_DB_CONTEXT_ROUTES: the decline writes only the org-scoped
+// `quotes` row, which the request's own RLS context can reach, so the ambient
+// request transaction is the right one.
+//
+// Attribution is 'msp': the outcome bus event fires and the quote creator gets
+// NO email (the tech who recorded it already knows). The evidence — method,
+// reference, reason — lives in the `quote.declined_on_behalf` audit row; the
+// quote row has no provenance columns for a decline.
+quoteLifecycleRoutes.post('/:id/decline-on-behalf',
+  scopes, acceptPerm,
+  zValidator('param', idParam), zValidator('json', declineQuoteOnBehalfSchema),
+  async (c) => {
+    const id = c.req.valid('param').id;
+    const body = c.req.valid('json');
+    const reason = body.reason || undefined;
+    try {
+      const actor = quoteActorFrom(c);
+      const { quote } = await getQuote(id, actor); // org-access 404
+      if (quote.status !== 'sent' && quote.status !== 'viewed') {
+        return c.json({
+          error: quote.status === 'draft'
+            ? 'This quote was never sent, so there is no customer decline to record — delete the draft instead'
+            : `Only a sent or viewed quote can be declined on the customer's behalf (this one is ${quote.status})`,
+          code: 'QUOTE_NOT_DECLINABLE',
+        }, 409);
+      }
+      const updated = await declineQuoteByActor(id, reason, actor, 'msp');
+      writeRouteAudit(c, declinedOnBehalfAuditEvent({
+        quoteId: id,
+        orgId: updated.orgId,
+        method: body.method,
+        reference: body.reference,
+        reason,
+      }));
+      return c.json({ data: updated });
+    } catch (err) { return handleServiceError(c, err); }
+  });
 
 // POST /:id/schedule-send — the undo-send window. Validates like a send-open
 // (draft + at least one customer-visible line) then schedules the REAL send as

@@ -303,11 +303,13 @@ var serviceInstallCmd = &cobra.Command{
 					_ = os.Chown(linuxWatchdogBinaryPath, 0, 0) // root-owned for the protected-sibling check
 				}
 			}
+			serverURL := persistedServerURLForInstall()
 			err := bootstrapWatchdog(bootstrapOptions{
 				agentPath: linuxBinaryPath,
 				version:   version,
 				goos:      runtime.GOOS,
 				goarch:    runtime.GOARCH,
+				serverURL: serverURL,
 			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr,
@@ -318,7 +320,7 @@ var serviceInstallCmd = &cobra.Command{
 						"  2. Download %s manually, place it next to breeze-agent,\n"+
 						"     then run `sudo breeze-watchdog service install`.\n"+
 						"  3. To skip the watchdog entirely, use `--no-watchdog`.\n",
-					err, agentStateLine, watchdogDownloadURL(version, runtime.GOOS, runtime.GOARCH))
+					err, agentStateLine, watchdogManualDownloadURL(version, runtime.GOOS, runtime.GOARCH, serverURL))
 			}
 		}
 

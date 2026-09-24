@@ -15,7 +15,8 @@ export interface PortalNavItem {
  * a customer does not connect the two labels.
  *
  * Fail-open flags (existing behavior, unchanged): Tickets and Devices stay
- * visible unless explicitly disabled — the API column defaults to true /
+ * visible unless explicitly disabled (Devices also has an opt-in visibility
+ * flag) — the API column defaults to true /
  * self-service defaults on, and the server-side 403 gate on the underlying
  * routes is the real enforcement.
  *
@@ -33,6 +34,7 @@ export function buildPortalNavItems(
     | 'enableTickets'
     | 'enableAssetCheckout'
     | 'enableSelfService'
+    | 'enableDevices'
     | 'enablePasswordReset'
     | 'enableDashboard'
     | 'enableSecurity'
@@ -41,6 +43,7 @@ export function buildPortalNavItems(
     | 'enableSupportUsage'
     | 'enableService'
     | 'enableDocuments'
+    | 'enableNetworkVisibility'
   >
 ): PortalNavItem[] {
   return [
@@ -52,7 +55,7 @@ export function buildPortalNavItems(
     branding.enableTickets !== false
       ? { href: '/tickets', label: 'Support' }
       : null,
-    branding.enableSelfService !== false
+    branding.enableDevices === true || branding.enableSelfService !== false
       ? { href: '/devices', label: 'Devices' }
       : null,
     branding.enableSecurity === true
@@ -75,6 +78,11 @@ export function buildPortalNavItems(
       : null,
     branding.enableAssetCheckout === true
       ? { href: '/assets', label: 'Equipment' }
+      : null,
+    // #6640: another new fail-closed surface, appended after the existing
+    // block for the same reason as Service/Documents above.
+    branding.enableNetworkVisibility === true
+      ? { href: '/network', label: 'Network' }
       : null,
     { href: '/profile', label: 'Profile' }
   ].filter((item): item is PortalNavItem => item !== null);

@@ -46,6 +46,7 @@ import { createScheduledBackupJobIfAbsent, deviceHelperQueues } from '../service
 import { recordDispatchedExpectation } from '../services/agentWorkExpectation';
 import { attachWorkerObservability } from './workerObservability';
 import { captureException } from '../services/sentry';
+import { createAuditLogAsync } from '../services/auditService';
 import { assertQueueJobName, parseQueueJobData } from '../services/bullmqValidation';
 import {
   backupQueueJobDataSchema,
@@ -457,6 +458,40 @@ export interface BackupTarget {
 }
 
 /**
+ * A file-mode backup resolved to zero usable paths (#6001).
+ *
+ * Typed rather than a bare Error so the dispatch catch — and any future caller
+ * — can tell "this configuration can never back anything up" apart from a
+ * transient resolution failure. The message is what a tech reads in the job's
+ * error log, so it names the remedy, not the internal invariant.
+ */
+export class EmptyBackupPathsError extends Error {
+  readonly code = 'BACKUP_NO_PATHS' as const;
+  constructor() {
+    super(
+      'File backup selected but no paths are configured for this device — ' +
+      'add at least one folder to the Backup tab of the configuration policy that governs it, ' +
+      'or attach a backup profile.'
+    );
+    this.name = 'EmptyBackupPathsError';
+  }
+}
+
+/**
+ * Whitespace-only and empty strings are not paths. Trimming here (rather than
+ * at the dozen call sites that can write them) keeps the emptiness test and the
+ * dispatched payload in agreement: a run must never be admitted on the strength
+ * of a path the agent would then discard.
+ */
+function normalizeBackupPaths(paths: unknown): string[] {
+  if (!Array.isArray(paths)) return [];
+  return paths
+    .filter((p): p is string => typeof p === 'string')
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+}
+
+/**
  * Resolves backup mode + targets into one or more typed commands.
  *
  * For file/system_image, returns a single backup_run command.
@@ -471,10 +506,40 @@ export async function resolveBackupTargets(
   switch (backupMode) {
     case 'file': {
       const t = targets as { paths?: string[]; excludes?: string[] };
+      // #6001: REFUSE rather than emit `{ paths: [] }`. The only thing an empty
+      // list can ever produce is a command the agent bounces at 0s with
+      // "backup_run payload has no paths"; failing here turns that late, opaque
+      // agent error into a server-side job failure naming the remedy, for all
+      // three entry points (manual, run-all, scheduled sweep) at once.
+      //
+      // This guard is LOAD-BEARING, not a redundant belt: `min(1)` on
+      // `fileTargetsSchema` (packages/shared/src/validators/backupTargets.ts)
+      // is not imported by the API's write path, which persists
+      // `paths: Array.isArray(s.paths) ? s.paths : []` unchecked
+      // (services/configurationPolicy.ts). So an empty selection IS reachable
+      // in the settings row, and only the PROFILE resolver
+      // (`backupSelectionSpecs`) drops an empty-path selection before job
+      // creation. Legacy custom links have had no such check until now.
+      const paths = normalizeBackupPaths(t.paths);
+      if (paths.length === 0) {
+        throw new EmptyBackupPathsError();
+      }
+      // A path list that lost entries to normalization is not the selection the
+      // tech configured. Never silent: it is the only trail a support engineer
+      // has when asked why one folder in a policy stopped being backed up
+      // while the job still reports success.
+      const droppedPaths = (Array.isArray(t.paths) ? t.paths.length : 0) - paths.length;
+      if (droppedPaths > 0) {
+        console.warn(
+          `[BackupWorker] Dropped ${droppedPaths} unusable path entr${droppedPaths === 1 ? 'y' : 'ies'} ` +
+          `(non-string or blank) from the file selection for device ${deviceId} — ` +
+          'backing up the remaining ' + `${paths.length}`
+        );
+      }
       // Preserve the omitted-vs-empty distinction the agent relies on: a
       // missing excludes field means "fall back to locally-configured
       // excludes", an explicit [] means "no exclusions for this run".
-      const payload: Record<string, unknown> = { paths: t.paths ?? [] };
+      const payload: Record<string, unknown> = { paths };
       if (t.excludes !== undefined) {
         payload.excludes = t.excludes;
       }
@@ -711,6 +776,118 @@ type BackupDispatchPrepare =
     };
 
 /**
+ * #6351: why a dispatched file/system_image backup is about to upload a FULL
+ * copy instead of deduping against a base. Emitted on every fallback so the
+ * condition is visible in the API log rather than only by counting objects in
+ * the bucket.
+ */
+export type FullBackupFallbackReason =
+  | 'no_prior_snapshot'
+  | 'base_expired'
+  | 'storage_identity_changed'
+  | 'backup_type_mismatch'
+  | 'base_job_not_completed'
+  | 'base_retired'
+  | 'base_deleted_race'
+  | 'base_retired_race';
+
+/**
+ * The newest snapshot for this device+config ignoring EVERY eligibility
+ * filter, used only to explain a fallback. `null` means there is none at all.
+ */
+export interface BaseCandidateProbe {
+  expiresAt: Date | null;
+  storageIdentity: string | null;
+  backupType: string | null;
+  jobStatus: string | null;
+  retired: boolean;
+}
+
+/**
+ * Pure classifier for the "no eligible base" fallback — mirrors the candidate
+ * query's WHERE clause, in the same order, so the reason it reports is the
+ * first filter the newest snapshot actually fails.
+ */
+export function classifyMissingBaseReason(
+  probe: BaseCandidateProbe | null,
+  ctx: { storageIdentity: string; mode: 'file' | 'system_image'; now: Date },
+): FullBackupFallbackReason {
+  if (!probe) return 'no_prior_snapshot';
+  if (probe.storageIdentity !== ctx.storageIdentity) return 'storage_identity_changed';
+  const typeMatches =
+    ctx.mode === 'system_image'
+      ? probe.backupType === 'system_image'
+      : probe.backupType === 'file' || probe.backupType === null;
+  if (!typeMatches) return 'backup_type_mismatch';
+  if (probe.expiresAt !== null && probe.expiresAt <= ctx.now) return 'base_expired';
+  if (probe.jobStatus !== 'completed') return 'base_job_not_completed';
+  if (probe.retired) return 'base_retired';
+  // Every mirrored filter passed, so the newest snapshot was not the blocker
+  // (e.g. it belongs to a different device row than the one queried). Report
+  // the generic case rather than inventing a cause.
+  return 'no_prior_snapshot';
+}
+
+/**
+ * #6351: the newest snapshot for this device+config with EVERY eligibility
+ * filter dropped, so `classifyMissingBaseReason` can name the first filter it
+ * fails. Read-only and diagnostic — run after the dispatch transaction has
+ * committed, never inside it.
+ *
+ * Deliberately NOT scoped by storage identity: when the newest snapshot sits
+ * under a different bucket/path than this dispatch, "the config was
+ * re-pointed" is the answer an operator wants first. The cost is that an
+ * older, same-identity row's own rejection reason stays unreported in that
+ * case — acceptable for a log line, and never consulted by the fallback
+ * decision itself.
+ */
+async function readBaseCandidateProbe(
+  deviceId: string,
+  configId: string,
+): Promise<BaseCandidateProbe | null> {
+  const [row] = await db
+    .select({
+      expiresAt: backupSnapshots.expiresAt,
+      storageIdentity: backupSnapshots.storageIdentity,
+      backupType: backupSnapshots.backupType,
+      jobStatus: backupJobs.status,
+      retirementId: backupSnapshotRetirements.id,
+    })
+    .from(backupSnapshots)
+    .innerJoin(backupJobs, eq(backupSnapshots.jobId, backupJobs.id))
+    .leftJoin(
+      backupSnapshotRetirements,
+      and(
+        eq(backupSnapshotRetirements.storageIdentity, backupSnapshots.storageIdentity),
+        eq(backupSnapshotRetirements.snapshotId, backupSnapshots.snapshotId),
+      ),
+    )
+    .where(and(eq(backupSnapshots.deviceId, deviceId), eq(backupSnapshots.configId, configId)))
+    .orderBy(desc(backupSnapshots.timestamp))
+    .limit(1);
+
+  if (!row) return null;
+  return {
+    expiresAt: row.expiresAt ?? null,
+    storageIdentity: row.storageIdentity ?? null,
+    backupType: row.backupType ?? null,
+    jobStatus: row.jobStatus ?? null,
+    retired: row.retirementId != null,
+  };
+}
+
+function logFullBackupFallback(
+  reason: FullBackupFallbackReason,
+  params: { jobId: string; deviceId: string; configId: string; storageIdentity: string },
+): void {
+  console.warn(
+    `[BackupWorker] Job ${params.jobId} (device ${params.deviceId}, config ${params.configId}) ` +
+      `has no incremental base and will upload a FULL copy — reason=${reason}, ` +
+      `storage_identity=${params.storageIdentity}`,
+  );
+}
+
+/**
  * D18 §3.1/§3.6: stamps this job's storage_identity (from the providerConfig
  * actually placed in the dispatch payload) on EVERY dispatched target —
  * including `hyperv_backup`/`mssql_backup` (review fix: GC must be able to
@@ -756,9 +933,18 @@ async function stampDispatchPinAndIdentity(params: {
   const mode = params.mode;
 
   const leaseMs = resolveBackupBaseLeaseMs();
-  const publishLeaseExpiresAt = new Date(Date.now() + leaseMs);
+  const dispatchedAt = new Date();
+  const publishLeaseExpiresAt = new Date(dispatchedAt.getTime() + leaseMs);
 
-  return db.transaction(async (tx) => {
+  // #6351 review fix: the fallback-reason diagnosis runs AFTER the
+  // transaction commits, never inside it. A failure in a purely explanatory
+  // query must not roll back the job-row stamp and turn an accepted
+  // full-copy dispatch into a failed backup (and in Postgres a statement
+  // error aborts the surrounding transaction outright, so catching it inside
+  // would not help).
+  let pendingFallback: FullBackupFallbackReason | 'diagnose' | null = null;
+
+  const outcome = await db.transaction(async (tx) => {
     // Review fix (spec §3.1 selection criteria): "no retirement row" is part
     // of the SELECTION itself, not a post-hoc check on whatever sorted first
     // — a LEFT JOIN + IS NULL here means a retired newest snapshot simply
@@ -791,7 +977,23 @@ async function stampDispatchPinAndIdentity(params: {
           mode === 'system_image'
             ? eq(backupSnapshots.backupType, 'system_image')
             : or(eq(backupSnapshots.backupType, 'file'), isNull(backupSnapshots.backupType)),
-          or(isNull(backupSnapshots.expiresAt), gt(backupSnapshots.expiresAt, publishLeaseExpiresAt)),
+          // #6351: the candidate must merely be UNEXPIRED RIGHT NOW — not
+          // survive the whole publish lease. Requiring
+          // `expiresAt > publishLeaseExpiresAt` was unsatisfiable for the
+          // default configuration: an ordinary daily snapshot expires at
+          // `taken + keepDaily` (7 days) while the lease runs to `now + 7
+          // days`, so the newest snapshot always fell short by exactly the
+          // gap between the two runs and EVERY backup fell back to a full
+          // copy. Survival across the lease is what the PIN is for:
+          // backupRetention.ts's `deleteSnapshotRow` returns 'pinned' for any
+          // snapshot named by an in-flight job's base_snapshot_id or by a
+          // still-live publish lease, regardless of expires_at (proved by
+          // backupRetentionPins.integration.test.ts's "skips an expired
+          // snapshot pinned as a running job's base"). Once the child
+          // publishes, the parent's objects stay reachable through the
+          // child's own manifest in the mark-and-sweep root set, so letting
+          // the parent ROW expire on schedule is safe.
+          or(isNull(backupSnapshots.expiresAt), gt(backupSnapshots.expiresAt, dispatchedAt)),
           eq(backupJobs.status, 'completed'),
           isNull(backupSnapshotRetirements.id),
         ),
@@ -811,6 +1013,7 @@ async function stampDispatchPinAndIdentity(params: {
       .where(eq(backupJobs.id, params.jobId));
 
     if (!candidate) {
+      pendingFallback = 'diagnose';
       return { baseSnapshotId: '', publishLeaseExpiresAt };
     }
 
@@ -825,6 +1028,7 @@ async function stampDispatchPinAndIdentity(params: {
     if (!locked) {
       // Row already gone — a concurrent retention delete won the race.
       await tx.update(backupJobs).set({ baseSnapshotId: null }).where(eq(backupJobs.id, params.jobId));
+      pendingFallback = 'base_deleted_race';
       return { baseSnapshotId: '', publishLeaseExpiresAt };
     }
 
@@ -841,11 +1045,40 @@ async function stampDispatchPinAndIdentity(params: {
 
     if (retirement) {
       await tx.update(backupJobs).set({ baseSnapshotId: null }).where(eq(backupJobs.id, params.jobId));
+      pendingFallback = 'base_retired_race';
       return { baseSnapshotId: '', publishLeaseExpiresAt };
     }
 
     return { baseSnapshotId: candidate.snapshotId, publishLeaseExpiresAt };
   });
+
+  if (pendingFallback !== null) {
+    const logParams = {
+      jobId: params.jobId,
+      deviceId: params.deviceId,
+      configId: params.configId,
+      storageIdentity,
+    };
+    if (pendingFallback !== 'diagnose') {
+      logFullBackupFallback(pendingFallback, logParams);
+    } else {
+      try {
+        const probe = await readBaseCandidateProbe(params.deviceId, params.configId);
+        logFullBackupFallback(
+          classifyMissingBaseReason(probe, { storageIdentity, mode, now: dispatchedAt }),
+          logParams,
+        );
+      } catch (err) {
+        // Diagnosis only — the dispatch itself already committed.
+        console.warn(
+          `[BackupWorker] Job ${params.jobId} has no incremental base and will upload a FULL copy; ` +
+            `the reason probe failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+
+  return outcome;
 }
 
 /**
@@ -885,6 +1118,12 @@ async function prepareBackupDispatchTargets(
       .select({
         backupMode: configPolicyBackupSettings.backupMode,
         targets: configPolicyBackupSettings.targets,
+        // #6001: the legacy top-level column. The Backup tab writes the custom
+        // selection's folder list to BOTH `paths` and `targets.paths`, but only
+        // `targets` was ever read at dispatch — so a settings row written by an
+        // older UI/API build, or by an API caller that sends only the
+        // documented top-level `paths` field, dispatched an empty list.
+        legacyPaths: configPolicyBackupSettings.paths,
       })
       .from(configPolicyBackupSettings)
       .where(eq(configPolicyBackupSettings.featureLinkId, job.featureLinkId))
@@ -893,6 +1132,15 @@ async function prepareBackupDispatchTargets(
     if (settings) {
       backupMode = settings.backupMode;
       modeTargets = (settings.targets as Record<string, unknown>) ?? {};
+      // Fall back ONLY when `targets` carries no usable file paths, and only
+      // for file mode — `targets` stays authoritative wherever it is populated,
+      // so this can never override a deliberate narrowing of the selection.
+      if (backupMode === 'file' && normalizeBackupPaths(modeTargets.paths).length === 0) {
+        const legacyPaths = normalizeBackupPaths(settings.legacyPaths);
+        if (legacyPaths.length > 0) {
+          modeTargets = { ...modeTargets, paths: legacyPaths };
+        }
+      }
     }
   }
 
@@ -1180,9 +1428,48 @@ async function processDispatchBackup(
     prepared.map((target) => [target.commandJobId, 'not-attempted' as TargetSendState])
   );
   let parentFailureDetail: string | null = null;
+  let deviceOrgChanged = false;
 
   try {
     for (const target of prepared) {
+      // Re-read after payload preparation and between sends: enqueue-time
+      // ownership cannot authorize a backup on a device moved to another org.
+      // Keep the relay acknowledgement wait outside the short DB context.
+      const admitted = await runWithSystemDbAccess(async () => {
+        const [device] = await db.select({ orgId: devices.orgId }).from(devices)
+          .where(eq(devices.id, data.deviceId)).limit(1);
+        if (device?.orgId === data.orgId) return true;
+
+        console.warn('[BackupWorker] Refusing backup dispatch: device_org_changed', {
+          jobId: data.jobId, deviceId: data.deviceId, orgId: data.orgId,
+        });
+        createAuditLogAsync({
+          orgId: data.orgId,
+          actorType: 'system',
+          actorId: '00000000-0000-0000-0000-000000000000',
+          action: 'backup.dispatch.denied',
+          resourceType: 'backup_job',
+          resourceId: data.jobId,
+          result: 'failure',
+          details: { deviceId: data.deviceId, reason: 'device_org_changed' },
+        });
+        return false;
+      });
+      if (!admitted) {
+        deviceOrgChanged = true;
+        for (const pending of prepared) {
+          if (sendState.get(pending.commandJobId) !== 'not-attempted') continue;
+          sendState.set(pending.commandJobId, 'failed');
+          failedTargets.push(`${pending.commandType} (device_org_changed)`);
+          if (pending.commandJobId === data.jobId) {
+            parentFailureDetail = 'device_org_changed';
+          } else {
+            failedChildJobs.push({ commandJobId: pending.commandJobId, detail: 'device_org_changed' });
+          }
+        }
+        break;
+      }
+
       // Set BEFORE the await: if the send throws, delivery is ambiguous and
       // this row must be left in-flight rather than settled as never-sent.
       sendState.set(target.commandJobId, 'attempting');
@@ -1229,9 +1516,11 @@ async function processDispatchBackup(
       if (sentCount === 0) {
         await markJobFailed(
           data.jobId,
-          lastNonOfflineOutcomeStatus
-            ? `Failed to send command to agent (dispatch outcome ${lastNonOfflineOutcomeStatus})`
-            : 'Failed to send command to agent',
+          deviceOrgChanged
+            ? 'device_org_changed'
+            : lastNonOfflineOutcomeStatus
+              ? `Failed to send command to agent (dispatch outcome ${lastNonOfflineOutcomeStatus})`
+              : 'Failed to send command to agent',
         );
         return { dispatched: false };
       }
@@ -1473,4 +1762,9 @@ export const __testOnly = {
   // D18 W01 (#5429): exposed so integration tests can race this real
   // function against cleanupExpiredSnapshots without hand-rolling its SQL.
   stampDispatchPinAndIdentity,
+  // #6001: exposed so the backup-parity integration suite can assert on the
+  // ACTUAL backup_run payload a scheduled job produces (and on the job row a
+  // pathless link leaves behind) without standing up a queue + agent socket.
+  // This is the only place the settings row is turned into a command.
+  prepareBackupDispatchTargets,
 };

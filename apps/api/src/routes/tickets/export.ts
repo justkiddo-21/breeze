@@ -27,12 +27,15 @@ ticketExportRoutes.get(
       return c.json({ error: 'Access to this organization denied' }, 403);
     }
     const { rows } = await listBillables(q.from, q.to, q.orgId, auth.accessibleOrgIds);
-    const lines = [CSV_HEADERS.join(',')];
+    const lines = [csvRow(CSV_HEADERS)];
     for (const r of rows) {
       lines.push(csvRow([
         r.kind, r.date.toISOString(), r.orgName ?? '', r.ticketNumber ?? '',
         r.description ?? '', r.technician ?? '', r.quantity, r.rate ?? '',
-        r.amount, r.currencyCode ?? '', r.billingStatus,
+        // A missingRate gap has no amount to report — never render it as a
+        // real $0.00 line (#6461). MISSING_RATE is an explicit, greppable
+        // marker rather than a blank cell that could be read as "unset".
+        r.missingRate ? 'MISSING_RATE' : (r.amount ?? ''), r.currencyCode ?? '', r.billingStatus,
         r.isApproved === null ? '' : String(r.isApproved)
       ]));
     }

@@ -44,6 +44,16 @@ vi.mock('../../middleware/auth', async () => ({
   siteAccessCheck: (await vi.importActual<typeof import('../../middleware/auth')>('../../middleware/auth')).siteAccessCheck,
 }));
 
+// #4211 (W01) — aiDrafts.ts (mounted under ticketsRoutes) now imports
+// getLatestTicketProposal, which pulls in runTrace.ts's real dependency
+// chain (alertVerdicts/sweepFindings -> actionIntents/intentService ->
+// aiTools.ts) — heavier than this file's own minimal `../../db/schema`
+// mock below supports. This suite never exercises the ai-proposal routes
+// (that's aiDrafts.test.ts), so stub the module out entirely.
+vi.mock('../../services/aiTicketProposal', () => ({
+  getLatestTicketProposal: vi.fn(),
+}));
+
 vi.mock('../../db', () => ({
   runOutsideDbContext: (fn: () => unknown) => fn(),
   withSystemDbAccessContext: (fn: () => unknown) => fn(),
@@ -87,6 +97,14 @@ vi.mock('../../db/schema', () => ({
     startedAt: 'startedAt', endedAt: 'endedAt', durationMinutes: 'durationMinutes',
     description: 'description', isBillable: 'isBillable', billingStatus: 'billingStatus',
     hourlyRate: 'hourlyRate', isApproved: 'isApproved', addedBy: 'addedBy'
+  },
+  // #5783 W01: ticketChecklistService is reachable from routes/tickets/index.ts,
+  // and its module-scope CHECKLIST_ORDER reads these columns at import time.
+  ticketChecklistItems: {
+    id: 'id', orgId: 'orgId', ticketId: 'ticketId', label: 'label', detail: 'detail',
+    position: 'position', doneAt: 'doneAt', doneByUserId: 'doneByUserId', source: 'source',
+    sourceTemplateItemId: 'sourceTemplateItemId', createdBy: 'createdBy',
+    createdAt: 'createdAt', updatedAt: 'updatedAt',
   },
   ticketParts: {
     id: 'id', ticketId: 'ticketId', orgId: 'orgId', addedBy: 'addedBy',
@@ -268,6 +286,21 @@ describe('parts routes', () => {
     expect(timeServiceMocks.deleteTicketPart).toHaveBeenCalled();
   });
 
+  // #6589 — the service now refuses a zero-row delete; the route must surface
+  // that as a 409 rather than its usual `{ deleted: true }`.
+  it('DELETE /parts/:id surfaces a lost-delete race as 409 PART_DELETE_LOST', async () => {
+    dbSelectMock.mockReturnValueOnce([{ id: PART_ID, ticketId: TICKET_ID }]);
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    timeServiceMocks.deleteTicketPart.mockRejectedValue(
+      new TimeEntryServiceError('Part could not be deleted — reload and retry', 409, 'PART_DELETE_LOST')
+    );
+
+    const res = await ticketsRoutes.request(`/parts/${PART_ID}`, { method: 'DELETE' });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: 'PART_DELETE_LOST' });
+  });
+
   it('GET /:id/time-entries 404s for out-of-scope ticket', async () => {
     getScopedTicketOr404Mock.mockResolvedValue(null);
     const res = await ticketsRoutes.request(`/${TICKET_ID}/time-entries`);
@@ -308,6 +341,39 @@ describe('parts routes', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.data.time.billableAmounts[0].amount).toBe('125.00');
+  });
+
+  // #6466: billableMinutes counts every billable row (COALESCE minutes, no
+  // rate filter), but billableAmounts only counts rows with a rate — so the
+  // route stamps missingRateCount from a route-local query, independent of
+  // whatever getTicketBillingSummary itself returns.
+  it('GET /:id/billing-summary stamps missingRateCount from rate-less billable entries', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    timeServiceMocks.getTicketBillingSummary.mockResolvedValue({
+      time: { totalMinutes: 90, billableMinutes: 30, billableAmounts: [] },
+      parts: { partsCount: 0, billableTotals: [] }
+    });
+    timeServiceMocks.getTicketTimeEntryDefaults.mockResolvedValue(null);
+    dbSelectMock.mockReturnValueOnce([{ n: 2 }]);
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/billing-summary`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.time.billableMinutes).toBe(30);
+    expect(body.data.time.missingRateCount).toBe(2);
+  });
+
+  it('GET /:id/billing-summary defaults missingRateCount to 0 when every billable entry has a rate', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    timeServiceMocks.getTicketBillingSummary.mockResolvedValue({
+      time: { totalMinutes: 60, billableMinutes: 60, billableAmounts: [{ currencyCode: 'USD', amount: '125.00' }] },
+      parts: { partsCount: 0, billableTotals: [] }
+    });
+    timeServiceMocks.getTicketTimeEntryDefaults.mockResolvedValue(null);
+    dbSelectMock.mockReturnValueOnce([{ n: 0 }]);
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/billing-summary`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.time.missingRateCount).toBe(0);
   });
 
   // #5321: the ticket quick-add prefills its rate from here and warns when the
@@ -384,7 +450,7 @@ describe('GET /export/billables.csv', () => {
     const body = await res.text();
     const headerLine = body.split('\n')[0];
     const dataLine = body.split('\n')[1]?.replaceAll('"', '');
-    expect(headerLine).toBe('type,date,organization,ticket,description,technician,quantity,rate,amount,currency,billing_status,approved');
+    expect(headerLine).toBe('"type","date","organization","ticket","description","technician","quantity","rate","amount","currency","billing_status","approved"');
     expect(body).toContain('T-2026-0001');
     expect(dataLine).toContain(',62.50,USD,not_billed,');
     expect(body).not.toContain('cost');
@@ -397,6 +463,30 @@ describe('GET /export/billables.csv', () => {
       rowCount: 1,
       byteCount: Buffer.byteLength(body, 'utf8'),
     });
+  });
+
+  // #6461: a missingRate row must render as an explicit gap marker in the CSV,
+  // never as a fabricated $0.00 amount, and must not appear in totalsByCurrency.
+  it('renders a missingRate row as MISSING_RATE, never a $0.00 amount', async () => {
+    timeServiceMocks.listBillables.mockResolvedValue({
+      rows: [{
+        kind: 'time', date: new Date('2026-06-10T10:00:00Z'), orgName: 'Acme',
+        ticketNumber: 'T-2026-0002', description: 'no rate set', technician: 'Tess',
+        quantity: '0.50', rate: null, amount: null, missingRate: true,
+        currencyCode: 'USD',
+        billingStatus: 'not_billed', isApproved: true
+      }],
+      totalsByCurrency: []
+    });
+    const res = await ticketsRoutes.request('/export/billables.csv?from=2026-06-01&to=2026-06-30');
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    const dataLine = body.split('\n')[1]?.replaceAll('"', '');
+    expect(dataLine).toContain(',MISSING_RATE,USD,not_billed,');
+    // Every csvRow cell is quoted (see csvExport.escapeCsvCell), so checking
+    // the raw `body` for an unquoted ',0.00,USD,' would never match even
+    // without the fix — assert against the de-quoted `dataLine` instead.
+    expect(dataLine).not.toContain(',0.00,');
   });
 
   it('rejects missing date params with 400', async () => {
@@ -480,7 +570,7 @@ describe('GET /export/billables.csv', () => {
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe(
-      'type,date,organization,ticket,description,technician,quantity,rate,amount,currency,billing_status,approved',
+      '"type","date","organization","ticket","description","technician","quantity","rate","amount","currency","billing_status","approved"',
     );
   });
 });

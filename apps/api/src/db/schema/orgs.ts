@@ -1,4 +1,4 @@
-import { pgTable, uuid, varchar, text, timestamp, jsonb, pgEnum, integer, boolean, numeric, char, uniqueIndex } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, varchar, text, timestamp, jsonb, pgEnum, integer, boolean, numeric, char, uniqueIndex, index } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import type { ImpactWeightOverrides } from '@breeze/shared';
 
@@ -45,6 +45,10 @@ export const partners = pgTable('partners', {
   // accepted. Dedicated column, not settings JSONB — the settings cards replace
   // sub-objects wholesale (#3597), and a column keeps gate === read-back.
   autoEmailInvoiceOnQuoteAccept: boolean('auto_email_invoice_on_quote_accept').notNull().default(true),
+  // #6635: email the customer a short notice when a tech records a quote
+  // acceptance ON THEIR BEHALF. DEFAULT OFF — a new outbound customer email
+  // must not start firing on upgrade. Same dedicated-column reasoning as above.
+  notifyCustomerOnBehalfAcceptance: boolean('notify_customer_on_behalf_acceptance').notNull().default(false),
   // P2-6 (#4193). PARTIAL overrides of DEFAULT_IMPACT_WEIGHTS (@breeze/shared);
   // NULL means "defaults". Dedicated column, not a partners.settings
   // sub-object — settings cards replace sub-objects wholesale (#3597) and
@@ -99,6 +103,7 @@ export const partners = pgTable('partners', {
   billingIdentitySyncedAt: timestamp('billing_identity_synced_at', { withTimezone: true }),
   billingSubscriptionStatus: text('billing_subscription_status'),
   currencyCode: char('currency_code', { length: 3 }).notNull().default('USD'),
+  labourPricingConvertedAt: timestamp('labour_pricing_converted_at', { withTimezone: true }).defaultNow(),
   defaultTaxRate: numeric('default_tax_rate', { precision: 8, scale: 5 }),
   invoiceNumberPrefix: varchar('invoice_number_prefix', { length: 12 }).notNull().default('INV'),
   invoiceTermsDays: integer('invoice_terms_days').notNull().default(30),
@@ -215,6 +220,10 @@ export const organizations = pgTable('organizations', {
   purgeAt: timestamp('purge_at', { withTimezone: true }),
   // Which terminal status finalizeOrganizationOffboarding lands on.
   offboardingTarget: varchar('offboarding_target', { length: 16 }).notNull().default('churn'),
+  // Execution plane W04 (spec 2026-09-13 §8): per-org opt-in for model-written
+  // code to execute on a vendor sandbox. Default false until the DPA review;
+  // enforced at analysis-run ADMISSION (runService.ts), never in the catalog.
+  aiExternalProcessing: boolean('ai_external_processing').notNull().default(false),
   deletedAt: timestamp('deleted_at')
 }, (table) => ({
   orgPartnerUnique: uniqueIndex('organizations_id_partner_id_unique').on(table.id, table.partnerId),
@@ -241,6 +250,7 @@ export const sites = pgTable('sites', {
   partnerExportUpdatedAt: timestamp('partner_export_updated_at', { precision: 3 }).defaultNow().notNull()
 }, (table) => ({
   idOrgUnique: uniqueIndex('sites_id_org_id_uniq').on(table.id, table.orgId),
+  orgIdIdx: index('sites_org_id_idx').on(table.orgId),
 }));
 
 export const enrollmentKeys = pgTable('enrollment_keys', {

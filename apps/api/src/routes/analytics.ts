@@ -12,6 +12,7 @@ import {
   mlFeedbackEvents,
   metricAnomalyCandidates,
   metricAnomalies,
+  metricAnomalyEpisodes,
   metricRollups,
   devices,
   slaDefinitions as slaDefinitionsTable,
@@ -21,6 +22,7 @@ import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthC
 import { writeRouteAudit } from '../services/auditEvents';
 import { captureException } from '../services/sentry';
 import { PERMISSIONS, canAccessSite, type UserPermissions } from '../services/permissions';
+import { slaDefinitionOutOfScope, slaScopeNarrowed, type SlaTargetShape } from '../services/slaSiteScope';
 import { METRIC_ANOMALY_V1_SHADOW_VERSION } from '../services/metricAnomalies';
 
 export const analyticsRoutes = new Hono();
@@ -92,6 +94,45 @@ async function resolveSiteAllowedDeviceIds(
   return orgDevices
     .filter((d) => typeof d.siteId === 'string' && canAccessSite(perms, d.siteId))
     .map((d) => d.id);
+}
+
+// `permissions`-shaped caller adapted to the AuthContext shape the shared SLA
+// gate speaks, so routes and the AI tool layer run the SAME implementation
+// (services/slaSiteScope.ts).
+function slaScopeAuthFor(perms: UserPermissions | undefined) {
+  return {
+    allowedSiteIds: perms?.allowedSiteIds,
+    canAccessSite: (siteId: string | null | undefined) =>
+      // `perms` undefined means unrestricted, in which case the gate is never
+      // consulted (`slaScopeNarrowed` is false) — the guard is for the type.
+      !!perms && typeof siteId === 'string' && canAccessSite(perms, siteId),
+  };
+}
+
+/**
+ * Drop SLA definitions whose `target_type`/`target_ids` name sites or devices a
+ * site-restricted caller cannot reach. Site is an app-layer axis only — RLS
+ * does not defend it — and both this route and `query_analytics` filtered on
+ * `org_id` alone, disclosing out-of-scope compliance figures and the target
+ * UUIDs themselves.
+ */
+async function filterSlaDefinitionsForSiteScope<T extends SlaTargetShape>(
+  orgId: string | null | undefined,
+  perms: UserPermissions | undefined,
+  rows: T[],
+): Promise<T[]> {
+  const scopeAuth = slaScopeAuthFor(perms);
+  if (!slaScopeNarrowed(scopeAuth) || rows.length === 0) return rows;
+  const needsDeviceAxis = rows.some((r) => (r.targetType ?? '').toLowerCase() === 'device');
+  // `null` means "not resolved" and DENIES downstream; `[]` means "resolved to
+  // nothing". A narrowed caller with no orgId cannot resolve a device set, so
+  // it must get `[]` rather than `null` collapsing into "unrestricted"
+  // (review #6110). Only `needsDeviceAxis === false` may pass `null`, and then
+  // no row reaches the device branch at all.
+  const allowedDeviceIds = needsDeviceAxis
+    ? (orgId ? (await resolveSiteAllowedDeviceIds(orgId, perms)) ?? [] : [])
+    : null;
+  return rows.filter((r) => !slaDefinitionOutOfScope(scopeAuth, r, allowedDeviceIds));
 }
 
 const timeSeriesQuerySchema = z.object({
@@ -289,6 +330,7 @@ function zeroAnomalyEvaluationResponse(options: {
       dismissed: 0,
       promoted: 0,
       resolved: 0,
+      cleared: 0,
     },
     rates: {
       dismissRate: 0,
@@ -301,9 +343,21 @@ function zeroAnomalyEvaluationResponse(options: {
       promoted: 0,
       resolved: 0,
     },
+    episodes: zeroEpisodeEvaluation(),
     ...(options.includeV1 ? {
       v1Shadow: zeroV1ShadowEvaluation(0),
     } : {}),
+  };
+}
+
+function zeroEpisodeEvaluation() {
+  return {
+    total: 0,
+    byStatus: { open: 0, resolved: 0, dismissed: 0 },
+    byCloseReason: { cleared: 0, expired_offline: 0, expired_no_data: 0, detection_off: 0, user: 0, snoozed: 0 },
+    medianDurationSeconds: null as number | null,
+    recurrenceShare: 0,
+    humanLabelledShare: 0,
   };
 }
 
@@ -1157,14 +1211,17 @@ analyticsRoutes.get(
       ))
       .groupBy(mlFeedbackEvents.eventType);
 
-    const status = { open: 0, dismissed: 0, promoted: 0, resolved: 0 };
+    const status = { open: 0, dismissed: 0, promoted: 0, resolved: 0, cleared: 0 };
     for (const row of statusRows) {
       const key = String(row.status);
-      if (key === 'open' || key === 'dismissed' || key === 'promoted' || key === 'resolved') {
+      if (key === 'open' || key === 'dismissed' || key === 'promoted' || key === 'resolved' || key === 'cleared') {
         status[key] = Number(row.count) || 0;
       }
     }
 
+    // cleared members are automatic (auto-resolve, spec D5/D7), never a human
+    // label — excluded from `total` and therefore from every rate denominator
+    // below, but still surfaced as its own count in `status.cleared`.
     const total = status.open + status.dismissed + status.promoted + status.resolved;
     const feedback = { total: 0, dismissed: 0, promoted: 0, resolved: 0 };
     for (const row of feedbackRows) {
@@ -1174,6 +1231,77 @@ analyticsRoutes.get(
       if (row.eventType === 'anomaly.resolved') feedback.resolved += count;
     }
     feedback.total = feedback.dismissed + feedback.promoted + feedback.resolved;
+
+    const episodeOrgCondition =
+      query.orgId
+        ? eq(metricAnomalyEpisodes.orgId, query.orgId)
+        : typeof auth?.orgCondition === 'function'
+          ? auth.orgCondition(metricAnomalyEpisodes.orgId)
+          : auth?.orgId
+            ? eq(metricAnomalyEpisodes.orgId, auth.orgId)
+            : undefined;
+
+    const episodeConditions: SQL[] = [
+      gte(metricAnomalyEpisodes.firstSeenAt, since),
+      ...(episodeOrgCondition ? [episodeOrgCondition] : []),
+      ...(query.deviceId ? [eq(metricAnomalyEpisodes.deviceId, query.deviceId)] : []),
+      ...(allowedDeviceIds !== null && !query.deviceId && allowedDeviceIds.length > 0
+        ? [inArray(metricAnomalyEpisodes.deviceId, allowedDeviceIds)]
+        : []),
+    ];
+
+    const episodeGroupRows = await db
+      .select({
+        status: metricAnomalyEpisodes.status,
+        closeReason: metricAnomalyEpisodes.closeReason,
+        count: sql<number>`count(*)`,
+      })
+      .from(metricAnomalyEpisodes)
+      .where(and(...episodeConditions))
+      .groupBy(metricAnomalyEpisodes.status, metricAnomalyEpisodes.closeReason);
+
+    const [episodeAggRow] = await db
+      .select({
+        total: sql<number>`count(*)`,
+        recurring: sql<number>`count(*) filter (where ${metricAnomalyEpisodes.recurrenceCount} >= 1)`,
+        // A8: denominator = closed episodes except snoozed successors (the echo
+        // of an earlier human dismiss); numerator = the ones a human labelled,
+        // by closing them or by promoting them (linked alert), however they closed.
+        labelEligibleClosed: sql<number>`count(*) filter (where ${metricAnomalyEpisodes.status} <> 'open' and ${metricAnomalyEpisodes.closeReason} is distinct from 'snoozed')`,
+        humanLabelled: sql<number>`count(*) filter (where ${metricAnomalyEpisodes.status} <> 'open' and ${metricAnomalyEpisodes.closeReason} is distinct from 'snoozed' and (${metricAnomalyEpisodes.closeReason} = 'user' or ${metricAnomalyEpisodes.linkedAlertId} is not null))`,
+        medianDurationSeconds: sql<number | null>`percentile_cont(0.5) within group (order by extract(epoch from (${metricAnomalyEpisodes.resolvedAt} - ${metricAnomalyEpisodes.firstSeenAt}))) filter (where ${metricAnomalyEpisodes.resolvedAt} is not null)`,
+      })
+      .from(metricAnomalyEpisodes)
+      .where(and(...episodeConditions));
+
+    const episodeByStatus = { open: 0, resolved: 0, dismissed: 0 };
+    const episodeByCloseReason = { cleared: 0, expired_offline: 0, expired_no_data: 0, detection_off: 0, user: 0, snoozed: 0 };
+    for (const row of episodeGroupRows) {
+      const statusKey = String(row.status);
+      if (statusKey === 'open' || statusKey === 'resolved' || statusKey === 'dismissed') {
+        episodeByStatus[statusKey] += Number(row.count) || 0;
+      }
+      const reasonKey = row.closeReason ? String(row.closeReason) : null;
+      if (reasonKey && reasonKey in episodeByCloseReason) {
+        episodeByCloseReason[reasonKey as keyof typeof episodeByCloseReason] += Number(row.count) || 0;
+      }
+    }
+
+    const episodeTotal = Number(episodeAggRow?.total) || 0;
+    const episodeRecurring = Number(episodeAggRow?.recurring) || 0;
+    const episodeLabelEligibleClosed = Number(episodeAggRow?.labelEligibleClosed) || 0;
+    const episodeHumanLabelled = Number(episodeAggRow?.humanLabelled) || 0;
+    const episodeMedianDurationSeconds =
+      episodeAggRow?.medianDurationSeconds == null ? null : Math.round(Number(episodeAggRow.medianDurationSeconds));
+
+    const episodes = {
+      total: episodeTotal,
+      byStatus: episodeByStatus,
+      byCloseReason: episodeByCloseReason,
+      medianDurationSeconds: episodeMedianDurationSeconds,
+      recurrenceShare: episodeTotal > 0 ? episodeRecurring / episodeTotal : 0,
+      humanLabelledShare: episodeLabelEligibleClosed > 0 ? episodeHumanLabelled / episodeLabelEligibleClosed : 0,
+    };
 
     let v1Shadow: ReturnType<typeof zeroV1ShadowEvaluation> | undefined;
     if (query.includeV1) {
@@ -1288,6 +1416,7 @@ analyticsRoutes.get(
         resolveRate: total > 0 ? status.resolved / total : 0,
       },
       feedback,
+      episodes,
       ...(v1Shadow ? { v1Shadow } : {}),
     });
   }
@@ -1575,6 +1704,24 @@ analyticsRoutes.get(
 
     const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
 
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (slaScopeNarrowed(slaScopeAuthFor(perms))) {
+      // A narrowed caller cannot be paginated in SQL: visibility depends on
+      // each definition's target_ids, which no index can express. SLA
+      // definitions are few per org, so fetch the org's set, apply the site
+      // gate, then paginate in memory — the total stays honest.
+      const allRows = await db
+        .select()
+        .from(slaDefinitionsTable)
+        .where(whereCondition)
+        .orderBy(desc(slaDefinitionsTable.updatedAt), desc(slaDefinitionsTable.id));
+      const visible = await filterSlaDefinitionsForSiteScope(auth.orgId, perms, allRows);
+      return c.json({
+        data: visible.slice(offset, offset + limit),
+        pagination: { page, limit, total: visible.length }
+      });
+    }
+
     const countResult = await db
       .select({ count: sql<number>`count(*)` })
       .from(slaDefinitionsTable)
@@ -1684,6 +1831,14 @@ analyticsRoutes.get(
 
     const hasAccess = await ensureOrgAccess(sla.orgId, auth);
     if (!hasAccess) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    // Org access is not site access: a definition targeting sites or devices
+    // this caller cannot reach stays hidden (same gate as GET /analytics/sla).
+    const compliancePerms = c.get('permissions') as UserPermissions | undefined;
+    const visibleSla = await filterSlaDefinitionsForSiteScope(sla.orgId, compliancePerms, [sla]);
+    if (visibleSla.length === 0) {
       return c.json({ error: 'Access denied' }, 403);
     }
 

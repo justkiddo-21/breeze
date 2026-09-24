@@ -13,7 +13,7 @@ export const queueActorMetaSchema = z.object({
   source: z.string().min(1),
 }).strict();
 
-const backupSnapshotFileSchema = z
+export const backupSnapshotFileSchema = z
   .object({
     sourcePath: z.string().min(1),
     // Stable pre-VSS path (D12): under a shadow copy sourcePath is the
@@ -37,7 +37,7 @@ const backupSnapshotFileSchema = z
     }
   });
 
-const backupSnapshotSummarySchema = z.object({
+export const backupSnapshotSummarySchema = z.object({
   id: z.string().min(1),
   timestamp: z.string().min(1).optional(),
   size: z.number().nonnegative().optional(),
@@ -71,6 +71,11 @@ export const backupProcessResultSchema = z.object({
   // open z.record (arbitrary keys allowed) so an unmodeled field never fails
   // the job. NOTE: this schema itself is .strict(), so new *top-level* fields
   // still must be declared here or the whole job fails validation.
+  // Free-form job metadata the agent attaches (#5413). Persistence reads it
+  // (normalizeMetadata in backupResultPersistence.ts) and the Redis-DOWN inline
+  // branch already carried it by spread — declaring it here is what lets the
+  // queued path carry it too. Open record for the same reason as the manifests.
+  metadata: z.record(z.string(), z.unknown()).optional(),
   backupType: z.enum(['file', 'system_image', 'database', 'application']).optional(),
   systemStateManifest: z.record(z.string(), z.unknown()).nullish(),
   // Bare-metal recovery (W01): disk layout + guard verdict, forwarded the same
@@ -230,6 +235,11 @@ export const monitorQueueJobDataSchema = z.discriminatedUnion('type', [
     type: z.literal('process-check-result'),
     monitorId: z.string().min(1),
     result: monitorCheckResultSchema,
+    // #5291 W04 - the org the probe ran FOR and the device it ran FROM. Both
+    // optional so a payload enqueued before this wave still parses at the
+    // dequeue boundary instead of dead-lettering the drain.
+    orgId: z.string().min(1).optional(),
+    deviceId: z.string().min(1).optional(),
     meta: queueActorMetaSchema.optional(),
   }).strict(),
   z.object({
@@ -397,6 +407,32 @@ export const sensitiveDataQueueJobDataSchema = z.union([
     scanAt: z.string().min(1),
   }).strict(),
 ]);
+
+/**
+ * #6263 W01. `origin` distinguishes a tech pressing "Scan now" from the 60 s
+ * policy tick; only the scheduler variant carries the occurrence it was created
+ * for, which is what makes a duplicate tick a no-op.
+ */
+export const securityScanQueueJobDataSchema = z.union([
+  z.object({
+    type: z.literal('dispatch-scan'),
+    scanId: z.string().uuid(),
+    origin: z.literal('manual'),
+  }).strict(),
+  z.object({
+    type: z.literal('dispatch-scan'),
+    scanId: z.string().uuid(),
+    origin: z.literal('policy_scheduler'),
+    configPolicyId: z.string().uuid(),
+    occurrenceIso: z.string().min(1),
+  }).strict(),
+  z.object({
+    type: z.literal('schedule-policies'),
+    scanAt: z.string().min(1),
+  }).strict(),
+]);
+
+export type SecurityScanQueueJobData = z.infer<typeof securityScanQueueJobDataSchema>;
 
 export const drExecutionQueueJobDataSchema = z.object({
   type: z.literal('reconcile-execution'),

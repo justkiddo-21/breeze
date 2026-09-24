@@ -4,6 +4,14 @@ import { db } from '../../db';
 import { portalBranding } from '../../db/schema';
 import type { PortalVisibilityFlag } from '../../services/portal/portalFlags';
 
+// Network Visibility is deliberately excluded from the generic strict
+// 403 gate. Its approved shared contract represents disabled availability
+// as dataStatus: 'not_enabled' with null metrics.
+export type StrictPortalVisibilityFlag = Exclude<
+  PortalVisibilityFlag,
+  'enableNetworkVisibility'
+>;
+
 type PortalBooleanSetting = 'enableAssetCheckout' | 'enableSelfService';
 
 type PortalFeatureGateOptions = {
@@ -43,18 +51,36 @@ export const portalAssetCheckoutEnabledMiddleware = createPortalFeatureGate({
   code: 'PORTAL_ASSET_CHECKOUT_DISABLED',
 });
 
-export const portalSelfServiceEnabledMiddleware = createPortalFeatureGate({
-  setting: 'enableSelfService',
-  error: 'Self-service device access is not enabled for this portal',
-  code: 'PORTAL_SELF_SERVICE_DISABLED',
-});
+// Devices visibility is independent of self-service. Keep the legacy default
+// (missing settings = self-service enabled) for existing portals.
+export const portalDevicesEnabledMiddleware: MiddlewareHandler = async (c, next) => {
+  const auth = c.get('portalAuth');
+  if (!auth) return c.json({ error: 'Authentication required' }, 401);
+
+  const [row] = await db
+    .select({
+      enableDevices: portalBranding.enableDevices,
+      enableSelfService: portalBranding.enableSelfService,
+    })
+    .from(portalBranding)
+    .where(eq(portalBranding.orgId, auth.user.orgId))
+    .limit(1);
+
+  if (row?.enableDevices !== true && row?.enableSelfService === false) {
+    return c.json({
+      error: 'Device visibility is not enabled for this portal',
+      code: 'PORTAL_SELF_SERVICE_DISABLED',
+    }, 403);
+  }
+  return next();
+};
 
 // Strict W03 visibility gates (Task 3.3): unlike createPortalFeatureGate above
 // (missing row/default = enabled), these fail CLOSED — a missing
 // portal_branding row or an explicit false both return 403. Every existing
 // org defaults to false on all five columns (Task 3.1), so this is the
 // correct default-deny posture for newly introduced portal sections.
-const STRICT_PORTAL_FEATURES: Record<PortalVisibilityFlag, { error: string; code: string }> = {
+const STRICT_PORTAL_FEATURES: Record<StrictPortalVisibilityFlag, { error: string; code: string }> = {
   enableDashboard: {
     error: 'Dashboard is not enabled for this portal',
     code: 'PORTAL_DASHBOARD_DISABLED',
@@ -83,9 +109,13 @@ const STRICT_PORTAL_FEATURES: Record<PortalVisibilityFlag, { error: string; code
     error: 'Documents are not enabled for this portal',
     code: 'PORTAL_DOCUMENTS_DISABLED',
   },
+  enableLifecycle: {
+    error: 'Hardware lifecycle is not enabled for this portal',
+    code: 'PORTAL_LIFECYCLE_DISABLED',
+  },
 };
 
-export function createPortalFeatureGateStrict(flag: PortalVisibilityFlag): MiddlewareHandler {
+export function createPortalFeatureGateStrict(flag: StrictPortalVisibilityFlag): MiddlewareHandler {
   return async (c, next) => {
     const auth = c.get('portalAuth');
     if (!auth) {
@@ -117,7 +147,7 @@ export function createPortalFeatureGateStrict(flag: PortalVisibilityFlag): Middl
  * under either flag while the library listing stays gated on its own.
  */
 export function createPortalFeatureGateAny(
-  ...flags: readonly [PortalVisibilityFlag, ...PortalVisibilityFlag[]]
+  ...flags: readonly [StrictPortalVisibilityFlag, ...StrictPortalVisibilityFlag[]]
 ): MiddlewareHandler {
   return async (c, next) => {
     const auth = c.get('portalAuth');

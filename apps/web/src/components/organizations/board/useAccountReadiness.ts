@@ -4,6 +4,7 @@ import type { ServiceManagementMode } from '@/stores/orgStore';
 import type {
   AccountReadinessResponse,
   ReadinessCapabilities,
+  ReadinessConnector,
   ReadinessOrg,
   ReadinessRowState,
 } from '@/lib/orgReadiness';
@@ -22,6 +23,8 @@ export interface AccountReadinessState {
   byOrg: ReadonlyMap<string, ReadinessOrg>;
   rowState: ReadonlyMap<string, ReadinessRowState>;
   status: ReadinessStatus;
+  /** Partner-level connectors, identical across batches — the first successful batch wins. null until then, or when withheld. */
+  connectors: ReadinessConnector[] | null;
   /** Re-requests only the batches that failed; rows that already landed are kept. */
   retry: () => void;
 }
@@ -34,9 +37,9 @@ export function chunkIds(ids: readonly string[], size = READINESS_BATCH_SIZE): s
 
 type BatchResult = { kind: 'ok'; response: AccountReadinessResponse } | { kind: 'failed' } | { kind: 'unauthorized' };
 
-async function fetchBatch(ids: string[]): Promise<BatchResult> {
+async function fetchBatch(ids: string[], partnerId?: string): Promise<BatchResult> {
   try {
-    const res = await fetchWithAuth(`/orgs/account-readiness?orgIds=${ids.join(',')}`);
+    const res = await fetchWithAuth(`/orgs/account-readiness?${partnerId ? `partnerId=${encodeURIComponent(partnerId)}&` : ''}orgIds=${ids.join(',')}`);
     if (res.status === 401) return { kind: 'unauthorized' };
     if (!res.ok) return { kind: 'failed' };
     const body = (await res.json()) as AccountReadinessResponse | null;
@@ -54,12 +57,13 @@ async function fetchBatch(ids: string[]): Promise<BatchResult> {
  * responses are discarded on arrival (latest-wins). A manual reorder changes
  * the order, not the set, so it never refetches.
  */
-export function useAccountReadiness(orgIds: readonly string[]): AccountReadinessState {
+export function useAccountReadiness(orgIds: readonly string[], partnerId?: string): AccountReadinessState {
   const key = [...orgIds].sort().join(',');
   const [capabilities, setCapabilities] = useState<ReadinessCapabilities | null>(null);
   const [mode, setMode] = useState<ServiceManagementMode | null>(null);
   const [byOrg, setByOrg] = useState<Map<string, ReadinessOrg>>(() => new Map());
   const [rowState, setRowState] = useState<Map<string, ReadinessRowState>>(() => new Map());
+  const [connectors, setConnectors] = useState<ReadinessConnector[] | null>(null);
   const [inFlight, setInFlight] = useState(0);
   const [failedChunks, setFailedChunks] = useState<string[][]>([]);
   const generation = useRef(0);
@@ -79,7 +83,7 @@ export function useAccountReadiness(orgIds: readonly string[]): AccountReadiness
       for (;;) {
         const chunk = queue.shift();
         if (!chunk) return;
-        const result = await fetchBatch(chunk);
+        const result = await fetchBatch(chunk, partnerId);
         // Latest-wins: a response for a superseded id set never touches state —
         // the newer generation already reset everything it is about to fill.
         if (!mounted.current || gen !== generation.current) return;
@@ -99,6 +103,7 @@ export function useAccountReadiness(orgIds: readonly string[]): AccountReadiness
           const { response } = result;
           setCapabilities(response.capabilities);
           setMode(response.serviceManagementMode);
+          setConnectors((current) => current ?? (response.capabilities.integrations ? (response.connectors ?? []) : null));
           setByOrg((prev) => {
             const next = new Map(prev);
             for (const org of response.orgs) next.set(org.orgId, org);
@@ -118,12 +123,15 @@ export function useAccountReadiness(orgIds: readonly string[]): AccountReadiness
       }
     };
     await Promise.all(Array.from({ length: Math.min(READINESS_CONCURRENCY, chunks.length) }, worker));
-  }, []);
+  }, [partnerId]);
 
   useEffect(() => {
     const gen = ++generation.current;
     const ids = key ? key.split(',') : [];
+    setCapabilities(null);
+    setMode(null);
     setByOrg(new Map());
+    setConnectors(null);
     setFailedChunks([]);
     setRowState(new Map<string, ReadinessRowState>(ids.map((id) => [id, 'pending'])));
     setInFlight(0);
@@ -145,5 +153,5 @@ export function useAccountReadiness(orgIds: readonly string[]): AccountReadiness
 
   const status: ReadinessStatus = key === '' ? 'idle' : inFlight > 0 ? 'loading' : failedChunks.length > 0 ? 'partial' : 'ready';
 
-  return { capabilities, mode, byOrg, rowState, status, retry };
+  return { capabilities, mode, byOrg, rowState, status, connectors, retry };
 }

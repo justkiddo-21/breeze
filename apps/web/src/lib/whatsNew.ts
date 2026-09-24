@@ -18,6 +18,45 @@ export interface WhatsNewEntry {
  */
 export const WHATS_NEW_ENTRIES: WhatsNewEntry[] = [
   {
+    version: '0.116.0',
+    date: '2026-09-23',
+    title: 'Accept quotes on a customer\'s behalf, IOC threat scanning, and invoices grouped by ticket',
+    highlights: [
+      'Record a customer\'s phone or paper acceptance on a quote: "Accept on behalf" issues the invoice straight away, with the method, signer and an optional evidence file on the record — and "Decline on behalf" for the other answer.',
+      'Security ▸ IOC Scans: schedule scans from the policy Security tab, review threats across devices, and quarantine or restore them from one page.',
+      'Invoice lines can now be grouped by ticket and category on the PDF, the portal and the web invoice, and billable time without an hourly rate is flagged instead of silently inflating hours.',
+      'Network topology is now a partner module you switch on from Settings ▸ Partner ▸ Modules, and the customer portal gets a Network overview page.',
+      'Disk Cleanup: Windows Update Cleanup no longer hangs under the agent service, and space freed on btrfs hosts is reported correctly (needs agent 0.116.0).',
+    ],
+    learnMoreUrl: 'https://breezermm.com/release-notes',
+  },
+  {
+    version: '0.115.0',
+    date: '2026-09-21',
+    title: 'Automatic network topology maps, one alert delivery resolver, and disk cleanup that actually frees space',
+    highlights: [
+      'Network devices now assemble themselves into a live topology map from passive agent evidence — no active scanning needed — with shared config templates and on-demand diagnostics from the map.',
+      'Alerting: one delivery resolver replaces the old "send to everything enabled" fallback, with a real Delivery page (Channels, Routing, Escalation policies) and a preview of who actually gets notified.',
+      'Disk Cleanup now deletes for real (space is actually reclaimed), scans any fixed volume, and adds OS-native cleaners — Windows Disk Cleanup/DISM, macOS snapshots/Homebrew, Linux caches/journal.',
+      'Billing Profiles replace scattered legacy rate fields with one Rates screen, including minimums and rounding on billed time; existing rates convert automatically on upgrade.',
+      'Moving a device to another organization now requires an interactive session, and a step-up MFA prompt when two-factor authentication is on.',
+    ],
+    learnMoreUrl: 'https://breezermm.com/release-notes',
+  },
+  {
+    version: '0.114.0',
+    date: '2026-09-17',
+    title: 'Four new evidence report types, honest network device polling, and clearer visibility controls',
+    highlights: [
+      'Four new evidence report types are available under Reports for compliance and QBR evidence: identity & access review, vulnerability management, endpoint management, and threat detection.',
+      'The network device page now shows what SNMP polling actually found, including failed polls, instead of hiding them. SNMPv1 devices poll correctly again, and one bad OID instance no longer blanks the whole poll.',
+      'The portal Devices page is now a per-organization visibility toggle, off by default, so customers only see it once you turn it on.',
+      'The org AI budget editor moved into Org settings, under a new AI tab.',
+      "Variables' All Organizations view now lists only partner-wide variables, with each row showing its owning organization.",
+    ],
+    learnMoreUrl: 'https://breezermm.com/release-notes',
+  },
+  {
     version: '0.113.0',
     date: '2026-09-13',
     title: 'Remote desktop sessions that stay up, AI-authored scripts you approve on a card, and service deliverables in the customer portal',

@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('./aiTools', () => ({
   getToolTier: vi.fn((toolName: string) => {
     const tiers: Record<string, number> = {
+      manage_delivery: 1,
       manage_deployments: 1,
       manage_patches: 1,
       manage_groups: 1,
@@ -31,7 +32,6 @@ vi.mock('./aiTools', () => ({
       // Tier 3 (SR5-01) and downgrade list to Tier 2 (recon only)
       file_operations: 1,
       execute_command: 3,
-      run_backup_verification: 2,
       // Ticketing tools
       manage_tickets: 1,
       manage_alerts: 1,
@@ -67,6 +67,7 @@ import {
   checkToolPermission,
   checkPermissionRequirement,
   checkPermissionRequirements,
+  requiredPermissionsForTool,
   TIER1_ACTIONS,
   TIER2_ACTIONS,
   TIER3_ACTIONS,
@@ -544,14 +545,6 @@ describe('checkGuardrails — fleet tool tier escalation', () => {
     expect(result.requiresApproval).toBe(false);
   });
 
-  it('does not require a special full recovery approval path for backup verification', () => {
-    const result = checkGuardrails('run_backup_verification', {
-      deviceId: '11111111-1111-1111-1111-111111111111',
-      verificationType: 'test_restore',
-    });
-    expect(result.allowed).toBe(true);
-    expect(result.requiresApproval).toBe(false);
-  });
 });
 
 // ─── Approval descriptions for fleet tools ──────────────────────────────
@@ -914,6 +907,34 @@ describe('buildApprovalDescription — manage_ai_agents copy (P2-5, #4192)', () 
 });
 
 describe('checkGuardrails — billing and proposal action tier escalation', () => {
+  it('requires contract read authority in addition to invoice write for add_contract_line', () => {
+    expect(requiredPermissionsForTool('manage_invoices', { action: 'add_contract_line' })).toEqual([
+      { resource: 'invoices', action: 'write' },
+      { resource: 'contracts', action: 'read' },
+    ]);
+  });
+
+  it.each([
+    ['invoices.write', 'invoices'],
+    ['contracts.read', 'contracts'],
+  ])('denies add_contract_line when %s is absent', async (_label, missingResource) => {
+    const auth = {
+      user: { id: 'user-1' },
+      token: { roleId: 'operator', scope: 'partner' },
+      partnerId: 'partner-1',
+      orgId: null,
+    } as any;
+    vi.mocked(getUserPermissions).mockClear();
+    vi.mocked(hasPermission).mockClear();
+    vi.mocked(getUserPermissions).mockResolvedValue({ roleId: 'operator' } as any);
+    vi.mocked(hasPermission).mockImplementation((_perms, resource) => resource !== missingResource);
+
+    const result = await checkToolPermission('manage_invoices', { action: 'add_contract_line' }, auth);
+
+    expect(result).toContain(`requires ${missingResource}.`);
+    expect(getUserPermissions).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ['manage_invoices', 'issue'],
     ['manage_contracts', 'activate'],
@@ -1417,5 +1438,17 @@ describe('checkToolPermission — revoke_elevation requires pam.approve (fix/pam
 
     expect(await checkToolPermission('request_elevation', {}, auth)).toBeNull();
     expect(await checkToolPermission('get_elevation_history', {}, auth)).toBeNull();
+  });
+});
+
+describe('manage_delivery approval boundary', () => {
+  it.each(['create_routing', 'update_routing', 'delete_routing', 'set_default',
+    'create_escalation', 'update_escalation', 'delete_escalation'])('%s requires supervised approval', action => {
+    expect(checkGuardrails('manage_delivery', { action, ownerScope: 'partner', data: { channelIds: [] } }))
+      .toMatchObject({ tier: 3, requiresApproval: true, approvalScope: 'supervised' });
+  });
+  it.each(['resolve', 'list_routing', 'list_escalation'])('%s remains read-only', action => {
+    expect(checkGuardrails('manage_delivery', { action }))
+      .toMatchObject({ tier: 1, requiresApproval: false });
   });
 });

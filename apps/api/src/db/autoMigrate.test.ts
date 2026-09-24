@@ -58,6 +58,8 @@ import {
   hashSql,
   hasNoTransactionDirective,
   extractDefinedFunctionNames,
+  extractTouchedConstraintNames,
+  selectReplayFollowers,
   splitSqlStatements,
   CHECKSUM_RECONCILIATIONS,
   planMigrations,
@@ -360,6 +362,111 @@ CREATE OR REPLACE FUNCTION public.dup() RETURNS void AS $$ BEGIN END; $$ LANGUAG
     it('is case-insensitive on the CREATE/FUNCTION keywords themselves', () => {
       expect(extractDefinedFunctionNames('create or replace function public.lower_kw() returns void as $$ begin end; $$ language plpgsql;'))
         .toEqual(['public.lower_kw']);
+    });
+  });
+
+  describe('extractTouchedConstraintNames (#6700 / #6701)', () => {
+    it('returns an empty array for a file that touches no constraint', () => {
+      expect(extractTouchedConstraintNames('ALTER TABLE devices ADD COLUMN IF NOT EXISTS foo text;')).toEqual([]);
+    });
+
+    it('extracts DROP ... IF EXISTS and ADD of the same CHECK (the pam-actuation-lifecycle shape)', () => {
+      const sql = `
+ALTER TABLE intent_outbox DROP CONSTRAINT IF EXISTS intent_outbox_event_type_check;
+ALTER TABLE intent_outbox ADD CONSTRAINT intent_outbox_event_type_check CHECK (event_type IN ('a'));
+`;
+      expect(extractTouchedConstraintNames(sql)).toEqual(['intent_outbox_event_type_check']);
+    });
+
+    it('extracts ALTER CONSTRAINT ... [NOT] DEFERRABLE and VALIDATE CONSTRAINT', () => {
+      const sql = `
+ALTER TABLE public.devices ALTER CONSTRAINT devices_site_org_fk NOT DEFERRABLE;
+ALTER TABLE public.sites ALTER CONSTRAINT sites_org_fk DEFERRABLE INITIALLY IMMEDIATE;
+ALTER TABLE public.tickets VALIDATE CONSTRAINT tickets_org_fk;
+`;
+      expect(extractTouchedConstraintNames(sql)).toEqual(['devices_site_org_fk', 'sites_org_fk', 'tickets_org_fk']);
+    });
+
+    it('extracts both sides of RENAME CONSTRAINT', () => {
+      expect(extractTouchedConstraintNames('ALTER TABLE t RENAME CONSTRAINT old_chk TO new_chk;'))
+        .toEqual(['new_chk', 'old_chk']);
+    });
+
+    it('extracts names from a DO-block EXECUTE string literal and strips double quotes', () => {
+      const sql = `
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'foo_chk') THEN
+    EXECUTE 'ALTER TABLE foo ADD CONSTRAINT "Foo_Chk" CHECK (x > 0)';
+  END IF;
+END $$;
+`;
+      expect(extractTouchedConstraintNames(sql)).toEqual(['foo_chk']);
+    });
+
+    it('ignores constraint mentions in line comments and SET CONSTRAINTS', () => {
+      const sql = [
+        '-- ALTER TABLE devices DROP CONSTRAINT should_not_count;',
+        'SET CONSTRAINTS ALL DEFERRED;',
+        'SET CONSTRAINTS devices_site_org_fk DEFERRED;',
+      ].join('\n');
+      expect(extractTouchedConstraintNames(sql)).toEqual([]);
+    });
+
+    it('ignores an inline CONSTRAINT clause in CREATE TABLE (replaying CREATE TABLE IF NOT EXISTS never rewrites it)', () => {
+      const sql = 'CREATE TABLE IF NOT EXISTS t (id uuid, CONSTRAINT t_pk PRIMARY KEY (id));';
+      expect(extractTouchedConstraintNames(sql)).toEqual([]);
+    });
+  });
+
+  describe('selectReplayFollowers (#6700 / #6701)', () => {
+    const file = (name: string, content: string) => ({ name, content });
+
+    it('selects nothing when the base file defines no function and touches no constraint', () => {
+      expect(selectReplayFollowers('ALTER TABLE t ADD COLUMN IF NOT EXISTS x int;', [
+        file('b.sql', 'CREATE OR REPLACE FUNCTION public.f() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;'),
+      ])).toEqual([]);
+    });
+
+    it('selects a later file that widens a CHECK the base file narrows (#6700)', () => {
+      const base = `
+ALTER TABLE intent_outbox DROP CONSTRAINT IF EXISTS intent_outbox_event_type_check;
+ALTER TABLE intent_outbox ADD CONSTRAINT intent_outbox_event_type_check CHECK (event_type IN ('a'));
+`;
+      expect(selectReplayFollowers(base, [
+        file('b-unrelated.sql', 'ALTER TABLE t ADD CONSTRAINT other_chk CHECK (true);'),
+        file('c-widen.sql', `
+ALTER TABLE intent_outbox DROP CONSTRAINT IF EXISTS intent_outbox_event_type_check;
+ALTER TABLE intent_outbox ADD CONSTRAINT intent_outbox_event_type_check CHECK (event_type IN ('a','b'));
+`),
+      ])).toEqual(['c-widen.sql']);
+    });
+
+    it('still selects later redefiners of a function the base file defines', () => {
+      const base = 'CREATE OR REPLACE FUNCTION public.f() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;';
+      expect(selectReplayFollowers(base, [
+        file('b.sql', 'CREATE OR REPLACE FUNCTION public.f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;'),
+      ])).toEqual(['b.sql']);
+    });
+
+    it('closes transitively across the two name kinds, in filename order', () => {
+      // base touches chk_a; b re-touches chk_a AND defines g; c redefines g
+      // (never mentioned by base); d re-touches chk_b, which c introduced.
+      const base = 'ALTER TABLE t ADD CONSTRAINT chk_a CHECK (true);';
+      expect(selectReplayFollowers(base, [
+        file('b.sql', `ALTER TABLE t DROP CONSTRAINT IF EXISTS chk_a;
+CREATE OR REPLACE FUNCTION public.g() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;`),
+        file('c.sql', `CREATE OR REPLACE FUNCTION public.g() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;
+ALTER TABLE t2 ADD CONSTRAINT chk_b CHECK (true);`),
+        file('d.sql', 'ALTER TABLE t2 VALIDATE CONSTRAINT chk_b;'),
+        file('e.sql', 'ALTER TABLE t3 ADD CONSTRAINT chk_c CHECK (true);'),
+      ])).toEqual(['b.sql', 'c.sql', 'd.sql']);
+    });
+
+    it('does not cross-match a function name against a constraint name', () => {
+      const base = 'ALTER TABLE t ADD CONSTRAINT same_name CHECK (true);';
+      expect(selectReplayFollowers(base, [
+        file('b.sql', 'CREATE OR REPLACE FUNCTION same_name() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;'),
+      ])).toEqual([]);
     });
   });
 
@@ -888,6 +995,42 @@ describe('core migration ordering', () => {
   });
 });
 
+describe('AI origin attribution migration (#5022 W01)', () => {
+  it('sorts after the portal lifecycle flag migration it was authored on top of', () => {
+    const files = listMigrationFilenames();
+
+    expect(files).toContain('2026-10-16-182100-ai-origin-attribution.sql');
+    // Relative order against the newest migration on main when this file was
+    // authored — NOT absolute-last, so a later migration landing anywhere
+    // else does not redden this test (see the sibling "device removal
+    // retention" test above for the same pattern).
+    expect(files.indexOf('2026-10-16-182100-ai-origin-attribution.sql')).toBeGreaterThan(
+      files.indexOf('2026-10-16-181500-portal-lifecycle-flag.sql'),
+    );
+  });
+});
+
+describe('report_run_deliveries migration (#4248 W03)', () => {
+  const FILE = '2026-10-16-183300-report-run-deliveries.sql';
+
+  it('sorts after the newest migration on main when it was authored', () => {
+    const files = listMigrationFilenames();
+    expect(files).toContain(FILE);
+    expect(files.indexOf(FILE)).toBeGreaterThan(
+      files.indexOf('2026-10-16-182600-ticket-comment-proposal-note-uq.sql'),
+    );
+  });
+
+  it('is DDL-only: no DML, hence no breeze.scope election and no baseline entry', () => {
+    const sqlText = readFileSync(path.join(MIGRATIONS_DIR, FILE), 'utf8');
+    const withoutComments = sqlText.replace(/--[^\n]*/g, '');
+    expect(withoutComments).not.toMatch(/\b(INSERT|UPDATE|DELETE|MERGE)\b\s+(INTO|FROM|\w+\s+SET)/i);
+    expect(withoutComments).not.toContain("set_config('breeze.scope'");
+    // The FK is the reason no ASSOCIATED_SYSTEM_SCOPED_TABLES entry exists.
+    expect(withoutComments).toMatch(/REFERENCES public\.report_runs\(id\) ON DELETE CASCADE/);
+  });
+});
+
 describe('Wave 3 durable live authorization expansion', () => {
   it('maps the user permission epoch as a non-null bigint defaulting to zero', () => {
     const column = getTableConfig(users).columns.find((candidate) => candidate.name === 'permissions_epoch');
@@ -1314,4 +1457,56 @@ describe('device removal retention: decommissioned_at + device_lifecycle feature
     expect(migrationSql).not.toMatch(/\bBEGIN;/);
     expect(migrationSql).not.toMatch(/\bCOMMIT;/);
   });
+});
+
+
+describe('filesystem scan_path contraction (Disk Cleanup v2 W03)', () => {
+  const contraction = '2026-10-22-160000-filesystem-scan-path-not-null.sql';
+
+  it('sorts after both W02 expand migrations', () => {
+    const files = listMigrationFilenames();
+    expect(files).toContain(contraction);
+    for (const expanded of [
+      '2026-10-21-110000-filesystem-multi-volume.sql',
+      '2026-10-21-110100-filesystem-cleanup-run-status-running.sql',
+    ]) {
+      expect(files).toContain(expanded);
+      expect(files.indexOf(contraction)).toBeGreaterThan(files.indexOf(expanded));
+    }
+  });
+
+  it('requires scan paths and replaces the interim index with the named composite primary key', async () => {
+    const { deviceFilesystemSnapshots, deviceFilesystemScanState, deviceFilesystemCleanupRuns } =
+      await import('./schema/filesystem');
+    expect(deviceFilesystemSnapshots.scanPath.notNull).toBe(true);
+    expect(deviceFilesystemScanState.scanPath.notNull).toBe(true);
+    // System cleanup runs remain path-independent.
+    expect(deviceFilesystemCleanupRuns.scanPath.notNull).toBe(false);
+    const config = getTableConfig(deviceFilesystemScanState);
+    expect(config.primaryKeys).toHaveLength(1);
+    expect(config.primaryKeys[0]!.getName()).toBe('device_filesystem_scan_state_pkey');
+    expect(config.primaryKeys[0]!.columns.map((column) => column.name)).toEqual(['device_id', 'scan_path']);
+    expect(config.indexes).toHaveLength(0);
+  });
+
+  it('reconciles duplicate root candidates before converting NULL scan paths', () => {
+    const migration = readFileSync(path.resolve(__dirname, '../../migrations', contraction), 'utf8');
+    expect(migration).toMatch(/row_number\(\) OVER[\s\S]*PARTITION BY st.device_id[\s\S]*ORDER BY st.updated_at DESC/);
+    expect(migration).toMatch(/DELETE FROM device_filesystem_scan_state[\s\S]*position > 1/);
+    expect(migration.indexOf('DELETE FROM device_filesystem_scan_state'))
+      .toBeLessThan(migration.indexOf('UPDATE device_filesystem_scan_state'));
+    expect(migration).toMatch(/RAISE WARNING 'filesystem scan_path contraction: discarded % duplicate root candidates'/);
+  });
+
+  it('promotes W02’s actual unique index even though W02 already removed the old primary key', () => {
+    const migration = readFileSync(path.resolve(__dirname, '../../migrations', contraction), 'utf8');
+    expect(migration).toMatch(/IF NOT EXISTS[\s\S]*contype = 'p'/);
+    expect(migration).toMatch(/ADD CONSTRAINT device_filesystem_scan_state_pkey\s+PRIMARY KEY USING INDEX device_filesystem_scan_state_device_path_uidx/);
+    expect(migration).not.toMatch(/\bBEGIN;|\bCOMMIT;/);
+  });
+});
+
+it('keeps the retirement migration scoped to legacy source columns', () => {
+  const sql = readFileSync(new URL('../../migrations/2026-10-23-120000-legacy-source-retirement-columns.sql', import.meta.url), 'utf8');
+  expect(sql).not.toMatch(/ALTER\s+TABLE\s+(?:public\.)?monitor_definitions\b/i);
 });

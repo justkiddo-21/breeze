@@ -1,3 +1,5 @@
+import { topologyHeartbeat } from '../../services/topology/heartbeat';
+import { loadTopologyFlags, withResolvedTopologyFlags, type TopologyFlags } from '../../services/topology/flags';
 import { Hono } from 'hono';
 import { timingSafeEqual } from 'node:crypto';
 import { bodyLimit } from 'hono/body-limit';
@@ -253,6 +255,17 @@ export function normalizePamLifetimeProtocolVersion(value: unknown): 0 | 2 {
  * site refuses the session with 503 agent_upgrade_required.
  */
 export function normalizeRevocationLeaseProtocolVersion(value: unknown): 0 | 1 {
+  return value === 1 ? 1 : 0;
+}
+
+/**
+ * SEC-038 W06: normalize the only desktop start/terminal fence protocol
+ * version implemented here. Same tolerance contract as the lease version —
+ * absent, malformed, or a future version this server does not speak is 0, and
+ * behind REMOTE_DESKTOP_FENCE_REQUIRED every desktop-start dispatch site
+ * refuses with 503 agent_upgrade_required.
+ */
+export function normalizeDesktopFenceProtocolVersion(value: unknown): 0 | 1 {
   return value === 1 ? 1 : 0;
 }
 
@@ -526,6 +539,26 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
         `withholding version-to-version auto-upgrades (fail closed):`,
       err,
     );
+    captureException(err);
+  }
+
+  // Topology rollout flags are resolved HERE, in their own short system
+  // context, and handed to topology collection below. Resolving them inside
+  // the org block wedged US on 2026-09-22: the IP-history write there takes
+  // the per-org partner-export advisory lock, and the flags' partner-axis read
+  // then escapes to a SECOND pooled connection (readWithPartnerAxisVisibility).
+  // Once the pool filled with same-org heartbeats queued on that lock, the
+  // holder never got its second connection — a pool deadlock broken only by
+  // idle_in_transaction_session_timeout. Same #1105 ordering as the update
+  // policy above. On failure topology is skipped for this beat, never
+  // re-resolved inside the transaction.
+  let topologyFlags: TopologyFlags | null = null;
+  try {
+    topologyFlags = await withSystemDbAccessContext(() =>
+      loadTopologyFlags({ scope: { orgId: agent.orgId, siteId: agent.siteId } }),
+    );
+  } catch (err) {
+    console.error(`[heartbeat] failed to resolve topology flags for ${agentId}; skipping topology collection:`, err);
     captureException(err);
   }
 
@@ -863,6 +896,10 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     // and desktop sessions are refused again until the agent is back.
     revocationLeaseProtocolVersion: normalizeRevocationLeaseProtocolVersion(
       data.securityCapabilities?.revocationLeaseProtocolVersion,
+    ),
+    // SEC-038 W06 desktop fence capability, same non-sticky contract.
+    desktopFenceProtocolVersion: normalizeDesktopFenceProtocolVersion(
+      data.securityCapabilities?.desktopFenceProtocolVersion,
     ),
     // Migration-banner Task 2 — self-reported install edition + migration
     // flag. Written UNCONDITIONALLY every heartbeat, mirroring
@@ -1336,7 +1373,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   if (data.metrics) {
     try {
       const thresholdScan = await maybeQueueThresholdFilesystemAnalysis(
-        { id: device.id, osType: device.osType },
+        { id: device.id, osType: device.osType, orgId: device.orgId },
         data.metrics.diskPercent
       );
       if (thresholdScan.queued) {
@@ -1771,7 +1808,22 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     }
   }
 
+  // #3997 — do not ASK for a rotation the mint route will now refuse.
+  // `rotate-token` is off the tenant drain surface (agentAuth's
+  // TENANT_DRAIN_ALLOWED_ACTIONS) and the route itself fails closed on a
+  // drain, so signalling it here would have every agent in an offboarding
+  // tenant attempt a mint it cannot complete on EVERY heartbeat for the whole
+  // window (OFFBOARDING_DRAIN_WINDOW_HOURS, 72h by default), logging a rotation
+  // failure each time. Suppressing the signal changes nothing about safety —
+  // `handleTokenRotation` in agent/internal/heartbeat logs and returns, never
+  // gating the heartbeat or touching on-disk credentials — it only stops a
+  // guaranteed-useless round trip and its error noise.
+  //
+  // Only the TENANT drain is checked: `deviceUninstallDraining` returns from
+  // the minimal drain beat at the top of this handler and never reaches here,
+  // so testing it too would be unreachable code.
   const rotateToken =
+    !agent?.tenantDraining &&
     !authenticatedWithPreviousToken &&
     !pendingRotationLive &&
     (!device.watchdogTokenHash || isAgentTokenRotationDue(device.tokenIssuedAt));
@@ -1799,6 +1851,27 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     ),
   });
 
+  let networkContextReceipt;
+  const collectionUnavailable = data.networkContextV1 === undefined ? undefined : { accepted: false, reason: 'collection_unavailable', sourceReceipts: [] };
+  if (!topologyFlags) {
+    // Resolution failed before the org block (already reported there).
+    networkContextReceipt = collectionUnavailable;
+  } else {
+    try {
+      const resolvedFlags = topologyFlags;
+      const topology = await withResolvedTopologyFlags(
+        { orgId: agent.orgId, flags: resolvedFlags },
+        () => db.transaction(() => topologyHeartbeat(device, data)),
+      );
+      mergedConfigUpdate.networkContext = topology.config;
+      networkContextReceipt = topology.receipt;
+    } catch (error) {
+      console.error('[heartbeat] Topology collection failed:', error);
+      captureException(error);
+      networkContextReceipt = collectionUnavailable;
+    }
+  }
+
   // Main-branch response payload — built inside the org context, but the
   // manifest-trust-keyset and policy probe config are fetched AFTER this
   // context closes (see below).
@@ -1808,6 +1881,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     mainResponse: {
       commands: deliverableCommands,
       configUpdate: mergedConfigUpdate,
+      networkContextReceipt,
       upgradeTo,
       helperUpgradeTo: helperUpgradeTo ?? undefined,
       watchdogUpgradeTo: watchdogUpgradeTo ?? undefined,

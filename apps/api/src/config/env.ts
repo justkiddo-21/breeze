@@ -113,6 +113,86 @@ export function policyDecideEnabled(): boolean {
   return envFlag('BREEZE_AI_AGENTS_POLICY_DECIDE_ENABLED', false);
 }
 
+// SEC-038 W06 (#5537). When on, every remote-desktop start dispatch site
+// refuses an agent that has not declared desktopFenceProtocolVersion=1 (the
+// durable start/terminal generation fence from W04/W05) with 503
+// agent_upgrade_required — the same fail-closed shape as the #5481
+// revocation-lease gate. Default OFF: the release that introduces the gate is
+// a fleet no-op (old agents stay protected by the lease), and the flag is
+// flipped one release later once agents have auto-updated. Read at CALL time
+// so a test can flip it per-case without vi.resetModules().
+export function remoteDesktopFenceRequired(): boolean {
+  return envFlag('REMOTE_DESKTOP_FENCE_REQUIRED', false);
+}
+
+// Caller verification (anti-vishing, #6354). W01 ships the backend dark:
+// every caller-verification route returns 404 `feature_disabled` to an
+// AUTHENTICATED caller (auth runs first, so an anonymous request still gets
+// 401 — routerAuthGate.contract.test.ts requires that of every mounted route)
+// and the release gate refuses with `feature_disabled` while this is off. The
+// cross-wave contract is deliberately stricter than envFlag(): ONLY the exact
+// string 'true' enables it — '1' / 'yes' / 'on' / 'TRUE' stay off. Read at
+// CALL time so a test can flip it per-case without vi.resetModules().
+export function callerVerificationEnabled(): boolean {
+  return process.env.CALLER_VERIFICATION_ENABLED === 'true';
+}
+
+// #4442 W04 (AI sweeps act mode). A SUB-flag of
+// BREEZE_AI_AGENTS_POLICY_DECIDE_ENABLED, not a replacement for it: the sweep
+// lane widens autonomy to targets the run never established for itself (a
+// sweep proposal is fanned out per DEVICE from one device-less run), so it has
+// to be revocable on its own — turning it off must not disarm the
+// alert-triggered policy-decide lane that has been running independently.
+// Both flags are required for a sweep-minted intent to reach policy-decide.
+// Default OFF: with this false, resolvePolicyDecisionState returns
+// 'human_required' for every scoped intent without evaluating anything else,
+// which is byte-identical to the behaviour before this wave (see
+// policyDecide.sweepFlagOff.test.ts, the regression control for exactly that).
+// Read at CALL time, like policyDecideEnabled above, so a test can flip it
+// per case without vi.resetModules().
+// Task A7 (tool-catalog W1, spec docs/superpowers/plans/ai-mcp/2026-09-07-tool-catalog-w1-tool-sources-mcp.md).
+// Platform kill switch for the tool-catalog / tool-sources feature. Default
+// OFF (dark-ship). Read at CALL time, like policyDecideEnabled() above, so a
+// test can flip it per-case without vi.resetModules().
+export function toolSourcesEnabled(): boolean {
+  return envFlag('TOOL_SOURCES_ENABLED', false);
+}
+
+// Topology rollout deployment kill switch. Partner and organization flags are
+// still resolved for ordinary rollouts; setting this optional switch forces
+// every effective topology feature off. Read at call time so rollback does not
+// require a module reload and tests can change it per case.
+export function topologyGloballyDisabled(): boolean {
+  return envFlag('TOPOLOGY_DISABLED', false);
+}
+
+// Task A7. Sub-flag of toolSourcesEnabled(): whether a tool source's outbound
+// fetch may target a private/loopback/link-local address. Default OFF, and
+// refused outright on the hosted platform (validate.ts superRefine) — a
+// tool source that can reach a partner's internal network from a shared
+// hosted egress path is an SSRF vector, so this is self-hosted-only.
+export function toolSourcesAllowPrivateEgress(): boolean {
+  return envFlag('TOOL_SOURCES_ALLOW_PRIVATE_EGRESS', false);
+}
+
+export function sweepActEnabled(): boolean {
+  return envFlag('BREEZE_AI_AGENTS_SWEEP_ACT_ENABLED', false);
+}
+
+export type BreezeRegion = 'eu' | 'us';
+
+// Deployment region. Hosted regions are single-region deployments (one API +
+// worker per region), so the process knows its own region from env and every
+// org it serves lives in it. Used to pick the artifact blob bucket and, later,
+// the sandbox region (spec §8 "Residency"). Previously read inline by
+// routes/mcpServer.ts for partner-trust bootstrap; that reader now calls this.
+// Unrecognised values resolve to 'us' here; config/validate.ts refuses them at
+// boot so a typo cannot reach production.
+export function breezeRegion(): BreezeRegion {
+  const raw = (process.env.BREEZE_REGION ?? '').trim().toLowerCase();
+  return raw === 'eu' ? 'eu' : 'us';
+}
+
 /**
  * AI script authoring, review, and reviewer-gated execution (spec
  * 2026-09-11-ai-script-authoring-and-review-design.md §8).
@@ -240,6 +320,18 @@ export function m365SyncMaxBacklog(): number {
 /** Rows claimed per tick (spec §5.2 step 3, §5.9 — this is the capacity dial). */
 export function m365SyncTickBatch(): number {
   return positiveIntEnv('M365_SYNC_TICK_BATCH', 200, 1, 5_000);
+}
+
+// Inbound email-to-ticket flood protection. The global BullMQ inbound-queue
+// processing ceiling (jobs per second) is backpressure: it bounds the RATE of
+// ticket creation across all senders, NOT the total. Over-rate jobs are delayed
+// (never dropped) and still processed, so a sustained flood is slowed, not
+// capped. (Per-sender/domain/partner sliding-window caps were considered but
+// deferred: no implementation can be both exact and avoid a held-transaction
+// Redis call under #1105; the rate ceiling here is the protection that ships.)
+/** Global BullMQ inbound-queue processing ceiling (jobs per second). */
+export function inboundQueueMaxPerSec(): number {
+  return positiveIntEnv('INBOUND_QUEUE_MAX_PER_SEC', 20, 1, 5_000);
 }
 
 // Breeze AI for Office (Excel add-in / client AI). The Entra application

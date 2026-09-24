@@ -197,6 +197,30 @@ describe('backup retention', () => {
 
     expect(expiresAt?.toISOString()).toBe('2026-05-30T00:00:00.000Z');
   });
+
+  // #5400: retentionDays is a FLOOR, not silently overridden when a shorter
+  // GFS tier also matches. Decision (2026-09-22): computeExpiresAt takes the
+  // maximum of the GFS-tier window and retentionDays.
+  it('uses retentionDays as a floor when it is longer than the matching GFS tier (#5400)', () => {
+    const expiresAt = computeExpiresAt(
+      new Date('2026-03-31T00:00:00.000Z'),
+      { daily: true },
+      { retentionDays: 14, daily: 7 },
+    );
+
+    expect(expiresAt?.toISOString()).toBe('2026-04-14T00:00:00.000Z');
+  });
+
+  it('still lets a longer GFS tier win over a shorter retentionDays (floor, not ceiling)', () => {
+    const expiresAt = computeExpiresAt(
+      new Date('2026-03-31T00:00:00.000Z'),
+      { daily: true, weekly: true },
+      { retentionDays: 3, daily: 7, weekly: 4 },
+    );
+
+    // weekly: 4 * 7 = 28 days > retentionDays floor of 3
+    expect(expiresAt?.toISOString()).toBe('2026-04-28T00:00:00.000Z');
+  });
 });
 
 describe('cleanupExpiredSnapshots -- pins + retirement (D18 W01 section 3.2/3.3/3.7)', () => {
@@ -221,6 +245,7 @@ describe('cleanupExpiredSnapshots -- pins + retirement (D18 W01 section 3.2/3.3/
     selectQueue.push([]); // backup pin -- none
     selectQueue.push([]); // restore pin -- none
     selectQueue.push([]); // recovery pin -- none
+    selectQueue.push([]); // active-chain base pin (#5421) -- none
     selectQueue.push([]); // versionBoundSnapshots query (maxVersions pass) -- read AFTER the expired-row loop
 
     const result = await cleanupExpiredSnapshots('org-1');
@@ -248,6 +273,50 @@ describe('cleanupExpiredSnapshots -- pins + retirement (D18 W01 section 3.2/3.3/
     expect(result.skippedPinned).toBe(1);
     expect(result.deleted).toBe(0);
     expect(insertedRows.length).toBe(0);
+  });
+
+  it('skips a row still anchoring an ACTIVE backup chain as its full snapshot and counts it as skippedChainBase (#5421)', async () => {
+    // #5421: D17 made backup_chains.full_snapshot_id ON DELETE SET NULL, so
+    // deleting the full would silently null the pointer and leave the chain
+    // reporting active/healthy until the next differential noticed. An active
+    // chain's base is a retention hold: not deleted, no retirement written.
+    selectQueue.push([
+      { id: 'snap-chain-base', snapshotId: 'snap-chain-base-provider', deviceId: 'device-1', configId: 'config-1', storageIdentity: 's3::e::b', backupType: 'application' },
+    ]); // expired query
+    selectQueue.push([{ id: 'snap-chain-base', legalHold: false, isImmutable: false, immutableUntil: null }]); // FOR UPDATE lock
+    selectQueue.push([]); // backup pin -- none
+    selectQueue.push([]); // restore pin -- none
+    selectQueue.push([]); // recovery pin -- none
+    selectQueue.push([{ id: 'chain-1' }]); // active chain base pin -- FOUND
+    selectQueue.push([]); // versionBoundSnapshots query
+
+    const result = await cleanupExpiredSnapshots('org-1');
+
+    expect(result.skippedChainBase).toBe(1);
+    expect(result.deleted).toBe(0);
+    expect(result.skippedPinned).toBe(0);
+    expect(mockDb.delete).not.toHaveBeenCalled();
+    expect(insertedRows.length).toBe(0); // no retirement tombstone for a held row
+  });
+
+  it('deletes an expired full whose only chain rows are INACTIVE -- a broken/superseded chain is not a hold (#5421)', async () => {
+    selectQueue.push([
+      { id: 'snap-dead-chain', snapshotId: 'snap-dead-chain-provider', deviceId: 'device-1', configId: 'config-1', storageIdentity: 's3::e::b', backupType: 'application' },
+    ]); // expired query
+    selectQueue.push([{ id: 'snap-dead-chain', legalHold: false, isImmutable: false, immutableUntil: null }]); // FOR UPDATE lock
+    selectQueue.push([]); // backup pin -- none
+    selectQueue.push([]); // restore pin -- none
+    selectQueue.push([]); // recovery pin -- none
+    selectQueue.push([]); // active chain base pin -- none (the chain row is is_active=false)
+    selectQueue.push([]); // versionBoundSnapshots query
+
+    const result = await cleanupExpiredSnapshots('org-1');
+
+    expect(result.deleted).toBe(1);
+    expect(result.skippedChainBase).toBe(0);
+    expect(insertedRows).toEqual([
+      expect.objectContaining({ snapshotId: 'snap-dead-chain-provider', reason: 'expired' }),
+    ]);
   });
 
   it('re-reads legal hold under the FOR UPDATE lock, ignoring a stale enumeration-pass value (the enumeration select no longer even fetches it)', async () => {
@@ -308,6 +377,7 @@ describe('cleanupExpiredSnapshots -- pins + retirement (D18 W01 section 3.2/3.3/
     selectQueue.push([]); // s5 backup pin -- none
     selectQueue.push([]); // s5 restore pin -- none
     selectQueue.push([]); // s5 recovery pin -- none
+    selectQueue.push([]); // s5 active chain base pin (#5421) -- none
 
     const result = await cleanupExpiredSnapshots('org-1');
 
@@ -319,6 +389,36 @@ describe('cleanupExpiredSnapshots -- pins + retirement (D18 W01 section 3.2/3.3/
     expect(insertedRows).toEqual([
       expect.objectContaining({ snapshotId: 'snap-5', reason: 'max_versions' }),
     ]);
+  });
+
+  it('holds a max-versions-over-cap full that still anchors an ACTIVE chain (#5421)', async () => {
+    // The prune pass routes candidates through the SAME deleteSnapshotRow, so
+    // the chain-base hold must apply there too -- the real-world MSSQL case is
+    // a full falling out of the maxVersions window BEFORE the next full runs,
+    // which is count-based, not expiry-based.
+    selectQueue.push([]); // expired query -- nothing expired by date
+
+    const retention = { maxVersions: 1 };
+    const base = {
+      deviceId: 'd1', configId: 'c1', storageIdentity: 's3::e::b', backupType: 'application' as const, retention,
+    };
+    selectQueue.push([
+      { ...base, id: 'mv1', snapshotId: 'snap-mv-1', timestamp: new Date('2026-05-05') }, // kept (within cap)
+      { ...base, id: 'mv2', snapshotId: 'snap-mv-2', timestamp: new Date('2026-05-04') }, // over cap, chain base
+    ]); // versionBoundSnapshots query
+    selectQueue.push([{ id: 'mv2', legalHold: false, isImmutable: false, immutableUntil: null }]); // mv2 lock
+    selectQueue.push([]); // mv2 backup pin -- none
+    selectQueue.push([]); // mv2 restore pin -- none
+    selectQueue.push([]); // mv2 recovery pin -- none
+    selectQueue.push([{ id: 'chain-mv' }]); // mv2 active chain base pin -- FOUND
+
+    const result = await cleanupExpiredSnapshots('org-1');
+
+    expect(result.skippedChainBase).toBe(1);
+    expect(result.prunedByMaxVersions).toBe(0);
+    expect(result.deleted).toBe(0);
+    expect(mockDb.delete).not.toHaveBeenCalled();
+    expect(insertedRows.length).toBe(0);
   });
 
   it('logs and skips a row whose delete rejects with a FK violation (D17), and still deletes the next expired row', async () => {
@@ -334,17 +434,19 @@ describe('cleanupExpiredSnapshots -- pins + retirement (D18 W01 section 3.2/3.3/
       { id: 'snap-fk-blocked', snapshotId: 'snap-blocked', deviceId: 'device-1', configId: 'config-1', storageIdentity: 's3::e::b', backupType: 'file' },
       { id: 'snap-ok', snapshotId: 'snap-2', deviceId: 'device-1', configId: 'config-1', storageIdentity: 's3::e::b', backupType: 'file' },
     ]); // expired query
-    // Row 1 (snap-fk-blocked): lock + 3 pin checks, all clear, then the
+    // Row 1 (snap-fk-blocked): lock + 4 pin checks, all clear, then the
     // delete itself throws.
     selectQueue.push([{ id: 'snap-fk-blocked', legalHold: false, isImmutable: false, immutableUntil: null }]);
     selectQueue.push([]); // backup pin
     selectQueue.push([]); // restore pin
     selectQueue.push([]); // recovery pin
-    // Row 2 (snap-ok): lock + 3 pin checks, all clear, delete succeeds.
+    selectQueue.push([]); // active chain base pin (#5421)
+    // Row 2 (snap-ok): lock + 4 pin checks, all clear, delete succeeds.
     selectQueue.push([{ id: 'snap-ok', legalHold: false, isImmutable: false, immutableUntil: null }]);
     selectQueue.push([]); // backup pin
     selectQueue.push([]); // restore pin
     selectQueue.push([]); // recovery pin
+    selectQueue.push([]); // active chain base pin (#5421)
     selectQueue.push([]); // versionBoundSnapshots query (maxVersions pass)
 
     const fkError = Object.assign(

@@ -166,10 +166,14 @@ import {
 const SIG = { kind: 'remote_session', id: UUID };
 
 describe('time entry sources (W06)', () => {
-  it('is exactly the five-value vocabulary of the source migration', () => {
-    expect([...TIME_ENTRY_SOURCES]).toEqual(['manual', 'timer', 'location', 'remote_session', 'support_session']);
+  it('is exactly the six-value vocabulary of the source migrations', () => {
+    expect([...TIME_ENTRY_SOURCES]).toEqual(['manual', 'timer', 'location', 'remote_session', 'support_session', 'ai_suggested']);
     expect(timeEntrySourceSchema.safeParse('support_session').success).toBe(true);
     expect(timeEntrySourceSchema.safeParse('suggestion').success).toBe(false);
+  });
+
+  it('accepts ai_suggested as a source (#4177)', () => {
+    expect(timeEntrySourceSchema.parse('ai_suggested')).toBe('ai_suggested');
   });
 
   it('createTimeEntrySchema / startTimerSchema never accept source (D5)', () => {
@@ -218,5 +222,20 @@ describe('suggestionSignalsSchema', () => {
   it('accepts signals only', () => {
     expect(suggestionSignalsSchema.safeParse({ signals: [SIG] }).success).toBe(true);
     expect(suggestionSignalsSchema.safeParse({ signals: [SIG], reason: 'x' }).success).toBe(false);
+  });
+});
+
+describe('billing override input', () => {
+  it.each([null, 0, 30, 2147483647])('preserves minimumMinutes %s on create and update', minimumMinutes => {
+    const span = { startedAt: '2026-06-11T09:00:00Z', endedAt: '2026-06-11T09:30:00Z' };
+    expect(createTimeEntrySchema.parse({ ...span, minimumMinutes })).toHaveProperty('minimumMinutes', minimumMinutes);
+    expect(updateTimeEntrySchema.parse({ minimumMinutes })).toEqual({ minimumMinutes });
+  });
+  it.each([-1, 0.5, 2147483648, '30'])('rejects invalid minimumMinutes %s', minimumMinutes => {
+    expect(updateTimeEntrySchema.safeParse({ minimumMinutes }).success).toBe(false);
+  });
+  it('preserves resetBilling and rejects non-boolean values', () => {
+    expect(updateTimeEntrySchema.parse({ resetBilling: true })).toEqual({ resetBilling: true });
+    expect(updateTimeEntrySchema.safeParse({ resetBilling: 'true' }).success).toBe(false);
   });
 });

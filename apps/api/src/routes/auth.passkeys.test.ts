@@ -69,6 +69,7 @@ vi.mock('../services', () => {
       partnerId: identity.partnerId,
       scope: identity.scope,
       mfa: identity.mfa,
+      mfa_src: identity.mfaSrc,
       aep: epochs.authEpoch,
       mep: epochs.mfaEpoch,
       mdid: identity.mobileDeviceId,
@@ -209,6 +210,17 @@ vi.mock('../services/passkeys', () => ({
     constructor(message: string) {
       super(message);
       this.name = 'PasskeyChallengeError';
+    }
+  },
+  PasskeyVerificationError: class PasskeyVerificationError extends Error {
+    readonly detail: string;
+    readonly purpose: string;
+    constructor(purpose: string, cause: unknown) {
+      super('Passkey verification failed');
+      this.name = 'PasskeyVerificationError';
+      this.purpose = purpose;
+      this.detail = cause instanceof Error ? cause.message : String(cause);
+      this.cause = cause;
     }
   },
   ...passkeyMocks,
@@ -440,6 +452,7 @@ import {
   bindIssuedUserSession,
   cancelAuthIssuance,
   completeAdditionalMfaFactorEnrollment,
+  completeInitialMfaEnrollment,
   completeMfaFactorRemoval,
   createTokenPair,
   finishAuthIssuance,
@@ -449,12 +462,13 @@ import {
   rateLimiter,
   verifyPassword,
 } from '../services';
-import { PasskeyChallengeError } from '../services/passkeys';
+import { PasskeyChallengeError, PasskeyVerificationError } from '../services/passkeys';
 import { authMiddleware } from '../middleware/auth';
 import { withSystemDbAccessContext } from '../db';
 import { getEffectiveMfaPolicy } from '../services/mfaPolicy';
 import { validateStepUpGrant, consumeStepUpGrant } from '../services/mfaStepUpGrant';
 import { finalizeSsoPendingLink } from './auth/ssoLinkCompletion';
+import { verifyStepUpPasskeyAssertion } from './auth/passkeys';
 import { enforceIpAllowlist } from '../services/ipAllowlist';
 
 const user = {
@@ -773,7 +787,13 @@ describe('passkey MFA auth routes', () => {
       expect(passkeyMocks.generatePasskeyRegistrationOptions).toHaveBeenCalled();
     });
 
-    it('register/options returns the opaque 400 for a passwordless account with an invalid/expired grant', async () => {
+    // #4050: the 400 STATUS stays uniform with every sibling rejection (that
+    // is the half of the opacity rule that still matters); only the BODY is
+    // distinguishable now. Reaching this branch already required the account
+    // to be passwordless, which the `enrollment_proof_required` branch
+    // discloses anyway, so nothing new leaks — see
+    // ENROLLMENT_GRANT_EXPIRED_CODE in ./auth/helpers.
+    it('register/options returns the distinct expired-grant 400 for a passwordless account with an invalid/expired grant', async () => {
       dbState.selectQueue.push([{ passwordHash: null }]); // resolveEnrollmentStepUp probe
       dbState.selectQueue.push([{ mfaEnabled: false, passkeyCount: 0 }]); // resolveEnrollmentStepUp's userIsMfaProtected
       vi.mocked(validateStepUpGrant).mockResolvedValueOnce(false);
@@ -786,9 +806,10 @@ describe('passkey MFA auth routes', () => {
 
       expect(res.status).toBe(400);
       expect(await res.json()).toEqual({
-        error: 'Invalid credentials',
-        message: 'Invalid credentials',
-        code: 'invalid_credentials',
+        error: 'Your identity verification has expired. Please verify with your identity provider again.',
+        message: 'Your identity verification has expired. Please verify with your identity provider again.',
+        code: 'enrollment_grant_expired',
+        reauthUrl: '/sso/reauth/start',
       });
       expect(passkeyMocks.generatePasskeyRegistrationOptions).not.toHaveBeenCalled();
     });
@@ -814,9 +835,14 @@ describe('passkey MFA auth routes', () => {
         '11111111-1111-4111-8111-111111111111',
         expect.objectContaining({ userId: 'user-123', operation: 'enroll_first_factor' }),
       );
+      // The passkey this call installs is what assures the replacement
+      // session, so the enrollment identity is factor-sourced (spec D6) — the
+      // real primitive rejects any other source.
+      const enrollInput = vi.mocked(completeInitialMfaEnrollment).mock.calls[0]?.[0] as any;
+      expect(enrollInput.identity).toMatchObject({ mfa: true, mfaSrc: 'factor' });
     });
 
-    it('register/verify returns the opaque 400 for a passwordless account with an invalid/expired grant (no passkey written)', async () => {
+    it('register/verify returns the distinct expired-grant 400 for a passwordless account with an invalid/expired grant (no passkey written)', async () => {
       dbState.selectQueue.push([{ mfaEnabled: false, passkeyCount: 0 }]); // enforceExistingFactorStepUp's userIsMfaProtected
       dbState.selectQueue.push([{ passwordHash: null }]); // resolveEnrollmentStepUp probe
       dbState.selectQueue.push([{ mfaEnabled: false, passkeyCount: 0 }]); // resolveEnrollmentStepUp's userIsMfaProtected
@@ -833,9 +859,10 @@ describe('passkey MFA auth routes', () => {
 
       expect(res.status).toBe(400);
       expect(await res.json()).toEqual({
-        error: 'Invalid credentials',
-        message: 'Invalid credentials',
-        code: 'invalid_credentials',
+        error: 'Your identity verification has expired. Please verify with your identity provider again.',
+        message: 'Your identity verification has expired. Please verify with your identity provider again.',
+        code: 'enrollment_grant_expired',
+        reauthUrl: '/sso/reauth/start',
       });
     });
   });
@@ -855,6 +882,101 @@ describe('passkey MFA auth routes', () => {
 
     expect(res.status).toBe(400);
     expect(await res.json()).toMatchObject({ error: expect.stringMatching(/challenge|expired|invalid/i) });
+  });
+
+  // #6499: the SR2-20 step-up helper is the third path that used to let a
+  // library rejection escape as a 500. It must fail CLOSED (false), never
+  // throw — `mfa.ts` turns `false` into a generic rejected-factor response.
+  it('verifyStepUpPasskeyAssertion returns false — not a throw — on a rejected assertion', async () => {
+    dbState.selectQueue.push([insertedPasskeyRow]);
+    passkeyMocks.verifyPasskeyAuthentication.mockRejectedValueOnce(
+      new PasskeyVerificationError(
+        'authentication',
+        new Error('Unexpected authentication response origin "http://localhost:33032", expected "http://localhost:32902"'),
+      ),
+    );
+
+    await expect(
+      verifyStepUpPasskeyAssertion('user-123', { id: 'credential-1' }),
+    ).resolves.toBe(false);
+    // A rejected proof must not advance the stored signature counter.
+    expect(dbState.updateSets).toHaveLength(0);
+  });
+
+  it('verifyStepUpPasskeyAssertion still rethrows an unrecognized error', async () => {
+    dbState.selectQueue.push([insertedPasskeyRow]);
+    passkeyMocks.verifyPasskeyAuthentication.mockRejectedValueOnce(new Error('redis exploded'));
+
+    await expect(
+      verifyStepUpPasskeyAssertion('user-123', { id: 'credential-1' }),
+    ).rejects.toThrow('redis exploded');
+  });
+
+  // #6499: a WebAuthn origin/RP-ID mismatch used to escape the route as a 500
+  // whose body echoed the server's configured expected origin.
+  it('maps a passkey registration verification rejection to 400 without echoing the expected origin', async () => {
+    passkeyMocks.verifyPasskeyRegistration.mockRejectedValueOnce(
+      new PasskeyVerificationError(
+        'registration',
+        new Error('Unexpected registration response origin "http://localhost:33032", expected "http://localhost:32902"'),
+      ),
+    );
+
+    const res = await app.request('/auth/passkeys/register/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer access-token' },
+      body: JSON.stringify({
+        credential: { id: 'credential-1', response: {} },
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    const body = await res.text();
+    expect(body).not.toMatch(/localhost|expected|origin|rp_?id/i);
+    expect(JSON.parse(body)).toMatchObject({ code: 'mfa_proof_invalid' });
+  });
+
+  it('maps a passkey MFA verification rejection to 401 without echoing the expected origin', async () => {
+    redisMock.get.mockResolvedValueOnce(pendingMfaJson({
+      mfaMethod: 'passkey',
+      allowedMethods: { totp: false, sms: false, passkey: true },
+    }));
+    dbState.selectQueue.push(
+      [user],
+      [{
+        id: 'credential-row-1',
+        userId: 'user-123',
+        credentialId: 'credential-1',
+        publicKey: 'public-key',
+        counter: 0,
+        transports: ['internal'],
+        disabledAt: null,
+      }],
+    );
+    passkeyMocks.verifyPasskeyAuthentication.mockRejectedValueOnce(
+      new PasskeyVerificationError(
+        'authentication',
+        new Error('Unexpected authentication response origin "http://localhost:33032", expected "http://localhost:32902"'),
+      ),
+    );
+
+    const res = await app.request('/auth/mfa/passkey/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tempToken: 'temp-token',
+        credential: { id: 'credential-1', response: {} },
+      }),
+    });
+
+    expect(res.status).toBe(401);
+    const body = await res.text();
+    expect(body).not.toMatch(/localhost|expected|origin|rp_?id/i);
+    expect(createTokenPair).not.toHaveBeenCalled();
+    // The admitted auth-issuance lease must be released on a rejected proof,
+    // exactly as the sibling `verified: false` branch does — otherwise every
+    // origin-mismatch attempt strands one.
+    expect(cancelAuthIssuance).toHaveBeenCalledOnce();
   });
 
   it('returns passkey MFA state after password login for passkey-enrolled users', async () => {
@@ -1025,7 +1147,7 @@ describe('passkey MFA auth routes', () => {
 
     expect(res.status).toBe(200);
     expect(createTokenPair).toHaveBeenCalledWith(
-      expect.objectContaining({ sub: 'user-123', mfa: true }),
+      expect.objectContaining({ sub: 'user-123', mfa: true, mfa_src: 'factor' }),
       expect.objectContaining({ refreshFam: 'family-passkey' }),
     );
     expect(redisMock.del).toHaveBeenCalledWith('mfa:pending:temp-token');
@@ -1227,7 +1349,7 @@ describe('passkey MFA auth routes', () => {
 
     expect(res.status).toBe(200);
     expect(createTokenPair).toHaveBeenCalledWith(
-      expect.objectContaining({ sub: 'user-123', email: 'test@example.com', mfa: true }),
+      expect.objectContaining({ sub: 'user-123', email: 'test@example.com', mfa: true, mfa_src: 'factor' }),
       expect.objectContaining({ refreshFam: 'family-passkey' }),
     );
     expect(await res.json()).toMatchObject({
@@ -2018,7 +2140,7 @@ describe('passkey MFA auth routes', () => {
           orgId: 'org-5',
           partnerId: 'partner-2',
           scope: 'organization',
-          token: { sid: 'session-123', mfa: true, aep: 4, mep: 9, mdid: 'signed-device-1', roleId: 'role-7' },
+          token: { sid: 'session-123', mfa: true, mfa_src: 'factor', aep: 4, mep: 9, mdid: 'signed-device-1', roleId: 'role-7' },
         });
         return next();
       }) as never);
@@ -2045,6 +2167,8 @@ describe('passkey MFA auth routes', () => {
         partnerId: 'partner-2',
         scope: 'organization',
         mfa: true,
+        // Carried verbatim from the caller's signed token, never recomputed.
+        mfaSrc: 'factor',
         mobileDeviceId: 'signed-device-1',
       });
       expect(input.identity.mobileDeviceId).not.toBe('forged-device-header');
@@ -2096,6 +2220,10 @@ describe('passkey MFA auth routes', () => {
       expect(completeMfaFactorRemoval).toHaveBeenCalledTimes(1);
       const input = vi.mocked(completeMfaFactorRemoval).mock.calls[0]?.[0] as any;
       expect(input).toMatchObject({ userId: 'user-123', revokeReason: 'passkey-delete' });
+      // This caller's token predates the claim, so the re-mint carries none —
+      // absent stays absent, it is never recomputed into a source.
+      expect(input.identity).toMatchObject({ mfa: true });
+      expect(input.identity.mfaSrc).toBeUndefined();
       expect(input.recoveryCodes).toBeUndefined();
       expect(input.recoveryCodeHashes).toBeUndefined();
     });

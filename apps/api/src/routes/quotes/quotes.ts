@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { z } from 'zod';
-import { and, eq } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import { requireScope, requirePermission, type AuthContext } from '../../middleware/auth';
 import { PERMISSIONS } from '../../services/permissions';
 import {
@@ -20,7 +20,9 @@ import {
 import { createQuoteOrder, updateQuoteOrder, updateQuoteOrderLine } from '../../services/quoteOrderService';
 import { QuoteServiceError, type QuoteActor } from '../../services/quoteTypes';
 import { db } from '../../db';
-import { quoteImages } from '../../db/schema/quotes';
+import { quoteImages, quoteAcceptances } from '../../db/schema/quotes';
+import { users } from '../../db/schema/users';
+import { partners } from '../../db/schema/orgs';
 import { readCatalogItemImage } from '../../services/catalogImageStorage';
 import { safeContentDispositionFilename } from '../../utils/httpHeaders';
 import { resolveQuoteBranding } from '../../services/quoteBranding';
@@ -35,6 +37,7 @@ import {
 import { ContractTemplateServiceError } from '../../services/contractTemplateService';
 import { PdfMergeError } from '../../services/pdfMerge';
 import { writeRouteAudit } from '../../services/auditEvents';
+import { QUOTE_ACCEPTANCE_EVIDENCE_META, toAcceptanceEvidenceMeta } from '../../services/quoteAcceptanceEvidence';
 
 export const quoteCrudRoutes = new Hono();
 const scopes = requireScope('partner', 'system');
@@ -176,9 +179,80 @@ quoteCrudRoutes.get('/:id', scopes, readPerm, zValidator('param', idParam), asyn
     // explicitly so web doesn't have to depend on QuoteBranding growing new
     // fields to pick up theme/pageSize (Task 12).
     const presentation = { theme: branding.theme, pageSize: branding.pageSize };
+    // The acceptance record. Not previously returned at all: an accepted quote
+    // showed only a bare `Accepted` lifecycle stamp, with no signer, no method
+    // and — once accept-on-behalf exists — no way to tell an MSP-recorded
+    // acceptance from a customer click. Left-joined to `users` so a recorder
+    // deleted since (ON DELETE SET NULL) reads as "unknown" rather than
+    // dropping the whole row.
+    const [acceptanceRow] = await db
+      .select({
+        id: quoteAcceptances.id,
+        signerName: quoteAcceptances.signerName,
+        signerEmail: quoteAcceptances.signerEmail,
+        signedAt: quoteAcceptances.signedAt,
+        origin: quoteAcceptances.origin,
+        method: quoteAcceptances.method,
+        reference: quoteAcceptances.reference,
+        recordedByUserId: quoteAcceptances.recordedByUserId,
+        recordedByName: users.name,
+        // Evidence METADATA only (#6633) — never evidenceData.
+        ...QUOTE_ACCEPTANCE_EVIDENCE_META,
+      })
+      .from(quoteAcceptances)
+      .leftJoin(users, eq(users.id, quoteAcceptances.recordedByUserId))
+      // Org-scoped as well as quote-scoped, matching the portal read: RLS
+      // already confines this, and the redundant predicate keeps the two reads
+      // of the same table identical rather than relying on the id alone.
+      .where(and(eq(quoteAcceptances.quoteId, id), eq(quoteAcceptances.orgId, detail.quote.orgId)))
+      .orderBy(desc(quoteAcceptances.signedAt))
+      .limit(1);
+    const acceptance = acceptanceRow
+      ? {
+          id: acceptanceRow.id,
+          signerName: acceptanceRow.signerName,
+          signerEmail: acceptanceRow.signerEmail,
+          signedAt: acceptanceRow.signedAt,
+          origin: acceptanceRow.origin,
+          method: acceptanceRow.method,
+          reference: acceptanceRow.reference,
+          recordedBy: acceptanceRow.recordedByUserId
+            ? { id: acceptanceRow.recordedByUserId, name: acceptanceRow.recordedByName ?? null }
+            : null,
+          // Filename/type/size/time only; the storage key stays server-side.
+          evidence: toAcceptanceEvidenceMeta(acceptanceRow),
+        }
+      : null;
+    // The QUOTE's partner's auto-email-invoice setting (#6636). AcceptOnBehalfDialog
+    // needs this to preview whether accepting will email the invoice, but it used
+    // to fetch it from GET /orgs/partners/me — requireScope('partner') + requireOrgRead
+    // — which 403s for a caller whose role has quotes:read but not orgs:read, so
+    // the line silently never rendered for that whole class of session. Read it
+    // directly here instead, scoped to the QUOTE's own partnerId (never the
+    // caller's own partner context) under the same ambient db context branding/
+    // stripe already use above — same sanctioned pattern, no extra permission gate,
+    // since it's the quote's own tenant data and this route is already partner-/
+    // system-scoped only (quoteCrudRoutes' `scopes`). Column default is `true`,
+    // matched here when the row can't be read. Wrapped like the getConnection
+    // call above: this is a display-only preview field for one dialog, so a
+    // transient failure here must degrade the preview, not fail the whole
+    // quote-detail load.
+    let partnerAutoEmailRow: { autoEmailInvoiceOnQuoteAccept: boolean } | undefined;
+    try {
+      [partnerAutoEmailRow] = await db
+        .select({ autoEmailInvoiceOnQuoteAccept: partners.autoEmailInvoiceOnQuoteAccept })
+        .from(partners)
+        .where(eq(partners.id, detail.quote.partnerId))
+        .limit(1);
+    } catch (err) {
+      console.error('GET /quotes/:id: partner auto-email lookup failed', { quoteId: id, partnerId: detail.quote.partnerId, err });
+    }
+    const autoEmailInvoiceOnAccept = partnerAutoEmailRow?.autoEmailInvoiceOnQuoteAccept ?? true;
     return c.json({ data: {
       ...detail, quote: quoteForClient, blocks: blocksForEditor, branding, presentation, recipients,
+      acceptance,
       stripeConnected, stripeAccountCurrency, currencyWarning,
+      autoEmailInvoiceOnAccept,
     } });
   } catch (err) { return handleServiceError(c, err); }
 });

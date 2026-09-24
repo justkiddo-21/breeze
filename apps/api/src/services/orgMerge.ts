@@ -37,6 +37,7 @@ import * as dbModule from '../db';
 import { extractRowCount } from '../db/rowCount';
 import { organizations, orgMergeEvents } from '../db/schema';
 import { createAuditLog } from './auditService';
+import { revalidateTicketAssignee } from './ticketService';
 import { advanceUserEpochs, revokeAllRefreshFamilies, runPostCommitCleanup, type Tx } from './authLifecycle';
 import {
   buildKeepSurvivor,
@@ -53,11 +54,13 @@ import {
   type MergeTableOutcome,
 } from './orgMergeCustomExecutors';
 import { getOrgMergePolicies, type OrgMergePolicy } from './orgMergeRegistry';
+import { captureLoserContacts, finishBindingMerge } from './callerVerification/merge';
 import { applyTicketChildLockOrder } from './ticketOrgMoveLockOrder';
 import { topologicalCascadeOrder } from './tenantCascade';
 import { envInt } from '../utils/envInt';
 import { disconnectLiveAgentSocketsForOrgIds } from './tenantLifecycle';
 import { invalidateAgentTenantCache, isUsableOrgStatus } from './tenantStatus';
+import { prepareTopologyOrgMerge, finalizeTopologyOrgMerge } from './topology/tenantLifecycle';
 // Self-import so `executeOrgMerge` calls the exported bindings through the
 // module namespace, letting tests spy on `runPolicy` / `fenceLoser` — the same
 // pattern `tenantCascade.ts` uses for `topologicalCascadeOrder`.
@@ -116,6 +119,8 @@ export interface OrgMergeEventSummary {
   tables: Record<string, OrgMergeCounts>;
   /** Operator-review notes: duplicate portal logins / external links, discarded integration connections, revoked capabilities, demotions and role conflicts. */
   warnings: string[];
+  /** Present on merges performed after topology foundation rollout. */
+  topology?: { rekeyed: number; fenced: number };
 }
 
 export interface OrgMergeResult extends OrgMergeEventSummary {
@@ -555,15 +560,18 @@ export async function unfenceLoser(loser: OrgMergeCandidate): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /**
- * Re-read both orgs inside the merge transaction, `FOR UPDATE`, and re-assert
+ * Re-read both orgs inside the merge transaction, `FOR NO KEY UPDATE`, and re-assert
  * the pair is still mergeable (I2). Must run after the advisory locks and
  * before any row write.
  *
  * The survivor is locked because it is the one that was NEVER fenced — it
  * stays fully live and writable while the loser drains, so its status,
  * `deleted_at` and `partner_id` are all still mutable right up to this point.
- * `FOR UPDATE` also blocks a concurrent status change for the rest of the
- * transaction, so the check cannot be invalidated the instant after it passes.
+ * `FOR NO KEY UPDATE` blocks concurrent row updates and deletion for the rest
+ * of the transaction, so the check cannot be invalidated after it passes. It
+ * permits FK KEY SHARE checks from an in-flight topology publisher whose site
+ * state the merge must acquire next; FOR UPDATE would deadlock that publisher's
+ * alias-audit insert against this transaction's state wait.
  *
  * The loser is re-checked differently: `validateMergePair` would reject it
  * (its status is now `merging`, deliberately), so it is asserted directly to
@@ -579,7 +587,7 @@ export async function assertPairStillMergeable(
       FROM organizations
      WHERE id IN (${uuid(loser.id)}, ${uuid(survivor.id)})
      ORDER BY id
-     FOR UPDATE`)) as unknown as Array<{
+     FOR NO KEY UPDATE`)) as unknown as Array<{
     id: string;
     partner_id: string;
     name: string;
@@ -1049,7 +1057,7 @@ export async function executeOrgMerge(input: ExecuteOrgMergeInput): Promise<OrgM
         // have been suspended, archived, soft-deleted or moved to another
         // partner. Nothing fences the SURVIVOR (it stays live and writable by
         // design), so its state must be re-read here, under the advisory lock
-        // and FOR UPDATE, and re-validated. Merging into a suspended or
+        // and FOR NO KEY UPDATE, and re-validated. Merging into a suspended or
         // deleted org would strand the loser's whole dataset somewhere the
         // partner can no longer reach.
         await self.assertPairStillMergeable(loser, survivor);
@@ -1065,6 +1073,18 @@ export async function executeOrgMerge(input: ExecuteOrgMergeInput): Promise<OrgM
         // 23514 instead of this typed refusal.
         const txBlockers = await self.collectMergeBlockers(loser.id);
         if (txBlockers.length > 0) throw new OrgMergeBlockedError(txBlockers);
+
+        const topologyMerge = await prepareTopologyOrgMerge(loser.id, survivor.id);
+
+        // Capture before the device cascade can re-home its tickets. Eligibility
+        // must wait until the whole walk has also moved membership/site grants.
+        const assignedTickets = await dbModule.db.execute(sql`
+          SELECT id FROM tickets WHERE org_id = ${uuid(loser.id)} AND assigned_to IS NOT NULL
+        `) as unknown as Array<{ id: string }>;
+
+        // Caller verification (#6354): snapshot loser contacts before `contacts`
+        // repoints so the post-pass grant revocation can still find them.
+        const callerContactIds = await captureLoserContacts(loser.id);
 
         const policies = getOrgMergePolicies();
         // topologicalCascadeOrder is children-before-parents (erasure order);
@@ -1103,9 +1123,16 @@ export async function executeOrgMerge(input: ExecuteOrgMergeInput): Promise<OrgM
           }
         }
 
+        await finishBindingMerge(callerContactIds, survivor.id);
+
         const fixups = await self.runPostPassFixups(loser.id, survivor.id, input.partnerId);
         if (fixups.moved > 0 || fixups.dropped > 0) {
           summary[POST_PASS_FIXUPS_SUMMARY_KEY] = fixups;
+        }
+        const topology = await finalizeTopologyOrgMerge(loser.id, survivor.id, topologyMerge.siteIds);
+
+        for (const ticket of assignedTickets) {
+          await revalidateTicketAssignee(ticket.id, { userId: input.performedBy });
         }
 
         const warnings = self.buildMergeWarnings({
@@ -1114,7 +1141,7 @@ export async function executeOrgMerge(input: ExecuteOrgMergeInput): Promise<OrgM
           notes,
         });
 
-        const eventSummary: OrgMergeEventSummary = { tables: summary, warnings };
+        const eventSummary: OrgMergeEventSummary = { tables: summary, warnings, topology };
         const [event] = await dbModule.db
           .insert(orgMergeEvents)
           .values({

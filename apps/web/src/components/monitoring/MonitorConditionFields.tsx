@@ -1,16 +1,34 @@
+import { useEffect, useRef, useState } from 'react';
 import { useFormContext, type FieldValues } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
 import type { MonitorKind } from '@breeze/shared';
-import { MONITOR_KIND_FIELDS } from './monitorKindFields';
+import { fetchAllScripts } from '@/lib/scriptsFetch';
+import { MONITOR_KIND_FIELDS, NETWORK_CHECK_TARGET_DEFAULTS, type KindField } from './monitorKindFields';
 
-/** Which translated-option namespace a select field's values live under. */
-const SELECT_OPTION_NAMESPACE: Record<string, string> = {
+/**
+ * Which translated-option namespace a select field's values live under.
+ * Keyed by `field.key` alone, EXCEPT where two kinds reuse the same schema
+ * key for a differently-shaped enum — `antivirus.check` and
+ * `backup_continuity.check` both author into a field literally named `check`
+ * (#5291), so those two are keyed `${kind}:${key}` and looked up first.
+ */
+export const SELECT_OPTION_NAMESPACE: Record<string, string> = {
   category: 'eventCategories',
   level: 'eventLevels',
   resource: 'resources',
   direction: 'directions',
   errorType: 'directions',
+  match: 'compositeMatch',
+  presence: 'presences',
+  checkType: 'checkTypes',
+  'antivirus:check': 'antivirusChecks',
+  'backup_continuity:check': 'backupChecks',
 };
+
+interface FetchedScript {
+  id: string;
+  name: string;
+}
 
 export interface MonitorConditionFieldsProps {
   kind: MonitorKind;
@@ -25,17 +43,121 @@ export interface MonitorConditionFieldsProps {
  */
 export default function MonitorConditionFields({ kind, name }: MonitorConditionFieldsProps) {
   const { t } = useTranslation('monitoring');
-  const { register, formState: { errors } } = useFormContext<FieldValues>();
+  const { register, watch, setValue, formState: { errors } } = useFormContext<FieldValues>();
   const fields = MONITOR_KIND_FIELDS[kind];
 
   const conditionErrors = (errors[name] as Record<string, { message?: string } | undefined> | undefined) ?? {};
 
+  // One subscription for the whole condition object rather than one `watch()`
+  // call per `showWhen` field — the field list (and therefore how many
+  // fields would need watching) varies by `kind`, and calling a hook a
+  // variable number of times per render breaks the rules of hooks.
+  const conditionValues = (watch(name) as Record<string, unknown> | undefined) ?? {};
+  const isVisible = (field: KindField): boolean =>
+    !field.showWhen || String(conditionValues[field.showWhen.key] ?? '') === field.showWhen.equals;
+
+  // network_check only (#MSA-1): switching checkType (e.g. ping → HTTP check)
+  // must not silently carry over the PREVIOUS type's default target — a
+  // stale `8.8.8.8` on an HTTP check reads as a plausible value rather than
+  // the ping leftover it is. Only reset when the field still holds a known
+  // default (or is empty); a target the user actually typed is left alone.
+  const checkType = kind === 'network_check' ? String(conditionValues.checkType ?? '') : undefined;
+  const prevCheckTypeRef = useRef(checkType);
+  useEffect(() => {
+    if (kind !== 'network_check') return;
+    const prevCheckType = prevCheckTypeRef.current;
+    prevCheckTypeRef.current = checkType;
+    if (!checkType || checkType === prevCheckType) return;
+    const currentTarget = String(conditionValues.target ?? '');
+    const prevDefault = prevCheckType ? NETWORK_CHECK_TARGET_DEFAULTS[prevCheckType] : undefined;
+    if (currentTarget === '' || currentTarget === prevDefault) {
+      const nextDefault = NETWORK_CHECK_TARGET_DEFAULTS[checkType];
+      if (nextDefault !== undefined && nextDefault !== currentTarget) {
+        setValue(`${name}.target`, nextDefault, { shouldDirty: true });
+      }
+    }
+    // Only `checkType` should re-trigger this — watching `conditionValues`
+    // wholesale (or `name`) would fire on every keystroke in any field.
+  }, [checkType]);
+
+  const needsScripts = fields.some((field) => field.kind === 'script');
+  const [scripts, setScripts] = useState<FetchedScript[]>([]);
+  const [scriptsError, setScriptsError] = useState(false);
+
+  useEffect(() => {
+    if (!needsScripts) return;
+    let cancelled = false;
+    fetchAllScripts<FetchedScript>()
+      .then((result) => {
+        if (!cancelled) setScripts(result.data);
+      })
+      .catch(() => {
+        if (!cancelled) setScriptsError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [needsScripts]);
+
   return (
     <div className="grid gap-3 sm:grid-cols-2">
-      {fields.map((field) => {
+      {fields.filter(isVisible).map((field) => {
         const path = `${name}.${field.key}`;
         const label = t(/* i18n-dynamic */ field.labelKey) + (field.unit ? ` (${field.unit})` : '');
         const fieldError = conditionErrors[field.key]?.message;
+
+        if (field.kind === 'boolean') {
+          return (
+            <div key={field.key} className="flex items-center gap-2 pt-5">
+              <input
+                id={`condition-field-${field.key}`}
+                data-testid={`condition-field-${field.key}`}
+                type="checkbox"
+                className="h-4 w-4 rounded border"
+                {...register(path)}
+              />
+              <label className="text-xs font-medium text-muted-foreground" htmlFor={`condition-field-${field.key}`}>
+                {label}
+              </label>
+            </div>
+          );
+        }
+
+        if (field.kind === 'script') {
+          return (
+            <div key={field.key} className="space-y-1">
+              <label className="text-xs font-medium text-muted-foreground" htmlFor={`condition-field-${field.key}`}>
+                {label}
+              </label>
+              <select
+                id={`condition-field-${field.key}`}
+                data-testid={`condition-field-${field.key}`}
+                className="h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                {...register(path)}
+                // Explicit `value` (in addition to `register`'s own binding)
+                // so the DOM stays in sync with form state even when the
+                // matching <option> doesn't exist yet at mount/reset time —
+                // e.g. editing a saved script monitor, where `reset()` from
+                // the fetched monitor can land before this component's own
+                // async `/scripts` fetch has populated the option list.
+                // Without this, assigning a value with no matching <option>
+                // is a native-select no-op that never gets retried once the
+                // option does appear, so the picker silently reverts to the
+                // placeholder (#6207).
+                value={String(conditionValues[field.key] ?? '')}
+              >
+                <option value="">{t('fields.scriptSelectPlaceholder')}</option>
+                {scripts.map((script) => (
+                  <option key={script.id} value={script.id}>
+                    {script.name}
+                  </option>
+                ))}
+              </select>
+              {scriptsError && <p className="text-xs text-destructive">{t('fields.scriptLoadError')}</p>}
+              {fieldError && <p className="text-xs text-destructive">{fieldError}</p>}
+            </div>
+          );
+        }
 
         if (field.kind === 'operator') {
           return (
@@ -72,7 +194,8 @@ export default function MonitorConditionFields({ kind, name }: MonitorConditionF
                 {...register(path)}
               >
                 {(field.options ?? []).map((opt) => {
-                  const ns = SELECT_OPTION_NAMESPACE[field.key] ?? 'directions';
+                  const ns =
+                    SELECT_OPTION_NAMESPACE[`${kind}:${field.key}`] ?? SELECT_OPTION_NAMESPACE[field.key] ?? 'directions';
                   return (
                     <option key={opt} value={opt}>
                       {t(/* i18n-dynamic */ `${ns}.${opt}`, { defaultValue: opt })}

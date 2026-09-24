@@ -27,7 +27,9 @@ import (
 	"github.com/breeze-rmm/agent/internal/authstate"
 	"github.com/breeze-rmm/agent/internal/backupipc"
 	"github.com/breeze-rmm/agent/internal/collectors"
+	"github.com/breeze-rmm/agent/internal/collectors/networkcontext"
 	"github.com/breeze-rmm/agent/internal/config"
+	"github.com/breeze-rmm/agent/internal/desktopfence"
 	"github.com/breeze-rmm/agent/internal/executor"
 	"github.com/breeze-rmm/agent/internal/health"
 	"github.com/breeze-rmm/agent/internal/helper"
@@ -40,6 +42,7 @@ import (
 	"github.com/breeze-rmm/agent/internal/monitoring"
 	"github.com/breeze-rmm/agent/internal/mtls"
 	"github.com/breeze-rmm/agent/internal/netcache"
+	"github.com/breeze-rmm/agent/internal/networkdiagnostic"
 	"github.com/breeze-rmm/agent/internal/observability"
 	"github.com/breeze-rmm/agent/internal/onedrivehelper"
 	"github.com/breeze-rmm/agent/internal/pamlifetime"
@@ -82,6 +85,8 @@ const pendingActivationClockSkew = 10 * time.Minute
 const selfInitiatedRenewalLeadTime = 24 * time.Hour
 
 type HeartbeatPayload struct {
+	NetworkContextV1    *networkcontext.Report     `json:"networkContextV1,omitempty"`
+	NetworkContextReset *NetworkContextReset       `json:"networkContextReset,omitempty"`
 	Metrics             *collectors.SystemMetrics  `json:"metrics,omitempty"`
 	MetricsAvailable    *bool                      `json:"metricsAvailable,omitempty"`
 	Status              string                     `json:"status"`
@@ -221,8 +226,15 @@ type SecurityCapabilities struct {
 	// RevocationLeaseProtocolVersion declares that this build keeps a desktop
 	// session's revocation lease alive and stops streaming when it lapses. The
 	// API refuses to start a desktop session against an agent reporting 0.
-	RevocationLeaseProtocolVersion int                      `json:"revocationLeaseProtocolVersion,omitempty"`
-	PamReconciliation              *PamReconciliationStatus `json:"pamReconciliation,omitempty"`
+	RevocationLeaseProtocolVersion int `json:"revocationLeaseProtocolVersion,omitempty"`
+	// DesktopFenceProtocolVersion (SEC-038 W06) declares that this build keeps
+	// the durable per-session start/terminal generation fence (W04/W05): it
+	// refuses any desktop start not strictly newer than everything it has
+	// already seen, and refuses all starts after a terminal. Behind
+	// REMOTE_DESKTOP_FENCE_REQUIRED the API refuses to start a desktop session
+	// against an agent reporting 0, same shape as the revocation-lease gate.
+	DesktopFenceProtocolVersion int                      `json:"desktopFenceProtocolVersion,omitempty"`
+	PamReconciliation           *PamReconciliationStatus `json:"pamReconciliation,omitempty"`
 }
 
 type PamReconciliationStatus struct {
@@ -243,11 +255,12 @@ type DesktopAccessState struct {
 }
 
 type HeartbeatResponse struct {
-	Commands     []Command      `json:"commands"`
-	ConfigUpdate map[string]any `json:"configUpdate,omitempty"`
-	UpgradeTo    string         `json:"upgradeTo,omitempty"`
-	RenewCert    bool           `json:"renewCert,omitempty"`
-	RotateToken  bool           `json:"rotateToken,omitempty"`
+	NetworkContextReceipt *networkcontext.Receipt `json:"networkContextReceipt,omitempty"`
+	Commands              []Command               `json:"commands"`
+	ConfigUpdate          map[string]any          `json:"configUpdate,omitempty"`
+	UpgradeTo             string                  `json:"upgradeTo,omitempty"`
+	RenewCert             bool                    `json:"renewCert,omitempty"`
+	RotateToken           bool                    `json:"rotateToken,omitempty"`
 	// Issue #2621 — the server sees this agent authenticating with the STAGED
 	// credentials of an unconfirmed rotation. Finish phase two.
 	ConfirmTokenRotation   bool                   `json:"confirmTokenRotation,omitempty"`
@@ -327,18 +340,23 @@ func (h *Heartbeat) lifecycleMode() string {
 }
 
 type Heartbeat struct {
-	config                *config.Config
-	secureToken           *secmem.SecureString
-	client                *http.Client
-	clientMu              sync.RWMutex
-	stopChan              chan struct{}
-	metricsCol            *collectors.MetricsCollector
-	hardwareCol           *collectors.HardwareCollector
-	softwareCol           *collectors.SoftwareCollector
-	softwareObservationFn func() (collectors.SoftwareInventoryObservationV2, error)
-	inventoryCol          *collectors.InventoryCollector
-	vpnCol                *collectors.VPNCollector
-	changeTrackerCol      *collectors.ChangeTrackerCollector
+	topologyDiagnosticMu      sync.Mutex
+	topologyDiagnosticJournal *networkdiagnostic.Journal
+	topologyDiagnosticActive  map[string]activeTopologyDiagnostic
+	networkContextMu          sync.Mutex
+	networkContext            *networkContextManager
+	config                    *config.Config
+	secureToken               *secmem.SecureString
+	client                    *http.Client
+	clientMu                  sync.RWMutex
+	stopChan                  chan struct{}
+	metricsCol                *collectors.MetricsCollector
+	hardwareCol               *collectors.HardwareCollector
+	softwareCol               *collectors.SoftwareCollector
+	softwareObservationFn     func() (collectors.SoftwareInventoryObservationV2, error)
+	inventoryCol              *collectors.InventoryCollector
+	vpnCol                    *collectors.VPNCollector
+	changeTrackerCol          *collectors.ChangeTrackerCollector
 	// changeTrackerMu serializes the change tracker's collect → send → commit
 	// cycle. sendInventory is dispatched both on the 15-minute tick and by the
 	// "Refresh Inventory" command (handlers.go), so two cycles can genuinely
@@ -366,8 +384,8 @@ type Heartbeat struct {
 	// fields above (see lifecycleMode()); read every beat by
 	// recoveryMarker() and cleared once the server acks it.
 	recoveryMarkerVal *RecoveryMarker
-	securityScanner    *security.SecurityScanner
-	wsClient           *websocket.Client
+	securityScanner   *security.SecurityScanner
+	wsClient          *websocket.Client
 	// backupOutbox persists terminal backup results that failed to send over
 	// the WS connection, so a transient blip doesn't orphan the job
 	// server-side. Flushed on WS reconnect (see SetWebSocketClient). Never
@@ -462,6 +480,21 @@ type Heartbeat struct {
 	// absolute terminal tombstone. See desktop_fence.go. Carries its own lock
 	// and its zero value is ready to use, so it is never nil.
 	desktopStartFence desktopFence
+	// desktopFenceSyncTimeout bounds one fence resync round trip; zero means
+	// defaultDesktopFenceSyncTimeout. Tests shrink it.
+	desktopFenceSyncTimeout time.Duration
+	// leaseSyncRequester sends a nonce-correlated lease renewal for a fence
+	// resync. Defaults to requestRevocationLeaseSync; a nil requester means
+	// no control plane, which means no admission.
+	leaseSyncRequester func(sessionID, nonce string) error
+	// desktopFenceQueue serialises fence updates off the WS read pump: the
+	// hook must not block, and a fence write touches the disk.
+	desktopFenceQueue      chan websocket.RevocationLeaseMessage
+	desktopFenceWorkerOnce sync.Once
+	// helperFenceSynced records which helper sessions have acknowledged a
+	// fence seed, so the seed costs one round trip per helper rather than one
+	// per start. Cleared when the helper session ends.
+	helperFenceSynced map[string]bool
 
 	// desktopTargets maps remote desktop session id -> explicitly targeted
 	// Windows session ("" for untargeted/legacy connects) so the stop path can
@@ -1116,6 +1149,13 @@ func NewWithVersion(cfg *config.Config, version string, token *secmem.SecureStri
 	// watchdog lives in the helper process, so its renewals arrive here as
 	// ipc.TypeDesktopLeaseRenew and are forwarded onto the command socket.
 	h.leaseRenewRequester = h.requestRevocationLeaseRenew
+	h.leaseSyncRequester = h.requestRevocationLeaseSync
+
+	// SEC-038: make the desktop start fence durable. A restart must not forget
+	// a tombstone; anything the file does not cover fails closed through the
+	// resync above.
+	h.desktopStartFence.attachStore(desktopfence.NewStore(
+		filepath.Join(config.GetDataDir(), "desktop-fence-state.json")))
 
 	// Clean up any orphaned Screen Sharing left running from a previous crash.
 	h.tunnelMgr.CleanupOrphanedVNC()
@@ -1161,6 +1201,20 @@ func (h *Heartbeat) SetWebSocketClient(ws *websocket.Client) {
 // helper that owns the session, and falls back to the direct manager otherwise.
 func (h *Heartbeat) applyRevocationLeaseAnswer(msg websocket.RevocationLeaseMessage) {
 	if msg.SessionID == "" {
+		return
+	}
+	// SEC-038: every answer feeds the durable start fence — this is also the
+	// resync channel a start for an unknown session waits on. Queued, never
+	// applied inline: this callback runs on the WS read pump and a fence write
+	// hits the disk.
+	h.enqueueDesktopFenceAnswer(msg)
+
+	// "I cannot answer right now" is not a renewal and not a revocation. It
+	// ends a session whose FIRST renewal it is (owner decision 2) and is
+	// otherwise the silence the grace window budgets for.
+	if msg.Unavailable {
+		h.desktopMgr.NoteLeaseUnavailable(msg.SessionID)
+		go h.forwardRevocationLeaseToHelper(msg)
 		return
 	}
 	// The answer must reach whichever process actually hosts the session. On a
@@ -1234,6 +1288,7 @@ func (h *Heartbeat) forwardRevocationLeaseToHelper(msg websocket.RevocationLease
 		HardDeadlineUnixMs: msg.HardDeadlineUnixMs,
 		Revoked:            msg.Revoked,
 		Reason:             msg.Reason,
+		Unavailable:        msg.Unavailable,
 	}
 	if err := owner.SendNotify("desk-lease-"+msg.SessionID, ipc.TypeDesktopLeaseUpdate, update); err != nil {
 		log.Warn("failed to forward revocation lease update to the owning helper",
@@ -2938,6 +2993,10 @@ func (h *Heartbeat) applyConfigUpdate(update map[string]any) {
 		return
 	}
 
+	if raw, ok := update["networkContext"]; ok {
+		h.applyNetworkContextConfig(raw)
+	}
+
 	// Apply event_log_settings if present
 	elRaw, hasEL := update["event_log_settings"]
 	if !hasEL {
@@ -4049,6 +4108,45 @@ func resetHeartbeatWatchdogDumpState() {
 	heartbeatWatchdogSuppressedDumps.Store(0)
 }
 
+// heartbeatWatchdogStartHook and heartbeatWatchdogFinishHook, when non-nil,
+// are invoked by the watchdog goroutine immediately before it enters its
+// `select` and immediately after that select resolves, respectively. They
+// are synchronization points for tests that need to know precisely when the
+// watchdog goroutine has been scheduled and started racing `done` against
+// the timer, and when it has finished — instead of inferring either from a
+// wall-clock sleep (#6645: under a loaded CI runner, the watchdog goroutine
+// itself can be starved of scheduling for longer than a test's fixed sleep,
+// making sleep-based "surely it's running/done by now" assumptions flaky).
+// Both are nil in production and never allocate/branch in the hot path
+// beyond a single atomic load.
+var (
+	heartbeatWatchdogStartHook  atomic.Pointer[func()]
+	heartbeatWatchdogFinishHook atomic.Pointer[func()]
+)
+
+// setHeartbeatWatchdogStartHook installs a start hook and returns a restore
+// func that puts back whatever was previously installed. Intended for tests.
+func setHeartbeatWatchdogStartHook(fn func()) (restore func()) {
+	var p *func()
+	if fn != nil {
+		p = &fn
+	}
+	prev := heartbeatWatchdogStartHook.Swap(p)
+	return func() { heartbeatWatchdogStartHook.Store(prev) }
+}
+
+// setHeartbeatWatchdogFinishHook installs a finish hook and returns a
+// restore func that puts back whatever was previously installed. Intended
+// for tests.
+func setHeartbeatWatchdogFinishHook(fn func()) (restore func()) {
+	var p *func()
+	if fn != nil {
+		p = &fn
+	}
+	prev := heartbeatWatchdogFinishHook.Swap(p)
+	return func() { heartbeatWatchdogFinishHook.Store(prev) }
+}
+
 // heartbeatWatchdogTryAcquireDump reports whether a goroutine dump may be
 // emitted now, atomically claiming the slot if so. Safe for concurrent
 // watchdog goroutines (overlapping invocations race for one slot).
@@ -4311,6 +4409,12 @@ func (h *Heartbeat) sendHeartbeatWithWatchdog() {
 	defer close(done)
 
 	go func() {
+		if hook := heartbeatWatchdogStartHook.Load(); hook != nil {
+			(*hook)()
+		}
+		if hook := heartbeatWatchdogFinishHook.Load(); hook != nil {
+			defer (*hook)()
+		}
 		// The select fires at most once per invocation, so sync.Once is
 		// unnecessary — a plain select is sufficient.
 		select {
@@ -4519,6 +4623,8 @@ func (h *Heartbeat) sendHeartbeat() {
 	if dropped := logging.DroppedLogCount(); dropped > 0 {
 		payload.DroppedLogs = dropped
 	}
+
+	h.attachNetworkContext(&payload)
 
 	// Attach IP history update when assignments changed since last heartbeat.
 	if ipUpdate, ipErr := h.collectIPHistory(); ipErr != nil {
@@ -4819,6 +4925,7 @@ func (h *Heartbeat) acknowledgeRollbackObservation(id string) {
 }
 
 func (h *Heartbeat) processHeartbeatResponse(response *HeartbeatResponse) {
+	h.ackNetworkContext(response.NetworkContextReceipt)
 	// Bare-metal recovery W04a: only clear the marker once the server has
 	// actually acked it — a failed/lost beat must resend it next time.
 	if response.RecoveryMarkerAck && h.recoveryMarker() != nil {
@@ -6209,7 +6316,7 @@ func (h *Heartbeat) HandleCommand(wsCmd websocket.Command) websocket.CommandResu
 
 	wsResult := toWSCommandResult(cmd.ID, result)
 
-	if result.Status != "duplicate" && !isEphemeralCommand(cmd.Type) {
+	if result.Status != "duplicate" && !isEphemeralCommand(cmd.Type) && !isWSDirectOnlyCommand(cmd.Type) {
 		go func() {
 			if err := h.submitCommandResult(cmd.ID, result); err != nil {
 				log.Error("failed to submit command result", logging.KeyCommandID, cmd.ID, "error", err.Error())
@@ -6397,10 +6504,36 @@ func (h *Heartbeat) inFlightCommandStats(now time.Time) (inFlight, overdue int) 
 // script has already finished on its own.
 func isLifecycleCommand(cmdType string) bool {
 	switch cmdType {
-	case tools.CmdScriptCancel, tools.CmdScriptListRunning:
+	case tools.CmdScriptCancel, tools.CmdScriptListRunning, tools.CmdNetworkDiagnosticCancel:
 		return true
 	}
 	return false
+}
+
+// isWSDirectOnlyCommand reports whether a command type is ONLY ever
+// dispatched WS-direct, i.e. the server never creates a device_commands row
+// for it. HandleCommand's HTTP result submission targets
+// /api/v1/agents/{id}/commands/{id}/result, which looks the command up in
+// device_commands and 404s when there is no row — so for these types the POST
+// is guaranteed-doomed log noise on every single dispatch (#5414). The WS
+// reply from HandleCommand (plus, for backup, the unsolicited terminal
+// backup_result frame and its outbox) is already the authoritative delivery
+// channel; nothing server-side reads the HTTP ack for them.
+//
+// The server exempts WS-direct commands from the 404 by testing whether the
+// command id is a non-UUID (routes/agents/commands.ts). backup_run defeats
+// that heuristic because its id IS a UUID — jobs/backupWorker.ts reuses the
+// backup_jobs row id as the command id.
+//
+// Membership is per-COMMAND-TYPE and deliberately narrow: it is not "backup
+// commands". mssql_backup and hyperv_backup ride this same rowless path from
+// backupWorker.ts, but routes/backup/mssql.ts and hyperv.ts ALSO dispatch
+// them through executeCommand -> commandQueue, which does insert a
+// device_commands row that the HTTP result legitimately acks. Suppressing
+// their submission would break that path, so they stay out. backup_run has
+// exactly one dispatch site (backupWorker.ts) and never gets a row.
+func isWSDirectOnlyCommand(cmdType string) bool {
+	return cmdType == tools.CmdBackupRun
 }
 
 func isEphemeralCommand(cmdType string) bool {
@@ -7530,5 +7663,6 @@ func compiledSecurityCapabilities() SecurityCapabilities {
 		PeripheralPolicyProtocolVersion: 2,
 		RollbackProtocolVersion:         1,
 		RevocationLeaseProtocolVersion:  1,
+		DesktopFenceProtocolVersion:     1,
 	}
 }

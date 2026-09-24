@@ -1,3 +1,5 @@
+const { ensureDefaultProfile } = vi.hoisted(() => ({ ensureDefaultProfile: vi.fn(async () => ({ id: 'default-profile' })) }));
+vi.mock('./billingProfileService', () => ({ ensureDefaultProfile }));
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // In-memory capture of all insert calls performed against the transaction.
@@ -115,9 +117,15 @@ import { db } from '../db';
 
 beforeEach(() => {
   insertCalls = [];
+  vi.mocked(ensureDefaultProfile).mockClear();
 });
 
 describe('createPartner', () => {
+  it('creates exactly one default card in the partner currency in the creation transaction', async () => {
+    await createPartner({ orgName: 'Rates', adminEmail: 'rates@example.com', adminName: 'Rates', passwordHash: null, origin: { mcp: false }, status: 'active' });
+    expect(ensureDefaultProfile).toHaveBeenCalledExactlyOnceWith('partners-id', 'CAD', dbTestState.lastTransaction);
+  });
+
   it('writes probation whenever hosted partner trust evaluation is running (shadow or enforce), omits it when off', async () => {
     const previousIsHosted = process.env.IS_HOSTED;
     const previousMode = process.env.PARTNER_TRUST_MODE;
@@ -252,6 +260,23 @@ describe('createPartner', () => {
     const partnerCall = insertCalls.find((c) => (c.table as any).__t === 'partners')!;
     expect(partnerCall.values.settings).toMatchObject({
       ticketing: { inbound: { enabled: false } },
+    });
+  });
+
+  // Spec: docs/superpowers/specs/2026-09-18-mfa-required-default-new-partners-design.md (D1)
+  it('writes settings.security.requireMfa=true for new partners (signup path)', async () => {
+    await createPartner({
+      orgName: 'Acme',
+      adminEmail: 'alex@acme.com',
+      adminName: 'Alex',
+      passwordHash: 'hashed',
+      origin: { mcp: false },
+      status: 'active',
+    });
+
+    const partnerCall = insertCalls.find((c) => (c.table as any).__t === 'partners')!;
+    expect(partnerCall.values.settings).toMatchObject({
+      security: { requireMfa: true },
     });
   });
 

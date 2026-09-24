@@ -59,6 +59,26 @@ describe('InvoiceDocument — customer-facing, no internal cost', () => {
   });
 });
 
+// #6467: the disclosure is structured data (workedMinutes), not baked into
+// `description`, so it survives regardless of what the description says.
+describe('InvoiceDocument — worked-vs-billed note (#6467)', () => {
+  it('shows the note for a time_entry line whose worked minutes differ from billed', () => {
+    const withNote: InvoiceDetailData = {
+      ...detail,
+      lines: [{
+        id: 'l3', invoiceId: 'inv-1', sourceType: 'time_entry', parentLineId: null, catalogItemId: null,
+        name: null, description: 'On-site', quantity: '1.00', unitPrice: '225.00', costBasis: null, revenueAllocation: null,
+        taxable: false, customerVisible: true, lineTotal: '225.00', isUnapprovedTime: false, sortOrder: 0, deviceCount: 0,
+        workedMinutes: 30,
+      }],
+    };
+    render(<InvoiceDocument detail={withNote} customerName="Acme Industries" />);
+    expect(screen.getByTestId('invoice-document-line-worked-vs-billed-l3')).toHaveTextContent(
+      '0.50 h worked · 1.00 h billed',
+    );
+  });
+});
+
 describe('InvoiceDocument — partner branding letterhead', () => {
   const branded: InvoiceDetailData = {
     ...detail,
@@ -120,5 +140,78 @@ describe('InvoiceDocument — contract overage sibling (#3205 W04)', () => {
     expect(overCell.textContent).not.toContain('↳');
     const childCell = screen.getByText('Bundle component').closest('td')!;
     expect(childCell.className).toContain('pl-8');
+  });
+});
+
+describe('InvoiceDocument — ticket grouping and labeling (#3319)', () => {
+  it('groups lines under ticket headers with translated label and obeys #3319 title/blurb rules', () => {
+    const line = detail.lines[0]!;
+    render(<InvoiceDocument detail={{
+      ...detail,
+      lines: [
+        {
+          ...line,
+          id: 't-line-1',
+          ticketId: 'tick-1',
+          ticketNumber: '1042',
+          ticketSubject: 'Printer issue',
+          ticketCategory: 'Hardware',
+          name: 'Diagnostic Labor',
+          description: 'Replaced toner sensor',
+        },
+      ],
+    }} customerName="Acme Industries" />);
+
+    expect(screen.getByText(/Ticket #1042/)).toBeInTheDocument();
+    expect(screen.getByText(/: Printer issue/)).toBeInTheDocument();
+    expect(screen.getByText('Hardware')).toBeInTheDocument();
+    // #3319: name is the title, description is the blurb
+    expect(screen.getByText('Diagnostic Labor')).toBeInTheDocument();
+    expect(screen.getByText('Replaced toner sensor')).toBeInTheDocument();
+  });
+
+  it('does not merge two number-less tickets into one group', () => {
+    const line = detail.lines[0]!;
+    render(<InvoiceDocument detail={{
+      ...detail,
+      lines: [
+        {
+          ...line,
+          id: 't-line-1',
+          ticketId: 'tick-1',
+          ticketNumber: null,
+          ticketSubject: 'Email config',
+          ticketCategory: 'Software',
+          name: 'Work 1',
+        },
+        {
+          ...line,
+          id: 't-line-2',
+          ticketId: 'tick-2',
+          ticketNumber: null,
+          ticketSubject: 'Router reboot',
+          ticketCategory: 'Network',
+          name: 'Work 2',
+        },
+      ],
+    }} customerName="Acme Industries" />);
+
+    expect(screen.getByText(/: Email config/)).toBeInTheDocument();
+    expect(screen.getByText(/: Router reboot/)).toBeInTheDocument();
+    expect(screen.getAllByText(/Ticket work/)).toHaveLength(2);
+  });
+
+  it('renders lines without ticketId directly without ticket headers', () => {
+    const line = detail.lines[0]!;
+    render(<InvoiceDocument detail={{
+      ...detail,
+      lines: [
+        { ...line, id: 'plain', ticketId: null, name: 'Cloud Backup', description: 'Daily backup' },
+      ],
+    }} customerName="Acme Industries" />);
+
+    expect(screen.queryByText(/Ticket #/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Ticket work/)).not.toBeInTheDocument();
+    expect(screen.getByText('Cloud Backup')).toBeInTheDocument();
   });
 });

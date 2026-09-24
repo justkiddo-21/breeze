@@ -14,16 +14,30 @@ type RecoveryConfig struct {
 	TargetPaths   map[string]string `json:"targetPaths,omitempty"` // original -> target path overrides
 
 	// ExpectSystemState is derived from the recovery bootstrap payload (see
-	// session.go, RunRecoveryWithTokenContext) rather than set by a caller:
-	// it is true when bootstrap.Snapshot.SystemStateManifest is present and
-	// non-null, i.e. the snapshot's producer captured system state for this
-	// run. applySystemState (bmr.go) uses it to distinguish "this snapshot
+	// session.go, RunRecoveryWithTokenContext / SnapshotExpectsSystemState)
+	// rather than set by a caller: it is true when the snapshot's backupType
+	// is "system_image" OR bootstrap.Snapshot.SystemStateManifest is present
+	// and non-null (#5412 — a system_image snapshot whose state collection
+	// failed has a NULL manifest and must still be held to it). applySystemState (bmr.go) uses it to distinguish "this snapshot
 	// never had system state" (fine — the existing soft-skip path) from
 	// "state was advertised but couldn't be downloaded/applied" (fatal).
 	// Before this field existed, both cases looked identical to bmr.go, so a
 	// snapshot advertising system state that failed to download it still
 	// reported StateApplied=false with status "completed" (D15/O10).
 	ExpectSystemState bool `json:"expectSystemState,omitempty"`
+
+	// FileIndex is derived from the recovery bootstrap payload (see
+	// session.go, RunRecoveryWithTokenContext), exactly like
+	// ExpectSystemState above — never set directly by a caller. It carries
+	// the server's verified-complete per-file index for this snapshot when
+	// the server granted the snapshot-file-membership-v1 capability and the
+	// snapshot has cross-snapshot references; nil otherwise (self-contained
+	// snapshot, or a server/agent too old to negotiate it).
+	// RunRecoveryContext's scope check (bmr.go, immediately after the
+	// manifest is downloaded and before any target write) passes it to
+	// ApplyManifestScope so a manifest with external references can never be
+	// honoured on an assumption.
+	FileIndex *FileIndexInfo `json:"-"`
 }
 
 type AuthenticatedProviderConfig struct {
@@ -33,16 +47,17 @@ type AuthenticatedProviderConfig struct {
 }
 
 type AuthenticatedDownloadDescriptor struct {
-	Type                string `json:"type"`
-	Method              string `json:"method"`
-	URL                 string `json:"url"`
-	TokenQueryParam     string `json:"tokenQueryParam,omitempty"`
-	TokenHeaderName     string `json:"tokenHeaderName,omitempty"`
-	TokenHeaderFormat   string `json:"tokenHeaderFormat,omitempty"`
-	PathQueryParam      string `json:"pathQueryParam"`
-	RequiresAuthSession bool   `json:"requiresAuthentication"`
-	PathPrefix          string `json:"pathPrefix"`
-	ExpiresAt           string `json:"expiresAt"`
+	Type                string   `json:"type"`
+	Method              string   `json:"method"`
+	URL                 string   `json:"url"`
+	TokenQueryParam     string   `json:"tokenQueryParam,omitempty"`
+	TokenHeaderName     string   `json:"tokenHeaderName,omitempty"`
+	TokenHeaderFormat   string   `json:"tokenHeaderFormat,omitempty"`
+	PathQueryParam      string   `json:"pathQueryParam"`
+	RequiresAuthSession bool     `json:"requiresAuthentication"`
+	PathPrefix          string   `json:"pathPrefix"`
+	ExpiresAt           string   `json:"expiresAt"`
+	Capabilities        []string `json:"capabilities,omitempty"`
 }
 
 type AuthenticatedSnapshot struct {
@@ -52,6 +67,29 @@ type AuthenticatedSnapshot struct {
 	FileCount           int             `json:"fileCount"`
 	HardwareProfile     json.RawMessage `json:"hardwareProfile"`
 	SystemStateManifest json.RawMessage `json:"systemStateManifest"`
+	// BackupType is backup_snapshots.backup_type as the server sends it on
+	// both the authenticate and exchange bootstraps ("file" |
+	// "system_image"; see apps/api/src/services/recoveryBootstrap.ts and
+	// routes/backup/bmrRecoveries.ts). "system_image" alone is enough to
+	// expect system state — see SnapshotExpectsSystemState (#5412).
+	BackupType string `json:"backupType"`
+	// FileIndex is present only when the client negotiated
+	// CapabilitySnapshotFileMembershipV1 AND the snapshot's owning job
+	// reports referenced_files > 0 (Part 0 §1). Its Status is always
+	// "complete" by the time the agent sees it — the server refuses the
+	// authenticate/exchange call itself while hydration is pending
+	// (Part 0 §1 negotiateRecoveryCapabilities), so a non-complete
+	// FileIndexInfo can never legitimately reach the agent.
+	FileIndex *FileIndexInfo `json:"fileIndex,omitempty"`
+}
+
+// FileIndexInfo mirrors apps/api/src/services/recoveryBootstrap.ts's
+// buildAuthenticatedBootstrapPayload snapshot.fileIndex shape field-for-field.
+type FileIndexInfo struct {
+	Status            string   `json:"status"`
+	ManifestSHA256    string   `json:"manifestSha256"`
+	ExternalCount     int      `json:"externalCount"`
+	OriginSnapshotIDs []string `json:"originSnapshotIds"`
 }
 
 type AuthenticatedDevice struct {
@@ -133,11 +171,23 @@ type RecoveryResult struct {
 
 // ValidationResult from post-restore checks.
 type ValidationResult struct {
-	Passed          bool     `json:"passed"`
-	ServicesRunning bool     `json:"servicesRunning"`
-	NetworkUp       bool     `json:"networkUp"`
-	CriticalFiles   bool     `json:"criticalFiles"`
-	Failures        []string `json:"failures,omitempty"`
+	Passed          bool `json:"passed"`
+	ServicesRunning bool `json:"servicesRunning"`
+	NetworkUp       bool `json:"networkUp"`
+	CriticalFiles   bool `json:"criticalFiles"`
+	// SystemStateApplied mirrors SystemStateOutcome.Applied so the verdict
+	// says whether OS state landed, not just files (#5412).
+	SystemStateApplied bool     `json:"systemStateApplied"`
+	Failures           []string `json:"failures,omitempty"`
+}
+
+// SystemStateOutcome is what the system-state phase of a recovery
+// concluded, handed to Validate so the verdict can refuse to pass a run
+// that was supposed to apply OS state and did not (#5412).
+type SystemStateOutcome struct {
+	Expected      bool // the bootstrap/backupType said the snapshot carries state
+	ManifestFound bool // system-state/manifest.json downloaded and decoded
+	Applied       bool // the platform Restorer applied every artifact
 }
 
 // VMRestoreConfig for restoring a backup as a new VM.

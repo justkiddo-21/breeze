@@ -12,11 +12,14 @@ import { eq, and, asc, desc, lt, or, sql, SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
 import { createDrExecutionAndEnqueue } from './drExecutionService';
+import { drRestoreConfigSchema, isBareMetalRebuildConfig } from './drBareMetalRebuildStep';
+import { verifyDeviceAccess } from './aiTools';
 import { resolveSiteDevicePartition } from './aiToolsSiteScope';
 import {
   collectReadableDrRows,
   drGroupsReadable,
   drReadSiteCeiling,
+  drReadUnrestricted,
   filterReadableDrExecutions,
   filterReadableDrPlans,
 } from './drReadAuthorization';
@@ -80,6 +83,34 @@ async function planStoredDevicesDenied(
 
 type DRHandler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
 
+/**
+ * W05b: `restoreConfig` goes through the same schema the HTTP routes use, so a
+ * BARE_METAL_REBUILD config is stored normalised or rejected. The central
+ * `deviceArgs` gate only sees top-level input properties, so the rebuild host
+ * nested in the config is gated here with the very same check
+ * (`verifyDeviceAccess`: org + device-exact + site axes).
+ */
+function parseRestoreConfigInput(
+  input: unknown,
+): { config: Record<string, unknown> } | { error: string } {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    return { error: 'Invalid restoreConfig: expected an object' };
+  }
+  const parsed = drRestoreConfigSchema.safeParse(input);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    const where = first?.path?.length ? ` at ${first.path.join('.')}` : '';
+    return { error: `Invalid restoreConfig${where}: ${first?.message ?? 'invalid'}` };
+  }
+  return { config: parsed.data };
+}
+
+async function rebuildHostDenied(config: Record<string, unknown>, auth: AuthContext): Promise<string | null> {
+  if (!isBareMetalRebuildConfig(config) || typeof config.rebuildHostDeviceId !== 'string') return null;
+  const access = await verifyDeviceAccess(config.rebuildHostDeviceId, auth);
+  return 'error' in access ? access.error : null;
+}
+
 // ============================================
 // Helpers
 // ============================================
@@ -138,6 +169,8 @@ export function registerDRTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1,
+    domain: 'backup',
+    searchHint: 'disaster recovery plans, status, RPO/RTO targets and recovery group counts',
     definition: {
       name: 'query_dr_plans',
       description: 'List disaster recovery plans with plan status, RPO/RTO targets, and plan-group counts.',
@@ -189,7 +222,7 @@ export function registerDRTools(aiTools: Map<string, AiTool>): void {
       // Unrestricted and system callers keep the original single-query path.
       // Only the restricted branch needs a concrete org to resolve device
       // sites; a restricted caller whose org cannot be resolved fails CLOSED.
-      if (siteCeiling === null) {
+      if (drReadUnrestricted(auth)) {
         const rows = await load(undefined, limit);
         return JSON.stringify({ plans: rows, showing: rows.length });
       }
@@ -210,6 +243,8 @@ export function registerDRTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1,
+    domain: 'backup',
+    searchHint: 'disaster recovery plan details, recovery groups and restore configuration',
     definition: {
       name: 'get_dr_plan_details',
       description: 'Get a disaster recovery plan with all plan groups and restore configuration details.',
@@ -255,6 +290,8 @@ export function registerDRTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1,
+    domain: 'backup',
+    searchHint: 'disaster recovery execution status, plan run history and execution details',
     definition: {
       name: 'get_dr_execution_status',
       description: 'Get DR execution details for a specific execution or list executions for a plan.',
@@ -339,7 +376,7 @@ export function registerDRTools(aiTools: Map<string, AiTool>): void {
       // See query_dr_plans: unrestricted/system keeps the single-query path;
       // only the restricted branch needs a concrete org, and fails closed
       // without one.
-      if (siteCeiling === null) {
+      if (drReadUnrestricted(auth)) {
         const rows = await load(undefined, limit);
         return JSON.stringify({ executions: rows, showing: rows.length });
       }
@@ -360,6 +397,8 @@ export function registerDRTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 3,
+    domain: 'backup',
+    searchHint: 'disaster recovery plan execution: rehearsal, failover, failback',
     definition: {
       name: 'execute_dr_plan',
       description: 'Create a DR execution record and queue the execution manifest for failover, failback, or rehearsal.',
@@ -384,6 +423,13 @@ export function registerDRTools(aiTools: Map<string, AiTool>): void {
       const plan = await loadPlanWithAccess(planId, auth);
       if (!plan) return JSON.stringify({ error: 'Plan not found or access denied' });
       if (plan.status === 'archived') return JSON.stringify({ error: 'Cannot execute an archived plan' });
+      // Executing a plan restores/fails over every device its STORED groups
+      // name — none of which the caller had to submit, so the declarative
+      // `deviceArgs` gate never saw them (#6096 #2). Same helper the plan-level
+      // mutations use; a no-op for unrestricted callers.
+      if (await planStoredDevicesDenied(auth, plan.orgId, plan.id)) {
+        return JSON.stringify({ error: 'Plan not found or access denied' });
+      }
 
       const groupConditions: SQL[] = [eq(drPlanGroups.planId, plan.id)];
       const gc = orgWhere(auth, drPlanGroups.orgId);
@@ -429,10 +475,12 @@ export function registerDRTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 2,
+    domain: 'backup',
+    searchHint: 'disaster recovery plans: create, update; recovery groups: add, update, delete',
     deviceArgs: ['devices'],
     definition: {
       name: 'manage_dr_plan',
-      description: 'Create or update disaster recovery plans and plan groups.',
+      description: 'Create or update disaster recovery plans and plan groups. Actions: create_plan, update_plan, add_group, update_group, delete_group.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -532,8 +580,19 @@ export function registerDRTools(aiTools: Map<string, AiTool>): void {
           return JSON.stringify({ error: 'name is required for add_group' });
         }
 
+        const restoreConfig = parseRestoreConfigInput(input.restoreConfig ?? {});
+        if ('error' in restoreConfig) return JSON.stringify({ error: restoreConfig.error });
+
         const plan = await loadPlanWithAccess(planId, auth);
         if (!plan) return JSON.stringify({ error: 'Plan not found or access denied' });
+        // The submitted `devices` are gated by `deviceArgs`, but the PLAN being
+        // extended is not: attaching a group is a control-plane write over every
+        // site/device the plan already reaches (#6096 #2).
+        if (await planStoredDevicesDenied(auth, plan.orgId, plan.id)) {
+          return JSON.stringify({ error: 'Plan not found or access denied' });
+        }
+        const hostDenied = await rebuildHostDenied(restoreConfig.config, auth);
+        if (hostDenied) return JSON.stringify({ error: hostDenied });
 
         const [group] = await db
           .insert(drPlanGroups)
@@ -544,10 +603,7 @@ export function registerDRTools(aiTools: Map<string, AiTool>): void {
             sequence: input.sequence !== undefined ? Number(input.sequence) : 0,
             dependsOnGroupId: typeof input.dependsOnGroupId === 'string' ? input.dependsOnGroupId : null,
             devices: Array.isArray(input.devices) ? input.devices : [],
-            restoreConfig:
-              input.restoreConfig && typeof input.restoreConfig === 'object'
-                ? input.restoreConfig as Record<string, unknown>
-                : {},
+            restoreConfig: restoreConfig.config,
             estimatedDurationMinutes:
               input.estimatedDurationMinutes !== undefined
                 ? Number(input.estimatedDurationMinutes)
@@ -587,8 +643,12 @@ export function registerDRTools(aiTools: Map<string, AiTool>): void {
             typeof input.dependsOnGroupId === 'string' ? input.dependsOnGroupId : null;
         }
         if (Array.isArray(input.devices)) updateData.devices = input.devices;
-        if (input.restoreConfig !== undefined && typeof input.restoreConfig === 'object') {
-          updateData.restoreConfig = input.restoreConfig as Record<string, unknown>;
+        if (input.restoreConfig !== undefined) {
+          const restoreConfig = parseRestoreConfigInput(input.restoreConfig);
+          if ('error' in restoreConfig) return JSON.stringify({ error: restoreConfig.error });
+          const hostDenied = await rebuildHostDenied(restoreConfig.config, auth);
+          if (hostDenied) return JSON.stringify({ error: hostDenied });
+          updateData.restoreConfig = restoreConfig.config;
         }
         if (input.estimatedDurationMinutes !== undefined) {
           updateData.estimatedDurationMinutes = Number(input.estimatedDurationMinutes);

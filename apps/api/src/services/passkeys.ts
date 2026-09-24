@@ -15,8 +15,31 @@ const DEFAULT_DEV_ORIGIN = 'http://localhost:4321';
 const CHALLENGE_TTL_SECONDS = 5 * 60;
 
 export type PasskeyPurpose = 'registration' | 'authentication';
-export type PasskeyTransport = 'ble' | 'cable' | 'hybrid' | 'internal' | 'nfc' | 'smart-card' | 'usb';
+/**
+ * WebAuthn `AuthenticatorTransport` values, widened to `string`. `@simplewebauthn/server`
+ * 14 already types every relevant input/output surface as plain `string[]`, not the
+ * old 7-value literal union: `generateRegistrationOptions`'s
+ * `excludeCredentials[].transports`, `generateAuthenticationOptions`'s
+ * `allowCredentials[].transports`, and `verifyRegistrationResponse`'s input
+ * `response.response.transports` (`AuthenticatorAttestationResponseJSON.transports` —
+ * the authentication/assertion counterpart, `AuthenticatorAssertionResponseJSON`, has
+ * no `transports` field at all in 14.0.2). Narrowing here bought nothing but data
+ * loss. The spec (WebAuthn §5.8.3) asks relying parties to round-trip transport
+ * values they don't recognize rather than discard them, and this jsonb-backed column
+ * (`db/schema/userPasskeys.ts`) has no reason to reject one.
+ */
+export type PasskeyTransport = string;
 export type PasskeyDeviceType = 'singleDevice' | 'multiDevice';
+
+/**
+ * Pass transports through unchanged — no allowlist filtering (see `PasskeyTransport`
+ * above). `undefined` (no transports reported) becomes `null` to match the stored
+ * field's `PasskeyTransport[] | null` type; an explicit `[]` stays `[]`, it is not
+ * normalized to `null`.
+ */
+function toPasskeyTransports(transports: string[] | undefined): PasskeyTransport[] | null {
+  return transports ?? null;
+}
 
 export type WebAuthnConfig = {
   rpID: string;
@@ -72,6 +95,58 @@ export class PasskeyChallengeError extends Error {
   }
 }
 
+/**
+ * #6499: `@simplewebauthn/server` REJECTS (rather than returning
+ * `verified: false`) when the attestation/assertion fails a structural check —
+ * origin mismatch, RP ID mismatch, challenge mismatch, bad signature. Its
+ * messages embed the RELYING PARTY's configured expectations verbatim, e.g.
+ * `Unexpected registration response origin "http://x", expected "http://y"`.
+ * Those escaped the passkey routes as a 500 whose body handed the caller the
+ * server's `WEBAUTHN_ORIGIN` / `WEBAUTHN_RP_ID`.
+ *
+ * Every such rejection is normalized here into this error: a fixed, generic
+ * `message` safe to return to a client, with the library's text kept on
+ * `detail` (and the original on `cause`) for server-side logging only. Routes
+ * map it onto their existing rejected-proof response — it is a rejected proof,
+ * not an infrastructure failure, so it must never be a 5xx.
+ *
+ * NOTE: this deliberately does NOT weaken verification. The wrap happens
+ * strictly around the verify call, after the single-use challenge has already
+ * been consumed, and a wrapped rejection is still a rejection.
+ */
+export class PasskeyVerificationError extends Error {
+  /** The library's own message. Server-side logging ONLY — never returned to a client. */
+  readonly detail: string;
+  readonly purpose: PasskeyPurpose;
+
+  constructor(purpose: PasskeyPurpose, cause: unknown) {
+    super('Passkey verification failed');
+    this.name = 'PasskeyVerificationError';
+    this.purpose = purpose;
+    this.cause = cause;
+    this.detail = cause instanceof Error ? cause.message : String(cause);
+  }
+}
+
+/**
+ * Run a `@simplewebauthn` verify call, converting any rejection into a
+ * {@link PasskeyVerificationError} and logging the library detail server-side.
+ */
+async function runVerification<T>(purpose: PasskeyPurpose, verify: () => Promise<T>): Promise<T> {
+  try {
+    return await verify();
+  } catch (err) {
+    const wrapped = new PasskeyVerificationError(purpose, err);
+    // Log the ORIGINAL error object, not just its message: an expected
+    // mismatch is self-describing, but an unexpected throw (a decode failure
+    // on a corrupt stored credential, a library bug) is often uninformative
+    // without its stack — and self-hosted instances have no Sentry DSN, so
+    // stdout is the only place that detail can land.
+    console.warn('[passkeys] %s verification rejected:', purpose, err);
+    throw wrapped;
+  }
+}
+
 export function resolveWebAuthnConfig(): WebAuthnConfig {
   const origin = trimTrailingSlash(
     envString('WEBAUTHN_ORIGIN')
@@ -124,13 +199,13 @@ export async function verifyPasskeyRegistration(input: {
   const config = resolveWebAuthnConfig();
   const challenge = await consumePasskeyChallenge('registration', input.userId, input.epochs);
 
-  return verifyRegistrationResponse({
+  return runVerification('registration', () => verifyRegistrationResponse({
     response: input.response,
     expectedChallenge: challenge,
     expectedOrigin: config.origin,
     expectedRPID: config.rpID,
     requireUserVerification: true
-  });
+  }));
 }
 
 export function registrationInfoToPasskeyFields(
@@ -149,7 +224,7 @@ export function registrationInfoToPasskeyFields(
     counter: info.credential.counter,
     deviceType: info.credentialDeviceType,
     backedUp: info.credentialBackedUp,
-    transports: response?.response.transports ?? null,
+    transports: toPasskeyTransports(response?.response.transports),
     aaguid: info.aaguid || null
   };
 }
@@ -184,7 +259,7 @@ export async function verifyPasskeyAuthentication(input: {
   const config = resolveWebAuthnConfig();
   const challenge = await consumePasskeyChallenge('authentication', input.userId);
 
-  return verifyAuthenticationResponse({
+  return runVerification('authentication', () => verifyAuthenticationResponse({
     response: input.response,
     expectedChallenge: challenge,
     expectedOrigin: config.origin,
@@ -194,7 +269,7 @@ export async function verifyPasskeyAuthentication(input: {
     advancedFIDOConfig: {
       userVerification: 'required'
     }
-  });
+  }));
 }
 
 export function authenticationInfoToPasskeyUpdateFields(

@@ -88,8 +88,9 @@ export interface DeviceDeletionTx {
  *      themselves reference the device) — they have no device_id of their own
  *   2. linked_device_id and device_id detach targets set to NULL (business
  *      records like tickets and support_sessions outlive the device)
- *   3. the device_id cascade tables
- *   4. the device row itself
+ *   3. topology detachment from the locked device scope, retaining graph history
+ *   4. the device_id cascade tables
+ *   5. the device row itself
  *
  * Caller supplies the transaction: the route pairs this with link-group
  * dissolution, and the reaper runs it standalone.
@@ -286,9 +287,35 @@ export async function deleteDeviceCascade(
            updated_at = now()
      WHERE device_id = ${deviceId}`);
 
+  // Recipe library E2 (#6167), same rule as the task statement above: a
+  // target whose device is gone must RECORD that, or a detached target is
+  // indistinguishable from a target whose pointer was never resolved. Runs
+  // BEFORE the DEVICE_DETACH_DEVICE_ID_TABLES loop so the loop's generic
+  // device_id = NULL is a no-op for these rows rather than the first writer.
+  await tx.execute(sql`
+    UPDATE ai_operator_task_targets
+       SET device_id = NULL,
+           detached_at = COALESCE(detached_at, now()),
+           detached_reason = COALESCE(detached_reason, 'device_deleted'),
+           state = 'detached',
+           updated_at = now()
+     WHERE device_id = ${deviceId}`);
+
   for (const detachTable of DEVICE_DETACH_DEVICE_ID_TABLES) {
     await tx.execute(sql`UPDATE ${sql.identifier(detachTable)} SET device_id = NULL WHERE device_id = ${deviceId}`);
   }
+
+  // Run the same lifecycle function as the device BEFORE DELETE trigger
+  // before the generic cascade removes its binding. Otherwise that trigger
+  // sees no binding and cannot audit or invalidate the old graph/build fence.
+  // Keep this AFTER linked-asset detachment: source writers hold their asset
+  // row before capture takes site state. Taking site state here before that
+  // UPDATE would invert their lock order and deadlock concurrent asset edits.
+  // Read ownership from the parent row already locked in THIS transaction;
+  // no caller-supplied org/site or second connection participates. An absent
+  // device selects no row, preserving idempotent deletion.
+  await tx.execute(sql`SELECT breeze_detach_topology_inventory_binding(
+    'device', d.id, d.org_id, d.site_id) FROM devices d WHERE d.id = ${deviceId}`);
 
   for (const table of getDeviceCascadeDeleteTables()) {
     if (DEVICE_CASCADE_AUDIT_ADMIN_TABLES.has(table)) {

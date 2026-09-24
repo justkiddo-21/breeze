@@ -34,13 +34,14 @@ import type { AiTool } from './aiTools';
 // Type-only: the runtime import stays dynamic inside the handler.
 import type { CancelOutcome } from './scriptCancellation';
 import type { ToolExecutionContext, VerifiedRunScript } from './toolExecutionContext';
-import { dispatchScriptToDevice } from './scriptDispatch';
+import { aiDispatchScriptToDevice, aiExecuteCommand } from './aiDispatch';
 import { approvalMethodForRelease, assertProposalRunnable, proposalDispatchSnapshot, transitionProposal } from './scriptProposals';
 import { aiScriptAuthoringEnabled } from '../config/env';
 import { executeScriptSchema, AI_RUN_CONTEXT_JSON_SCHEMA_PROPERTIES } from './scriptRunRequest';
 import { loadTenantVariableScope } from './tenantVariableResolution';
 import { captureException } from './sentry';
 import { scriptNeedsVariableScope } from './sourcedParameters';
+import { deviceScopeCondition, siteScopeCondition } from './aiToolsSiteScope';
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
@@ -89,6 +90,9 @@ async function verifyDeviceAccess(
   auth: AuthContext,
   requireOnline = false
 ): Promise<{ device: typeof devices.$inferSelect } | { error: string }> {
+  if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) {
+    return { error: 'Device not found or access denied' };
+  }
   const conditions: SQL[] = [eq(devices.id, deviceId)];
   const orgCond = auth.orgCondition(devices.orgId);
   if (orgCond) conditions.push(orgCond);
@@ -271,7 +275,7 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
       if ('error' in access) { proposalResults[deviceId] = { error: access.error }; continue; }
       try {
         const dispatch = await runOutsideDbContext(() => withSystemDbAccessContext(() =>
-          dispatchScriptToDevice({
+          aiDispatchScriptToDevice(auth, 'run_script', {
             device: access.device,
             source: { kind: 'proposal', proposal: runnable.proposal, snapshot },
             triggerType: 'manual',
@@ -504,7 +508,7 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
             : await loadTenantVariableScope(
                 scriptNeedsVariableScope(script) ? [access.device.orgId] : []
               );
-          return dispatchScriptToDevice({
+          return aiDispatchScriptToDevice(auth, 'run_script', {
             device: access.device,
             source: { kind: 'saved', script },
             parameters: (input.parameters as Record<string, unknown>) ?? {},
@@ -591,10 +595,12 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 3,
+    domain: 'scripts',
+    searchHint: 'device system commands, process and service control, files and event log diagnostics',
     deviceArgs: ['deviceId'],
     definition: {
       name: 'execute_command',
-      description: 'Execute a system command on a device. Read-only command types (list_processes, file_list, event_logs_list) run without a durable approval step in auto-execute session modes (still audit logged); under the default per-step mode they still take a lightweight inline confirmation. list_services, event_logs_query, and all mutating/file_read command types always require full user approval. Use for process management, service control, file operations, etc. Paging/filter payload params: list_processes { page, limit (max 500; larger values reset to 50), search, sortBy, sortDesc }; event_logs_query (Windows only) { page (max 20), limit (max 500), logName, level, source, eventId }; file_list { path, limit (max 5000) } — no paging, narrow the path to see more. Other payload keys: start_service/stop_service/restart_service { serviceName } (same key manage_services takes; `name` also works — either key reaches the agent as `name`, which is what it actually reads); kill_process { processName, pid }; file_read { path }. Large results are compacted for chat — if the result carries stdoutTruncation/_chat metadata, page or narrow the payload rather than repeating the same call.',
+      description: "Execute a system command on a device. list_processes, file_list, event_logs_list skip durable approval in auto-execute modes (audit logged); per-step mode requires inline confirmation. All other command types, including file_read, require full user approval.",
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -609,7 +615,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
             ],
             description: 'The type of command to execute'
           },
-          payload: { type: 'object', description: 'Command-specific parameters' }
+          payload: { type: 'object', description: 'Command-specific parameters: serviceName (name alias) for service control; processName/pid for kill_process; path for file_read/file_list.' }
         },
         required: ['deviceId', 'commandType']
       }
@@ -643,8 +649,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
       }
 
       // Import and use executeCommand from commandQueue
-      const { executeCommand } = await getCommandQueue();
-      const result = await executeCommand(deviceId, commandType, payload, {
+      const result = await aiExecuteCommand(auth, 'execute_command', deviceId, commandType, payload, {
         userId: auth.user.id,
         timeoutMs: 30000
       });
@@ -659,10 +664,12 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 3,
+    domain: 'scripts',
+    searchHint: 'script execution on devices from saved library scripts or reviewed proposals',
     deviceArgs: ['deviceIds'],
     definition: {
       name: 'run_script',
-      description: 'Execute a script on one or more devices. Give EITHER scriptId (a saved library script) OR proposalId (a reviewed, AI-authored proposal from propose_script) — never both. A device inside a maintenance window that suppresses scripts is skipped, not failed: that device\'s result carries status "suppressed" with a message — report it as deferred and do not retry it now.',
+      description: "Run a saved scriptId or reviewed proposalId from propose_script on devices; never both. Maintenance-window suppression is deferred, not failure: report it and do not retry now. Approval is required; the approver sees the run context.",
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -687,6 +694,8 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 3,
+    domain: 'scripts',
+    searchHint: 'running script cancellation, stop an execution on a device',
     // The device is derived from the execution, not supplied — so there is no
     // device-id property for the central `enforceDeviceArgs` gate to check.
     // The handler therefore gates inline. It uses the shared
@@ -776,10 +785,12 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 3,
+    domain: 'devices',
+    searchHint: 'device system services: list, start, stop, restart',
     deviceArgs: ['deviceId'],
     definition: {
       name: 'manage_services',
-      description: 'List, start, stop, or restart system services on a device.',
+      description: 'List, start, stop, or restart system services on a device. Actions: list, start, stop, restart.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -797,7 +808,6 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
       const access = await verifyDeviceAccess(deviceId, auth, true);
       if ('error' in access) return JSON.stringify({ error: access.error });
 
-      const { executeCommand } = await getCommandQueue();
       const commandTypeMap: Record<string, string> = {
         list: 'list_services',
         start: 'start_service',
@@ -808,7 +818,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
       const commandType = commandTypeMap[action];
       if (!commandType) return JSON.stringify({ error: `Unknown action: ${action}` });
 
-      const result = await executeCommand(deviceId, commandType, {
+      const result = await aiExecuteCommand(auth, 'manage_services', deviceId, commandType, {
         name: input.serviceName
       }, { userId: auth.user.id, timeoutMs: 30000 });
 
@@ -822,10 +832,12 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1,
+    domain: 'devices',
+    searchHint: 'device processes, CPU and memory usage: list, kill',
     deviceArgs: ['deviceId'],
     definition: {
       name: 'manage_processes',
-      description: 'List running processes on a device with CPU and memory usage, or terminate a process.',
+      description: 'List running processes on a device with CPU and memory usage, or terminate a process. Actions: list, kill.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -838,7 +850,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
           processId: { type: 'string', description: 'The PID of the process to kill (required for kill action)' },
           processName: {
             type: 'string',
-            description: 'The name of the process being killed, from a prior list_processes/manage_services:list read (e.g. "notepad.exe"). Recommended alongside processId for kill: a bare PID gets reused by the OS the instant a process exits, so including the name lets a reviewer verify what a kill call actually targets. This is used for verification/filtering, not a same-process guarantee — it is not re-checked against the live process list at dispatch time.'
+            description: "Process name from a prior read, recommended with PID for reviewer verification. Not rechecked live; PID reuse means no same-process guarantee."
           },
           search: { type: 'string', description: 'Filter process list by name' },
           sortBy: {
@@ -861,11 +873,9 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
       const access = await verifyDeviceAccess(deviceId, auth, true);
       if ('error' in access) return JSON.stringify({ error: access.error });
 
-      const { executeCommand } = await getCommandQueue();
-
       if (action === 'list') {
         const limit = Math.min(Math.max(1, Number(input.limit) || 50), 200);
-        const result = await executeCommand(deviceId, 'list_processes', {
+        const result = await aiExecuteCommand(auth, 'manage_processes', deviceId, 'list_processes', {
           search: input.search ?? undefined,
           sortBy: input.sortBy ?? 'cpu',
           limit
@@ -879,7 +889,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
           return JSON.stringify({ error: 'processId is required for kill action' });
         }
 
-        const result = await executeCommand(deviceId, 'kill_process', {
+        const result = await aiExecuteCommand(auth, 'manage_processes', deviceId, 'kill_process', {
           pid: input.processId
         }, { userId: auth.user.id, timeoutMs: 30000 });
 
@@ -896,6 +906,8 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1,
+    domain: 'scripts',
+    searchHint: 'organization script library, names, descriptions, languages, OS targets and categories',
     definition: {
       name: 'list_scripts',
       description: 'Search and filter scripts in the organization library. Returns a list of matching scripts including name, description, language, OS targets, and category.',
@@ -950,6 +962,8 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1,
+    domain: 'scripts',
+    searchHint: 'script parameters, versions, execution statistics and optional source content',
     definition: {
       name: 'get_script_details',
       description: 'Get script details including parameters, version history, and execution statistics. Script content is omitted unless explicitly requested and may be minimized in AI transcripts.',
@@ -1024,6 +1038,25 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
       }
 
       if (includeExecutionStats) {
+        // Execution stats are device-attributable rows reached without naming a
+        // device: scope them to the caller's org AND to BOTH access axes. The
+        // exact-device axis applies on its own for a device-LESS analysis run
+        // (#6086); the SITE axis is the human counterpart and is a separate
+        // narrowing — a site-restricted technician carries `allowedSiteIds`
+        // and no `allowedDeviceIds`, so the device guard alone is a silent
+        // no-op for them and they read counts/avg duration for every site in
+        // the org (audit 2026-09-17 §1.1). `script_executions.device_id` is
+        // NOT NULL with an FK to `devices`, so the join below is lossless and
+        // the unrestricted caller's aggregate is unchanged — the same shape
+        // `get_script_execution_history` already uses.
+        const statsConditions: SQL[] = [eq(scriptExecutions.scriptId, scriptId)];
+        const statsOrgCondition = auth.orgCondition(scriptExecutions.orgId);
+        if (statsOrgCondition) statsConditions.push(statsOrgCondition);
+        const statsDeviceCondition = deviceScopeCondition(auth, scriptExecutions.deviceId);
+        if (statsDeviceCondition) statsConditions.push(statsDeviceCondition);
+        const statsSiteCondition = siteScopeCondition(auth, devices.siteId);
+        if (statsSiteCondition) statsConditions.push(statsSiteCondition);
+
         const [stats] = await db
           .select({
             totalExecutions: sql<number>`count(*)::int`,
@@ -1036,9 +1069,17 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
             avgDurationSeconds: sql<number>`avg(extract(epoch from (${scriptExecutions.completedAt} - ${scriptExecutions.startedAt})))::numeric(10,2)`,
           })
           .from(scriptExecutions)
-          .where(eq(scriptExecutions.scriptId, scriptId));
+          .innerJoin(devices, eq(devices.id, scriptExecutions.deviceId))
+          .where(and(...statsConditions));
 
         result.executionStats = stats;
+        // The numbers above are narrowed but look org-wide on the wire, so the
+        // model reports them as the script's whole history. Say what they cover
+        // (review #6110).
+        if (auth.allowedSiteIds !== undefined || auth.allowedDeviceIds !== undefined) {
+          result.executionStatsScopeNote =
+            'These execution statistics cover only the devices within your access scope, not every device in the organization.';
+        }
       }
 
       return JSON.stringify(result);
@@ -1051,6 +1092,8 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1,
+    domain: 'scripts',
+    searchHint: 'built-in script templates and starting points for common tasks',
     definition: {
       name: 'list_script_templates',
       description: 'Browse available script templates for common tasks. Templates are pre-built scripts that can be used as starting points.',
@@ -1098,6 +1141,8 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1,
+    domain: 'scripts',
+    searchHint: 'script run history, status, exit codes, stdout, stderr and timing',
     definition: {
       name: 'get_script_execution_history',
       description: 'Get past execution results for a script. Shows status, exit codes, stdout/stderr, and timing information.',
@@ -1132,6 +1177,9 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
       const executionConditions: SQL[] = [eq(scriptExecutions.scriptId, input.scriptId as string)];
       const executionOrgCondition = auth.orgCondition(scriptExecutions.orgId);
       if (executionOrgCondition) executionConditions.push(executionOrgCondition);
+      if (auth.allowedDeviceIds !== undefined) {
+        executionConditions.push(inArray(scriptExecutions.deviceId, auth.allowedDeviceIds));
+      }
       if (auth.allowedSiteIds !== undefined) {
         executionConditions.push(inArray(devices.siteId, auth.allowedSiteIds));
       }
@@ -1171,9 +1219,11 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1,
+    domain: 'scripts',
+    searchHint: 'single script execution by ID, current status, exit code, output and timing',
     definition: {
       name: 'get_script_execution',
-      description: 'Get a single script execution by ID, including status, exit code, stdout, stderr, and timing. Use this for runs started OUTSIDE the current tool call — e.g. the user clicked Test Run in the script editor, or you have an execution id from get_script_execution_history. Also use it in exactly one other case: when run_script returned status "timeout" for a device, that means the 60s wait expired, NOT that the script failed — the device is still running it, and its real exit code and output land on the executionId run_script returned. Re-check that executionId before concluding anything about the script; do not "fix" a script on the strength of a timeout alone. For any other run_script outcome, the returned result is final — do not re-check it.',
+      description: "Get execution status, exit code, stdout/stderr and timing. Use for external runs or run_script timeouts: timeout means the 60s wait expired, not script failure. Recheck that executionId before changing the script; other run_script outcomes are final.",
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -1227,7 +1277,9 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
         ))
         .limit(1);
 
-      if (!execution) return JSON.stringify({ error: 'Execution not found' });
+      if (!execution || (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(execution.deviceId))) {
+        return JSON.stringify({ error: 'Execution not found' });
+      }
       // Site axis: same rule verifyDeviceAccess applies on the write path.
       if (auth.canAccessSite && !auth.canAccessSite(execution.deviceSiteId)) {
         return JSON.stringify({ error: 'Execution not found' });
@@ -1244,6 +1296,8 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1,
+    domain: 'scripts',
+    searchHint: 'script search across organization scripts and built-in templates by category, language or OS',
     definition: {
       name: 'search_script_library',
       description: 'Search the script library including org scripts and built-in templates. Filter by category, language, OS, or search text.',
@@ -1370,10 +1424,12 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1,
+    domain: 'devices',
+    searchHint: 'Windows scheduled tasks: list, run, disable, enable',
     deviceArgs: ['deviceId'],
     definition: {
       name: 'manage_scheduled_tasks',
-      description: 'List, run, enable, or disable Windows scheduled tasks on a device.',
+      description: 'List, run, enable, or disable Windows scheduled tasks on a device. Actions: list, run, disable, enable.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -1399,7 +1455,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
       const access = await verifyDeviceAccess(deviceId, auth, true);
       if ('error' in access) return JSON.stringify({ error: access.error });
 
-      const { executeCommand, CommandTypes } = await getCommandQueue();
+      const { CommandTypes } = await getCommandQueue();
       const commandTypeMap: Record<string, string> = {
         list: CommandTypes.TASKS_LIST,
         run: CommandTypes.TASK_RUN,
@@ -1419,7 +1475,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
         payload.path = input.taskName;
       }
 
-      const result = await executeCommand(deviceId, commandType, payload, {
+      const result = await aiExecuteCommand(auth, 'manage_scheduled_tasks', deviceId, commandType, payload, {
         userId: auth.user.id,
         timeoutMs: 30000
       });
@@ -1429,15 +1485,24 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
   });
 
   // ============================================
-  // registry_operations - Tier 1 base, with action escalation
+  // registry_operations - Tier 2 base, with action escalation
+  //
+  // Base raised 1 -> 2 (2026-09-17 AI tool ROLE audit §2.4, SR5-01 precedent):
+  // every action dispatches a real agent command, whose HTTP path requires
+  // devices:execute + MFA (routes/devices/commands.ts:49). read_key/get_value
+  // are classified in TIER2_ACTIONS and the writes in TIER3_ACTIONS; the base
+  // tier is what an UNCLASSIFIED action would fall back to, and Tier 1 there
+  // meant no approval gate and no audit-tier prompt.
   // ============================================
 
   registerTool({
-    tier: 1,
+    tier: 2,
+    domain: 'devices',
+    searchHint: 'Windows registry: read key, get value, set value, create key, delete key',
     deviceArgs: ['deviceId'],
     definition: {
       name: 'registry_operations',
-      description: 'Read or modify Windows registry keys and values on a device.',
+      description: 'Read or modify Windows registry keys and values on a device. Actions: read_key, get_value, set_value, create_key, delete_key.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -1469,7 +1534,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
       const access = await verifyDeviceAccess(deviceId, auth, true);
       if ('error' in access) return JSON.stringify({ error: access.error });
 
-      const { executeCommand, CommandTypes } = await getCommandQueue();
+      const { CommandTypes } = await getCommandQueue();
 
       const commandTypeMap: Record<string, string> = {
         read_key: CommandTypes.REGISTRY_VALUES,
@@ -1493,7 +1558,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
       if (input.valueData !== undefined) payload.data = input.valueData;
       if (input.valueType) payload.type = input.valueType;
 
-      const result = await executeCommand(deviceId, commandType, payload, {
+      const result = await aiExecuteCommand(auth, 'registry_operations', deviceId, commandType, payload, {
         userId: auth.user.id,
         timeoutMs: 30000,
       });

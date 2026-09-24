@@ -27,6 +27,8 @@ import { canManagePartnerWidePolicies } from './partnerWideAccess';
 import {
   auditSoftwarePolicyToolEvent,
   summarizeEnforcementChange,
+  AI_AUTO_INSTALL_REFUSAL_MESSAGE,
+  remediationOptionsArmsAutoInstall,
 } from './aiToolsSoftwarePolicyAudit';
 import { sanitizeThrownToolError } from './aiToolErrors';
 import { validateS3Details } from '../routes/backup/schemas';
@@ -183,9 +185,11 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1,
+    domain: 'patching',
+    searchHint: 'update rings, patch deferral, deadlines and auto-approval: list, get, create, update',
     definition: {
       name: 'manage_update_rings',
-      description: 'Manage update rings (patch approval policies). Update rings control patch deferral, deadlines, and auto-approval. Create an update ring first, then link it to a configuration policy\'s patch feature via manage_policy_feature_link with featureType "patch" and featurePolicyId. Actions: list, get, create, update.',
+      description: "Manage update rings for patch deferral, deadlines and auto-approval. Use manage_policy_feature_link for policy patch schedules. Actions: list, get, create, update.",
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -198,7 +202,7 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           gracePeriodHours: { type: 'number', description: 'Hours after deadline before reboot is forced (default: 4)' },
           categories: { type: 'array', items: { type: 'string' }, description: 'Patch categories to include (e.g. ["critical","important","security"])' },
           excludeCategories: { type: 'array', items: { type: 'string' }, description: 'Patch categories to exclude' },
-          autoApprove: { type: 'object', description: 'Auto-approval rules, e.g. { enabled: true, severities: ["critical","important"], deferralDays: 0, thirdPartyApps: false, thirdPartyDeferralDays: null }. severities gate OS patches only and must be a subset of ["critical","important","moderate","low"]. thirdPartyApps auto-approves third-party app updates (winget/Chocolatey/Homebrew/custom) — it also requires the linked configuration policy to include third-party patch sources. If enabled is true you MUST set at least one severity OR thirdPartyApps: true. On update, omitting thirdPartyApps/thirdPartyDeferralDays preserves the ring\'s current third-party settings; send explicit values to change them.' },
+          autoApprove: { type: 'object', description: "enabled, severities, deferralDays, thirdPartyApps, thirdPartyDeferralDays. Enabled needs severities or thirdPartyApps; omitted third-party fields persist." },
           enabled: { type: 'boolean', description: 'Whether ring is active (for update)' },
           limit: { type: 'number', description: 'Max results for list (default 25)' },
         },
@@ -345,6 +349,8 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1,
+    domain: 'patching',
+    searchHint: 'software allowlist, blocklist and audit policies: list, get, create, update',
     definition: {
       name: 'manage_software_policies',
       description: 'Manage software policies (allowlist/blocklist/audit). Create a software policy first, then link it to a configuration policy\'s software_policy feature via manage_policy_feature_link with featureType "software_policy" and featurePolicyId. Actions: list, get, create, update.',
@@ -353,13 +359,13 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
         properties: {
           action: { type: 'string', enum: ['list', 'get', 'create', 'update'], description: 'Action to perform' },
           policyId: { type: 'string', description: 'Software policy UUID (required for get/update)' },
-          ownerScope: { type: 'string', enum: ['organization', 'partner'], description: 'Ownership for create: "organization" (default, owned by the current org) or "partner" (partner-wide "all orgs" template usable by every org under the partner; requires full partner org access)' },
+          ownerScope: { type: 'string', enum: ['organization', 'partner'], description: "Create ownership: organization (default, current org) or partner (all-org template; requires full partner org access)." },
           name: { type: 'string', description: 'Policy name (required for create)' },
           description: { type: 'string', description: 'Policy description' },
           mode: { type: 'string', enum: ['allowlist', 'blocklist', 'audit'], description: 'Policy mode (required for create)' },
           rules: { type: 'object', description: 'Rules definition: { software: [{ name, vendor?, minVersion?, maxVersion?, catalogId?, reason? }], allowUnknown?: false }' },
           enforceMode: { type: 'boolean', description: 'Whether to enforce (block/uninstall) or just alert (default: false)' },
-          remediationOptions: { type: 'object', description: '{ autoUninstall?: false, notifyUser?: true, gracePeriod?: number, cooldownMinutes?: 30, maintenanceWindowOnly?: false }' },
+          remediationOptions: { type: 'object', description: "Options: autoUninstall, notifyUser, gracePeriod, cooldownMinutes, maintenanceWindowOnly. autoInstall is forbidden here; arming installs needs a human with MFA." },
           isActive: { type: 'boolean', description: 'Active state (for update)' },
           limit: { type: 'number', description: 'Max results for list (default 25)' },
         },
@@ -430,6 +436,11 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
         if (!input.name) return JSON.stringify({ error: 'name is required' });
         if (!input.mode) return JSON.stringify({ error: 'mode is required (allowlist, blocklist, or audit)' });
 
+        // Contract-A D4: AI callers may never arm software installation.
+        if (remediationOptionsArmsAutoInstall(input.remediationOptions)) {
+          return JSON.stringify({ error: AI_AUTO_INSTALL_REFUSAL_MESSAGE });
+        }
+
         const rows = await db.insert(softwarePolicies).values({
           orgId: owner.orgId,
           partnerId: owner.partnerId,
@@ -482,6 +493,11 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           return JSON.stringify({ error: 'Modifying a partner-wide software policy requires full partner org access (orgAccess must be "all")' });
         }
 
+        // Contract-A D4: AI callers may never arm software installation.
+        if (remediationOptionsArmsAutoInstall(input.remediationOptions)) {
+          return JSON.stringify({ error: AI_AUTO_INSTALL_REFUSAL_MESSAGE });
+        }
+
         const updates: Record<string, unknown> = {
           updatedAt: new Date(),
           // Site-ceiling gate contract §3: this AI-tool write bypasses
@@ -528,6 +544,8 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1,
+    domain: 'security',
+    searchHint: 'USB, Bluetooth and Thunderbolt control policies: list, get, create, update',
     definition: {
       name: 'manage_peripheral_policies',
       description: 'Manage peripheral control policies (USB, Bluetooth, Thunderbolt). Create a peripheral policy first, then link it to a configuration policy\'s peripheral_control feature via manage_policy_feature_link with featureType "peripheral_control" and featurePolicyId. Actions: list, get, create, update.',
@@ -666,9 +684,11 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1,
+    domain: 'backup',
+    searchHint: 'backup selection profiles, files, System State, SQL Server and Hyper-V: list, get, create, update, delete',
     definition: {
       name: 'manage_backup_profiles',
-      description: 'Manage backup selection profiles — reusable "what to protect" bundles (file paths/excludes, System State, SQL Server, Hyper-V) for a device class, e.g. "Server". Link a profile to a configuration policy via manage_policy_feature_link with featureType "backup" and featurePolicyId = the profile id; the policy carries schedule/retention/destination. Profiles are org-owned or partner-wide ("all orgs"). Actions: list, get, create, update, delete.',
+      description: 'Manage org-owned or partner-wide backup selection profiles: files, System State, SQL Server and Hyper-V. Profiles define what to protect; manage_policy_feature_link sets policy schedule, retention and destination. Actions: list, get, create, update, delete.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -677,7 +697,7 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           name: { type: 'string', description: 'Profile name (required for create)' },
           description: { type: 'string', description: 'Optional description' },
           ownerScope: { type: 'string', enum: ['organization', 'partner'], description: 'create only: "organization" (default, current org) or "partner" ("all orgs" — requires full partner access)' },
-          selections: { type: 'object', description: 'Data sources: { file?: { enabled, paths[], excludes[] }, system_image?: { enabled, includeSystemState? }, mssql?: { enabled, backupType?: "full"|"differential"|"log", excludeDatabases[] }, hyperv?: { enabled, consistencyType?: "application"|"crash", excludeVms[] } }. At least one source enabled; file requires paths.' },
+          selections: { type: 'object', description: 'Backup sources: file, system_image, mssql, hyperv. At least one enabled; file requires paths.' },
           isActive: { type: 'boolean', description: 'Active state' },
         },
         required: ['action'],
@@ -840,9 +860,11 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
 
   registerTool({
     tier: 1,
+    domain: 'backup',
+    searchHint: 'backup storage provider configurations: list, get, create, update',
     definition: {
       name: 'manage_backup_configs',
-      description: 'Manage backup configurations (storage provider settings). Create a backup config first, then link it to a configuration policy\'s backup feature via manage_policy_feature_link with featureType "backup" and featurePolicyId. Use query_backups to list existing jobs and trigger_backup for on-demand backups. Actions: list, get, create, update.',
+      description: 'Manage backup storage configurations; manage_backup_profiles defines selections. Use config IDs as inlineSettings.destinationConfigId with manage_policy_feature_link. Jobs: query_backups; on-demand runs: trigger_backup. Actions: list, get, create, update.',
       input_schema: {
         type: 'object' as const,
         properties: {

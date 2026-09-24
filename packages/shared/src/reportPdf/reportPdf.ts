@@ -2,6 +2,20 @@ import { jsPDF } from 'jspdf';
 import autoTable, { type CellHookData } from 'jspdf-autotable';
 import type { PostureControls, PostureProduct, PostureSummary } from '../types/postureReport';
 import type { ExecutiveSummary } from '../types/executiveSummaryReport';
+import type { HardwareLifecycleSummary } from '../types/hardwareLifecycleReport';
+import { renderHardwareLifecycleReport } from './hardwareLifecyclePdf';
+import type { ThreatDetectionSummary } from '../types/threatDetectionReport';
+import type { IdentityAccessSummary } from '../types/identityAccessReport';
+// Namespace import, not a named one: the arm below must be observable by a
+// `vi.spyOn(threat, 'renderThreatDetectionReport')` in
+// reportPdf.threatDetection.test.ts. A type with no arm falls silently through
+// to renderGenericReport, and that spy is the only thing that catches it.
+import * as threatDetectionPdf from './threatDetectionPdf';
+import type { EndpointManagementSummary } from '../types/endpointManagementReport';
+import { renderEndpointManagementReport } from './endpointManagementPdf';
+import type { VulnerabilityManagementSummary } from '../types/vulnerabilityManagementReport';
+import { renderVulnerabilityManagementReport } from './vulnerabilityManagementPdf';
+import * as identityAccessPdf from './identityAccessPdf';
 import {
   NARRATIVE_BULLET_MAX_CHARS,
   NARRATIVE_HEADLINE_MAX_CHARS,
@@ -33,7 +47,7 @@ type RGB = [number, number, number];
 
 // Palette derived from the web theme tokens (apps/web/src/styles/globals.css),
 // converted from HSL to the sRGB tuples jsPDF expects.
-const C = {
+const BASE_C = {
   ink: [17, 19, 24] as RGB, //            foreground
   primary: [47, 85, 198] as RGB, //       --primary  hsl(225 62% 48%)
   primaryDeep: [33, 58, 138] as RGB, //   header band shade
@@ -50,6 +64,72 @@ const C = {
   bandText: [224, 231, 250] as RGB, //    secondary text on the band
 } satisfies Record<string, RGB>;
 
+type Palette = { [K in keyof typeof BASE_C]: RGB };
+
+/**
+ * The active palette. `buildReportPdf` swaps in the partner's brand colours
+ * for the duration of one synchronous build and restores the Breeze default
+ * afterwards, so every drawing helper keeps reading `C.primary` unchanged.
+ */
+let C: Palette = BASE_C;
+
+// --- Brand colour derivation --------------------------------------------------
+
+const HEX_COLOR = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
+
+export function parseHexColor(value: string | null | undefined): RGB | null {
+  const v = (value ?? '').trim();
+  if (!HEX_COLOR.test(v)) return null;
+  const h = v.length === 4 ? `#${v[1]}${v[1]}${v[2]}${v[2]}${v[3]}${v[3]}` : v;
+  return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+}
+
+function relativeLuminance([r, g, b]: RGB): number {
+  const lin = (c: number) => {
+    const v = c / 255;
+    return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+}
+
+function contrastRatio(a: RGB, b: RGB): number {
+  const la = relativeLuminance(a);
+  const lb = relativeLuminance(b);
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+}
+
+function mix(a: RGB, b: RGB, t: number): RGB {
+  return [0, 1, 2].map((i) => Math.round(a[i]! + (b[i]! - a[i]!) * t)) as RGB;
+}
+
+/** Darken until the colour reads as text on white and carries white text on a band (≥4.5:1). */
+function ensureTextContrast(color: RGB): RGB {
+  let c = color;
+  for (let i = 0; i < 20 && contrastRatio(c, BASE_C.white) < 4.5; i += 1) c = mix(c, BASE_C.ink, 0.12);
+  return c;
+}
+
+/**
+ * Partner brand colours applied to the report chrome. The primary carries the
+ * band, subtitle, table heads and bullets; the accent carries the ribbon and
+ * section ticks. Status colours (green/amber/red) never change — they mean
+ * something. A brand primary too light for white text is darkened, not
+ * rejected, so the deliverable stays recognisably the partner's.
+ */
+export function paletteForBranding(branding?: ReportBranding | null): Palette {
+  const primary = parseHexColor(branding?.primaryColor);
+  if (!primary) return BASE_C;
+  const safePrimary = ensureTextContrast(primary);
+  const accent = parseHexColor(branding?.accentColor) ?? mix(primary, BASE_C.white, 0.45);
+  return {
+    ...BASE_C,
+    primary: safePrimary,
+    primaryDeep: mix(safePrimary, BASE_C.ink, 0.3),
+    teal: accent,
+    bandText: mix(safePrimary, BASE_C.white, 0.85),
+  };
+}
+
 export type ReportBranding = {
   /** Partner display name; falls back to "Breeze" when null. */
   name: string | null;
@@ -57,6 +137,13 @@ export type ReportBranding = {
   logoDataUrl: string | null;
   /** Logo intrinsic aspect ratio (width / height); used to size without distortion. */
   logoAspect: number | null;
+  /** Partner brand primary as a hex string; null keeps the Breeze palette. */
+  primaryColor?: string | null;
+  /** Partner brand accent (ribbon, section ticks); derived from the primary when null. */
+  accentColor?: string | null;
+  /** Partner contact for the closing "to approve or discuss" line; null hides it. */
+  contactEmail?: string | null;
+  contactName?: string | null;
 };
 
 export type BuildOpts = {
@@ -65,7 +152,7 @@ export type BuildOpts = {
   generatedAt: string;
   /** IANA timezone for formatting ISO date cells in generic tables. */
   timezone: string;
-  summary?: PostureSummary | ExecutiveSummary | OrgNarrativeReportSummary | FleetDesignReportSummary;
+  summary?: PostureSummary | ExecutiveSummary | OrgNarrativeReportSummary | FleetDesignReportSummary | HardwareLifecycleSummary | ThreatDetectionSummary | EndpointManagementSummary | VulnerabilityManagementSummary | IdentityAccessSummary;
   /** Slim baseline from the previous completed run, when the caller supplied
    * one (report_runs.result.previous) — drives the scorecard trend chip and
    * its "since <date>" label. */
@@ -92,6 +179,11 @@ const REPORT_TYPE_LABELS: Record<string, string> = {
   ai_org_narrative: 'Weekly AI Operations Narrative',
   ai_agent_impact: 'AI Agent Impact',
   ai_fleet_design: 'Fleet Design',
+  identity_access_review: 'Identity & Access Review',
+  hardware_lifecycle: 'Hardware Lifecycle',
+  threat_detection_review: 'Threat Detection Review',
+  endpoint_management_review: 'Endpoint Management Review',
+  vulnerability_management: 'Vulnerability Management',
 };
 
 const reportTypeLabel = (t: string): string => REPORT_TYPE_LABELS[t] ?? titleCase(t);
@@ -162,19 +254,24 @@ function drawHeaderBand(doc: jsPDF, opts: BuildOpts): void {
   // vector mark + partner/Breeze name. A failed embed degrades to the mark+name.
   let drewLogo = false;
   if (branding?.logoDataUrl) {
-    const logoH = 9;
+    // Fit the logo inside a 9 mm × 60 mm box, preserving its aspect: a tall
+    // mark fills the height, a wide wordmark fills the width and shrinks.
+    const maxH = 9;
+    const maxW = 60;
     const aspect = branding.logoAspect && branding.logoAspect > 0 ? branding.logoAspect : 3;
-    const logoW = Math.min(logoH * aspect, 46);
+    const scale = Math.min(maxH, maxW / aspect) / maxH;
+    const logoH = maxH * scale;
+    const logoW = logoH * aspect;
     const pad = 2;
     const chipW = logoW + pad * 2;
-    const chipH = logoH + pad * 2;
+    const chipH = maxH + pad * 2;
     const chipY = yMid - chipH / 2;
     // White safe-area chip so a dark or transparent partner logo always reads on
     // the brand-colour band (letterhead convention).
     set.fill(doc, C.white);
     doc.roundedRect(PAGE.mx, chipY, chipW, chipH, 1.6, 1.6, 'F');
     try {
-      doc.addImage(branding.logoDataUrl, 'PNG', PAGE.mx + pad, chipY + pad, logoW, logoH, undefined, 'FAST');
+      doc.addImage(branding.logoDataUrl, 'PNG', PAGE.mx + pad, chipY + pad + (maxH - logoH) / 2, logoW, logoH, undefined, 'FAST');
       drewLogo = true;
     } catch {
       // Erase the empty chip and fall back to the Breeze mark + name.
@@ -1838,8 +1935,30 @@ function renderGenericReport(doc: jsPDF, rows: Record<string, unknown>[], opts: 
  * band + footer) is applied to every page.
  */
 export function buildReportPdf(rows: unknown[], opts: BuildOpts): jsPDF {
+  C = paletteForBranding(opts.branding);
+  try {
+    return buildReportPdfWithPalette(rows, opts);
+  } finally {
+    C = BASE_C;
+  }
+}
+
+function buildReportPdfWithPalette(rows: unknown[], opts: BuildOpts): jsPDF {
   const doc = new jsPDF({ orientation: 'landscape' });
   const records = rows as Record<string, unknown>[];
+  // Document metadata: the title a reader sees in their viewer tab and the
+  // language a screen reader announces. Cheap, and the only structure jsPDF
+  // can give an assistive reader.
+  const orgName = (opts.summary as { org?: { name?: string } } | undefined)?.org?.name?.trim();
+  if (typeof doc.setProperties === 'function') {
+    doc.setProperties({
+      title: orgName ? `${reportTypeLabel(opts.reportType)} report for ${orgName}` : `${reportTypeLabel(opts.reportType)} report`,
+      subject: `${reportTypeLabel(opts.reportType)} report prepared ${opts.generatedAt}`,
+      author: opts.branding?.name?.trim() || 'Breeze',
+      creator: 'Breeze RMM',
+    });
+  }
+  if (typeof doc.setLanguage === 'function') doc.setLanguage('en-US');
 
   // SAFE guard is intentionally asymmetric: a summary carrying an exec shape
   // ('devices' key) must not enter the posture cover, but we don't require any
@@ -1890,6 +2009,159 @@ export function buildReportPdf(rows: unknown[], opts: BuildOpts): jsPDF {
     // section/table volume is unbounded up to the schema caps and may
     // paginate on its own.
     renderFleetDesignReport(doc, (opts.summary as FleetDesignReportSummary).fleetDesign!, opts);
+  } else if (
+    opts.reportType === 'hardware_lifecycle'
+    && opts.summary
+    && Array.isArray((opts.summary as HardwareLifecycleSummary).rows)
+  ) {
+    // Self-contained chrome: the plan table paginates on its own (didDrawPage)
+    // and the sections after it add pages as needed.
+    drawHeaderBand(doc, opts);
+    drawFooter(doc, opts);
+    renderHardwareLifecycleReport(
+      doc,
+      opts.summary as HardwareLifecycleSummary,
+      { generatedAt: opts.generatedAt, partnerName: opts.branding?.name ?? null, contactEmail: opts.branding?.contactEmail ?? null, contactName: opts.branding?.contactName ?? null },
+      {
+        C,
+        PAGE,
+        drawHeaderBand: (d) => drawHeaderBand(d, opts),
+        drawFooter: (d) => drawFooter(d, opts),
+        drawTitleBlock,
+        drawSectionHeading,
+      },
+    );
+  } else if (
+    opts.reportType === 'threat_detection_review'
+    && opts.summary
+    // `!= null` FIRST: `typeof null === 'object'`, so a summary carrying an
+    // explicit `coverage: null` would otherwise enter the arm and render the
+    // reassuring "covers the whole of this period" default — worse than
+    // falling through to the generic renderer, which at least does not claim
+    // coverage it cannot vouch for.
+    && (opts.summary as ThreatDetectionSummary).coverage != null
+    && typeof (opts.summary as ThreatDetectionSummary).coverage === 'object'
+  ) {
+    // Self-contained chrome: the detection table paginates on its own
+    // (didDrawPage) and the sections after it add pages as needed.
+    drawHeaderBand(doc, opts);
+    drawFooter(doc, opts);
+    threatDetectionPdf.renderThreatDetectionReport(
+      doc,
+      opts.summary as ThreatDetectionSummary,
+      {
+        generatedAt: opts.generatedAt,
+        partnerName: opts.branding?.name ?? null,
+        contactEmail: opts.branding?.contactEmail ?? null,
+        contactName: opts.branding?.contactName ?? null,
+        previous: opts.previous,
+      },
+      {
+        C,
+        PAGE,
+        drawHeaderBand: (d) => drawHeaderBand(d, opts),
+        drawFooter: (d) => drawFooter(d, opts),
+        drawTitleBlock,
+        drawSectionHeading,
+      },
+    );
+  } else if (
+    opts.reportType === 'endpoint_management_review'
+    && opts.summary
+    && Array.isArray((opts.summary as EndpointManagementSummary).rows)
+  ) {
+    // #5784 W03. Self-contained chrome for the same reason as the arm above:
+    // the device, trend and licence tables paginate on their own.
+    //
+    // A type with NO arm here silently falls through to renderGenericReport,
+    // which drops the entire designed summary and prints a plain row table —
+    // a plausible-looking, wrong PDF on both the portal (renderRunPdf) and the
+    // scheduled-email path. reportPdf.endpointManagement.test.ts is what
+    // catches that regression.
+    drawHeaderBand(doc, opts);
+    drawFooter(doc, opts);
+    renderEndpointManagementReport(
+      doc,
+      opts.summary as EndpointManagementSummary,
+      { generatedAt: opts.generatedAt, partnerName: opts.branding?.name ?? null },
+      {
+        C,
+        PAGE,
+        drawHeaderBand: (d) => drawHeaderBand(d, opts),
+        drawFooter: (d) => drawFooter(d, opts),
+        drawTitleBlock,
+        drawSectionHeading,
+      },
+    );
+  } else if (
+    opts.reportType === 'vulnerability_management'
+    && opts.summary
+    && typeof (opts.summary as VulnerabilityManagementSummary).open === 'object'
+  ) {
+    // #5784 W04. WITHOUT this arm the type falls through to
+    // `renderGenericReport` below, which prints the rows as a plain table and
+    // silently drops the whole designed summary — the exceptions section
+    // included. Self-contained chrome: both tables paginate on their own.
+    drawHeaderBand(doc, opts);
+    drawFooter(doc, opts);
+    renderVulnerabilityManagementReport(
+      doc,
+      opts.summary as VulnerabilityManagementSummary,
+      {
+        generatedAt: opts.generatedAt,
+        partnerName: opts.branding?.name ?? null,
+        contactEmail: opts.branding?.contactEmail ?? null,
+        contactName: opts.branding?.contactName ?? null,
+        previous: opts.previous,
+      },
+      {
+        C,
+        PAGE,
+        drawHeaderBand: (d) => drawHeaderBand(d, opts),
+        drawFooter: (d) => drawFooter(d, opts),
+        drawTitleBlock,
+        drawSectionHeading,
+      },
+    );
+  } else if (
+    opts.reportType === 'identity_access_review'
+    && opts.summary
+    // #5784 W06. `!= null` FIRST, for the same reason as the W02 arm above:
+    // `typeof null === 'object'`, so a snapshot carrying an explicit
+    // `coverage: null` would otherwise enter the arm and render the reassuring
+    // "covers the whole of this period" default. Falling through to the generic
+    // renderer at least claims no coverage it cannot vouch for.
+    //
+    // A type with NO arm here falls through to renderGenericReport, which prints
+    // the rows as a plain table and DROPS the whole designed summary. On a
+    // PII-bearing identity artifact that is not merely an ugly PDF: the caveats
+    // that keep it honest disappear while the sign-in rows remain.
+    && (opts.summary as IdentityAccessSummary).coverage != null
+    && typeof (opts.summary as IdentityAccessSummary).coverage === 'object'
+  ) {
+    // Self-contained chrome: the admin sign-in table paginates on its own
+    // (didDrawPage) and the sections after it add pages as needed.
+    drawHeaderBand(doc, opts);
+    drawFooter(doc, opts);
+    identityAccessPdf.renderIdentityAccessReport(
+      doc,
+      opts.summary as IdentityAccessSummary,
+      {
+        generatedAt: opts.generatedAt,
+        partnerName: opts.branding?.name ?? null,
+        contactEmail: opts.branding?.contactEmail ?? null,
+        contactName: opts.branding?.contactName ?? null,
+        previous: opts.previous,
+      },
+      {
+        C,
+        PAGE,
+        drawHeaderBand: (d) => drawHeaderBand(d, opts),
+        drawFooter: (d) => drawFooter(d, opts),
+        drawTitleBlock,
+        drawSectionHeading,
+      },
+    );
   } else {
     renderGenericReport(doc, records, opts);
   }

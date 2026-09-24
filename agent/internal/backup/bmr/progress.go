@@ -39,7 +39,121 @@ func (e *ProgressConflictError) Error() string {
 const (
 	progressMaxRetries  = 3
 	progressRequestPath = "/api/v1/backup/bmr/recover/progress"
+
+	// Caps mirror the server schema (apps/api/src/routes/backup/schemas.ts
+	// bmrProgressSchema) and w09-part0.md's Global Constraint "Bounded
+	// reporting": warnings <= 64 entries x 2000 chars, reason <= 2000
+	// chars, failedFilesSample <= 50 entries, serialized body <= 768 KiB
+	// (server body limit is 1 MiB).
+	maxProgressReasonRunes  = 2000
+	maxProgressWarnings     = 64
+	maxProgressWarningRunes = 2000
+	maxProgressFailedSample = 50
+	maxProgressBodyBytes    = 768 * 1024
 )
+
+// boundedFailures lets BoundProgressUpdate trim a typed Result (e.g.
+// *rebuild.Result) without bmr importing rebuild — rebuild already imports
+// bmr, so the reverse import would be a cycle. rebuild.Result implements
+// this via FailedFilesLen/CloneWithTrimmedFailedFiles.
+type boundedFailures interface {
+	FailedFilesLen() int
+	CloneWithTrimmedFailedFiles(max int) any
+}
+
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max])
+}
+
+// BoundProgressUpdate applies the caps this wave's Global Constraints
+// require (warnings <= 64 x 2000 chars, reason <= 2000 chars,
+// failedFilesSample <= 50 entries, serialized body <= 768 KiB) before a
+// ProgressUpdate is posted. It never mutates the caller's u.
+func BoundProgressUpdate(u ProgressUpdate) ProgressUpdate {
+	bounded := u
+	bounded.Reason = truncateRunes(u.Reason, maxProgressReasonRunes)
+
+	if len(u.Warnings) > 0 {
+		n := len(u.Warnings)
+		if n > maxProgressWarnings {
+			n = maxProgressWarnings
+		}
+		warnings := make([]string, n)
+		for i := 0; i < n; i++ {
+			warnings[i] = truncateRunes(u.Warnings[i], maxProgressWarningRunes)
+		}
+		bounded.Warnings = warnings
+	}
+
+	// Every real production call site passes a typed *rebuild.Result, never
+	// a map[string]any — the map branch below only covers the legacy path.
+	// Trim on a COPY, never the caller's pointer. CloneWithTrimmedFailedFiles
+	// is called unconditionally (not gated on FailedFilesLen() alone) since
+	// it also bounds Warnings/Error/Refusal (review finding #2): a Result
+	// whose FailedFilesSample is already <= maxProgressFailedSample (it is
+	// always capped to 50 at construction by restore_tree.go) but whose
+	// Warnings carries one entry per failed file still needs trimming, and
+	// a no-op trim on an already-small Result is cheap.
+	switch v := u.Result.(type) {
+	case boundedFailures:
+		bounded.Result = v.CloneWithTrimmedFailedFiles(maxProgressFailedSample)
+	case map[string]any:
+		if sample, ok := v["failedFilesSample"].([]string); ok && len(sample) > maxProgressFailedSample {
+			trimmed := make(map[string]any, len(v))
+			for k, val := range v {
+				trimmed[k] = val
+			}
+			trimmed["failedFilesSample"] = sample[:maxProgressFailedSample]
+			bounded.Result = trimmed
+		}
+	}
+
+	body, err := json.Marshal(bounded)
+	if err == nil && len(body) <= maxProgressBodyBytes {
+		return bounded
+	}
+
+	// Still too large (e.g. the failedFilesSample entries themselves are
+	// individually huge, or Result carries something else bulky) — fall
+	// back to a minimal, always-small summary rather than posting an
+	// oversized body the 1 MiB server limit would reject outright. Must
+	// read from a typed *rebuild.Result too (review finding #2) — not
+	// only from the legacy map[string]any shape — otherwise every
+	// production caller (which always passes a typed Result) degrades to
+	// a bare {"status","truncated":true} here, losing filesFailed and the
+	// failed-file sample even though bounded.Result (already trimmed
+	// above) would have fit comfortably.
+	summary := map[string]any{"status": bounded.Status, "truncated": true}
+	switch m := u.Result.(type) {
+	case map[string]any:
+		for _, k := range []string{"status", "error", "refusal", "filesFailed"} {
+			if v, present := m[k]; present {
+				summary[k] = v
+			}
+		}
+	default:
+		if sf, ok := bounded.Result.(resultSummaryFields); ok {
+			for k, v := range sf.SummaryFields() {
+				summary[k] = v
+			}
+		}
+	}
+	bounded.Result = summary
+	return bounded
+}
+
+// resultSummaryFields lets the last-resort fallback above pull a handful
+// of scalar fields (filesFailed, failedFilesOmitted, error, refusal) out
+// of a typed Result even when the full trimmed clone still didn't fit
+// under maxProgressBodyBytes — mirrors the boundedFailures seam (bmr
+// cannot import rebuild).
+type resultSummaryFields interface {
+	SummaryFields() map[string]any
+}
 
 // progressRetryDelay is a var (not const) so tests can shrink it to 0 —
 // see setProgressRetryDelayForTest in progress_test.go.
@@ -58,7 +172,7 @@ func PostRecoveryProgress(ctx context.Context, serverURL, token string, u Progre
 	body := struct {
 		Token string `json:"token"`
 		ProgressUpdate
-	}{Token: token, ProgressUpdate: u}
+	}{Token: token, ProgressUpdate: BoundProgressUpdate(u)}
 
 	payload, err := json.Marshal(body)
 	if err != nil {

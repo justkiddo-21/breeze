@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { db, withDbAccessContext, withSystemDbAccessContext } from '../../db';
-import { devices, scriptExecutions, scriptProposalReviews, scriptProposals } from '../../db/schema';
+import { auditLogs, devices, scriptExecutions, scriptProposalReviews, scriptProposals } from '../../db/schema';
 import { createOrganization, createPartner, createSite, createUser } from './db-utils';
 import { cascadeDeleteOrg } from '../../services/tenantCascade';
 import { executeOrgMerge } from '../../services/orgMerge';
@@ -144,6 +144,18 @@ runDb('a reviewer-decided (unattended) release stamps unattended_reviewer_gated 
     principal: { kind: 'user_session' },
     user: { id: user.id, email: user.email, name: 'U', isPlatformAdmin: false },
     partnerId: partner.id, orgId: org.id, scope: 'organization', accessibleOrgIds: [org.id], orgCondition, canAccessOrg,
+    // #5789: this proposal is `authorKind: 'chat_session'`, and the real
+    // release path (jobs/intentReleaseWorker.ts -> revalidateApprovedIntentForRelease
+    // -> buildAuthContextForIntent) rebuilds `aiOrigin` from the intent's OWN
+    // persisted `ai_origin_*` columns -- which a genuinely chat-created intent
+    // always carries, because propose_script itself only runs behind
+    // aiDispatch's own mandatory-origin gate. This fixture skips creating a
+    // real `action_intents` row (it hand-builds `auth` and calls the tool
+    // handler directly), so it has to supply the equivalent kind-only origin
+    // itself or `run_script` -> aiDispatchScriptToDevice's `requireAiOrigin`
+    // fails closed with MissingAiOriginError -- exactly the shape the guard
+    // is designed to reject on a REAL unattributed dispatch.
+    aiOrigin: { kind: 'ai_assistant' },
   } as AuthContext;
 
   // Exactly the context bag both release paths build for a lane intent
@@ -165,4 +177,28 @@ runDb('a reviewer-decided (unattended) release stamps unattended_reviewer_gated 
   expect(rows[0]!.sourceKind).toBe('proposal');
   expect(rows[0]!.approvedBy).toBe(user.id);
   expect(rows[0]!.approvalMethod).toBe('unattended_reviewer_gated');
+  // #5789: the origin threaded above must actually land on the row and
+  // produce exactly one `ai.` audit row — a proposal-backed dispatch with an
+  // aiOrigin writes `ai.script.executed`, never a second `ai.command.executed`
+  // (scriptDispatch.ts suppresses the commandQueue write for exactly this
+  // reason — see the review fix for #5788 item 2).
+  expect(rows[0]!.aiInitiatorKind).toBe('ai_assistant');
+
+  // The audit row is written by `void createAuditLogAsync(...)` (a lost audit
+  // row must never fail the dispatch), so it lands after the handler returns.
+  // Poll instead of reading once: read-once raced in CI three times on
+  // 2026-09-14, every time this file was the FIRST in its shard (cold pool,
+  // cold module graph) — the Postgres log then showed the audit insert
+  // arriving after the test's cleanup had already removed the org.
+  const readAiAudits = () => withSystemDbAccessContext(() =>
+    db.select({ action: auditLogs.action })
+      .from(auditLogs)
+      .where(eq(auditLogs.resourceId, device!.id)))
+    .then((rows) => rows.filter((a) => a.action.startsWith('ai.')).map((a) => a.action));
+  let aiAudits = await readAiAudits();
+  for (let attempt = 0; attempt < 150 && aiAudits.length === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    aiAudits = await readAiAudits();
+  }
+  expect(aiAudits).toEqual(['ai.script.executed']);
 });

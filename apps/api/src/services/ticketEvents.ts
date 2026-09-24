@@ -39,12 +39,14 @@ export type TicketEvent = TicketEventEnvelope & (
   // notify worker's ticket.commented branch skips the requester echo when
   // event.payload.inbound is set (guard: `isPublic && !inbound`), so the email is
   // never bounced back to the same sender — preventing a mail loop.
-  | { type: 'ticket.commented'; payload: { commentId: string; isPublic: boolean; inbound?: boolean } }
+  // verificationId: set when the comment is a caller-verification system
+  // effect (#6354); emitted post-commit by ticketOutboxPublisher.
+  | { type: 'ticket.commented'; payload: { commentId: string; isPublic: boolean; inbound?: boolean; verificationId?: string } }
   | { type: 'ticket.updated'; payload: { changed: string[] } }
   | { type: 'ticket.sla_breached'; payload: { target: 'response' | 'resolution'; internalNumber: string | null; subject: string; assigneeId: string | null } }
   // One-time autoresponse acknowledgement for an email-created ticket (spec §5).
-  // Emitted by inboundEmail/autoresponder.ts (after loop-prevention + the per-sender
-  // Redis cap) and handled by ticketNotifyWorker — the single outbound code path.
+  // Emitted by inboundEmail/autoresponder.ts (after loop-prevention) and handled by
+  // ticketNotifyWorker — the single outbound code path.
   // Payload-only: ticketId/orgId/partnerId come from TicketEventEnvelope.
   | { type: 'ticket.autoresponse'; payload: { to: string; internalNumber: string | null; subject: string } }
 );

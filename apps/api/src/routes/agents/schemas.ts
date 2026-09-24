@@ -148,6 +148,9 @@ const agentHealthObservationWireV1Schema = z.object({
 }).strict();
 
 export const heartbeatSchema = z.object({
+  // Version/shape failures are report-local and must not reject the heartbeat.
+  networkContextV1: z.unknown().optional(),
+  networkContextReset: z.unknown().optional(),
   metrics: z.object({
     cpuPercent: z.number(),
     ramPercent: z.number(),
@@ -346,6 +349,7 @@ export const heartbeatSchema = z.object({
     // tolerant contract: a malformed value drops this field alone, since the
     // route treats anything other than exactly 1 as "not capable".
     revocationLeaseProtocolVersion: z.number().int().optional().catch(undefined),
+    desktopFenceProtocolVersion: z.number().int().optional().catch(undefined),
     pamReconciliation: z.object({
       unresolvedCount: z.number().int().nonnegative(),
       quarantinedCount: z.number().int().nonnegative(),
@@ -760,6 +764,17 @@ const sessionTypeSchema = z.enum(['console', 'rdp', 'ssh', 'other']);
 const sessionActivityStateSchema = z.enum(['active', 'idle', 'locked', 'away', 'disconnected']);
 const sessionEventTypeSchema = z.enum(['login', 'logout', 'lock', 'unlock', 'switch']);
 
+// Caller verification (#6354 W01): OS identity evidence behind a session,
+// read by the agent from the logon token / uid. Exactly one of sid (Windows)
+// or uid (Unix) is present. `upn` is only supplied when the OS translated the
+// account to a directory user principal name.
+const sessionPrincipalSchema = z.object({
+  sid: z.string().regex(/^S-\d(?:-\d+)+$/).max(184).optional(),
+  uid: z.number().int().min(0).max(4294967295).optional(),
+  username: z.string().min(1).max(255),
+  upn: z.string().min(1).max(320).optional(),
+}).refine((p) => (p.sid !== undefined) !== (p.uid !== undefined), 'Exactly one SID or UID is required');
+
 export const submitSessionsSchema = z.object({
   sessions: z.array(z.object({
     username: z.string().min(1).max(255),
@@ -771,6 +786,7 @@ export const submitSessionsSchema = z.object({
     loginPerformanceSeconds: z.number().int().min(0).max(36000).optional(),
     isActive: z.boolean().optional(),
     lastActivityAt: z.string().optional(),
+    principal: sessionPrincipalSchema.optional(),
   })).max(128).default([]),
   events: z.array(z.object({
     type: sessionEventTypeSchema,
@@ -779,6 +795,7 @@ export const submitSessionsSchema = z.object({
     sessionId: z.string().max(128).optional(),
     timestamp: z.string().optional(),
     activityState: sessionActivityStateSchema.optional(),
+    principal: sessionPrincipalSchema.optional(),
   })).max(256).nullish(),
   collectedAt: z.string().optional(),
 });

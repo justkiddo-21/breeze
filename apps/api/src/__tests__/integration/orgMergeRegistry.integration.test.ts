@@ -223,6 +223,10 @@ const ORG_ID_BLOCKING_TRIGGERS: Readonly<Record<string, string>> = {
   // retention-GUC-only bypass as the audit tables. Table is leave-for-erasure.
   'script_proposal_reviews.script_proposal_reviews_block_update':
     'unconditional append-only RAISE (55000) on UPDATE',
+  // Append-only AI Operator task timeline (recipe library E2,
+  // 2026-10-26-160000): unconditional RAISE (55000) on UPDATE, same
+  // retention-GUC-only bypass. Table is leave-for-erasure.
+  'ai_operator_task_events.ai_operator_task_events_block_update': 'unconditional append-only RAISE',
 };
 
 /**
@@ -244,6 +248,27 @@ const CUSTOM_EXECUTORS_THAT_NEVER_WRITE_ORG_ID: Readonly<Record<string, string>>
 
 /** BENIGN = fires on the repoint but does not obstruct it. Reason per entry. */
 const ORG_ID_BENIGN_TRIGGERS: Readonly<Record<string, string>> = {
+  // Recipe library E2 (2026-10-26-160000): fires only on UPDATE OF
+  // device_id/ticket_id/contact_id and only stamps detached_at/_reason/state
+  // when the last pointer goes null. Never reads or writes org_id; the table is
+  // leave-for-erasure anyway.
+  'ai_operator_task_targets.ai_operator_task_targets_stamp_detach': 'stamps a detach when the last pointer is nulled; never touches org_id',
+  // These detach only on DELETE or an actual site change. Org-only repoints
+  // retain bindings; topology's ambient merge hooks fence and rekey them.
+  'devices.breeze_topology_source_lifecycle': 'same-site org-only updates retain source snapshots; merge prepare/finalize fences authority',
+  'topology_collection_runs.topology_evidence_immutable': 'permits org_id ownership updates while preserving historical content',
+  'topology_observations.topology_evidence_immutable': 'permits org_id ownership updates while preserving historical content',
+  'topology_config_template_versions.breeze_topology_template_content_guard': 'published payload immutable but owner org may move',
+  'topology_site_template_bindings.breeze_topology_template_unbind_guard': 'org-only merge preserves version fields',
+  'topology_probe_targets.breeze_topology_template_unbind_guard': 'org-only merge preserves version fields',
+  'topology_monitoring_policies.breeze_topology_template_unbind_guard': 'org-only merge preserves version fields',
+  'topology_diagnostic_runs.breeze_topology_diagnostic_run_guard': 'guards accepted content and terminal state, permits org-only ownership transfer',
+  'devices.breeze_topology_authority_detach': 'same-site org-only merge keeps bindings; prepare hook fences authority',
+  'discovered_assets.breeze_topology_authority_detach': 'same-site org-only merge keeps bindings; collision executor detaches before deletion',
+  'network_monitors.breeze_topology_monitor_site': 'only asset/site updates bind monitor scope; org-only merge uses deferred composite FKs',
+  'devices.breeze_topology_inventory_lifecycle': 'same-site org-only updates retain topology bindings',
+  'discovered_assets.breeze_topology_inventory_lifecycle': 'same-site org-only updates retain topology bindings',
+  'topology_manual_nodes.breeze_topology_inventory_lifecycle': 'same-site org-only updates retain topology bindings',
   // Validates NEW.org_id against backup_configs(storage_config_id) and raises
   // 23503 on a mismatch. It constrains the ORDER of the walk, not the write:
   // c2c_backup_configs.storage_config_id -> backup_configs(id) is a real FK, so
@@ -290,6 +315,18 @@ const ORG_ID_BENIGN_TRIGGERS: Readonly<Record<string, string>> = {
   // is still loser-owned) does not abort.
   'device_custom_field_values.device_custom_field_values_coherent':
     'merge fence: permits the repoint while the definition is still loser-owned, gated on same-partner status=\'merging\'',
+  // Cancels pending/queued CIS remediation actions for the moving device
+  // (2026-10-20-140000-cancel-cis-remediation-on-device-org-move.sql). It
+  // carries its own merge fence: `WHERE o.status::text = 'merging'` short-
+  // circuits to `RETURN NEW` before the cancellation UPDATE ever runs, so
+  // during a merge (which repoints devices.org_id set-based for the loser)
+  // it never touches cis_remediation_actions at all — same fence pattern as
+  // custom_field_definitions_no_shadow and device_custom_field_values_
+  // coherent above. Outside a merge it only ever writes
+  // cis_remediation_actions, never devices.org_id itself, and always
+  // `RETURN NEW` unconditionally — it neither RAISEs nor reverts the repoint.
+  'devices.breeze_cancel_cis_remediation_before_device_org_move':
+    'merge fence short-circuits during org merge; otherwise only cancels remediation rows and always RETURN NEW, never blocking or reverting the org_id write',
   // Plain updated_at bumps.
   'elevation_requests.trg_elevation_requests_updated_at': 'updated_at bump',
   'incidents.trg_incidents_updated_at': 'updated_at bump',

@@ -6,7 +6,9 @@ import { navigateTo } from '@/lib/navigation';
 import { ActionError, runAction, handleActionError } from '../../lib/runAction';
 import { isValidEmail } from '@/lib/email';
 import { currencyLabel, currencyOptions } from '@/lib/currencies';
+import { useOrgBillingProfile } from './OrgBillingProfile';
 import { pctFromFraction } from './invoiceTypes';
+import InheritedField from '../shared/InheritedField';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -32,8 +34,7 @@ interface OrgCurrencyImpact {
   changeRequired: boolean;
   impactsByCurrency: OrgCurrencyImpactGroup[];
   configurationWarnings: {
-    orgDefaultRate: { configured: boolean; rateCurrency: string | null; willStopApplying: boolean };
-    categoryRatesSkipped: number;
+    assignedBillingProfile: { id: string | null; currencyCode: string | null; currencyMismatch: boolean };
     orgCatalogOverridesSkipped: number;
     /** Unbilled time with hours but no hourly rate, stamped in the TARGET
      *  currency or unstamped — NOT stranded by the change, so it is reported on
@@ -58,6 +59,11 @@ interface OrgBilling {
   taxId: string | null;
   taxExempt: boolean;
   taxRate: string | null;
+  /** Additive field from GET /orgs/organizations/:id (settings consolidation,
+   *  W02-WEB / M10) — the partner's `defaultTaxRate`, already resolved in the
+   *  ambient request context. Used ONLY to label the blank-rate placeholder
+   *  with the inherited value (settings rule 4); never sent back on save. */
+  partnerDefaultTaxRate: string | null;
   billingContact: { email?: string | null; name?: string | null } | null;
   billingAddressLine1: string | null;
   billingAddressLine2: string | null;
@@ -89,10 +95,12 @@ export default function OrgBillingSettings({ orgId }: Props) {
   const [currencyPanelOpen, setCurrencyPanelOpen] = useState(false);
   const [currencyStale, setCurrencyStale] = useState(false);
   const [changingCurrency, setChangingCurrency] = useState(false);
+  const billingProfile = useOrgBillingProfile(orgId, currencyCode, saving || changingCurrency);
 
   const [taxId, setTaxId] = useState('');
   const [taxExempt, setTaxExempt] = useState(false);
   const [taxPercent, setTaxPercent] = useState('');
+  const [partnerDefaultTaxRate, setPartnerDefaultTaxRate] = useState<string | null>(null);
   const [contactEmail, setContactEmail] = useState('');
   const [contactName, setContactName] = useState('');
   const [line1, setLine1] = useState('');
@@ -115,6 +123,7 @@ export default function OrgBillingSettings({ orgId }: Props) {
       setTaxId(o.taxId ?? '');
       setTaxExempt(Boolean(o.taxExempt));
       setTaxPercent(pctFromFraction(o.taxRate));
+      setPartnerDefaultTaxRate(o.partnerDefaultTaxRate ?? null);
       setContactEmail(o.billingContact?.email ?? '');
       setContactName(o.billingContact?.name ?? '');
       setLine1(o.billingAddressLine1 ?? '');
@@ -235,6 +244,7 @@ export default function OrgBillingSettings({ orgId }: Props) {
         request: () => fetchWithAuth(`/orgs/${orgId}/billing-settings`, {
           method: 'PATCH',
           body: JSON.stringify({
+            billingProfileId: billingProfile.billingProfileId,
             taxId: taxId.trim() === '' ? null : taxId.trim(),
             taxExempt,
             taxRate: pct === '' ? null : Number(pct) / 100,
@@ -254,13 +264,14 @@ export default function OrgBillingSettings({ orgId }: Props) {
         successMessage: t('orgBillingSettings.saveSuccess'),
         onUnauthorized: UNAUTHORIZED,
       });
+      if (billingProfile.billingProfileId !== undefined) billingProfile.markSaved();
       void load();
     } catch (err) {
       handleActionError(err, t('orgBillingSettings.saveError'));
     } finally {
       setSaving(false);
     }
-  }, [saving, contactEmailInvalid, taxId, taxExempt, taxPercent, contactEmail, contactName, line1, line2, city, region, postal, country, orgId, load]);
+  }, [saving, contactEmailInvalid, taxId, taxExempt, taxPercent, contactEmail, contactName, line1, line2, city, region, postal, country, orgId, load, billingProfile.billingProfileId, billingProfile.markSaved, t]);
 
   if (loading) return <p className="text-sm text-muted-foreground">{t('orgBillingSettings.loading')}</p>;
   if (loadError) {
@@ -288,7 +299,8 @@ export default function OrgBillingSettings({ orgId }: Props) {
       <section className="rounded-lg border bg-card p-6 shadow-xs">
         <h2 className="text-lg font-semibold">{t('orgBillingSettings.currency.title')}</h2>
         <p className="mt-1 text-sm text-muted-foreground">{t('orgBillingSettings.currency.description')}</p>
-        <div className="mt-4 sm:max-w-xs">
+        <div className="grid gap-6 sm:grid-cols-2">
+        <div className="mt-4">
           <label className="text-sm font-medium" htmlFor="ob-currency">{t('orgBillingSettings.currency.label')}</label>
           {/* An already-stored off-list code stays selectable via currencyOptions
               so an existing setting is never silently reset (#3204 precedent). */}
@@ -302,6 +314,9 @@ export default function OrgBillingSettings({ orgId }: Props) {
               <option key={code} value={code}>{currencyLabel(code, i18n.language)}</option>
             ))}
           </select>
+        </div>
+
+        {billingProfile.panel}
         </div>
 
         {currencyPanelOpen && (
@@ -384,16 +399,11 @@ export default function OrgBillingSettings({ orgId }: Props) {
                 <div>
                   <h4 className="text-sm font-semibold">{t('orgBillingSettings.currency.warningsTitle')}</h4>
                   <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
-                    {impact.configurationWarnings.orgDefaultRate.willStopApplying && (
+                    {impact.configurationWarnings.assignedBillingProfile.currencyMismatch && (
                       <li data-testid="org-billing-currency-warning-rate">
-                        {t('orgBillingSettings.currency.warningRate', {
-                          currency: impact.configurationWarnings.orgDefaultRate.rateCurrency ?? '',
+                        {t('orgBillingProfile.currencyWarning', {
+                          currency: impact.configurationWarnings.assignedBillingProfile.currencyCode ?? '',
                         })}
-                      </li>
-                    )}
-                    {impact.configurationWarnings.categoryRatesSkipped > 0 && (
-                      <li data-testid="org-billing-currency-warning-categories">
-                        {t('orgBillingSettings.currency.warningCategories', { count: impact.configurationWarnings.categoryRatesSkipped })}
                       </li>
                     )}
                     {impact.configurationWarnings.orgCatalogOverridesSkipped > 0 && (
@@ -440,13 +450,19 @@ export default function OrgBillingSettings({ orgId }: Props) {
             <input id="ob-taxid" type="text" maxLength={100} value={taxId} onChange={(e) => setTaxId(e.target.value)} data-testid="org-billing-taxid" className={inputCls} />
           </div>
           <div>
-            <label className="text-sm font-medium" htmlFor="ob-taxrate">{t('orgBillingSettings.tax.taxRate')}</label>
-            <input
-              id="ob-taxrate" type="number" min={0} max={100} step="0.001" value={taxPercent}
-              onChange={(e) => setTaxPercent(e.target.value)} placeholder={t('orgBillingSettings.tax.partnerDefault')}
+            <InheritedField
+              id="ob-taxrate"
+              label={t('orgBillingSettings.tax.taxRate')}
+              value={taxPercent}
+              onChange={setTaxPercent}
+              inheritedValue={partnerDefaultTaxRate !== null ? pctFromFraction(partnerDefaultTaxRate) : null}
+              inheritedSource={t('orgBillingSettings.tax.partnerDefault')}
               disabled={taxExempt}
+              type="number"
+              min={0}
+              max={100}
+              step="0.001"
               data-testid="org-billing-taxrate"
-              className={`${inputCls} disabled:opacity-50`}
             />
           </div>
         </div>

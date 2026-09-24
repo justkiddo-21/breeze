@@ -12,6 +12,8 @@
  * (`ai_agent_op_evidence` is `leave-for-erasure`, per `orgMergeRegistry.ts`).
  * `mergeAiAgents` must clear the loser's supervised keys BEFORE repointing.
  */
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import type { SQL } from 'drizzle-orm';
@@ -387,5 +389,175 @@ describe('m365 tenant sync merge disposition', () => {
     const moved = await CUSTOM_EXECUTORS.m365_sync_state!(L, S);
     expect(moved).toEqual({ moved: 0, dropped: 0, notes: [] });
     expect(executeMock, 'the move half must issue no SQL').toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('moveAiRunArtifacts — split disposition by anchor (execution-plane W01)', () => {
+  afterEach(() => {
+    executeMock.mockReset();
+  });
+
+  it('re-points ONLY session-anchored rows, leaving run-anchored evidence with the loser shell', async () => {
+    executeMock.mockResolvedValueOnce({ rowCount: 4 });
+
+    const outcome = await CUSTOM_EXECUTORS.ai_run_artifacts!(L, S);
+
+    expect(outcome).toMatchObject({ moved: 4, dropped: 0 });
+    expect(executeMock, 'exactly one statement — the scoped repoint').toHaveBeenCalledTimes(1);
+
+    const compiled = dialect.sqlToQuery(executeMock.mock.calls[0]![0] as SQL);
+    expect(compiled.sql).toMatch(/update\s+ai_run_artifacts/i);
+    // The anchor split IS the fix: without this predicate the statement would
+    // also drag run-anchored rows off their immutable ai_agent_runs org and
+    // 23503 the whole merge at COMMIT.
+    expect(compiled.sql).toMatch(/run_id\s+is\s+null/i);
+    expect(compiled.sql).not.toMatch(/run_id\s+is\s+not\s+null/i);
+    // Bound params, not SQL text: a text-only assertion would pass against a
+    // statement that moved rows the wrong way.
+    expect(compiled.params).toContain(L);
+    expect(compiled.params).toContain(S);
+    // Survivor is the value being written, loser the row filter.
+    expect(compiled.params.indexOf(S)).toBeLessThan(compiled.params.indexOf(L));
+  });
+
+  it('is registered as a custom policy, not leave-for-erasure', () => {
+    expect(getOrgMergePolicies().get('ai_run_artifacts')?.kind).toBe('custom');
+  });
+});
+
+// ============================================================================
+// #5022 W01 Task 14 — script_executions detaches its AI origin on merge.
+//
+// It was a plain `repoint`. It still repoints org_id, but a merged execution
+// must not keep pointing at an `ai_agent_runs` row: runs are
+// `leave-for-erasure` (org_id is trigger-immutable), so the run stays with the
+// loser shell and dies with it while the execution moves to the survivor.
+//
+// `ai_session_id` is NOT actually at risk here — `ai_sessions` is itself in
+// REPOINT_TABLES and follows — but it is nulled together with the run id so
+// merge and device-move behave identically and "the fact survives, the pointer
+// does not" is ONE rule, not two. Do not "simplify" it back.
+// ============================================================================
+describe('script_executions merge policy detaches AI origin pointers (#5022 W01)', () => {
+  afterEach(() => {
+    executeMock.mockReset();
+  });
+
+  it('is classified custom, with a registered move executor', () => {
+    const policies = getOrgMergePolicies();
+
+    expect(policies.get('script_executions')).toMatchObject({ kind: 'custom' });
+    expect(CUSTOM_EXECUTORS.script_executions).toBeTypeOf('function');
+  });
+
+  it('repoints org_id AND nulls both origin pointers in one statement', async () => {
+    executeMock.mockResolvedValueOnce({ rowCount: 3 });
+
+    const result = await CUSTOM_EXECUTORS.script_executions!(L, S);
+
+    expect(executeMock).toHaveBeenCalledTimes(1);
+    const sqlText = dialect.sqlToQuery(executeMock.mock.calls[0]![0] as SQL).sql.replace(/\s+/g, ' ');
+    expect(sqlText).toMatch(/UPDATE script_executions/);
+    expect(sqlText).toMatch(/set org_id =|SET org_id =/i);
+    expect(sqlText).toMatch(/ai_session_id = NULL/i);
+    expect(sqlText).toMatch(/ai_agent_run_id = NULL/i);
+    // ai_initiator_kind is RETAINED.
+    expect(sqlText).not.toMatch(/ai_initiator_kind\s*=\s*NULL/i);
+    expect(result.moved).toBe(3);
+    expect(result.dropped).toBe(0);
+  });
+
+  it('is NOT listed as an executor that never writes org_id — it does write it', () => {
+    // Guards against a copy-paste into CUSTOM_EXECUTORS_THAT_NEVER_WRITE_ORG_ID
+    // in orgMergeRegistry.integration.test.ts, which would suppress the
+    // assertion that this executor re-tenants its rows at all.
+    const src = readFileSync(
+      fileURLToPath(new URL('./orgMergeCustomExecutors.ts', import.meta.url)),
+      'utf8',
+    ).replace(/\s+/g, ' ');
+
+    expect(src).toMatch(/UPDATE script_executions SET org_id =/);
+    expect(src).toMatch(/ai_agent_run_id = NULL/);
+  });
+});
+
+/**
+ * Tool catalog (#5215 / #5216). `tool_sources_org_slug_uq (org_id, slug)
+ * WHERE org_id IS NOT NULL` means two orgs may each own a source with the same
+ * slug; a plain repoint would violate it and abort the whole merge. Dropping
+ * the loser's registration instead would silently remove a working integration
+ * (and its enabled tools) with no signal, so the executor RENAMES on collision.
+ * The rename has to carry into `tool_source_tools.qualified_name`, which
+ * embeds the slug — otherwise the resolver would keep advertising a name that
+ * no longer splits back to a real source.
+ */
+describe('mergeToolSources / mergeToolSourceTools', () => {
+  afterEach(() => {
+    executeMock.mockReset();
+  });
+
+  it('classifies both tables as custom with registered move executors', () => {
+    const policies = getOrgMergePolicies();
+
+    expect(policies.get('tool_sources')).toMatchObject({ kind: 'custom' });
+    expect(policies.get('tool_source_tools')).toMatchObject({ kind: 'custom' });
+    expect(CUSTOM_EXECUTORS.tool_sources).toBeTypeOf('function');
+    expect(CUSTOM_EXECUTORS.tool_source_tools).toBeTypeOf('function');
+  });
+
+  it('renames a colliding slug, rewrites the child qualified names, then repoints', async () => {
+    executeMock
+      .mockResolvedValueOnce({ rowCount: 1 }) // slug rename
+      .mockResolvedValueOnce({ rowCount: 4 }) // qualified_name rewrite
+      .mockResolvedValueOnce({ rowCount: 2 }); // repoint
+
+    const result = await CUSTOM_EXECUTORS.tool_sources!(L, S);
+
+    expect(executeMock).toHaveBeenCalledTimes(3);
+    const renameSql = dialect.sqlToQuery(executeMock.mock.calls[0]![0] as SQL).sql.replace(/\s+/g, ' ');
+    expect(renameSql).toMatch(/UPDATE tool_sources/i);
+    // Only on an actual collision under the survivor.
+    expect(renameSql).toMatch(/EXISTS/i);
+    // The suffix must stay inside tool_sources_slug_chk (^[a-z][a-z0-9]{1,23}$):
+    // no underscore, no hyphen, and capped at 24 characters.
+    expect(renameSql).not.toMatch(/\|\|\s*'_/);
+    expect(renameSql).toMatch(/left\(/i);
+
+    const qualifiedSql = dialect.sqlToQuery(executeMock.mock.calls[1]![0] as SQL).sql.replace(/\s+/g, ' ');
+    expect(qualifiedSql).toMatch(/UPDATE tool_source_tools/i);
+    expect(qualifiedSql).toMatch(/qualified_name/i);
+    expect(qualifiedSql).toMatch(/name_not_addressable/);
+
+    const repointSql = dialect.sqlToQuery(executeMock.mock.calls[2]![0] as SQL).sql.replace(/\s+/g, ' ');
+    expect(repointSql).toMatch(/UPDATE "?tool_sources"? SET org_id =/i);
+
+    expect(result.moved).toBe(2);
+    expect(result.dropped).toBe(0);
+    expect(result.notes.join(' ')).toMatch(/renamed 1/);
+  });
+
+  it('emits no note when nothing collided', async () => {
+    executeMock
+      .mockResolvedValueOnce({ rowCount: 0 })
+      .mockResolvedValueOnce({ rowCount: 0 })
+      .mockResolvedValueOnce({ rowCount: 5 });
+
+    const result = await CUSTOM_EXECUTORS.tool_sources!(L, S);
+
+    expect(result.moved).toBe(5);
+    expect(result.notes).toEqual([]);
+  });
+
+  it('repoints tool_source_tools org_id so the owner guard still matches the parent', async () => {
+    executeMock.mockResolvedValueOnce({ rowCount: 7 });
+
+    const result = await CUSTOM_EXECUTORS.tool_source_tools!(L, S);
+
+    expect(executeMock).toHaveBeenCalledTimes(1);
+    const sqlText = dialect.sqlToQuery(executeMock.mock.calls[0]![0] as SQL).sql.replace(/\s+/g, ' ');
+    expect(sqlText).toMatch(/UPDATE tool_source_tools/i);
+    expect(sqlText).toMatch(/SET org_id =/i);
+    expect(result.moved).toBe(7);
+    expect(result.dropped).toBe(0);
   });
 });

@@ -8,12 +8,23 @@ const RELEASED_INTENT_DECISION = { approvalScope: 'four_eyes', decidedVia: 'sess
 const RELEASED_CONTEXT = { releaseDecision: RELEASED_INTENT_DECISION };
 import { createSessionPostToolUse, createSessionPreToolUse, runPreFlightChecks, safeParseJson } from './aiAgentSdk';
 import { db } from '../db';
-import { checkGuardrails, checkToolPermission, checkToolRateLimit } from './aiGuardrails';
+import { checkGuardrails, checkToolPermission, checkToolRateLimit, checkPermissionRequirements } from './aiGuardrails';
+import { checkTenantToolRateLimit } from './toolSources/guardrails';
+import type { TenantToolDescriptor } from './toolSources/resolver';
 import { waitForApproval } from './aiAgent';
 import type { ActionIntentSnapshot } from './actionIntents/intentService';
 import type { IntentReleaseRevalidation } from './actionIntents/revalidateRelease';
 import { APPROVED_EXECUTING_MESSAGE, APPROVED_EXECUTING_STATUS } from './aiToolHandoff';
 import { setActionIntentMetricsRecorder } from './actionIntents/metrics';
+
+const mockResolveLiveSessionToolAuthority = vi.fn(async (session: any): Promise<any> => ({
+  ok: true,
+  auth: session.auth,
+  toolAuth: session.toolAuth ?? session.auth,
+}));
+vi.mock('./aiSessionLiveAuthority', () => ({
+  resolveLiveSessionToolAuthority: (...args: unknown[]) => (mockResolveLiveSessionToolAuthority as any)(...args),
+}));
 
 // ============================================
 // Mocks
@@ -82,6 +93,14 @@ vi.mock('./aiGuardrails', () => ({
   checkGuardrails: vi.fn(),
   checkToolPermission: vi.fn(),
   checkToolRateLimit: vi.fn(),
+  checkPermissionRequirements: vi.fn(),
+}));
+
+// Real guardrailCheckForTenantTool/tenantToolPermissionRequirement (pure,
+// no side effects) — only checkTenantToolRateLimit (redis) is mocked.
+vi.mock('./toolSources/guardrails', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./toolSources/guardrails')>()),
+  checkTenantToolRateLimit: vi.fn(),
 }));
 
 const mockWriteAuditEvent = vi.fn();
@@ -299,8 +318,29 @@ function makeActiveSession(overrides: Record<string, unknown> = {}) {
     toolUseIdQueue: ['tool-use-1'],
     auditSnapshot: null,
     allowedTools: undefined,
+    tenantTools: new Map(),
     ...overrides,
   } as any;
+}
+
+function makeTenantToolDescriptor(overrides: Partial<TenantToolDescriptor> = {}): TenantToolDescriptor {
+  return {
+    id: 'tool-1',
+    sourceId: 'source-1',
+    sourceName: 'Hudu',
+    sourceKind: 'mcp',
+    ownerRef: { orgId: 'org-1', partnerId: null },
+    qualifiedName: 'hudu__get_asset',
+    name: 'get_asset',
+    description: 'Get an asset',
+    inputSchema: { type: 'object' },
+    tier: 1,
+    revision: 'rev-1',
+    rateLimitPerMinute: 60,
+    validate: () => ({ success: true }),
+    definition: { name: 'hudu__get_asset', description: 'Get an asset', input_schema: { type: 'object' } },
+    ...overrides,
+  };
 }
 
 // Typed as the real snapshot so an omitted field is a COMPILE error rather
@@ -728,6 +768,156 @@ describe('createSessionPreToolUse', () => {
       status: 'executing',
     }));
     expect(waitForApproval).not.toHaveBeenCalled();
+  });
+
+  describe('Task A10: tenant (BYO MCP) tools', () => {
+    beforeEach(() => {
+      vi.mocked(checkPermissionRequirements).mockResolvedValue(null);
+      vi.mocked(checkTenantToolRateLimit).mockResolvedValue(null);
+    });
+
+    it('a non-registered, non-tenant tool name is denied as Unknown tool', async () => {
+      const session = makeActiveSession();
+      const result = await createSessionPreToolUse(session)('not_a_real_tool', {});
+      expect(result).toEqual({ allowed: false, error: 'Unknown tool: not_a_real_tool' });
+    });
+
+    it('allows a tier-1 tenant tool after checkPermissionRequirements resolves null', async () => {
+      const descriptor = makeTenantToolDescriptor({ qualifiedName: 'hudu__get_asset', tier: 1 });
+      const session = makeActiveSession({ tenantTools: new Map([[descriptor.qualifiedName, descriptor]]) });
+
+      const result = await createSessionPreToolUse(session)('hudu__get_asset', { id: 'a-1' });
+
+      expect(result).toEqual({ allowed: true, intentId: undefined, context: undefined });
+      expect(checkPermissionRequirements).toHaveBeenCalledWith(
+        session.auth,
+        [{ resource: 'external_tools', action: 'use' }],
+      );
+      expect(checkTenantToolRateLimit).toHaveBeenCalledWith(descriptor, session.auth.user.id);
+      // Never routed through the core-tool RBAC/rate-limit checks.
+      expect(checkToolPermission).not.toHaveBeenCalled();
+      expect(checkToolRateLimit).not.toHaveBeenCalled();
+    });
+
+    it('denies a tenant tool when checkPermissionRequirements returns a denial string', async () => {
+      vi.mocked(checkPermissionRequirements).mockResolvedValue('Insufficient permissions: requires external_tools.use');
+      const descriptor = makeTenantToolDescriptor({ qualifiedName: 'hudu__get_asset', tier: 1 });
+      const session = makeActiveSession({ tenantTools: new Map([[descriptor.qualifiedName, descriptor]]) });
+
+      const result = await createSessionPreToolUse(session)('hudu__get_asset', {});
+
+      expect(result).toEqual({ allowed: false, error: 'Insufficient permissions: requires external_tools.use' });
+    });
+
+    // Tool catalog W01 PR B (#5216), Task B4: a tier-3 tenant tool takes the
+    // durable action-intents flow, carrying the external binding so release
+    // revalidation can reload the exact row + revision the approver saw.
+    describe('tier-3 tenant tools route through action intents (PR B)', () => {
+      beforeEach(() => {
+        // Same release-path scaffolding as the 'Tier 3: durable action-intents
+        // backing' suite below (revalidation mocked ok; the inline
+        // release-win system read returns a non-null row).
+        mockCreateActionIntent.mockReset();
+        mockWaitForIntentDecision.mockReset();
+        mockTransitionIntent.mockReset();
+        mockRevalidateApprovedIntentForRelease.mockReset();
+        mockRevalidateApprovedIntentForRelease.mockResolvedValue({ ok: true, auth: {} } as IntentReleaseRevalidation);
+        const selectChain: Record<string, unknown> = {
+          from: vi.fn(() => selectChain),
+          where: vi.fn(() => selectChain),
+          limit: vi.fn(async () => [{ id: 'intent', boundArgumentDigest: 'digest', ...RELEASED_INTENT_DECISION }]),
+        };
+        vi.mocked(db.select).mockReturnValue(selectChain as any);
+      });
+
+      const tier3 = () => makeTenantToolDescriptor({
+        id: 'tool-3',
+        qualifiedName: 'hudu__create_asset',
+        name: 'create_asset',
+        tier: 3,
+        revision: 'rev-7',
+        sourceName: 'Hudu',
+      });
+
+      it('mints a chat intent with the externalTool binding and denies when the approver rejects', async () => {
+        const descriptor = tier3();
+        mockInsertReturning({ id: 'exec-ext-1' });
+        mockCreateActionIntent.mockResolvedValue(makeIntentSnapshot({ id: 'intent-ext-1', approvalRequestIds: ['appr-ext-1'] }));
+        mockWaitForIntentDecision.mockResolvedValue('rejected');
+        const mockSet = vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) }));
+        vi.mocked(db.update).mockReturnValue({ set: mockSet } as any);
+        const session = makeActiveSession({
+          approvalMode: 'auto_approve',
+          tenantTools: new Map([[descriptor.qualifiedName, descriptor]]),
+        });
+
+        const result = await createSessionPreToolUse(session)('hudu__create_asset', { name: 'Printer 3' });
+
+        expect(result).toEqual({ allowed: false, error: 'Tool execution was rejected, cancelled, or expired' });
+        expect(mockCreateActionIntent).toHaveBeenCalledWith(session.auth, expect.objectContaining({
+          toolName: 'hudu__create_asset',
+          input: { name: 'Printer 3' },
+          source: 'chat',
+          orgId: 'org-1',
+          reason: 'hudu__create_asset — external tool from Hudu',
+          externalTool: { toolSourceToolId: 'tool-3', revision: 'rev-7', sourceName: 'Hudu' },
+        }));
+        // Never the core classifier / RBAC for a qualified name.
+        expect(checkGuardrails).not.toHaveBeenCalled();
+        expect(checkToolPermission).not.toHaveBeenCalled();
+        expect(checkPermissionRequirements).toHaveBeenCalledWith(session.auth, [{ resource: 'external_tools', action: 'write' }]);
+        expect(session.eventBus.publish).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'approval_required',
+          executionId: 'exec-ext-1',
+          approvalRequestId: 'appr-ext-1',
+          toolName: 'hudu__create_asset',
+          approvalScope: 'supervised',
+          intentBacked: true,
+        }));
+      });
+
+      it('allows the call once the intent is approved and the session wins the release CAS', async () => {
+        const descriptor = tier3();
+        mockInsertReturning({ id: 'exec-ext-2' });
+        mockCreateActionIntent.mockResolvedValue(makeIntentSnapshot({ id: 'intent-ext-2', approvalRequestIds: ['appr-ext-2'] }));
+        mockWaitForIntentDecision.mockResolvedValue('approved');
+        mockTransitionIntent.mockResolvedValue(true);
+        const mockSet = vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) }));
+        vi.mocked(db.update).mockReturnValue({ set: mockSet } as any);
+        const session = makeActiveSession({
+          approvalMode: 'per_step',
+          tenantTools: new Map([[descriptor.qualifiedName, descriptor]]),
+        });
+
+        const result = await createSessionPreToolUse(session)('hudu__create_asset', { name: 'Printer 3' });
+
+        expect(result).toEqual({ allowed: true, intentId: 'intent-ext-2', context: RELEASED_CONTEXT });
+        expect(mockTransitionIntent).toHaveBeenCalledWith(
+          'intent-ext-2', 'approved', 'executing',
+          expect.objectContaining({ executedAt: null, executionStartedAt: expect.any(Date) }),
+          { requireNotExpired: 'release' },
+        );
+        expect(mockRevalidateApprovedIntentForRelease).toHaveBeenCalled();
+      });
+
+      it('never passes externalTool for a core tool', async () => {
+        vi.mocked(checkGuardrails).mockReturnValue({
+          allowed: true, tier: 3, requiresApproval: true, description: 'Execute command',
+        } as any);
+        mockInsertReturning({ id: 'exec-core' });
+        mockCreateActionIntent.mockResolvedValue(makeIntentSnapshot({ id: 'intent-core', approvalRequestIds: ['appr-core'] }));
+        mockWaitForIntentDecision.mockResolvedValue('rejected');
+        const mockSet = vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) }));
+        vi.mocked(db.update).mockReturnValue({ set: mockSet } as any);
+        const session = makeActiveSession({ approvalMode: 'per_step', tenantTools: new Map([[tier3().qualifiedName, tier3()]]) });
+
+        await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' });
+
+        const input = mockCreateActionIntent.mock.calls[0]?.[1] as Record<string, unknown>;
+        expect(input.toolName).toBe('execute_command');
+        expect(input).not.toHaveProperty('externalTool');
+      });
+    });
   });
 
   describe('#3130: read-only Tier 2 auto-executes under per_step', () => {
@@ -1642,6 +1832,32 @@ describe('createSessionPreToolUse', () => {
       expect(mockTransitionIntent).not.toHaveBeenCalled();
     });
 
+    it('fails closed when the requester loses the underlying tool authority while awaiting self-approval', async () => {
+      vi.mocked(checkGuardrails).mockReturnValue({
+        allowed: true, tier: 2, requiresApproval: true, description: 'Take screenshot',
+      } as any);
+      mockInsertReturning({ id: 'exec-live-deny' });
+      vi.mocked(waitForApproval).mockResolvedValue(true);
+      mockResolveLiveSessionToolAuthority.mockResolvedValueOnce({
+        ok: false,
+        reason: 'Insufficient permissions: requires devices.control',
+      });
+      const mockSet = vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) }));
+      vi.mocked(db.update).mockReturnValue({ set: mockSet } as any);
+      const session = makeActiveSession({ approvalMode: 'per_step', auditSnapshot: {} });
+
+      const result = await createSessionPreToolUse(session)('take_screenshot', { deviceId: 'd-1' });
+
+      expect(result).toEqual({ allowed: false, error: 'Authorization changed while awaiting approval; the action was not executed.' });
+      expect(mockResolveLiveSessionToolAuthority).toHaveBeenCalledTimes(1);
+      expect(mockSet).toHaveBeenCalledWith(expect.objectContaining({ status: 'rejected' }));
+      expect(mockSet).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'executing' }));
+      expect(mockWriteAuditEvent).toHaveBeenCalledWith(undefined, expect.objectContaining({
+        action: 'ai.security.tool_authority_changed',
+        result: 'failure',
+      }));
+    });
+
     it('returns allowed:false without creating an action intent when rejected or timed out', async () => {
       vi.mocked(checkGuardrails).mockReturnValue({
         allowed: true,
@@ -1683,6 +1899,109 @@ describe('createSessionPreToolUse', () => {
 
       expect(mockTransitionIntent).not.toHaveBeenCalled();
     });
+  });
+
+  it('fails closed and aborts an approved plan before a Tier-2 step can use stale site authority', async () => {
+    vi.mocked(checkGuardrails).mockReturnValue({
+      allowed: true, tier: 2, requiresApproval: true, description: 'Take screenshot',
+    } as any);
+    mockResolveLiveSessionToolAuthority.mockResolvedValueOnce({
+      ok: false,
+      reason: 'Site authority changed',
+    });
+    const session = makeActiveSession({
+      approvalMode: 'action_plan',
+      auditSnapshot: {},
+      activePlanId: 'plan-live-deny',
+      approvedPlanSteps: new Map([[0, { toolName: 'take_screenshot', input: { deviceId: 'd-1' } }]]),
+    });
+
+    const result = await createSessionPreToolUse(session)('take_screenshot', { deviceId: 'd-1' });
+
+    expect(result).toEqual({ allowed: false, error: 'Authorization changed after plan approval; the action was not executed.' });
+    expect(session.activePlanId).toBeNull();
+    expect(session.eventBus.publish).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'plan_complete', status: 'aborted',
+    }));
+    expect(session.eventBus.publish).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'plan_step_start' }));
+    expect(mockWriteAuditEvent).toHaveBeenCalledWith(undefined, expect.objectContaining({
+      action: 'ai.security.tool_authority_changed',
+      result: 'failure',
+    }));
+  });
+
+  it('revalidates live authority at the auto-approve release point and fails closed', async () => {
+    vi.mocked(checkGuardrails).mockReturnValue({
+      allowed: true, tier: 2, requiresApproval: false, description: 'Take screenshot',
+    } as any);
+    mockResolveLiveSessionToolAuthority.mockResolvedValueOnce({
+      ok: false,
+      reason: 'User is no longer active',
+    });
+    const session = makeActiveSession({ approvalMode: 'auto_approve', auditSnapshot: {} });
+
+    const result = await createSessionPreToolUse(session)('take_screenshot', { deviceId: 'd-1' });
+
+    // Release point #1: auto_approve / readOnlyAutoExec. This branch has no
+    // approval prompt at all, so without revalidation a revoked user's queued
+    // Tier-2 tool would execute on the session's start-time snapshot.
+    expect(result).toEqual({
+      allowed: false,
+      error: 'Authorization changed before execution; the action was not executed.',
+    });
+    expect(mockResolveLiveSessionToolAuthority).toHaveBeenCalledTimes(1);
+    expect(db.insert).not.toHaveBeenCalled();
+    expect(mockWriteAuditEvent).toHaveBeenCalledWith(undefined, expect.objectContaining({
+      action: 'ai.security.tool_authority_changed',
+      result: 'failure',
+    }));
+  });
+
+  it('fails closed when the live authority revalidation itself throws', async () => {
+    vi.mocked(checkGuardrails).mockReturnValue({
+      allowed: true, tier: 2, requiresApproval: false, description: 'Take screenshot',
+    } as any);
+    mockResolveLiveSessionToolAuthority.mockRejectedValueOnce(new Error('db unreachable'));
+    const session = makeActiveSession({ approvalMode: 'auto_approve', auditSnapshot: {} });
+
+    const result = await createSessionPreToolUse(session)('take_screenshot', { deviceId: 'd-1' });
+
+    // A revalidation that cannot complete must DENY, never fall through to the
+    // stale snapshot — a database blip would otherwise reopen the whole window.
+    expect(result).toEqual({
+      allowed: false,
+      error: 'Authorization changed before execution; the action was not executed.',
+    });
+    expect(db.insert).not.toHaveBeenCalled();
+    expect(mockWriteAuditEvent).toHaveBeenCalledWith(undefined, expect.objectContaining({
+      action: 'ai.security.tool_authority_changed',
+      result: 'failure',
+      errorMessage: 'Live authority revalidation failed',
+    }));
+  });
+
+  it('updates the session authority in place when live revalidation succeeds', async () => {
+    vi.mocked(checkGuardrails).mockReturnValue({
+      allowed: true, tier: 2, requiresApproval: false, description: 'Take screenshot',
+    } as any);
+    const freshAuth = { ...makeAuth({ scope: 'organization' }), token: { roleId: 'role-fresh' } } as any;
+    const freshToolAuth = { ...freshAuth, accessibleOrgIds: ['org-1'] } as any;
+    mockResolveLiveSessionToolAuthority.mockResolvedValueOnce({
+      ok: true, auth: freshAuth, toolAuth: freshToolAuth,
+    });
+    mockInsertReturning({ id: 'exec-live-ok' });
+    const session = makeActiveSession({ approvalMode: 'auto_approve', auditSnapshot: {} });
+
+    const result = await createSessionPreToolUse(session)('take_screenshot', { deviceId: 'd-1' });
+
+    expect(result).toEqual({ allowed: true });
+    // The refreshed authority must REPLACE the snapshot, or the tool still
+    // runs on stale reach even though revalidation passed.
+    expect(session.auth).toBe(freshAuth);
+    expect(session.toolAuth).toBe(freshToolAuth);
+    expect(mockWriteAuditEvent).not.toHaveBeenCalledWith(undefined, expect.objectContaining({
+      action: 'ai.security.tool_authority_changed',
+    }));
   });
 
   it('blocks tools outside the session allowlist before approval handling', async () => {
@@ -2225,12 +2544,31 @@ describe('createSessionPostToolUse', () => {
     }), false, 12);
 
     // Two inserts fire (aiMessages then aiToolExecutions); the execution row is
-    // the one carrying toolInput.
+    // the one carrying redacted toolInput.
     const execInsert = values.mock.calls
       .map((c) => c[0])
       .find((v) => v && typeof v === 'object' && 'toolInput' in v);
     expect(execInsert).toBeDefined();
     expect((execInsert as any).delegantToolCallId).toBe('tc-123');
+  });
+
+  it('redacts sensitive input before inserting a tier-1 execution row', async () => {
+    const session = makeActiveSession();
+    const values = mockInsertValues();
+    const callback = createSessionPostToolUse(session);
+
+    await callback('query_devices', {
+      deviceId: 'device-1',
+      providerConfig: { accessKey: 'synthetic-access', secretKey: 'synthetic-secret' },
+    }, JSON.stringify({ status: 'completed' }), false, 12);
+
+    const execInsert = values.mock.calls
+      .map((c) => c[0])
+      .find((v) => v && typeof v === 'object' && 'toolInput' in v);
+    expect(execInsert.toolInput).toMatchObject({
+      deviceId: 'device-1',
+      providerConfig: { accessKey: '[REDACTED]', secretKey: '[REDACTED]' },
+    });
   });
 
   it('omits delegantToolCallId for non-M365 tool output (no key present)', async () => {

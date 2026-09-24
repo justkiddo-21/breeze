@@ -27,6 +27,7 @@ import {
   ChevronsDownUp,
   ShieldCheck,
   KeyRound,
+  LayoutTemplate,
   Package,
   Plug,
   Network,
@@ -72,6 +73,7 @@ import { SIDEBAR_CYCLE_MODE_EVENT } from '../../lib/keyboard/useGlobalShortcuts'
 import type { PermissionGrant } from '@breeze/shared';
 import { fetchWithAuth, useAuthStore } from '../../stores/auth';
 import { SERVICE_MANAGEMENT_MODES, useOrgStore, type ServiceManagementMode } from '../../stores/orgStore';
+import { useToolSourcesGate } from '../../stores/featuresStore';
 import { hasPermission } from '../../lib/permissions';
 import { WEB_VERSION } from '../../lib/version';
 import { semverCompare } from '@breeze/shared';
@@ -167,6 +169,8 @@ type NavItem = {
   // Shown only when the current partner has AI for Office enabled (runtime flag
   // from /orgs/partners/me). Undefined means not gated on the partner flag.
   requiresAiForOffice?: boolean;
+  /** #5216 W01: gated on the SERVER's TOOL_SOURCES_ENABLED via /config. */
+  requiresToolSources?: boolean;
   // Hidden unless the user holds this permission (e.g. billing nav gated on
   // invoices:read). UX only — the route still enforces it server-side. While
   // the permission set is still loading, the item stays hidden. Typed as the
@@ -238,7 +242,11 @@ export const navSections: NavSection[] = [
     icon: BrainCircuit,
     items: [
       { name: 'Fleet Orchestration', labelKey: 'nav.fleetOrchestration', href: '/fleet', icon: BrainCircuit },
-      { name: 'AI Assistant', labelKey: 'nav.aiAssistant', href: '/workspace', icon: MessagesSquare },
+      // #6498: /workspace drives the own-session /ai/* routes, every one of
+      // which requires ai_sessions:use (#6396). Without this gate a role holding
+      // only devices:read saw the full AI Workspace and a bare "Permission
+      // denied" on send.
+      { name: 'AI Assistant', labelKey: 'nav.aiAssistant', href: '/workspace', icon: MessagesSquare, requiredPermission: { resource: 'ai_sessions', action: 'use' } },
       { name: 'AI Agents', labelKey: 'nav.aiAgents', href: '/settings/ai-agents', icon: Bot, requiredPermission: { resource: 'ai_agents', action: 'read' } },
       // Execution-trace runs list/detail (Wave 6 PR 1, #3828) — file-routed under
       // /ai-agents/runs (not /settings/*) since a run is fleet activity, not
@@ -250,8 +258,9 @@ export const navSections: NavSection[] = [
       // Fleet Designer W03 (#5653) — apply/rollback surface for a Fleet
       // Design report, so it sits beside the other AI-report reads.
       { name: 'Fleet Design', labelKey: 'nav.fleetDesign', href: '/ai-agents/fleet-design', icon: DraftingCompass, requiredPermission: { resource: 'ai_agents', action: 'read' } },
-      { name: 'AI Usage & Budget', labelKey: 'nav.aiUsageBudget', href: '/settings/ai-usage', icon: BrainCircuit, partnerScopeOnly: true },
+      { name: 'AI Usage', labelKey: 'nav.aiUsage', href: '/settings/ai-usage', icon: BrainCircuit, partnerScopeOnly: true },
       { name: 'Script authoring', labelKey: 'nav.scriptAuthoring', href: '/settings/ai-script-authoring', icon: FileCode, requiredPermission: { resource: 'ai_agents', action: 'read' } },
+      { name: 'Tool Sources', labelKey: 'nav.toolSources', href: '/settings/tool-sources', icon: Plug, requiresToolSources: true, requiredPermission: { resource: 'tool_sources', action: 'read' } },
       { name: 'AI for Office', labelKey: 'nav.aiForOffice', href: '/ai-for-office', icon: FileSpreadsheet, partnerScopeOnly: true, requiresAiForOffice: true },
     ],
   },
@@ -282,6 +291,7 @@ export const navSections: NavSection[] = [
     // A billing-only role has no devices:read grant, so the whole section hides.
     items: [
       { name: 'Overview', labelKey: 'nav.securityOverview', href: '/security', icon: ShieldCheck, requiredPermission: { resource: 'devices', action: 'read' } },
+      { name: 'IOC Scans', labelKey: 'nav.securityScans', href: '/security/scans', icon: ScanSearch, requiredPermission: { resource: 'devices', action: 'read' } },
       ...(ENABLE_EDR_INTEGRATIONS
         ? [{ name: 'EDR', labelKey: 'nav.edr', href: '/security/edr', icon: ShieldAlert, requiredPermission: { resource: 'devices', action: 'read' } } satisfies NavItem]
         : []),
@@ -337,7 +347,11 @@ export const navSections: NavSection[] = [
       { name: 'Quotes', labelKey: 'nav.quotes', href: '/billing/quotes', icon: FileText, partnerScopeOnly: true, requiredPermission: { resource: 'quotes', action: 'read' } },
       { name: 'Invoices', labelKey: 'nav.invoices', href: '/billing/invoices', icon: Receipt, partnerScopeOnly: true, requiredPermission: { resource: 'invoices', action: 'read' } },
       { name: 'Contracts', labelKey: 'nav.contracts', href: '/contracts', icon: FileSignature, partnerScopeOnly: true, requiredPermission: { resource: 'contracts', action: 'read' } },
+      // ScrollText, not FileText: Quotes three rows up already uses FileText, and
+      // two identical icons in one section is the confusion this wave removes.
+      { name: 'Agreements', labelKey: 'nav.agreements', href: '/agreements/templates', icon: ScrollText, partnerScopeOnly: true, requiredPermission: { resource: 'agreements', action: 'read' } },
       { name: 'Product Catalog', labelKey: 'nav.productCatalog', href: '/settings/catalog', icon: Tags, partnerScopeOnly: true, requiredPermission: { resource: 'catalog', action: 'read' } },
+      { name: 'Deliverable Templates', labelKey: 'nav.deliverableTemplates', href: '/settings/deliverable-templates', icon: LayoutTemplate, partnerScopeOnly: true },
     ],
   },
   {
@@ -363,6 +377,7 @@ export const navSections: NavSection[] = [
     items: [
       { name: 'Partner', labelKey: 'nav.partner', href: '/settings/partner', icon: Building, partnerScopeOnly: true },
       { name: 'Billing', labelKey: 'nav.billing', href: '/settings/billing', icon: CreditCard, partnerScopeOnly: true, requiredPermission: { resource: 'invoices', action: 'write' } },
+      { name: 'Ticketing', labelKey: 'nav.ticketing', href: '/settings/ticketing', icon: Ticket, partnerScopeOnly: true },
       // Users + Roles are both served by the users routes (users:read).
       { name: 'Users', labelKey: 'nav.users', href: '/settings/users', icon: Users, requiredPermission: { resource: 'users', action: 'read' } },
       { name: 'Roles', labelKey: 'nav.roles', href: '/settings/roles', icon: KeyRound, requiredPermission: { resource: 'users', action: 'read' } },
@@ -461,6 +476,10 @@ const allNavItems: NavItem[] = [
 const pathAliases: Record<string, string> = {
   '/software-inventory': '/software',
   '/software-policies': '/software',
+  // The Agreements nav item points at the Templates tab; the Signed tab is a
+  // sibling route, not a child, so prefix matching would leave the item
+  // unhighlighted there.
+  '/agreements/signed': '/agreements/templates',
 };
 
 // Determine which section a given href belongs to (for auto-expand)
@@ -595,6 +614,9 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
   const [brandName, setBrandName] = useState<string | null>(null);
   const [brandLogoUrl, setBrandLogoUrl] = useState<string | null>(null);
   const [aiForOfficeEnabled, setAiForOfficeEnabled] = useState(false);
+  // #5216 W01 — the server kill switch, read from /config through the shared
+  // features store (the same one registration/aiOperatorTasks use).
+  const { enabled: toolSourcesEnabled } = useToolSourcesGate();
   // #5075 W04 — persisted, so the first paint after a reload already has the
   // right sections; the /orgs/partners/me effect below refreshes it.
   const serviceManagementMode = useOrgStore((state) => state.serviceManagementMode);
@@ -813,6 +835,7 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
   const isNavItemVisible = (item: NavItem): boolean => {
     if (item.requiresModule === 'service_management' && serviceManagementMode !== 'native') return false;
     if (item.requiresAiForOffice && !aiForOfficeEnabled) return false;
+    if (item.requiresToolSources && !toolSourcesEnabled) return false;
     if (item.platformAdminOnly && !isPlatformAdmin) return false;
     if (item.partnerScopeOnly) {
       const { scope } = getJwtClaims();

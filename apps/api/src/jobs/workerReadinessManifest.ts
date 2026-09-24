@@ -7,7 +7,8 @@ export type ConsumerRequirementRule =
   | 'abuse_or_partner_trust_enabled' // shared abuse/partner-trust consumer
   | 'audit_chain_verify_enabled' // audit verification kill switch
   | 'event_dispatch_enabled'  // D3a: eventDispatch (EVENT_DISPATCH_MODE !== 'off')
-  | 'ai_agents_enabled';      // D3a: aiAgentRunner (AI_AGENTS_ENABLED)
+  | 'ai_agents_enabled'       // D3a: aiAgentRunner (AI_AGENTS_ENABLED)
+  | 'sending_domains_configured'; // W03: sendingDomainsWorker (EMAIL_DOMAINS_PROVIDER set)
 
 export type WorkerInitializerClassification =
   | {
@@ -23,6 +24,12 @@ export type WorkerInitializerClassification =
       initializer:
         | 'desktopSessionOrphanRecovery'
         | 'oauthRevocationRetryWorker'
+        | 'topologyOutboxWorker'
+        | 'topologyReconcileWorker'
+        | 'topologyCollectionRetentionWorker'
+        | 'topologyTemplateApplyWorker'
+        | 'topologyDiagnosticWorker'
+        | 'topologyDiagnosticSweeper'
         | 'incidentCorrelationWorker'
         | 'incidentTimelineEnricher'
         | 'incidentSlaMonitor';
@@ -41,6 +48,7 @@ const consumers = (
 
 export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification[] = [
   consumers('alertWorkers', ['alertWorker']),
+  consumers('monitorConversionPreviewWorker'),
   consumers('alertCorrelationWorker'),
   consumers('metricRollupsWorker'),
   consumers('metricRollupMaintenance'),
@@ -81,6 +89,9 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('m365SyncRetention'),
   consumers('serviceProcessCheckRetention'),
   consumers('changeLogRetention'),
+  // Disk Cleanup v2 W03. Plain Redis-required consumer: it constructs and
+  // attaches unconditionally wherever it is placed, with no feature flag.
+  consumers('filesystemCleanupRunRetention'),
   consumers('oauthCleanup'),
   consumers('stripeAccountCacheRefresh'),
   consumers('exchangeRateSync'),
@@ -100,9 +111,17 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   { kind: 'non_consumer', initializer: 'desktopSessionOrphanRecovery' },
   consumers('playbookRetention'),
   consumers('discoveryWorker'),
+  // Database-backed interval repair; no BullMQ consumer to declare.
+  { kind: 'non_consumer', initializer: 'topologyOutboxWorker' },
+  { kind: 'non_consumer', initializer: 'topologyReconcileWorker' },
+  { kind: 'non_consumer', initializer: 'topologyCollectionRetentionWorker' },
+  { kind: 'non_consumer', initializer: 'topologyTemplateApplyWorker' },
+  { kind: 'non_consumer', initializer: 'topologyDiagnosticWorker' },
+  { kind: 'non_consumer', initializer: 'topologyDiagnosticSweeper' },
   consumers('networkBaselineWorker'),
   consumers('snmpWorker'),
   consumers('monitorWorker'),
+  consumers('monitorScriptWorker'),
   consumers('unifiWorker'),
   consumers('unifiTelemetryWorker'),
   consumers('snmpRetention'),
@@ -114,6 +133,7 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('dnsSyncWorker'),
   consumers('s1SyncWorker'),
   consumers('huntressSyncWorker'),
+  consumers('backupProviderSyncWorker'),
   // The Worker is constructed unconditionally and attached unconditionally;
   // M365_TENANT_SYNC_ENABLED gates the TICK registration and the processor
   // body, not the construction. A flag-gated construction would need its own
@@ -127,7 +147,9 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('patchSchedulerWorker'),
   consumers('maintenanceRebootWorker'),
   consumers('backupWorker'),
+  consumers('backupSnapshotFileIndexWorker'),
   consumers('sensitiveDataWorker'),
+  consumers('securityScanWorker'),
   consumers('peripheralJobs', ['peripheralAnomalyWorker', 'peripheralPolicyDistributionWorker']),
   consumers('browserSecurityWorker', ['browserSecurityEvalWorker']),
   consumers('c2cBackupWorker'),
@@ -159,6 +181,9 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('quoteExpiryReaper'),
   consumers('suppressionExpiryReaper'),
   consumers('ticketNotifyWorker'),
+  // Caller verification (#6354 W01) — post-commit effects publisher; one
+  // consumer named for its initializer, Redis-required like its neighbours.
+  consumers('callerVerificationPublisher'),
   consumers('ticketSlaWorker'),
   consumers('inboundEmailWorker'),
   consumers('ticketMailboxPollWorker'),
@@ -180,6 +205,7 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('orgMerge'),
   consumers('pamActuationWorker'),
   consumers('ticketAttachmentReaper'),
+  consumers('aiArtifactSweeper'),
   consumers('ticketOutboxPublisher'),
   consumers('metricAnomalyIncidentPublisher'),
   consumers('aiUnattendedExposureRetention'),
@@ -222,6 +248,13 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('ticketOutboxRetention'),
   consumers('intentOutboxRetention'),
   consumers('metricAnomalyIncidentRetention'),
+  // #5290 (W03) — daily monitor breach-episode retention prune, same shape as
+  // mlOutputRetention/metricAnomalyIncidentRetention/agentLogRetention: one
+  // Worker, no flag gate, constructs and attaches unconditionally under its
+  // own registry-key name.
+  consumers('monitorEpisodeRetention'),
+  // #4248 W03 — one Worker, unconditional, attached under its registry name.
+  consumers('reportRunDeliveryReconciler'),
   consumers('accountingReconcileWorker'),
   // Merge-forward (origin/main 2026-09-06): three more `socket-owner` registry
   // entries, each read rather than inferred. None is feature-flag gated and
@@ -248,6 +281,17 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
     optionalConsumers: ['eventDispatchMaintenance'],
   },
   consumers('agentCommandRelay'),
+  // Tool Catalog W1 (#5215 / #5216), Task A6 — one Worker, unconditional,
+  // attached under its registry name. Not flag-gated at the readiness layer:
+  // TOOL_SOURCES_ENABLED gates the job PROCESSOR body (discoverSource is
+  // skipped), not whether the Worker itself constructs and attaches.
+  consumers('toolSourceDiscoveryWorker'),
+  // Partner sending domains W03. initializeSendingDomainsWorker returns before
+  // constructing a Worker when EMAIL_DOMAINS_PROVIDER is unset — the default on
+  // every self-hosted install and on hosted until W05 — so a plain-required row
+  // would leave every api/all process permanently not-ready. Same shape and
+  // same reason as aiAgentRunner above.
+  consumers('sendingDomainsWorker', ['sendingDomainsWorker'], 'sending_domains_configured'),
 ] as const;
 
 export function consumersForInitializer(initializer: string): readonly string[] {
@@ -265,6 +309,7 @@ function ruleEnabled(
     abuseSignalsEnabled: boolean;
     eventDispatchEnabled: boolean;
     aiAgentsEnabled: boolean;
+    sendingDomainsConfigured: boolean;
   },
 ): boolean {
   switch (rule) {
@@ -278,6 +323,8 @@ function ruleEnabled(
       return input.eventDispatchEnabled;
     case 'ai_agents_enabled':
       return input.aiAgentsEnabled;
+    case 'sending_domains_configured':
+      return input.sendingDomainsConfigured;
   }
 }
 
@@ -289,6 +336,7 @@ export function declareExpectedConsumers(input: {
   auditChainVerifyEnabled: boolean;
   eventDispatchEnabled: boolean;
   aiAgentsEnabled: boolean;
+  sendingDomainsConfigured: boolean;
   registry: WorkerReadinessRegistry;
 }): void {
   if (!input.redisAvailable) return;

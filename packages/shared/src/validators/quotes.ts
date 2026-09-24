@@ -431,8 +431,42 @@ export const acceptQuoteSchema = z.object({
   signerEmail: z.string().email().max(255).optional(),
 });
 
+/** How the customer's agreement was obtained, for an MSP-recorded acceptance
+ *  (spec 2026-09-21 §4). Exported as a tuple so the web method picker and the
+ *  API enum are literally the same list — a drift here is a 400 the tech
+ *  cannot diagnose. Every member must fit quote_acceptances.method varchar(32). */
+export const QUOTE_ACCEPT_ON_BEHALF_METHODS = [
+  'verbal', 'email', 'signed_document', 'purchase_order', 'other',
+] as const;
+
+/** Body for POST /quotes/:id/accept-on-behalf.
+ *
+ *  `reference` is required and non-blank on purpose: it is what a dispute
+ *  reviewer would look for — "PO 4471", "email from J. Doe 2026-09-20 14:02",
+ *  "call with owner, notes in T-0231". An acceptance recorded without one is a
+ *  claim, not a record. */
+export const acceptQuoteOnBehalfSchema = z.object({
+  method: z.enum(QUOTE_ACCEPT_ON_BEHALF_METHODS),
+  reference: z.string().trim().min(1).max(500),
+  signerName: z.string().trim().min(1).max(255),
+  signerEmail: z.string().trim().email().max(255).optional().nullable(),
+});
+
 export const declineQuoteSchema = z.object({
   reason: z.string().max(5000).optional(),
+});
+
+/** Body for POST /quotes/:id/decline-on-behalf (#6634) — the tech records a
+ *  decline the customer gave by phone, email or letter.
+ *
+ *  Same method list and the same evidence rule as accept-on-behalf: `reference`
+ *  is required, because a decline recorded with nothing behind it is a claim.
+ *  `reason` is the customer's own words and carries the customer decline's
+ *  limit — it lands in the same `decline_reason` column. */
+export const declineQuoteOnBehalfSchema = z.object({
+  method: z.enum(QUOTE_ACCEPT_ON_BEHALF_METHODS),
+  reference: z.string().trim().min(1).max(500),
+  reason: z.string().trim().max(5000).optional(),
 });
 
 export const listQuotesQuerySchema = z.object({
@@ -489,7 +523,10 @@ export type CloneQuoteInput = z.infer<typeof cloneQuoteSchema>;
 export type UpdateQuoteInput = z.infer<typeof updateQuoteSchema>;
 export type ListQuotesQuery = z.infer<typeof listQuotesQuerySchema>;
 export type AcceptQuoteInput = z.infer<typeof acceptQuoteSchema>;
+export type AcceptQuoteOnBehalfInput = z.infer<typeof acceptQuoteOnBehalfSchema>;
+export type QuoteAcceptOnBehalfMethod = (typeof QUOTE_ACCEPT_ON_BEHALF_METHODS)[number];
 export type DeclineQuoteInput = z.infer<typeof declineQuoteSchema>;
+export type DeclineQuoteOnBehalfInput = z.infer<typeof declineQuoteOnBehalfSchema>;
 export type CreateQuoteOrderInput = z.infer<typeof createQuoteOrderSchema>;
 export type UpdateQuoteOrderInput = z.infer<typeof updateQuoteOrderSchema>;
 export type UpdateQuoteOrderLineInput = z.infer<typeof updateQuoteOrderLineSchema>;

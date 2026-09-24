@@ -14,9 +14,10 @@ import {
   type InvoiceLine,
   formatMoney,
   lineTitle,
+  lineWorkedVsBilledNote,
   computeInvoiceProfit,
 } from './invoiceTypes';
-import { toCents, fromCents } from '@breeze/shared';
+import { toCents, roundToCurrency } from '@breeze/shared';
 import CatalogItemPicker from '../catalog/CatalogItemPicker';
 import PolishButton from '../catalog/PolishButton';
 import { listCatalog, type CatalogItem } from '../../lib/api/catalog';
@@ -79,7 +80,7 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
   const canSeeMargin = can('invoices', 'read');
   const [fallbackShowMargin] = useShowMargin();
   const effectiveShowMargin = showMargin ?? fallbackShowMargin;
-  const { invoice, lines: serverLines } = detail;
+  const { invoice, lines: serverLines, billToEmail, effectiveTaxRate } = detail;
   const currency = invoice.currencyCode;
 
   // ---- undo-able deletion (deferred DELETE + grace window) -----------------
@@ -124,8 +125,12 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
   // lineTotal over customer-visible lines — bundle children persist
   // lineTotal '0.00', so recomputing qty×price here would double-count them —
   // then tax = taxable basis × the invoice's committed rate, one
-  // round-half-up at the cent boundary. Same inputs, same rounding: the
-  // optimistic figures can never settle different from the next GET.
+  // round-half-up at the cent boundary — and then each of subtotal/tax/total
+  // is rounded at the CURRENCY's minor unit (`roundToCurrency`), the total
+  // built from the already-rounded subtotal + tax. That last step is not
+  // decoration: dropping back to a 2-decimal-only `fromCents` is exactly the
+  // zero-decimal bug of #6441. Same inputs, same rounding: the optimistic
+  // figures can never settle different from the next GET.
   const optimisticTotals = useMemo(() => {
     if (pendingDeletedLineIds.size === 0 && flushedDeletedLineIds.size === 0) return null;
     let subtotalCents = 0;
@@ -137,13 +142,22 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
       if (l.taxable) taxableCents += c;
     }
     const rate = invoice.taxRate ? Number(invoice.taxRate) : 0;
+    // Tax rounds half-up at the classic cent boundary FIRST (rounding the
+    // major-unit float instead loses ties to FP noise), then the CURRENCY
+    // decides each figure's final boundary — and the total is built from the
+    // already-rounded subtotal + tax, exactly as computeInvoiceTotals does.
+    // `fromCents` alone never rounds at the currency's minor unit at all, so on
+    // a zero-decimal currency (JPY) it summed unrounded cents and landed the
+    // total a whole yen away from the next GET (#6441).
     const taxCents = Math.floor(taxableCents * rate + 0.5);
+    const subtotal = roundToCurrency(subtotalCents / 100, currency);
+    const taxTotal = roundToCurrency(taxCents / 100, currency);
     return {
-      subtotal: fromCents(subtotalCents),
-      taxTotal: fromCents(taxCents),
-      total: fromCents(subtotalCents + taxCents),
+      subtotal,
+      taxTotal,
+      total: roundToCurrency(Number(subtotal) + Number(taxTotal), currency),
     };
-  }, [pendingDeletedLineIds, flushedDeletedLineIds, lines, invoice.taxRate]);
+  }, [pendingDeletedLineIds, flushedDeletedLineIds, lines, invoice.taxRate, currency]);
   const railSubtotal = optimisticTotals?.subtotal ?? invoice.subtotal;
   const railTax = optimisticTotals?.taxTotal ?? invoice.taxTotal;
   const railTotal = optimisticTotals?.total ?? invoice.total;
@@ -606,6 +620,30 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
   // with no obvious cause — point the operator at where the rate actually lives.
   const hasTaxableLine = lines.some((l) => l.taxable);
   const noTaxRate = !invoice.taxRate || Number(invoice.taxRate) <= 0;
+  // #6338: "no tax rate is set" was a lie whenever the partner default was
+  // waiting to be applied at issue — the draft's own rate is org-level only,
+  // so a blank org rate read as $0.00 tax and the $200.00 total the tech
+  // approved issued at $215.00. When the API tells us a rate WILL apply,
+  // preview it here instead of warning. The Subtotal/Tax/Total rows keep
+  // showing what is actually committed on the draft; only the hint looks ahead.
+  const inheritedTaxPreview = useMemo(() => {
+    const rate = effectiveTaxRate ? Number(effectiveTaxRate) : 0;
+    if (!(rate > 0) || !noTaxRate || !hasTaxableLine) return null;
+    let taxableCents = 0;
+    for (const l of lines) {
+      if (!l.customerVisible || !l.taxable) continue;
+      taxableCents += toCents(l.lineTotal);
+    }
+    // Mirrors computeInvoiceTotals step for step, so the preview settles to
+    // exactly what issuing produces: round half-up at the classic cent boundary
+    // FIRST (rounding the major-unit float instead loses ties to FP noise), then
+    // let the CURRENCY decide each figure's final boundary — JPY rounds to whole
+    // units, so a preview built on 2-decimal `fromCents` alone would promise a
+    // fractional yen that issueInvoice will never produce.
+    const taxCents = Math.floor(taxableCents * rate + 0.5);
+    const tax = roundToCurrency(taxCents / 100, currency);
+    return { rate, tax, total: roundToCurrency(Number(railSubtotal) + Number(tax), currency) };
+  }, [effectiveTaxRate, noTaxRate, hasTaxableLine, lines, railSubtotal, currency]);
 
   return (
     <div className="space-y-6" data-testid="invoice-editor">
@@ -822,7 +860,16 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
               <div className="flex justify-between"><dt className="text-muted-foreground">{t('invoiceEditor.summary.tax')}{!noTaxRate ? ` (${formatPercent(Number(invoice.taxRate), { minimumFractionDigits: 2, maximumFractionDigits: 2 })})` : ''}</dt><dd data-testid="invoice-tax">{formatMoney(railTax, currency)}</dd></div>
               <div className="flex justify-between border-t pt-1 font-semibold"><dt>{t('invoiceEditor.summary.total')}</dt><dd data-testid="invoice-total">{formatMoney(railTotal, currency)}</dd></div>
             </dl>
-            {hasTaxableLine && noTaxRate && (
+            {inheritedTaxPreview && (
+              <p className="mt-3 text-xs text-muted-foreground" data-testid="invoice-tax-inherited-hint">
+                {t('invoiceEditor.summary.inheritedTaxRate', {
+                  rate: formatPercent(inheritedTaxPreview.rate, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+                  tax: formatMoney(inheritedTaxPreview.tax, currency),
+                  total: formatMoney(inheritedTaxPreview.total, currency),
+                })}
+              </p>
+            )}
+            {hasTaxableLine && noTaxRate && !inheritedTaxPreview && (
               <p className="mt-3 text-xs text-muted-foreground" data-testid="invoice-tax-rate-hint">
                 {t('invoiceEditor.summary.noTaxRate')}{' '}
                 <a href="/settings/billing" className="underline hover:text-foreground">{t('invoiceEditor.summary.setTaxRate')}</a>.
@@ -838,11 +885,19 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
           <div className="rounded-lg border bg-card p-4 shadow-xs" data-testid="invoice-bill-to">
             <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">{t('invoiceEditor.billTo.title')}</h3>
             {invoice.billToName ? (
-              <p className="text-sm">
-                <a href={`/organizations/${encodeURIComponent(invoice.orgId)}`} data-testid="org-record-link" className="hover:underline">
-                  {invoice.billToName}
-                </a>
-              </p>
+              <>
+                <p className="text-sm">
+                  <a href={`/organizations/${encodeURIComponent(invoice.orgId)}`} data-testid="org-record-link" className="hover:underline">
+                    {invoice.billToName}
+                  </a>
+                </p>
+                {/* Draft-only fallback (sweep paper cut #16): set by the API
+                    ONLY alongside a fallen-back billToName — see invoiceTypes.
+                    InvoiceDetail.billToEmail. */}
+                {billToEmail && (
+                  <p className="text-sm text-muted-foreground" data-testid="invoice-bill-to-email">{billToEmail}</p>
+                )}
+              </>
             ) : (
               <p className="text-sm text-muted-foreground">
                 {t('invoiceEditor.billTo.noContact')}{' '}
@@ -955,6 +1010,10 @@ function LineRow({
   // Deliberately the PERSISTED name, not the live draft — an accessible name
   // that changes on every keystroke is itself SR churn.
   const rowLabelItem = (line.name ?? '').trim() || (line.description ?? '').trim() || t('invoiceEditor.fields.untitledLine');
+  // #6467: worked-vs-billed disclosure, read-only here — it is structured
+  // data (`workedMinutes`), not part of the description below, so editing
+  // that text can never erase it.
+  const workedVsBilledNote = lineWorkedVsBilledNote(line, t);
   const [name, setName] = useState(line.name ?? '');
   const [desc, setDesc] = useState(line.description ?? '');
   const [qty, setQty] = useState(line.quantity);
@@ -1076,6 +1135,25 @@ function LineRow({
     <>
       <tr className="border-t" data-testid={`invoice-line-${line.id}`}>
         <td className="px-3 py-2">
+          {(line.ticketNumber || line.ticketCategory) && (
+            <div className="mb-1 flex items-center gap-1.5 text-xs">
+              {line.ticketNumber && (
+                <a
+                  href={`/tickets#${line.ticketNumber}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center rounded bg-primary/10 px-1.5 py-0.5 font-medium text-primary hover:bg-primary/20 transition-colors"
+                >
+                  {line.ticketNumber}
+                </a>
+              )}
+              {line.ticketCategory && (
+                <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-muted-foreground font-medium">
+                  {line.ticketCategory}
+                </span>
+              )}
+            </div>
+          )}
           <input
             type="text" value={name} disabled={!canWrite || isPending(nameKey)}
             aria-label={t('invoiceEditor.fields.lineName')} placeholder={t('invoiceEditor.fields.name')}
@@ -1165,6 +1243,11 @@ function LineRow({
             className={`min-h-8 w-full resize-y overflow-hidden rounded-md border bg-background px-2 py-1 text-sm text-muted-foreground transition-colors focus:outline-hidden focus:ring-2 focus:ring-ring disabled:opacity-60 ${fieldRing(descDirty, saved)}`}
           />
           <UnsavedFieldHint id={unsavedHintId('invoice-line', line.id, 'desc')} show={descDirty} />
+          {workedVsBilledNote && (
+            <p className="mt-1 text-xs text-muted-foreground" data-testid={`invoice-line-worked-vs-billed-${line.id}`}>
+              {workedVsBilledNote}
+            </p>
+          )}
         </td>
       </tr>
       {children.map((ch) => (

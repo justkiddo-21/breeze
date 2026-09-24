@@ -11,6 +11,11 @@ vi.mock('../db', () => ({
     select: (...args: unknown[]) => selectMock(...args),
     insert: (...args: unknown[]) => insertMock(...args),
   },
+  withSystemDbAccessContext: (fn: () => unknown) => fn(),
+}));
+
+vi.mock('./effectiveSettings', () => ({
+  getEffectiveAiBudget: vi.fn().mockResolvedValue({ maxTurnsPerSession: 50 }),
 }));
 
 vi.mock('../db/schema', () => ({
@@ -26,7 +31,9 @@ vi.mock('../db/schema', () => ({
   },
 }));
 
-vi.mock('./aiAgentSystemPrompt', () => ({ AI_SYSTEM_PROMPT_BASE: 'base' }));
+vi.mock('./aiAgentSystemPrompt', () => ({ AI_SYSTEM_PROMPT_BASE: 'base', AI_SYSTEM_PROMPT_TAIL: 'tail' }));
+vi.mock('./aiToolIndex', () => ({ composeStaticSystemPrompt: () => 'base\nindex\ntail' }));
+vi.mock('./aiAgentSdkTools', () => ({ listChatSurfaceToolNames: () => [] }));
 vi.mock('./brainDeviceContext', () => ({
   getActiveDeviceContext: vi.fn().mockResolvedValue(null),
 }));

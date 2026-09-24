@@ -185,8 +185,17 @@ export const DEVICE_LINK_DEPENDENT_COLUMNS: Readonly<Record<string, readonly str
 // beyond the generic device_id = NULL this list drives: deviceDeletion.ts
 // ('device_deleted') and moveOrg.ts ('device_moved'); both also fence any live
 // task, because a task whose target has vanished must not keep executing.
+// ai_operator_task_targets (recipe library E2, #6167) detaches for the same
+// reason one level down: a target is the frozen record of WHAT a task was
+// pointed at, and its target_label must outlive the device. Three callers stamp
+// more than the generic device_id = NULL this list drives — deviceDeletion.ts
+// ('device_deleted'), moveOrg.ts ('device_moved') and the merge fence
+// ('org_merged') — and all three also set state = 'detached'. The generic
+// device_id = NULL is itself safe: the table's BEFORE UPDATE trigger
+// ai_operator_task_targets_stamp_detach stamps the detach in the same row
+// write, which one_pointer_chk requires.
 export const DEVICE_DETACH_DEVICE_ID_TABLES = [
-  'abuse_endpoint_fingerprints', 'ai_agent_runs', 'ai_operator_tasks', 'invoice_line_devices', 'support_sessions', 'tickets',
+  'abuse_endpoint_fingerprints', 'ai_agent_runs', 'ai_operator_task_targets', 'ai_operator_tasks', 'invoice_line_devices', 'support_sessions', 'tickets',
 ] as const;
 
 /**
@@ -215,11 +224,18 @@ export const DEVICE_DETACH_DEVICE_ID_TABLES = [
  *
  * ai_operator_tasks is deliberately ABSENT for the same reason (#5205 W03,
  * #5208): AI Operator task history stays in the org that delegated the work.
- * `org_id` is the task's immutable tenant and anchors four composite
+ * `org_id` is the task's immutable tenant and anchors seven composite
  * (x, org_id) FKs, so a restamp here would 23503 the moment the task has an
- * operation, an outbox wake, a linked run or a linked intent. moveOrg detaches instead —
+ * operation, an outbox wake, a target, a step, an event, a linked run or a
+ * linked intent. moveOrg detaches instead —
  * device_id = NULL plus target_detached_at/reason and a fence of any live
  * task. It is listed in INTENTIONALLY_NO_ORG_ID in moveOrg.coverage.test.ts.
+ *
+ * ai_operator_task_targets is deliberately ABSENT for exactly the same reason
+ * (recipe library E2, #6167): a target's org_id IS its task's org_id and
+ * anchors ai_operator_task_targets_task_org_fk, so a re-stamp here would 23503
+ * while the task stayed behind. moveOrg detaches instead. It is listed in
+ * INTENTIONALLY_NO_ORG_ID in moveOrg.coverage.test.ts.
  *
  * ai_unattended_exposure is deliberately ABSENT too (wave 5a, #3827): it has
  * an org_id column but is cascade-deleted, not moved. (a) Exposure history
@@ -254,11 +270,20 @@ export const DEVICE_DETACH_DEVICE_ID_TABLES = [
  * route code runs. moveOrg detaches device_id instead — an explicit,
  * LOAD-BEARING statement, not a mirror of the generic loop. It is listed in
  * INTENTIONALLY_NO_ORG_ID in moveOrg.coverage.test.ts.
+ *
+ * script_executions IS in the list below and so re-stamps normally, but its AI
+ * ORIGIN POINTERS are detached on the way (#5022 W01): ai_agent_runs above is
+ * not re-stamped and ai_sessions is re-stamped only when device-bound, so a
+ * moved execution could otherwise keep pointing at a session or run in the
+ * source tenant. ai_initiator_kind is RETAINED — the fact that an AI did the
+ * work survives the move; the cross-tenant pointer does not. Mirrored in
+ * moveOrg.ts and in breeze_cascade_device_org_id().
  */
 // offline_transition_effects is intentionally absent: immutable historical source
 // ownership remains with the original org; pending alert admission rejects a moved
 // device. The DB discovery function has the same exclusion in migration000800.
 const CORE_DEVICE_ORG_DENORMALIZED_TABLES = [
+  'topology_node_bindings',
   'agent_health_observations', 'agent_logs', 'ai_screenshots', 'ai_sessions', 'alerts', 'asset_checkouts',
   'audit_baseline_results', 'audit_policy_states',
   'automation_action_results', 'automation_run_device_results',
@@ -285,7 +310,14 @@ const CORE_DEVICE_ORG_DENORMALIZED_TABLES = [
   'fleet_finding_devices',
   'group_membership_log',
   'huntress_agents', 'huntress_incidents', 'hyperv_vms', 'local_vaults',
-  'metric_anomaly_candidates', 'metric_anomalies', 'metric_anomaly_incidents', 'metric_rollups',
+  // metric_anomaly_episodes: device_id + denormalized org_id (episodes W01). Its
+  // only inbound FK is metric_anomalies.episode_id ON DELETE SET NULL, so the
+  // position relative to metric_anomalies is not load-bearing.
+  'metric_anomaly_candidates', 'metric_anomalies', 'metric_anomaly_episodes', 'metric_anomaly_incidents', 'metric_rollups',
+  // #5290 — both denormalise org_id from the device.
+  'monitor_device_state', 'monitor_episodes',
+  // #5291 W04 - carries device_id AND a denormalized org_id.
+  'network_monitor_results',
   'onedrive_device_state',
   'peripheral_events', 'peripheral_policy_delivery_events', 'peripheral_policy_device_states',
   'file_egress_events',
@@ -397,6 +429,12 @@ export const CUSTOM_ORG_REWRITE_TABLES = [
   'ticket_outbox',
   'ticket_attachments',
   'ticket_email_links',
+  // ticket_checklist_items (#5783 W01): rewritten through the tickets join,
+  // appended last to extend — not reorder — the shared lock order. Its
+  // composite (ticket_id, org_id) FK is DEFERRABLE INITIALLY IMMEDIATE, so
+  // moveOrg.ts also names ticket_checklist_items_ticket_org_fk in its
+  // SET CONSTRAINTS … DEFERRED statement.
+  'ticket_checklist_items',
 ] as const;
 
 /**
@@ -463,6 +501,7 @@ export const ALERT_CHILD_ORG_REWRITE_TABLES = [
  * schema PR adding site_id to a device-id-scoped table populates this list.
  */
 export const DEVICE_SITE_DENORMALIZED_TABLES = [
+  'topology_node_bindings',
   'elevation_requests',
 ] as const;
 
@@ -477,6 +516,7 @@ export const DEVICE_SITE_DENORMALIZED_TABLES = [
  * The test in cascadeDelete.test.ts will fail CI if you forget.
  */
 const CORE_DEVICE_CASCADE_DELETE_TABLES = [
+  'topology_node_bindings',
   'bare_metal_recoveries',
   'offline_transition_effects',
   // recovery_tokens & backup_chains FK to backup_snapshots (no cascade),
@@ -491,6 +531,9 @@ const CORE_DEVICE_CASCADE_DELETE_TABLES = [
   // Latest projection references the immutable observation, so it must be
   // deleted before the observation in the explicit device cascade.
   'device_agent_health_latest', 'device_software_inventory_state',
+  // #5290 — monitor_device_state.current_episode_id FKs to monitor_episodes
+  // (ON DELETE SET NULL), so delete the state rows before the episodes.
+  'monitor_device_state', 'monitor_episodes',
   'agent_health_observations', 'software_inventory_observations',
   'device_group_memberships', 'group_membership_log',
   'device_hardware', 'device_network', 'device_ip_history', 'device_disks',
@@ -520,6 +563,8 @@ const CORE_DEVICE_CASCADE_DELETE_TABLES = [
   'remote_sessions', 'tunnel_sessions',
   // Monitoring & logs
   'service_process_check_results', 'alerts', 'agent_logs', 'script_executions',
+  // #5291 W04 - probe results now name the device they ran FROM.
+  'network_monitor_results',
   'device_event_logs', 'automation_policy_compliance', 'backup_sla_events',
   // Per-device automation execution results (FK device_id → devices.id ON DELETE
   // CASCADE; leaf table, no children) — #2023
@@ -559,7 +604,10 @@ const CORE_DEVICE_CASCADE_DELETE_TABLES = [
   'device_reliability_history', 'device_reliability',
   'playbook_executions', 'time_series_metrics', 'capacity_predictions',
   'device_process_samples', 'remediation_suggestions',
-  'metric_anomaly_candidates', 'metric_anomalies', 'metric_anomaly_incidents', 'metric_rollups',
+  // metric_anomaly_episodes: device_id + denormalized org_id (episodes W01). Its
+  // only inbound FK is metric_anomalies.episode_id ON DELETE SET NULL, so the
+  // position relative to metric_anomalies is not load-bearing.
+  'metric_anomaly_candidates', 'metric_anomalies', 'metric_anomaly_episodes', 'metric_anomaly_incidents', 'metric_rollups',
   // Portal & integrations (tickets are detached, not deleted —
   // see DEVICE_DETACH_DEVICE_ID_TABLES)
   'psa_ticket_mappings', 'asset_checkouts',
@@ -946,6 +994,8 @@ coreRoutes.get(
         deviceRoleSource: devices.deviceRoleSource,
         deviceFunction: devices.deviceFunction,
         deviceFunctionSource: devices.deviceFunctionSource,
+        purchaseDate: devices.purchaseDate,
+        purchaseDateSource: devices.purchaseDateSource,
         osVersion: devices.osVersion,
         osBuild: devices.osBuild,
         architecture: devices.architecture,
@@ -1183,6 +1233,11 @@ coreRoutes.get(
         // silently dropped (#800/#1273/#2138) — asserted by
         // core.list-response-shape.test.ts.
         possibleReplacementOfDeviceId: d.possibleReplacementOfDeviceId ?? null,
+        // #5701 follow-up: purchaseDate/purchaseDateSource are selected above
+        // but were dropped here — the same list-mapper failure mode as
+        // #800/#1273/#2138 (see the comment above).
+        purchaseDate: d.purchaseDate ?? null,
+        purchaseDateSource: d.purchaseDateSource ?? null,
         batteryStatus: d.batteryStatus ?? null,
         activeVpns: d.activeVpns ?? null,
         linkGroupId: d.linkGroupId ?? null,
@@ -1720,6 +1775,11 @@ coreRoutes.patch(
       updates.deviceRole = data.deviceRole;
       updates.deviceRoleSource = 'manual';
     }
+    if (data.purchaseDate !== undefined) {
+      // Both NULL or both set — devices_purchase_date_source_chk.
+      updates.purchaseDate = data.purchaseDate;
+      updates.purchaseDateSource = data.purchaseDate === null ? null : 'manual';
+    }
     // NOTE: no `updates.customFields` branch. Custom-field values were written
     // to `device_custom_field_values` above; the merge-with-existing semantics
     // this used to implement are now the upsert's, keyed on
@@ -1732,6 +1792,9 @@ coreRoutes.patch(
     // out of site-visibility scoping. Mirrors moveOrg.ts. The proxied `db`
     // resolves to the request-context tx via AsyncLocalStorage, so this
     // opens a savepoint within the request transaction (established pattern).
+    // breeze_topology_inventory_lifecycle detaches the old current binding
+    // BEFORE the device UPDATE, so the generic loop cannot drag historical
+    // topology nodes, manual facts or pins into the destination site.
     const siteChanged = data.siteId !== undefined && data.siteId !== device.siteId;
 
     let updated: typeof devices.$inferSelect | undefined;

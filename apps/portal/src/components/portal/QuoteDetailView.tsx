@@ -6,7 +6,7 @@ import { type QuoteDetail, publicApiPath, portalApi } from '@/lib/api';
 import { shortDate } from '@/lib/format';
 import { computeChargeNow } from '@/lib/invoiceDeposit';
 import { QuoteBlocks, money } from './quoteBlocks';
-import { DocumentPaper, DocumentHeader, DocumentTerms, type DocSeller } from './documentShell';
+import { DocumentCover, DocumentPaper, DocumentHeader, DocumentTerms, type DocSeller } from './documentShell';
 import { BTN_PRIMARY, BTN_SECONDARY } from './ui';
 import { SignaturePanel } from './SignaturePanel';
 
@@ -70,6 +70,15 @@ export function QuoteDetailView({ detail, error, statusCode }: QuoteDetailViewPr
   const seller = (quote.sellerSnapshot ?? null) as DocSeller | null;
   // Omit a missing date rather than printing an em-dash placeholder on a
   // document the customer forwards (the public token view already does this).
+  // The cover is authored per quote; null or disabled means the document opens on its header.
+  const cover = quote.coverPage?.enabled
+    ? {
+        title: quote.coverPage.title ?? null,
+        coverImageId: quote.coverPage.coverImageId ?? null,
+        preparedForName: quote.coverPage.preparedForName ?? null,
+        showPreparedBy: quote.coverPage.showPreparedBy !== false,
+      }
+    : null;
   const headerDates = [
     ...(quote.issueDate ? [{ label: 'Issued', value: shortDate(quote.issueDate) }] : []),
     ...(quote.expiryDate ? [{ label: 'Valid until', value: shortDate(quote.expiryDate) }] : []),
@@ -215,6 +224,15 @@ export function QuoteDetailView({ detail, error, statusCode }: QuoteDetailViewPr
       )}
 
       <DocumentPaper primaryColor={branding?.primaryColor} docTheme={presentation?.theme}>
+        {cover && (
+          <DocumentCover
+            title={cover.title || quote.title || quote.quoteNumber || 'Proposal'}
+            imageUrl={cover.coverImageId ? publicApiPath(`/portal/quotes/${quote.id}/images/${cover.coverImageId}`) : null}
+            preparedForName={cover.preparedForName || quote.billToName}
+            preparedByName={branding?.partnerName}
+            showPreparedBy={cover.showPreparedBy}
+          />
+        )}
         <DocumentHeader
           logoUrl={branding?.logoUrl}
           partnerName={branding?.partnerName}
@@ -225,7 +243,8 @@ export function QuoteDetailView({ detail, error, statusCode }: QuoteDetailViewPr
           statusLabel={STATUS_LABELS[status] ?? status}
           statusTone={quoteStatusTone(status)}
           dates={headerDates}
-          preparedForName={quote.billToName ?? undefined}
+          preparedForName={cover ? undefined : quote.billToName ?? undefined}
+          titleAs={cover ? 'h2' : 'h1'}
         />
 
         {quote.introNotes && (
@@ -331,6 +350,10 @@ export function QuoteDetailView({ detail, error, statusCode }: QuoteDetailViewPr
           </div>
         </section>
 
+        {/* Two distinct free-text columns, both genuinely terms: `terms` is the
+            API-only legacy field, `termsAndConditions` is what the quote editor
+            writes. The quote's notes live in `introNotes`, elsewhere on the page.
+            Spec 2026-09-14 §3 checked this and left both labels as-is. */}
         {quote.terms && <DocumentTerms label="Terms">{quote.terms}</DocumentTerms>}
         {quote.termsAndConditions && (
           <DocumentTerms label="Terms & Conditions" testId="quote-terms-conditions">{quote.termsAndConditions}</DocumentTerms>
@@ -357,6 +380,20 @@ export function QuoteDetailView({ detail, error, statusCode }: QuoteDetailViewPr
           className="space-y-3 rounded-md bg-success/10 p-4 text-sm text-success-on-tint"
         >
           <p>{!msgError && msg ? msg : 'This proposal has been accepted.'}</p>
+          {quote.acceptanceOrigin === 'on_behalf' && (
+            // The customer never clicked anything — their provider recorded an
+            // agreement reached elsewhere. Saying so plainly is what makes the
+            // record honest from their side; the method and the reference are
+            // the provider's internal detail and are deliberately absent.
+            // Both values are nullable (unbranded portal / an acceptance whose
+            // accepted_at never landed), and a blank name or a dangling "on ."
+            // reads as a bug to the customer — fall back, and drop the date
+            // clause entirely rather than printing an empty one.
+            <p data-testid="quote-accepted-on-behalf">
+              Accepted on your behalf by {branding?.partnerName || 'your provider'}
+              {quote.acceptedAt ? ` on ${shortDate(quote.acceptedAt)}` : ''}.
+            </p>
+          )}
           <div className="flex flex-wrap items-center gap-3">
             {canPay && (
               <button

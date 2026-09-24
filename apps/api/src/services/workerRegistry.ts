@@ -75,11 +75,65 @@ export interface StartWorkersHooks {
  */
 export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
   {
+    name: 'topologyReconcileWorker', placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/topologyReconcileWorker');
+      return { init: m.initializeTopologyReconcileWorker, shutdown: m.shutdownTopologyReconcileWorker };
+    },
+  },
+  {
+    name: 'topologyCollectionRetentionWorker', placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/topologyCollectionRetentionWorker');
+      return { init: m.initializeTopologyCollectionRetentionWorker, shutdown: m.shutdownTopologyCollectionRetentionWorker };
+    },
+  },
+  {
+    name: 'topologyOutboxWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/topologyOutboxWorker');
+      return { init: m.initializeTopologyOutboxWorker, shutdown: m.shutdownTopologyOutboxWorker };
+    },
+  },
+  {
+    name: 'topologyTemplateApplyWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/topologyTemplateApplyWorker');
+      return { init: m.initializeTopologyTemplateApplyWorker, shutdown: m.shutdownTopologyTemplateApplyWorker };
+    },
+  },
+  {
+    name: 'topologyDiagnosticWorker',
+    placement: 'socket-owner',
+    load: async () => {
+      const m = await import('../jobs/topologyDiagnosticWorker');
+      return { init: m.initializeTopologyDiagnosticWorker, shutdown: m.shutdownTopologyDiagnosticWorker };
+    },
+  },
+  {
+    name: 'topologyDiagnosticSweeper',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/topologyDiagnosticSweeper');
+      return { init: m.initializeTopologyDiagnosticSweeper, shutdown: m.shutdownTopologyDiagnosticSweeper };
+    },
+  },
+  {
     name: 'alertWorkers',
     placement: 'global',
     load: async () => {
       const m = await import('../jobs/alertWorker');
       return { init: m.initializeAlertWorkers, shutdown: m.shutdownAlertWorkers };
+    },
+  },
+  {
+    name: 'monitorConversionPreviewWorker',
+    placement: 'socket-owner',
+    load: async () => {
+      const m = await import('../jobs/monitorConversionPreviewWorker');
+      return { init: m.initializeMonitorConversionPreviewWorker, shutdown: m.shutdownMonitorConversionPreviewWorker };
     },
   },
   {
@@ -120,6 +174,14 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     load: async () => {
       const m = await import('../jobs/aiBudgetAlertDelivery');
       return { init: m.initializeAiBudgetAlertWorker, shutdown: m.shutdownAiBudgetAlertWorker };
+    },
+  },
+  {
+    name: 'aiArtifactSweeper',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/aiArtifactSweeper');
+      return { init: m.initializeAiArtifactSweeper, shutdown: m.shutdownAiArtifactSweeper };
     },
   },
   {
@@ -439,6 +501,17 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    name: 'filesystemCleanupRunRetention',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/filesystemCleanupRunRetention');
+      return {
+        init: m.initializeFilesystemCleanupRunRetention,
+        shutdown: m.shutdownFilesystemCleanupRunRetention,
+      };
+    },
+  },
+  {
     name: 'oauthCleanup',
     placement: 'global',
     load: async () => {
@@ -671,6 +744,23 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    // #5291 W04 — dispatches `script` monitors' diagnostic probes.
+    // socket-owner, not global: its runtime import closure reaches
+    // routes/agentWs.ts — jobs/monitorScriptWorker.ts ->
+    // services/scriptDispatch.ts -> routes/agentWs.ts. Same shape as
+    // policyEvaluationWorker above; found by
+    // workerEntrypointClosure.contract.test.ts, not guessed. (monitorWorker
+    // stays 'global' because it dispatches through the agentCommandRelay
+    // facade instead.) The repeatable tick is still consumed once per fleet:
+    // the queue, not the placement, is what serialises it.
+    name: 'monitorScriptWorker',
+    placement: 'socket-owner',
+    load: async () => {
+      const m = await import('../jobs/monitorScriptWorker');
+      return { init: m.initializeMonitorScriptWorker, shutdown: m.shutdownMonitorScriptWorker };
+    },
+  },
+  {
     name: 'unifiWorker',
     placement: 'global',
     load: async () => {
@@ -759,6 +849,18 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    // Backup provider integration W02 (#6008 / #6010). 'global': its runtime
+    // import closure reaches alertService + eventBus but no socket-local
+    // dispatch — the same shape as monitorWorker and warrantyWorker, both
+    // 'global'. Verified mechanically by workerEntrypointClosure.contract.test.ts.
+    name: 'backupProviderSyncWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/backupProviderSync');
+      return { init: m.initializeBackupProviderSyncJob, shutdown: m.shutdownBackupProviderSyncJob };
+    },
+  },
+  {
     // socket-owner, not global: its runtime import closure reaches
     // routes/agentWs.ts — jobs/m365SyncWorker.ts -> services/m365Sync/run.ts
     // -> services/m365ControlPlane/readActionService.ts ->
@@ -830,11 +932,31 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    name: 'backupSnapshotFileIndexWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/backupSnapshotFileIndexWorker');
+      return { init: m.initializeBackupSnapshotFileIndexWorker, shutdown: m.shutdownBackupSnapshotFileIndexWorker };
+    },
+  },
+  {
     name: 'sensitiveDataWorker',
     placement: 'socket-owner',
     load: async () => {
       const m = await import('../jobs/sensitiveDataJobs');
       return { init: m.initializeSensitiveDataWorkers, shutdown: m.shutdownSensitiveDataWorkers };
+    },
+  },
+  {
+    // #6263 W01. socket-owner, not global: the dispatch path imports
+    // services/commandQueue, whose closure reaches routes/agentWs.ts — the same
+    // reason sensitiveDataWorker above is socket-owner. Verified by
+    // workerEntrypointClosure.contract.test.ts, not by guessing.
+    name: 'securityScanWorker',
+    placement: 'socket-owner',
+    load: async () => {
+      const m = await import('../jobs/securityScanJobs');
+      return { init: m.initializeSecurityScanWorkers, shutdown: m.shutdownSecurityScanWorkers };
     },
   },
   {
@@ -1127,6 +1249,18 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    // Caller verification (#6354 W01) — post-commit publisher: rejection
+    // notifications (in-app + email) and W02/W03 challenge delivery/timeouts,
+    // driven off scalar markers on the verification row. 'global': no
+    // agent-socket-local dependency.
+    name: 'callerVerificationPublisher',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/callerVerificationPublisher');
+      return { init: m.initializeCallerVerificationPublisher, shutdown: m.shutdownCallerVerificationPublisher };
+    },
+  },
+  {
     name: 'ticketSlaWorker',
     placement: 'global',
     load: async () => {
@@ -1364,6 +1498,60 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
         init: m.initializeMfaEnrollmentNoticeWorker,
         shutdown: m.shutdownMfaEnrollmentNoticeWorker,
       };
+    },
+  },
+  {
+    // #5290 (Monitoring & automation unification, W03) — daily prune of
+    // CLOSED monitor_episodes rows past the 400-day retention window.
+    name: 'monitorEpisodeRetention',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/monitorEpisodeRetention');
+      return {
+        init: m.initializeMonitorEpisodeRetention,
+        shutdown: m.shutdownMonitorEpisodeRetention,
+      };
+    },
+  },
+  {
+    // #4248 W03 (AI Scorecard #5757) — 15-minute sweep over unsettled
+    // report_run_deliveries: re-attempts pending narrative emails the
+    // finalizer never reached, marks stale claims `unknown` (never resends).
+    name: 'reportRunDeliveryReconciler',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/reportRunDeliveryReconciler');
+      return {
+        init: m.initializeReportRunDeliveryReconciler,
+        shutdown: m.shutdownReportRunDeliveryReconciler,
+      };
+    },
+  },
+  {
+    // Tool Catalog W1 (#5215 / #5216), Task A6 — reconciles a tool source's
+    // remote MCP tool listing (tier proposal, revisions, removals). No-ops
+    // when TOOL_SOURCES_ENABLED is off.
+    name: 'toolSourceDiscoveryWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/toolSourceDiscoveryWorker');
+      return { init: m.initializeToolSourceDiscoveryWorkers, shutdown: m.shutdownToolSourceDiscoveryWorkers };
+    },
+  },
+  {
+    // Partner sending domains W03. The ONE place that calls the email-domain
+    // provider (spec §2). `initializeSendingDomainsWorker` returns before
+    // constructing anything when EMAIL_DOMAINS_PROVIDER is unset, which is the
+    // default — hence the matching 'sending_domains_configured' readiness rule.
+    // placement 'global': the module's runtime import closure (domainSync ->
+    // providerRegistry/adapters -> services/email.ts, opsAlerts, partnerTrust,
+    // auditEvents, db, redis) reaches neither routes/agentWs.ts nor
+    // services/agentCommandAwait.ts.
+    name: 'sendingDomainsWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/sendingDomainsWorker');
+      return { init: m.initializeSendingDomainsWorker, shutdown: m.shutdownSendingDomainsWorker };
     },
   },
 ];

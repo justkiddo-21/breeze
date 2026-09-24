@@ -196,6 +196,17 @@ describe('lockReportRun', () => {
     const result = await lockReportRun(RUN, () => undefined);
     expect(result).toEqual({ reportRunId: RUN, reportId: 'report-1', orgId: ORG, summary: null, outcome: null });
   });
+
+  it('#3198 W01: refuses a partner-owned row instead of coercing orgId: null into a string', async () => {
+    const PARTNER = '44444444-4444-4444-8444-444444444444';
+    seed([[{ reportRunId: RUN, reportId: 'report-1', orgId: null, partnerId: PARTNER, summary: null }]]);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = await lockReportRun(RUN, () => undefined);
+
+    expect(result).toBeNull();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('refusing partner-owned report row'));
+  });
 });
 
 describe('toLedgerItem', () => {
@@ -257,5 +268,25 @@ describe('loadLedger', () => {
     const result = await loadLedger(RUN, ORG);
     expect(result).toBe(ROWS);
     expect(calls.selects[0]!.orderBy).toBeDefined();
+  });
+});
+
+describe('explicit apply ledger executor', () => {
+  it('records, refreshes and finds the group on the supplied savepoint', async () => {
+    const ambient = makeExec([]);
+    holder.exec = ambient.exec;
+    const tx = makeExec([
+      [{ id: 'ledger-row' }],
+      [{ createdRefs: { groupId: 'group-1' } }],
+      [{ id: 'group-1' }],
+    ]);
+    const executor = tx.exec as unknown as NonNullable<Parameters<typeof recordApplied>[1]>;
+    await recordApplied({ orgId: ORG, reportRunId: RUN, itemRef: 'functions:file_server', itemKind: 'function', step: 1, userId: USER }, executor);
+    await updateCreatedRefs('ledger-row', ORG, { groupId: 'group-1' }, executor);
+    expect(await findReusableGroup(ORG, 'file_server', executor)).toEqual({ groupId: 'group-1' });
+    expect(tx.calls.inserts).toHaveLength(1);
+    expect(tx.calls.updates).toHaveLength(1);
+    expect(tx.calls.selects).toHaveLength(2);
+    expect(ambient.calls).toEqual({ selects: [], inserts: [], updates: [] });
   });
 });

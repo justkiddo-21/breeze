@@ -6,10 +6,18 @@ import { ActionMenu, type ActionMenuItem } from '@/components/shared/ActionMenu'
 import { DataCard, ResponsiveTable } from '@/components/shared/ResponsiveTable';
 import { SortableTh } from '@/components/shared/SortableTh';
 import { FALLBACK_STATUS_CLASS, statusColors, statusLabelKeys } from '@/lib/orgStatus';
-import { purgeCountdownDays, shouldShowDeviceCount, type BoardColumn, type BoardRow, type BoardSort } from '@/lib/orgReadiness';
+import {
+  purgeCountdownDays,
+  shouldShowDeviceCount,
+  type BoardColumn,
+  type BoardRow,
+  type BoardSort,
+  type ReadinessConnector,
+} from '@/lib/orgReadiness';
 import type { Organization } from '@/components/settings/organizationTypes';
 import type { Organization as StoreOrganization } from '@/stores/orgStore';
 import { ReadinessChips } from './ReadinessChips';
+import IntegrationBadges from './IntegrationBadges';
 import type { ManualOrderApi } from './useManualOrder';
 
 /** `aria-describedby` target for every reorder handle: the page renders one hidden sentence with this id. */
@@ -34,6 +42,8 @@ export interface AccountBoardTableProps {
   /** Archived filter: muted rows, badge + purge countdown, no readiness cells. */
   archivedView: boolean;
   now: Date;
+  /** Partner-level connectors from the readiness response; null until the first batch lands or when withheld. */
+  connectors?: ReadinessConnector[] | null;
 }
 
 const ROW_MENU_TRIGGER_CLASS =
@@ -54,12 +64,15 @@ export function AccountBoardTable({
   menuItemsFor,
   archivedView,
   now,
+  connectors,
 }: AccountBoardTableProps) {
   const { t } = useTranslation('organizations');
   const { t: tSettings } = useTranslation('settings');
   const showSetup = !archivedView && columns.includes('setup');
   const showAccount = !archivedView && columns.includes('account');
+  const showIntegrations = !archivedView && columns.includes('integrations');
   const showTickets = !archivedView && columns.includes('tickets');
+  const psaProvider = connectors?.find((c) => c.system === 'psa')?.provider;
   const dragEnabled = manualOrder !== null && !manualOrder.reorderPending;
   const rowTabIndex = (org: Organization) => (activeRowId === org.id ? 0 : -1);
 
@@ -90,7 +103,12 @@ export function AccountBoardTable({
       tabIndex={rowTabIndex(row.org)}
       title={row.org.name}
       onKeyDown={(event) => onRowKeyDown(event, index)}
-      onClick={(event) => event.stopPropagation()}
+      onClick={(event) => {
+        event.stopPropagation();
+        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return;
+        event.preventDefault();
+        onOpenRecord(row.org);
+      }}
       className="block max-w-xs truncate text-sm font-medium hover:underline"
     >
       {row.org.name}
@@ -214,6 +232,11 @@ export function AccountBoardTable({
           />
           {showSetup && <th className="px-3 py-3 font-medium">{t('orgBoard.columns.setup')}</th>}
           {showAccount && <th className="px-3 py-3 font-medium">{t('orgBoard.columns.account')}</th>}
+          {showIntegrations && (
+            <th className="px-3 py-3 font-medium" data-testid="org-board-col-integrations">
+              {t('orgBoard.columns.integrations')}
+            </th>
+          )}
           {showTickets && (
             <SortableTh
               namespace="organizations"
@@ -271,6 +294,11 @@ export function AccountBoardTable({
                   <ReadinessChips row={row} section="account" />
                 </td>
               )}
+              {showIntegrations && (
+                <td className="px-3 py-3">
+                  <IntegrationBadges row={row} psaProvider={psaProvider} />
+                </td>
+              )}
               {showTickets && <td className="px-3 py-3">{renderTickets(row)}</td>}
               <td className="px-2 py-3 text-right">{renderMenu(row, 'table')}</td>
             </tr>
@@ -305,6 +333,14 @@ export function AccountBoardTable({
                   section={showSetup && showAccount ? 'all' : showSetup ? 'setup' : 'account'}
                   testIdPrefix="org-board-card-chip"
                 />
+              </div>
+            </div>
+          )}
+          {showIntegrations && (
+            <div className="mt-3">
+              <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t('orgBoard.columns.integrations')}</p>
+              <div className="mt-1">
+                <IntegrationBadges row={row} psaProvider={psaProvider} testIdPrefix="org-board-card-badge" />
               </div>
             </div>
           )}

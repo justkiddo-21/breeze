@@ -1,4 +1,4 @@
-import { pgTable, uuid, varchar, text, integer, timestamp, boolean, jsonb, pgEnum } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, varchar, text, integer, timestamp, boolean, jsonb, pgEnum, index } from 'drizzle-orm/pg-core';
 import { organizations, partners } from './orgs';
 import { devices } from './devices';
 import { users } from './users';
@@ -18,6 +18,11 @@ export const portalBranding = pgTable('portal_branding', {
   primaryColor: varchar('primary_color', { length: 50 }),
   secondaryColor: varchar('secondary_color', { length: 50 }),
   accentColor: varchar('accent_color', { length: 50 }),
+  // Curated chrome-accent preset key (packages/shared/src/types/
+  // portalChromeAccent.ts). Null = default ('spruce'). Distinct from
+  // accentColor above: that's a free-form legacy color, this is a validated
+  // key the portal maps to pre-checked light/dark tokens.
+  chromeAccent: varchar('chrome_accent', { length: 20 }),
   customDomain: varchar('custom_domain', { length: 255 }),
   domainVerified: boolean('domain_verified').notNull().default(false),
   welcomeMessage: text('welcome_message'),
@@ -31,6 +36,7 @@ export const portalBranding = pgTable('portal_branding', {
   // with this on gets an "Equipment" page that duplicates Devices and can't
   // borrow anything. Off by default until the portal side ships.
   enableAssetCheckout: boolean('enable_asset_checkout').notNull().default(false),
+  enableDevices: boolean('enable_devices').notNull().default(false),
   enableSelfService: boolean('enable_self_service').notNull().default(true),
   enablePasswordReset: boolean('enable_password_reset').notNull().default(true),
   // Portal visibility Wave 1 (#4562): per-org gates for the customer portal
@@ -44,6 +50,13 @@ export const portalBranding = pgTable('portal_branding', {
   // org document library. Same fail-closed shape as the five flags above.
   enableService: boolean('enable_service').notNull().default(false),
   enableDocuments: boolean('enable_documents').notNull().default(false),
+  // Portal Hardware Lifecycle (#5719): required alongside enableReports so an
+  // MSP can turn on generic report self-service before exposing the
+  // replacement plan, which names specific machines.
+  enableLifecycle: boolean('enable_lifecycle').notNull().default(false),
+  // Customer Portal Network Visibility (#5861): independent, fail-closed
+  // visibility gate for the read-only networking surface.
+  enableNetworkVisibility: boolean('enable_network_visibility').notNull().default(false),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
 });
@@ -98,7 +111,9 @@ export const portalUsers = pgTable('portal_users', {
   invitedAt: timestamp('invited_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
-});
+}, (table) => ({
+  orgIdIdx: index('portal_users_org_id_idx').on(table.orgId),
+}));
 
 // P2-4 (#4191): tickets also gains a composite-FK target unique index,
 // `tickets_id_org_uq` on (id, org_id) — a plain `CREATE UNIQUE INDEX` in
@@ -229,7 +244,23 @@ export const ticketComments = pgTable('ticket_comments', {
   // origin_principal_kind = 'ai_agent' — at most one AI-authored comment per
   // run. Not modeled in Drizzle for the same "partial index" reason as
   // ticketDrafts.ts's ticket_drafts_active_uq.
-  agentRunId: uuid('agent_run_id')
+  agentRunId: uuid('agent_run_id'),
+  // #4211 (W01): the agent run whose ticketProposal.summary a TECHNICIAN chose
+  // to post under their own identity. Distinct from agentRunId above, which
+  // means "an agent run wrote this row". A row with proposedByRunId set is
+  // human-authored (origin_principal_kind='user', user_id=<tech>) and MUST NOT
+  // trip the helpdesk loop guard — see the migration header. FK
+  // (ON DELETE SET NULL) is SQL-only, same circular-import reason as agentRunId.
+  //
+  // #4211 review: also carries a partial unique index,
+  // ticket_comments_one_proposal_note_per_run_uq ON ticket_comments
+  // (proposed_by_run_id) WHERE proposed_by_run_id IS NOT NULL AND
+  // origin_principal_kind = 'user' — at most one technician-posted proposal
+  // note per run, same idempotency shape as agent_run_id's own
+  // ticket_comments_one_ai_note_per_run_uq. Not modeled in Drizzle for the
+  // same "partial index" reason as that index and ticketDrafts.ts's
+  // ticket_drafts_active_uq.
+  proposedByRunId: uuid('proposed_by_run_id')
 });
 
 export const assetCheckouts = pgTable('asset_checkouts', {

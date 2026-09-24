@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import zlib from 'node:zlib';
 import PDFDocument from 'pdfkit';
 import { formatMoney } from '@breeze/shared';
-import { renderInvoiceHtml, renderInvoicePdfBuffer, buildInvoiceEmailAmounts, invoiceColumnsFor, type InvoiceBranding } from './invoicePdf';
+import { renderInvoiceHtml, renderInvoicePdfBuffer, buildInvoiceEmailAmounts, invoiceColumnsFor, resolveInvoiceFooter, resolveDraftBillTo, type InvoiceBranding } from './invoicePdf';
 import { invoices, invoiceLines } from '../db/schema';
 
 type InvoiceRow = typeof invoices.$inferSelect;
@@ -174,6 +174,46 @@ describe('renderInvoiceHtml', () => {
     expect(html).not.toContain('<script>alert(1)</script>');
     expect(html).toContain('&lt;script&gt;');
   });
+
+  // #6467: the worked-vs-billed disclosure is rendered from workedMinutes
+  // (structured data), never baked into `description` — so it survives
+  // regardless of what the description says, and localizes off the same
+  // document_locale the rest of the invoice's money glyphs already honour.
+  it('shows the worked-vs-billed note in English for a time_entry line, from workedMinutes not description', () => {
+    const html = renderInvoiceHtml(
+      makeInvoice(),
+      [makeLine({ sourceType: 'time_entry', description: 'On-site', quantity: '1.00', workedMinutes: 30 })],
+      branding,
+    );
+    expect(html).toContain('0.50 h worked · 1.00 h billed');
+  });
+
+  it('shows no note when workedMinutes equals the billed quantity', () => {
+    const html = renderInvoiceHtml(
+      makeInvoice(),
+      [makeLine({ sourceType: 'time_entry', description: 'Remote', quantity: '1.00', workedMinutes: 60 })],
+      branding,
+    );
+    expect(html).not.toContain('h worked');
+  });
+
+  it('shows no note for a non-time-entry line (workedMinutes null)', () => {
+    const html = renderInvoiceHtml(
+      makeInvoice(),
+      [makeLine({ sourceType: 'manual', description: 'Widget', workedMinutes: null })],
+      branding,
+    );
+    expect(html).not.toContain('h worked');
+  });
+
+  it('localizes the note off the stamped document locale (pt-BR)', () => {
+    const html = renderInvoiceHtml(
+      makeInvoice({ documentLocale: 'pt-BR' }),
+      [makeLine({ sourceType: 'time_entry', description: 'On-site', quantity: '1.00', workedMinutes: 30 })],
+      branding,
+    );
+    expect(html).toContain('0.50 h trabalhadas · 1.00 h faturadas');
+  });
 });
 
 describe('renderInvoicePdfBuffer', () => {
@@ -337,4 +377,189 @@ describe('buildInvoiceEmailAmounts (deposit-vs-balance split for the email)', ()
     const a = buildInvoiceEmailAmounts({ ...base, depositDue: '300.00', amountPaid: '900.00', balance: '100.00' });
     expect(a.amountDueNow).toBe('$100.00'); // never advertises more than is owed
   });
-})
+});
+
+describe('Invoice ticket grouping and line labeling (#3319)', () => {
+  it('renders lines without ticketId directly without ticket headers', () => {
+    const lines = [
+      makeLine({ name: 'Monthly Managed Services', description: 'Includes 24/7 monitoring', ticketId: null }),
+    ];
+    const html = renderInvoiceHtml(makeInvoice(), lines, branding);
+    expect(html).toContain('Monthly Managed Services');
+    expect(html).toContain('Includes 24/7 monitoring');
+    expect(html).not.toContain('Ticket #');
+    expect(html).not.toContain('Ticket work');
+  });
+
+  it('renders ticket header and follows #3319 title/blurb rules for ticket lines', () => {
+    const lines = [
+      makeLine({
+        ticketId: 't-1',
+        ticketNumber: '1042',
+        ticketSubject: 'Printer down',
+        ticketCategory: 'Hardware',
+        name: 'Diagnostic & Repair',
+        description: 'Replaced feed rollers',
+      } as never),
+    ];
+    const html = renderInvoiceHtml(makeInvoice(), lines, branding);
+    expect(html).toContain('Ticket #1042: Printer down');
+    expect(html).toContain('Hardware');
+    // #3319: name is the title, description is the blurb
+    expect(html).toContain('Diagnostic &amp; Repair');
+    expect(html).toContain('Replaced feed rollers');
+  });
+
+  it('uses description as title with no blurb for ticket lines with name=null', () => {
+    const lines = [
+      makeLine({
+        ticketId: 't-1',
+        ticketNumber: '1042',
+        name: null,
+        description: 'Labor on workstation',
+      } as never),
+    ];
+    const html = renderInvoiceHtml(makeInvoice(), lines, branding);
+    expect(html).toContain('Labor on workstation');
+  });
+
+  it('does not merge two number-less tickets into one group', () => {
+    const lines = [
+      makeLine({
+        ticketId: 't-1',
+        ticketNumber: null,
+        ticketSubject: 'Network glitch',
+        ticketCategory: 'Network',
+        name: 'Router reboot',
+      } as never),
+      makeLine({
+        ticketId: 't-2',
+        ticketNumber: null,
+        ticketSubject: 'Email issue',
+        ticketCategory: 'Software',
+        name: 'Password reset',
+      } as never),
+    ];
+    const html = renderInvoiceHtml(makeInvoice(), lines, branding);
+    expect(html).toContain('Network glitch');
+    expect(html).toContain('Email issue');
+    // Two distinct headers with 'Ticket work'
+    const matches = html.match(/Ticket work/g);
+    expect(matches).toHaveLength(2);
+  });
+
+  it('spans the tax column in the ticket header when tax is shown', () => {
+    const lines = [makeLine({ ticketId: 't-1', ticketNumber: '1042', name: 'Repair' } as never)];
+    const taxed = renderInvoiceHtml(makeInvoice({ taxRate: '0.0825', taxTotal: '8.25' }), lines, branding);
+    expect(taxed).toMatch(/<td colspan="4"[^>]*>Ticket #1042/);
+    const untaxed = renderInvoiceHtml(makeInvoice({ taxRate: '0', taxTotal: '0' }), lines, branding);
+    expect(untaxed).toMatch(/<td colspan="3"[^>]*>Ticket #1042/);
+  });
+
+  it('keeps first-seen group order when ticket lines interleave', () => {
+    const lines = [
+      makeLine({ ticketId: 't-1', ticketNumber: 'A-1', name: 'first-a' } as never),
+      makeLine({ ticketId: null, name: 'loose' }),
+      makeLine({ ticketId: 't-1', ticketNumber: 'A-1', name: 'second-a' } as never),
+      makeLine({ ticketId: 't-2', ticketNumber: 'B-2', name: 'only-b' } as never),
+    ];
+    const html = renderInvoiceHtml(makeInvoice(), lines, branding);
+    const order = ['Ticket #A-1', 'first-a', 'second-a', 'loose', 'Ticket #B-2', 'only-b'].map((s) => html.indexOf(s));
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+  });
+
+  it('renders English "Category:" label in PDFKit buffer', async () => {
+    const lines = [
+      makeLine({
+        ticketId: 't-1',
+        ticketNumber: '1042',
+        ticketCategory: 'Networking',
+        name: 'Configure Switch',
+      } as never),
+    ];
+    const pdf = await renderInvoicePdfBuffer(makeInvoice(), lines, branding);
+    const textFragments = extractPositionedPdfText(pdf).map((f) => f.text);
+    expect(textFragments.some((t) => t.includes('Category: Networking'))).toBe(true);
+    expect(textFragments.some((t) => t.includes('Categorie:'))).toBe(false);
+  });
+});
+
+// Settings consolidation W02-API (M11, audit finding 22): the ONE footer/terms
+// resolver, shared by the render path (loadInvoiceForRender) and the issue-time
+// snapshot (invoiceService.issueInvoice).
+describe('resolveInvoiceFooter', () => {
+  it.each<[string, { invoiceTerms: string | null; partnerFooter: string | null; brandingFooter: string | null }, string | null]>([
+    ['invoice terms set — wins over everything', { invoiceTerms: 'Net 30, invoice terms', partnerFooter: 'Partner footer', brandingFooter: 'Portal footer' }, 'Net 30, invoice terms'],
+    ['invoice terms null, partner footer set — partner wins over portal', { invoiceTerms: null, partnerFooter: 'Partner footer', brandingFooter: 'Portal footer' }, 'Partner footer'],
+    ['invoice terms null, partner footer null, portal footer set — portal is the last resort', { invoiceTerms: null, partnerFooter: null, brandingFooter: 'Portal footer' }, 'Portal footer'],
+    ['all three null — no footer at all', { invoiceTerms: null, partnerFooter: null, brandingFooter: null }, null],
+  ])('%s', (_name, input, expected) => {
+    expect(resolveInvoiceFooter(input)).toBe(expected);
+  });
+});
+
+// Sweep paper cut #16: a DRAFT invoice has no bill-to snapshot yet
+// (billToName/billToAddress/billToTaxId are stamped only at issue —
+// invoiceService.issueInvoice), so before issue the BILL TO block would
+// otherwise render completely blank — not even the organization name, which
+// the quote PDF prints for the same draft state. Fall back to the org's name
+// (and its billing-contact email) for DISPLAY only; an issued invoice's own
+// frozen billToName is never touched.
+describe('resolveDraftBillTo', () => {
+  it('falls back to the org name + billing contact email on a draft with no bill-to name', () => {
+    expect(resolveDraftBillTo({
+      status: 'draft', billToName: null, orgName: 'Sweep Org B',
+      orgBillingContact: { email: 'ap@sweeporgb.example' },
+    })).toEqual({ billToName: 'Sweep Org B', billToEmail: 'ap@sweeporgb.example' });
+  });
+
+  it('falls back to the org name with a null email when the org has a contact with no email', () => {
+    expect(resolveDraftBillTo({
+      status: 'draft', billToName: null, orgName: 'Sweep Org B', orgBillingContact: null,
+    })).toEqual({ billToName: 'Sweep Org B', billToEmail: null });
+  });
+
+  it('treats a blank/whitespace billToName as absent, same as null', () => {
+    expect(resolveDraftBillTo({
+      status: 'draft', billToName: '   ', orgName: 'Sweep Org B', orgBillingContact: null,
+    })).toEqual({ billToName: 'Sweep Org B', billToEmail: null });
+  });
+
+  it('a tech-entered billToName on a draft wins over the org name, and no email is surfaced', () => {
+    expect(resolveDraftBillTo({
+      status: 'draft', billToName: 'Custom Bill-To', orgName: 'Sweep Org B',
+      orgBillingContact: { email: 'ap@sweeporgb.example' },
+    })).toEqual({ billToName: 'Custom Bill-To', billToEmail: null });
+  });
+
+  it('never falls back once issued — the frozen billToName (even null) is returned verbatim', () => {
+    expect(resolveDraftBillTo({
+      status: 'sent', billToName: null, orgName: 'Sweep Org B', orgBillingContact: { email: 'ap@sweeporgb.example' },
+    })).toEqual({ billToName: null, billToEmail: null });
+  });
+});
+
+// Renderer-level check that the fallback email actually prints under BILL TO
+// when a caller (loadInvoiceForRender) supplies it via branding — never
+// printed when absent (every issued-invoice fixture in this file omits it).
+describe('BILL TO email fallback rendering (sweep paper cut #16)', () => {
+  it('renderInvoiceHtml prints the fallback email under Bill To when billToName is blank', () => {
+    const html = renderInvoiceHtml(
+      makeInvoice({ billToName: null, billToAddress: null, billToTaxId: null }),
+      [makeLine()],
+      { ...branding, billToEmailFallback: 'ap@sweeporgb.example' },
+    );
+    expect(html).toContain('ap@sweeporgb.example');
+  });
+
+  it('renderInvoicePdfBuffer draws the fallback email under BILL TO when billToName is blank', async () => {
+    const pdf = await renderInvoicePdfBuffer(
+      makeInvoice({ billToName: null, billToAddress: null, billToTaxId: null }),
+      [makeLine()],
+      { ...branding, billToEmailFallback: 'ap@sweeporgb.example' },
+    );
+    const text = extractPositionedPdfText(pdf).map((f) => f.text).join('|');
+    expect(text).toContain('ap@sweeporgb.example');
+  });
+});
