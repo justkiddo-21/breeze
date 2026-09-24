@@ -140,3 +140,7 @@ docker-compose.override.pam.yml
 
 # Measured acceptance/soak artifacts (topology fleet gates, ad-hoc harness runs)
 test-results/
+
+# TURN TLS cert material (Let's Encrypt via lego) — never commit the private key
+.lego/
+coturn-tls/
