@@ -8,12 +8,31 @@
 # the file to container_file_t so SELinux (enforcing) permits the read —
 # shared label since both redis and api mount the same host file.
 services:
+  # Fork uses a locally-built binaries image (ghcr push needs a PAT this
+  # host lacks). pull_policy: never uses the local podman image store so
+  # binaries-init seeds /data/binaries with the FORK agent binaries
+  # (KResLab-signed, DLP) instead of upstream's — required for
+  # BINARY_SOURCE=local agent auto-update to serve the right binary.
+  binaries-init:
+    pull_policy: never
+
   redis:
     volumes:
       - ./podman-secrets/redis_password:/run/secrets/redis_password:ro,z
   api:
     volumes:
       - ./podman-secrets/redis_password:/run/secrets/redis_password:ro,z
+    # Fork agent auto-update: serve the fork's own (KResLab-signed, DLP) agent
+    # binaries from the local binaries volume and sign update manifests with the
+    # per-deployment key (auto-generated, delivered to agents via heartbeat +
+    # pinned TOFU). .ghcr hardcodes BINARY_SOURCE: github, and .podman loads
+    # AFTER it, so this is where the fork flips it. AGENT_AUTO_PROMOTE=false is a
+    # safety lever: sync REGISTERS binaries but never auto-promotes them to the
+    # fleet upgrade target — promote deliberately via POST /agent-versions/promote
+    # (test one device first). Flip to true once a new version is validated.
+    environment:
+      BINARY_SOURCE: local
+      AGENT_AUTO_PROMOTE: "false"
 
   # docker-compose.override.yml.ghcr stubs coturn out to a no-op (`image:
   # alpine:3.19`, `entrypoint: ["true"]`) on the assumption TURN runs on a

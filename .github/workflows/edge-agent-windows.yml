@@ -11,6 +11,17 @@ name: Edge Agent (Windows, self-signed)
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Version baked into every binary via -X main.version (and into the
+          winres --file-version/--product-version). Must be plain numeric semver
+          (e.g. 0.116.1) — compareAgentVersions rejects a non-numeric core, and a
+          `-suffix` sorts BELOW the plain version. MUST match the VERSION
+          registered for the served binaries (binaries-image VERSION file /
+          BREEZE_VERSION) or the heartbeat upgrade check loops forever.
+        required: true
+        default: "0.116.1"
 
 permissions:
   contents: read
@@ -37,7 +48,7 @@ jobs:
         run: |
           go-winres simply --arch amd64 --no-suffix `
             --icon icon.ico --admin `
-            --file-version 0.0.0 --product-version 0.0.0 `
+            --file-version ${{ inputs.version }} --product-version ${{ inputs.version }} `
             --product-name "Breeze" `
             --file-description "Breeze" `
             --copyright "Copyright (c) Breeze RMM" `
@@ -55,7 +66,7 @@ jobs:
         run: |
           go-winres simply --arch amd64 --no-suffix `
             --icon icon.ico `
-            --file-version 0.0.0 --product-version 0.0.0 `
+            --file-version ${{ inputs.version }} --product-version ${{ inputs.version }} `
             --product-name "Breeze RMM User Helper" `
             --file-description "Breeze RMM User Helper" `
             --copyright "Copyright (c) Breeze RMM" `
@@ -73,7 +84,7 @@ jobs:
         run: |
           go-winres simply --arch amd64 --no-suffix `
             --icon icon.ico --admin `
-            --file-version 0.0.0 --product-version 0.0.0 `
+            --file-version ${{ inputs.version }} --product-version ${{ inputs.version }} `
             --product-name "Breeze" `
             --file-description "Breeze Helper" `
             --copyright "Copyright (c) Breeze RMM" `
@@ -94,16 +105,23 @@ jobs:
           # implicitly since there's no Windows C cross-compiler on those
           # hosts; force the same value here for a native windows-latest build.
           CGO_ENABLED: 0
+          AGENT_VERSION: ${{ inputs.version }}
         run: |
           # pwsh only surfaces the LAST command's exit code, so an earlier
           # `go build` failure (e.g. the agent exe) would otherwise pass green
           # and only blow up later at signing with "file not found". Fail fast
           # after each build instead.
-          go build -o bin/breeze-agent-windows-amd64.exe ./cmd/breeze-agent
+          #
+          # -X main.version stamps the reported version on EVERY component. The
+          # watchdog and user-helper ride the same heartbeat upgrade check as the
+          # agent, so leaving any of them on the "0.5.0" default loops that
+          # component's update forever once served under a higher registered
+          # version.
+          go build -ldflags "-s -w -X main.version=$env:AGENT_VERSION" -o bin/breeze-agent-windows-amd64.exe ./cmd/breeze-agent
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          go build -ldflags "-H windowsgui" -o bin/breeze-user-helper-windows-amd64.exe ./cmd/breeze-user-helper
+          go build -ldflags "-s -w -X main.version=$env:AGENT_VERSION -H windowsgui" -o bin/breeze-user-helper-windows-amd64.exe ./cmd/breeze-user-helper
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          go build -o bin/breeze-watchdog-windows-amd64.exe ./cmd/breeze-watchdog
+          go build -ldflags "-s -w -X main.version=$env:AGENT_VERSION" -o bin/breeze-watchdog-windows-amd64.exe ./cmd/breeze-watchdog
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Import KResLab code-signing cert

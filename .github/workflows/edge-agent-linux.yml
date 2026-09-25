@@ -8,6 +8,18 @@ name: Edge Agent (Linux)
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Version baked into the binary via -X main.version (must be plain
+          numeric semver, e.g. 0.116.1 — compareAgentVersions rejects a
+          non-numeric core, and a `-suffix` sorts BELOW the plain version).
+          This is the value the agent reports on heartbeat; it MUST match the
+          VERSION registered for the served binary (the binaries-image VERSION
+          file / BREEZE_VERSION) or the heartbeat upgrade check loops forever
+          (target > reported stays true after every "successful" update).
+        required: true
+        default: "0.116.1"
 
 permissions:
   contents: read
@@ -34,7 +46,13 @@ jobs:
           # Matches every other build of this agent: the pure-Go X11 capture path
           # (internal/remote/desktop/x11) needs no cgo.
           CGO_ENABLED: 0
-        run: go build -o bin/breeze-agent-linux-amd64 ./cmd/breeze-agent
+          AGENT_VERSION: ${{ inputs.version }}
+        # -X main.version stamps the reported version. Omitting it (the old bug)
+        # left the cmd/breeze-agent default "0.5.0" baked in, so every heartbeat
+        # saw target > 0.5.0 and re-offered the update in an infinite loop. -s -w
+        # mirrors build-edition.sh's self-host ldflags (this deployment serves the
+        # self-host edition; no hostpolicy flags are needed).
+        run: go build -ldflags "-s -w -X main.version=${AGENT_VERSION}" -o bin/breeze-agent-linux-amd64 ./cmd/breeze-agent
 
       # Bundle the OpenH264 encoder lib the agent needs for H264. It normally
       # auto-downloads this on first capture, but air-gapped kiosk machines can't
