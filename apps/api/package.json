@@ -89,7 +89,7 @@
     "i18next": "^26.3.6",
     "ioredis": "^5.11.1",
     "jose": "^6.2.3",
-    "js-yaml": "^5.2.2",
+    "js-yaml": "^5.4.1",
     "jspdf": "^4.2.1",
     "jspdf-autotable": "^5.0.8",
     "nanoid": "^6.0.0",
