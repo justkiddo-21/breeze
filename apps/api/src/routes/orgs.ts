@@ -2860,7 +2860,12 @@ orgRoutes.get('/sites/:id', requireScope('organization', 'partner', 'system'), r
     return c.json({ error: 'Access to this site denied' }, 403);
   }
 
-  return c.json(site);
+  const [{ deviceCount }] = await db
+    .select({ deviceCount: sql<number>`count(*)::int` })
+    .from(devices)
+    .where(and(eq(devices.siteId, site.id), ne(devices.status, 'decommissioned')));
+
+  return c.json({ ...site, deviceCount });
 });
 
 orgRoutes.patch('/sites/:id', requireScope('organization', 'partner', 'system'), requireSiteWrite, requireMfa(), zValidator('json', updateSiteSchema), async (c) => {
