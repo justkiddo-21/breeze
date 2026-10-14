@@ -138,6 +138,25 @@ export default function SiteDetailPage({ siteId }: { siteId: string }) {
   const [assignments, setAssignments] = useState<PolicyAssignment[]>([]);
   const [assignmentsError, setAssignmentsError] = useState<string>();
   const [availablePolicies, setAvailablePolicies] = useState<AvailablePolicy[]>([]);
+  const [siteDevices, setSiteDevices] = useState<any[]>([]);
+  const [siteDevicesLoading, setSiteDevicesLoading] = useState(false);
+
+  useEffect(() => {
+    const sid = site?.id;
+    if (!sid) return;
+    let cancelled = false;
+    setSiteDevicesLoading(true);
+    fetchWithAuth(`/devices?siteId=${encodeURIComponent(sid)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (cancelled || !data) return;
+        const list = Array.isArray(data) ? data : (data.devices ?? data.data ?? []);
+        setSiteDevices(list);
+      })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setSiteDevicesLoading(false); });
+    return () => { cancelled = true; };
+  }, [site?.id]);
   const [selectedPolicyId, setSelectedPolicyId] = useState('');
   const [assignPriority, setAssignPriority] = useState('0');
   const [assigning, setAssigning] = useState(false);
@@ -749,6 +768,53 @@ export default function SiteDetailPage({ siteId }: { siteId: string }) {
               >
                 {t('siteDetailPage.devices.viewAll')}
               </a>
+
+              <div className="mt-6 overflow-x-auto rounded-md border">
+                <table className="w-full text-sm">
+                  <thead className="bg-muted/50 text-left text-xs uppercase text-muted-foreground">
+                    <tr>
+                      <th className="px-4 py-2 font-medium">Device</th>
+                      <th className="px-4 py-2 font-medium">OS</th>
+                      <th className="px-4 py-2 font-medium">Status</th>
+                      <th className="px-4 py-2 font-medium">Last Seen</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {siteDevicesLoading && (
+                      <tr><td colSpan={4} className="px-4 py-6 text-center text-muted-foreground">Loading...</td></tr>
+                    )}
+                    {!siteDevicesLoading && siteDevices.length === 0 && (
+                      <tr><td colSpan={4} className="px-4 py-6 text-center text-muted-foreground">No devices</td></tr>
+                    )}
+                    {!siteDevicesLoading && siteDevices.map((d: any) => (
+                      <tr key={d.id} className="border-t hover:bg-muted/30">
+                        <td className="px-4 py-2">
+                          <a href={`/devices/${d.id}`} className="font-medium text-primary hover:underline">
+                            {d.displayName || d.hostname || d.id}
+                          </a>
+                          {d.displayName && d.hostname && d.displayName !== d.hostname && (
+                            <div className="text-xs text-muted-foreground">{d.hostname}</div>
+                          )}
+                        </td>
+                        <td className="px-4 py-2 capitalize">{d.osType ?? d.os ?? '—'}</td>
+                        <td className="px-4 py-2">
+                          <span className={cn(
+                            'inline-flex rounded-full px-2 py-0.5 text-xs font-medium',
+                            d.status === 'online'
+                              ? 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300'
+                              : 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300'
+                          )}>
+                            {d.status ?? 'unknown'}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2 text-muted-foreground">
+                          {d.lastSeenAt ? new Date(d.lastSeenAt).toLocaleString() : '—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
           )}
         </main>
