@@ -21,7 +21,7 @@ type Props = {
 // Matches the server-side cap on partners.email_signature (PATCH /partners/me).
 const MAX_EMAIL_SIGNATURE_LENGTH = 2000;
 
-const COUNTRY_CODES = ['', 'US', 'CA', 'MX', 'GB', 'IE', 'FR', 'DE', 'ES', 'IT', 'NL', 'BE', 'CH', 'AT', 'SE', 'NO', 'DK', 'FI', 'PL', 'PT', 'CZ', 'GR', 'AU', 'NZ', 'JP', 'KR', 'CN', 'HK', 'SG', 'IN', 'AE', 'IL', 'ZA', 'BR', 'AR', 'CL', 'CO'] as const;
+const COUNTRY_CODES = ['', 'US', 'CA', 'MX', 'GB', 'IE', 'FR', 'DE', 'ES', 'IT', 'NL', 'BE', 'CH', 'AT', 'SE', 'NO', 'DK', 'FI', 'PL', 'PT', 'CZ', 'GR', 'AU', 'NZ', 'JP', 'KR', 'CN', 'HK', 'SG', 'VN', 'IN', 'AE', 'IL', 'ZA', 'BR', 'AR', 'CL', 'CO'] as const;
 
 const inputClass = 'h-10 w-full rounded-md border bg-background px-3 text-sm';
 
