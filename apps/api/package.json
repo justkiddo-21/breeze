@@ -111,7 +111,7 @@
     "stripe": "^22.3.2",
     "tldts": "^7.4.13",
     "twilio": "^6.0.2",
-    "zod": "^4.4.3"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@types/archiver": "^8.0.0",

@@ -20,7 +20,7 @@
     "hono": "4.13.8",
     "mailparser": "^3.9.14",
     "v9u-smb2": "^1.0.6",
-    "zod": "4.4.3"
+    "zod": "4.6.6"
   },
   "devDependencies": {
     "@breeze/extension-testkit": "workspace:*",
